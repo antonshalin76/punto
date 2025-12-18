@@ -45,15 +45,15 @@ sudo dnf install gcc make cmake interception-tools xclip xsel xdotool xprop pyth
 
 ### Назначение зависимостей
 
-| Пакет                 | Назначение                                 |
-| --------------------- | ------------------------------------------ |
-| `build-essential`     | Компилятор GCC и make                      |
-| `interception-tools`  | Перехват и эмуляция клавиатурных событий   |
-| `xclip`               | Работа с буфером обмена X11                |
-| `xsel`                | Работа с буфером обмена X11 (альтернатива) |
-| `xdotool`             | Эмуляция нажатий клавиш в X11              |
-| `x11-utils` (`xprop`) | Определение активного окна                 |
-| `python3`             | Для скрипта `punto-invert`                 |
+| Пакет                | Назначение                                                         |
+| ------------------------- | ---------------------------------------------------------------------------- |
+| `build-essential`       | Компилятор GCC и make                                             |
+| `interception-tools`    | Перехват и эмуляция клавиатурных событий |
+| `xclip`                 | Работа с буфером обмена X11                              |
+| `xsel`                  | Работа с буфером обмена X11 (альтернатива)   |
+| `xdotool`               | Эмуляция нажатий клавиш в X11                          |
+| `x11-utils` (`xprop`) | Определение активного окна                           |
+| `python3`               | Для скрипта `punto-invert`                                       |
 
 ### Сборка Interception Tools из исходников
 
@@ -67,17 +67,18 @@ cmake --build build
 sudo cmake --install build
 ```
 
-
 ## Установка
 
 ### Способ 1: Установка deb-пакета (рекомендуется)
 
 ```bash
 # Скачайте или соберите пакет
+git clone https://github.com/antonshalin76/punto.git
 sudo apt install ./punto-ubuntu.deb
 ```
 
 Пакет автоматически:
+
 - Установит все зависимости
 - Скопирует бинарники в `/usr/local/bin/`
 - Создаст конфигурации в `/etc/punto/` и `/etc/interception/`
@@ -86,7 +87,7 @@ sudo apt install ./punto-ubuntu.deb
 ### Способ 2: Сборка deb-пакета из исходников
 
 ```bash
-cd /home/anton/scripts/punto-c
+git clone https://github.com/antonshalin76/punto.git
 ./build-deb.sh
 sudo apt install ./punto-ubuntu.deb
 ```
@@ -94,11 +95,9 @@ sudo apt install ./punto-ubuntu.deb
 ### Способ 3: Ручная установка
 
 ```bash
-cd /home/anton/scripts/punto-c
 make clean && make
 sudo make install
 ```
-
 
 ### Настройка udevmon
 
@@ -122,11 +121,11 @@ sudo systemctl start udevmon
 
 ### Горячие клавиши
 
-| Комбинация           | Действие                                          |
-| -------------------- | ------------------------------------------------- |
-| **Pause**            | Инвертировать раскладку текущего/последнего слова |
-| **Pause** (повторно) | Инвертировать обратно (toggle)                    |
-| **Shift+Pause**      | Инвертировать раскладку выделенного текста        |
+| Комбинация               | Действие                                                                               |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------- |
+| **Pause**                    | Инвертировать раскладку текущего/последнего слова |
+| **Pause** (повторно) | Инвертировать обратно (toggle)                                             |
+| **Shift+Pause**              | Инвертировать раскладку выделенного текста              |
 
 ### Примеры
 
@@ -182,13 +181,13 @@ sudo systemctl start udevmon
 
 ### Компоненты
 
-| Файл           | Назначение                                              |
-| -------------- | ------------------------------------------------------- |
-| `src/punto.c`  | Основная логика обработки клавиш                        |
+| Файл         | Назначение                                                                    |
+| ---------------- | --------------------------------------------------------------------------------------- |
+| `src/punto.c`  | Основная логика обработки клавиш                           |
 | `punto-switch` | Bash-скрипт переключения раскладки через IBus/GSettings |
-| `punto-invert` | Python-скрипт инверсии выделенного текста               |
-| `udevmon.yaml` | Конфигурация для udevmon                                |
-| `Makefile`     | Сборка и установка                                      |
+| `punto-invert` | Python-скрипт инверсии выделенного текста                |
+| `udevmon.yaml` | Конфигурация для udevmon                                                 |
+| `Makefile`     | Сборка и установка                                                      |
 
 ## Настройка
 
@@ -211,24 +210,23 @@ delays:
 
 ### Доступные клавиши
 
-| Имя                       | Клавиша   |
-| ------------------------- | --------- |
-| `leftctrl`, `rightctrl`   | Ctrl      |
-| `leftalt`, `rightalt`     | Alt       |
-| `leftshift`, `rightshift` | Shift     |
-| `leftmeta`, `rightmeta`   | Super/Win |
-| `grave`                   | \` ~      |
-| `space`                   | Пробел    |
-| `tab`                     | Tab       |
-| `backslash`               | \\        |
-| `capslock`                | Caps Lock |
+| Имя                        | Клавиша |
+| ----------------------------- | -------------- |
+| `leftctrl`, `rightctrl`   | Ctrl           |
+| `leftalt`, `rightalt`     | Alt            |
+| `leftshift`, `rightshift` | Shift          |
+| `leftmeta`, `rightmeta`   | Super/Win      |
+| `grave`                     | \` ~           |
+| `space`                     | Пробел   |
+| `tab`                       | Tab            |
+| `backslash`                 | \\             |
+| `capslock`                  | Caps Lock      |
 
 После изменения конфига перезапустите сервис:
 
 ```bash
 sudo systemctl restart udevmon
 ```
-
 
 ## Удаление
 
@@ -253,7 +251,6 @@ sudo systemctl stop udevmon
 sudo systemctl disable udevmon
 sudo rm -rf /etc/punto
 ```
-
 
 ## Решение проблем
 
@@ -289,4 +286,4 @@ MIT License
 
 ## Автор
 
-Создано с помощью AI-ассистента для пользователя anton.
+Anton Shalin <anton.shalin@gmail.com>

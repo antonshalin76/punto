@@ -1,0 +1,18 @@
+# Punto Switcher Configuration
+# Путь по умолчанию: /etc/punto/config.yaml
+
+# Хоткей переключения раскладки
+# Доступные модификаторы: leftctrl, rightctrl, leftalt, rightalt, leftshift, rightshift
+# Доступные клавиши: grave (` ~), space, tab, и т.д.
+hotkey:
+  modifier: leftctrl
+  key: grave
+
+# Задержки (в миллисекундах)
+delays:
+  # Задержка между нажатием и отпусканием клавиши
+  key_press: 20
+  # Задержка после переключения раскладки
+  layout_switch: 100
+  # Задержка между символами при перепечатывании
+  retype: 3

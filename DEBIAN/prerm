@@ -1,0 +1,8 @@
+#!/bin/bash
+set -e
+
+# Остановка сервиса перед удалением
+systemctl stop udevmon || true
+
+echo "Punto Switcher будет удален."
+echo "Конфигурационные файлы сохранены в /etc/punto/"

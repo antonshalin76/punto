@@ -1,0 +1,29 @@
+#!/bin/bash
+set -e
+
+# Создание директорий
+mkdir -p /etc/punto
+mkdir -p /etc/interception
+
+# Установка конфигурации (если не существует)
+if [ ! -f /etc/punto/config.yaml ]; then
+    cp /usr/share/punto-switcher/config.yaml /etc/punto/config.yaml
+fi
+
+# Установка конфигурации udevmon (если не существует)
+if [ ! -f /etc/interception/udevmon.yaml ]; then
+    cp /usr/share/punto-switcher/udevmon.yaml /etc/interception/udevmon.yaml
+else
+    # Добавить конфигурацию punto если её нет
+    if ! grep -q "punto" /etc/interception/udevmon.yaml; then
+        cat /usr/share/punto-switcher/udevmon.yaml >> /etc/interception/udevmon.yaml
+    fi
+fi
+
+# Включение и запуск сервиса
+systemctl daemon-reload
+systemctl enable udevmon || true
+systemctl restart udevmon || true
+
+echo "Punto Switcher установлен успешно!"
+echo "Используйте Pause для инверсии слова, Shift+Pause для инверсии выделенного текста."

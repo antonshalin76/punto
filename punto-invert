@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""
+Invert keyboard layout for selected text.
+Called by punto when Shift+Pause is pressed.
+Handles copy/paste with terminal detection.
+"""
+
+import subprocess
+import sys
+import os
+import pwd
+import time
+
+# EN -> RU mapping
+EN_TO_RU = {
+    'q': 'й', 'w': 'ц', 'e': 'у', 'r': 'к', 't': 'е', 'y': 'н', 'u': 'г', 'i': 'ш',
+    'o': 'щ', 'p': 'з', '[': 'х', ']': 'ъ', 'a': 'ф', 's': 'ы', 'd': 'в', 'f': 'а',
+    'g': 'п', 'h': 'р', 'j': 'о', 'k': 'л', 'l': 'д', ';': 'ж', "'": 'э', 'z': 'я',
+    'x': 'ч', 'c': 'с', 'v': 'м', 'b': 'и', 'n': 'т', 'm': 'ь', ',': 'б', '.': 'ю',
+    '`': 'ё', '/': '.', '?': ',',
+    'Q': 'Й', 'W': 'Ц', 'E': 'У', 'R': 'К', 'T': 'Е', 'Y': 'Н', 'U': 'Г', 'I': 'Ш',
+    'O': 'Щ', 'P': 'З', '{': 'Х', '}': 'Ъ', 'A': 'Ф', 'S': 'Ы', 'D': 'В', 'F': 'А',
+    'G': 'П', 'H': 'Р', 'J': 'О', 'K': 'Л', 'L': 'Д', ':': 'Ж', '"': 'Э', 'Z': 'Я',
+    'X': 'Ч', 'C': 'С', 'V': 'М', 'B': 'И', 'N': 'Т', 'M': 'Ь', '<': 'Б', '>': 'Ю',
+    '~': 'Ё',
+}
+RU_TO_EN = {v: k for k, v in EN_TO_RU.items()}
+
+
+def get_active_user_env():
+    """Find active GUI user and their DISPLAY/XAUTHORITY."""
+    try:
+        cmd = "loginctl list-sessions | grep 'seat0' | awk '{print $3}' | head -n 1"
+        user = subprocess.getoutput(cmd).strip()
+        if not user:
+            user = subprocess.getoutput("who | grep '(:0)' | awk '{print $1}' | head -n 1").strip()
+        
+        if not user:
+            return None, {}
+
+        uid = pwd.getpwnam(user).pw_uid
+        pid_cmd = f"pgrep -u {user} gnome-session | head -n 1"
+        pid = subprocess.getoutput(pid_cmd).strip()
+        
+        env = os.environ.copy()
+        env['USER'] = user
+        env['HOME'] = pwd.getpwnam(user).pw_dir
+        
+        if pid:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                env_data = f.read().split(b'\0')
+                for item in env_data:
+                    if item.startswith(b"DISPLAY="):
+                        env['DISPLAY'] = item.split(b'=', 1)[1].decode()
+                    if item.startswith(b"XAUTHORITY="):
+                        env['XAUTHORITY'] = item.split(b'=', 1)[1].decode()
+        
+        if 'DISPLAY' not in env:
+            env['DISPLAY'] = ':0'
+        if 'XAUTHORITY' not in env:
+            env['XAUTHORITY'] = f"/run/user/{uid}/gdm/Xauthority"
+            
+        return user, env
+    except Exception:
+        return None, {}
+
+
+def run_as_user(user, env, cmd):
+    """Run command as specific user."""
+    wrapper = ['sudo', '-u', user, 'env', 
+               f"DISPLAY={env.get('DISPLAY', ':0')}",
+               f"XAUTHORITY={env.get('XAUTHORITY', '')}"] + cmd
+    try:
+        proc = subprocess.Popen(wrapper, 
+                                stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        stdout, _ = proc.communicate()
+        return stdout
+    except Exception:
+        return None
+
+
+def is_terminal_window(user, env):
+    """Check if active window is a terminal using xprop."""
+    try:
+        # Get active window ID
+        wid_result = subprocess.run(
+            ['sudo', '-u', user, 'env', 
+             f"DISPLAY={env.get('DISPLAY', ':0')}",
+             f"XAUTHORITY={env.get('XAUTHORITY', '')}",
+             'xdotool', 'getactivewindow'],
+            capture_output=True, text=True, timeout=2
+        )
+        if wid_result.returncode != 0:
+            return False
+            
+        wid = wid_result.stdout.strip()
+        
+        # Get WM_CLASS using xprop
+        result = subprocess.run(
+            ['sudo', '-u', user, 'env', 
+             f"DISPLAY={env.get('DISPLAY', ':0')}",
+             f"XAUTHORITY={env.get('XAUTHORITY', '')}",
+             'xprop', '-id', wid, 'WM_CLASS'],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0:
+            # Parse WM_CLASS: WM_CLASS(STRING) = "instance", "class"
+            output = result.stdout.strip()
+            # Extract just the class names between quotes
+            import re
+            classes = re.findall(r'"([^"]+)"', output)
+            classes_lower = [c.lower() for c in classes]
+            
+            terminals = ['gnome-terminal', 'gnome-terminal-server', 'konsole', 
+                        'xterm', 'urxvt', 'terminator', 'tilix', 'alacritty', 
+                        'kitty', 'terminology', 'xfce4-terminal', 'mate-terminal']
+            return any(term in classes_lower for term in terminals)
+    except Exception:
+        pass
+    return False
+
+
+
+
+def main():
+    try:
+        user, env = get_active_user_env()
+        if not user:
+            sys.exit(1)
+
+        # Detect terminal for copy/paste keys
+        in_terminal = is_terminal_window(user, env)
+        if in_terminal:
+            copy_keys = 'ctrl+shift+c'
+            paste_keys = 'ctrl+shift+v'
+        else:
+            copy_keys = 'ctrl+c'
+            paste_keys = 'ctrl+v'
+
+        # For terminal: use primary selection (contains selected text automatically)
+        # For other apps: use clipboard via Ctrl+C
+        
+        if in_terminal:
+
+            # 1. Get text from primary selection (auto-filled when text is selected)
+            text_bytes = run_as_user(user, env, ['xclip', '-selection', 'primary', '-o'])
+            if not text_bytes:
+                sys.exit(0)
+            
+            # 2. Delete text using Backspace (terminal doesn't support Delete for selection)
+            text_len = len(text_bytes.decode('utf-8', errors='ignore'))
+            for _ in range(text_len):
+                run_as_user(user, env, ['xdotool', 'key', 'BackSpace'])
+            time.sleep(0.1)
+
+        else:
+            # 1. Copy selected text
+            run_as_user(user, env, ['xdotool', 'key', '--clearmodifiers', copy_keys])
+            time.sleep(0.2)
+            
+            # 2. Get text from clipboard
+            text_bytes = run_as_user(user, env, ['xclip', '-selection', 'clipboard', '-o'])
+            if not text_bytes:
+                sys.exit(0)
+
+             
+        text = text_bytes.decode('utf-8', errors='ignore')
+
+        # 3. Invert layout
+        has_cyrillic = any('\u0400' <= c <= '\u04FF' for c in text)
+        mapping = RU_TO_EN if has_cyrillic else EN_TO_RU
+        inverted = ''.join([mapping.get(c, c) for c in text])
+
+        # 4. Set clipboard
+        proc = subprocess.Popen(
+            ['sudo', '-u', user, 'env', 
+             f"DISPLAY={env.get('DISPLAY', ':0')}",
+             f"XAUTHORITY={env.get('XAUTHORITY', '')}",
+             'xsel', '--clipboard', '--input'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        proc.communicate(input=inverted.encode('utf-8'))
+        time.sleep(0.1)
+        
+        # 5. Paste
+        run_as_user(user, env, ['xdotool', 'key', '--clearmodifiers', paste_keys])
+        
+    except Exception:
+        pass
+
+
+if __name__ == '__main__':
+    main()

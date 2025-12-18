@@ -1,0 +1,18 @@
+Package: punto-switcher
+Version: 1.0.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: interception-tools, xclip, xsel, xdotool, x11-utils, python3
+Maintainer: Anton Shalin <anton@example.com>
+Description: Punto Switcher для Linux
+ Легковесная реализация Punto Switcher для Linux.
+ Позволяет исправлять текст, набранный в неправильной
+ раскладке клавиатуры.
+ .
+ Возможности:
+  - Ручная инверсия слова (Pause)
+  - Повторная инверсия (Pause)
+  - Инверсия выделенного текста (Shift+Pause)
+  - Поддержка систмных хоткеев
+  - Минимальное потребление ресурсов

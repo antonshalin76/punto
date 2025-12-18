@@ -25,5 +25,6 @@ systemctl daemon-reload
 systemctl enable udevmon || true
 systemctl restart udevmon || true
 
-echo "Punto Switcher установлен успешно!"
+echo "Punto Switcher for Ubuntu установлен успешно!"
+echo "Author Anton Shalin <anton.shalin@gmail.com>"
 echo "Используйте Pause для инверсии слова, Shift+Pause для инверсии выделенного текста."

@@ -4,8 +4,8 @@ Section: utils
 Priority: optional
 Architecture: amd64
 Depends: interception-tools, xclip, xsel, xdotool, x11-utils, python3
-Maintainer: Anton Shalin <anton@example.com>
-Description: Punto Switcher для Linux
+Maintainer: Anton Shalin <anton.shalin@gmail.com>
+Description: Punto Switcher для Linux Ubuntu (C версия)
  Легковесная реализация Punto Switcher для Linux.
  Позволяет исправлять текст, набранный в неправильной
  раскладке клавиатуры.

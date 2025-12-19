@@ -313,6 +313,19 @@ static void invert_selection(void) {
 }
 
 /**
+ * Transliterate selected text via external script
+ */
+static void transliterate_selection(void) {
+  release_modifiers();
+  usleep(cfg_delay_key_press);
+
+  // Script will handle copy, transliterate, and paste
+  if (system("/usr/local/bin/punto-translit") != 0) {
+    return;
+  }
+}
+
+/**
  * Invert selected text case via external script
  */
 static void invert_selection_case(void) {
@@ -379,6 +392,7 @@ int main(void) {
   setbuf(stdout, NULL);
 
   bool ctrl = false, alt = false, meta = false;
+  bool lctrl = false, lalt = false;
 
   while (fread(&ev, sizeof(ev), 1, stdin) == 1) {
     if (ev.type != EV_KEY) {
@@ -397,11 +411,15 @@ int main(void) {
     }
     if (code == KEY_LEFTCTRL || code == KEY_RIGHTCTRL) {
       ctrl = (value != 0);
+      if (code == KEY_LEFTCTRL)
+        lctrl = (value != 0);
       emit_event(&ev);
       continue;
     }
     if (code == KEY_LEFTALT || code == KEY_RIGHTALT) {
       alt = (value != 0);
+      if (code == KEY_LEFTALT)
+        lalt = (value != 0);
       emit_event(&ev);
       continue;
     }
@@ -425,33 +443,33 @@ int main(void) {
       continue;
     }
 
-    // SHIFT+PAUSE = Invert selection layout
-    if (code == KEY_PAUSE && shift_pressed) {
-      invert_selection();
-      continue;
-    }
-
-    // CTRL+PAUSE = Invert last word case
-    if (code == KEY_PAUSE && ctrl) {
-      if (word_len >= 1) {
-        invert_case_last_word(word_buffer, word_shift, word_len, NULL, 0);
-        word_len = 0;
-        trailing_len = 0;
-      } else if (last_word_len >= 1) {
-        invert_case_last_word(last_word_buffer, last_word_shift, last_word_len,
-                              trailing_buffer, trailing_len);
-      }
-      continue;
-    }
-
-    // ALT+PAUSE = Invert selection case
-    if (code == KEY_PAUSE && alt) {
-      invert_selection_case();
-      continue;
-    }
-
-    // PAUSE = Manual switch (layout)
+    // PAUSE hotkey combinations
     if (code == KEY_PAUSE) {
+      if (lctrl && lalt) {
+        transliterate_selection();
+        continue;
+      }
+      if (shift_pressed) {
+        invert_selection();
+        continue;
+      }
+      if (alt) {
+        invert_selection_case();
+        continue;
+      }
+      if (ctrl) {
+        if (word_len >= 1) {
+          invert_case_last_word(word_buffer, word_shift, word_len, NULL, 0);
+          word_len = 0;
+          trailing_len = 0;
+        } else if (last_word_len >= 1) {
+          invert_case_last_word(last_word_buffer, last_word_shift,
+                                last_word_len, trailing_buffer, trailing_len);
+        }
+        continue;
+      }
+
+      // Default Pause (Layout switch)
       if (word_len >= 1) {
         perform_manual_switch(word_buffer, word_shift, word_len, NULL, 0);
         word_len = 0;

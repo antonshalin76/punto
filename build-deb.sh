@@ -3,7 +3,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VERSION="1.0.2"
+VERSION="1.0.3"
 PACKAGE_NAME="punto-switcher"
 BUILD_DIR="${SCRIPT_DIR}/build-deb"
 DEB_DIR="${BUILD_DIR}/${PACKAGE_NAME}_${VERSION}"
@@ -36,6 +36,7 @@ cp "${SCRIPT_DIR}/punto" "${DEB_DIR}/usr/local/bin/"
 cp "${SCRIPT_DIR}/punto-switch" "${DEB_DIR}/usr/local/bin/"
 cp "${SCRIPT_DIR}/punto-invert" "${DEB_DIR}/usr/local/bin/"
 cp "${SCRIPT_DIR}/punto-case-invert" "${DEB_DIR}/usr/local/bin/"
+cp "${SCRIPT_DIR}/punto-translit" "${DEB_DIR}/usr/local/bin/"
 chmod 755 "${DEB_DIR}/usr/local/bin/"*
 
 # Конфигурации -> /usr/share/punto-switcher

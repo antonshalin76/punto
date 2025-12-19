@@ -271,7 +271,7 @@ static void switch_layout_via_hotkey(void) {
   send_key(cfg_hotkey_modifier, 1);
   usleep(cfg_delay_key_press);
   send_key(cfg_hotkey_key, 1);
-  usleep(cfg_delay_key_press + 10000);
+  usleep(cfg_delay_key_press + 50000); // Increased hold time to 50ms + delay
   send_key(cfg_hotkey_key, 0);
   usleep(cfg_delay_key_press);
   send_key(cfg_hotkey_modifier, 0);
@@ -307,8 +307,10 @@ static void invert_selection(void) {
   usleep(cfg_delay_key_press);
 
   // Script will handle copy, invert, and paste
-  if (system("/usr/local/bin/punto-invert") != 0) {
-    return;
+  if (system("/usr/local/bin/punto-invert") == 0) {
+    usleep(
+        cfg_delay_layout_switch); // Give the system time to process the paste
+    switch_layout();
   }
 }
 

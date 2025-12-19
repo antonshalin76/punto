@@ -3,7 +3,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VERSION="1.0.3"
+VERSION="1.0.4"
 PACKAGE_NAME="punto-switcher"
 BUILD_DIR="${SCRIPT_DIR}/build-deb"
 DEB_DIR="${BUILD_DIR}/${PACKAGE_NAME}_${VERSION}"

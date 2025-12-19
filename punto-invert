@@ -147,7 +147,7 @@ def main():
             # 1. Get text from primary selection (auto-filled when text is selected)
             text_bytes = run_as_user(user, env, ['xclip', '-selection', 'primary', '-o'])
             if not text_bytes:
-                sys.exit(0)
+                sys.exit(1)
             
             # 2. Delete text using Backspace (terminal doesn't support Delete for selection)
             text_len = len(text_bytes.decode('utf-8', errors='ignore'))
@@ -163,7 +163,7 @@ def main():
             # 2. Get text from clipboard
             text_bytes = run_as_user(user, env, ['xclip', '-selection', 'clipboard', '-o'])
             if not text_bytes:
-                sys.exit(0)
+                sys.exit(1)
 
              
         text = text_bytes.decode('utf-8', errors='ignore')
@@ -188,9 +188,11 @@ def main():
         
         # 5. Paste
         run_as_user(user, env, ['xdotool', 'key', '--clearmodifiers', paste_keys])
+        time.sleep(0.05)
+        sys.exit(0)
         
     except Exception:
-        pass
+        sys.exit(1)
 
 
 if __name__ == '__main__':

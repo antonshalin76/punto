@@ -89,6 +89,10 @@ static int last_word_buffer[MAX_WORD_LEN];
 static bool last_word_shift[MAX_WORD_LEN];
 static int last_word_len = 0;
 
+// Trailing spaces/tabs buffer
+static int trailing_buffer[MAX_WORD_LEN];
+static int trailing_len = 0;
+
 // Current Shift state
 static bool shift_pressed = false;
 
@@ -248,6 +252,17 @@ static void retype_buffer_with_case(const int *buf, const bool *shifts,
 }
 
 /**
+ * Retype simple scancodes without shift (for spaces/tabs)
+ */
+static void retype_simple(const int *buf, int len) {
+  for (int i = 0; i < len; i++) {
+    send_key(buf[i], 1);
+    send_key(buf[i], 0);
+    usleep(cfg_delay_retype);
+  }
+}
+
+/**
 
  * Switch layout using configured hotkey (fallback)
  */
@@ -286,14 +301,20 @@ static void invert_selection(void) {
   }
 }
 
-static void perform_manual_switch(const int *buf, const bool *shifts, int len) {
-  memcpy(last_word_buffer, buf, len * sizeof(int));
-  memcpy(last_word_shift, shifts, len * sizeof(bool));
-  last_word_len = len;
+static void perform_manual_switch(const int *buf, const bool *shifts, int w_len,
+                                  const int *trail_buf, int t_len) {
+  if (w_len > 0) {
+    memcpy(last_word_buffer, buf, w_len * sizeof(int));
+    memcpy(last_word_shift, shifts, w_len * sizeof(bool));
+    last_word_len = w_len;
+  }
 
-  send_backspace(len);
+  send_backspace(last_word_len + t_len);
   switch_layout();
-  retype_buffer_with_case(buf, shifts, len);
+  retype_buffer_with_case(last_word_buffer, last_word_shift, last_word_len);
+  if (t_len > 0 && trail_buf) {
+    retype_simple(trail_buf, t_len);
+  }
 }
 
 int main(void) {
@@ -366,30 +387,46 @@ int main(void) {
     // PAUSE = Manual switch
     if (code == KEY_PAUSE) {
       if (word_len >= 1) {
-        perform_manual_switch(word_buffer, word_shift, word_len);
+        perform_manual_switch(word_buffer, word_shift, word_len, NULL, 0);
         word_len = 0;
+        trailing_len = 0;
       } else if (last_word_len >= 1) {
-        perform_manual_switch(last_word_buffer, last_word_shift, last_word_len);
+        perform_manual_switch(last_word_buffer, last_word_shift, last_word_len,
+                              trailing_buffer, trailing_len);
       }
       continue;
     }
 
     // Delimiters (only keys that are ALWAYS delimiters, not letters in other
     // layouts)
-    if (code == KEY_SPACE || code == KEY_ENTER || code == KEY_TAB) {
-
+    if (code == KEY_SPACE || code == KEY_TAB) {
       if (word_len > 0) {
         memcpy(last_word_buffer, word_buffer, word_len * sizeof(int));
         memcpy(last_word_shift, word_shift, word_len * sizeof(bool));
         last_word_len = word_len;
+        word_len = 0;
+        trailing_len = 0;
       }
+      if (trailing_len < MAX_WORD_LEN - 1) {
+        trailing_buffer[trailing_len++] = code;
+      }
+      emit_event(&ev);
+      continue;
+    }
+
+    if (code == KEY_ENTER || code == KEY_KPENTER) {
       word_len = 0;
+      last_word_len = 0;
+      trailing_len = 0;
       emit_event(&ev);
       continue;
     }
 
     // Letter keys
     if (code > 0 && code < 256 && SCANCODE_TO_CHAR[code]) {
+      if (word_len == 0) {
+        trailing_len = 0;
+      }
       if (word_len < MAX_WORD_LEN - 1) {
         word_buffer[word_len] = code;
         word_shift[word_len] = shift_pressed;
@@ -410,6 +447,10 @@ int main(void) {
     // Reset buffer on unknown keys (but not navigation/function keys)
     if (!is_nav_key && !is_fkey) {
       word_len = 0;
+    } else if (is_nav_key) {
+      word_len = 0;
+      last_word_len = 0;
+      trailing_len = 0;
     }
     emit_event(&ev);
   }

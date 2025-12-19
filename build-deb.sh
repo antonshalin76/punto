@@ -3,7 +3,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VERSION="1.0.0"
+VERSION="1.0.1"
 PACKAGE_NAME="punto-switcher"
 BUILD_DIR="${SCRIPT_DIR}/build-deb"
 DEB_DIR="${BUILD_DIR}/${PACKAGE_NAME}_${VERSION}"
@@ -24,9 +24,9 @@ echo "Создание структуры пакета..."
 
 # DEBIAN
 mkdir -p "${DEB_DIR}/DEBIAN"
-cp "${SCRIPT_DIR}/debian/DEBIAN/control" "${DEB_DIR}/DEBIAN/"
-cp "${SCRIPT_DIR}/debian/DEBIAN/postinst" "${DEB_DIR}/DEBIAN/"
-cp "${SCRIPT_DIR}/debian/DEBIAN/prerm" "${DEB_DIR}/DEBIAN/"
+cp "${SCRIPT_DIR}/DEBIAN/control" "${DEB_DIR}/DEBIAN/"
+cp "${SCRIPT_DIR}/DEBIAN/postinst" "${DEB_DIR}/DEBIAN/"
+cp "${SCRIPT_DIR}/DEBIAN/prerm" "${DEB_DIR}/DEBIAN/"
 chmod 755 "${DEB_DIR}/DEBIAN/postinst"
 chmod 755 "${DEB_DIR}/DEBIAN/prerm"
 

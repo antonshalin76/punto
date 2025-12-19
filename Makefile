@@ -26,6 +26,7 @@ install: $(TARGET)
 	install -Dm755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
 	install -Dm755 punto-switch $(DESTDIR)$(BINDIR)/punto-switch
 	install -Dm755 punto-invert $(DESTDIR)$(BINDIR)/punto-invert
+	install -Dm755 punto-case-invert $(DESTDIR)$(BINDIR)/punto-case-invert
 	install -d $(DESTDIR)$(CONFDIR)
 	@if [ ! -f $(DESTDIR)$(CONFDIR)/config.yaml ]; then \
 		install -Dm644 config.yaml $(DESTDIR)$(CONFDIR)/config.yaml; \
@@ -38,6 +39,7 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
 	rm -f $(DESTDIR)$(BINDIR)/punto-switch
 	rm -f $(DESTDIR)$(BINDIR)/punto-invert
+	rm -f $(DESTDIR)$(BINDIR)/punto-case-invert
 	@echo "Config at $(CONFDIR) preserved. Remove manually if needed."
 
 

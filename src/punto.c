@@ -284,16 +284,27 @@ static void switch_layout_via_hotkey(void) {
 static void switch_layout(void) { switch_layout_via_hotkey(); }
 
 /**
- * Invert selected text via external script
- * Script handles copy/paste with terminal detection
+ * Release all modifiers to prevent interference with retyping
  */
-static void invert_selection(void) {
-  // Release all modifiers before calling script
+static void release_modifiers(void) {
   send_key(KEY_LEFTSHIFT, 0);
   send_key(KEY_RIGHTSHIFT, 0);
   send_key(KEY_LEFTCTRL, 0);
   send_key(KEY_RIGHTCTRL, 0);
-  usleep(cfg_delay_key_press * 2);
+  send_key(KEY_LEFTALT, 0);
+  send_key(KEY_RIGHTALT, 0);
+  send_key(KEY_LEFTMETA, 0);
+  send_key(KEY_RIGHTMETA, 0);
+  usleep(cfg_delay_key_press);
+}
+
+/**
+ * Invert selected text via external script
+ * Script handles copy/paste with terminal detection
+ */
+static void invert_selection(void) {
+  release_modifiers();
+  usleep(cfg_delay_key_press);
 
   // Script will handle copy, invert, and paste
   if (system("/usr/local/bin/punto-invert") != 0) {
@@ -301,8 +312,51 @@ static void invert_selection(void) {
   }
 }
 
+/**
+ * Invert selected text case via external script
+ */
+static void invert_selection_case(void) {
+  release_modifiers();
+  usleep(cfg_delay_key_press);
+
+  // Script will handle copy, swapcase, and paste
+  if (system("/usr/local/bin/punto-case-invert") != 0) {
+    return;
+  }
+}
+
+static void invert_case_last_word(const int *buf, const bool *shifts, int w_len,
+                                  const int *trail_buf, int t_len) {
+  release_modifiers();
+
+  if (w_len > 0) {
+    memcpy(last_word_buffer, buf, w_len * sizeof(int));
+    memcpy(last_word_shift, shifts, w_len * sizeof(bool));
+    last_word_len = w_len;
+  }
+
+  if (last_word_len == 0)
+    return;
+
+  send_backspace(last_word_len + t_len);
+
+  // Create inverted shift buffer
+  bool inverted_shifts[MAX_WORD_LEN];
+  for (int i = 0; i < last_word_len; i++) {
+    inverted_shifts[i] = !last_word_shift[i];
+  }
+
+  retype_buffer_with_case(last_word_buffer, inverted_shifts, last_word_len);
+
+  if (t_len > 0 && trail_buf) {
+    retype_simple(trail_buf, t_len);
+  }
+}
+
 static void perform_manual_switch(const int *buf, const bool *shifts, int w_len,
                                   const int *trail_buf, int t_len) {
+  release_modifiers();
+
   if (w_len > 0) {
     memcpy(last_word_buffer, buf, w_len * sizeof(int));
     memcpy(last_word_shift, shifts, w_len * sizeof(bool));
@@ -357,13 +411,6 @@ int main(void) {
       continue;
     }
 
-    // Bypass for system hotkeys
-    if (ctrl || alt || meta) {
-      word_len = 0;
-      emit_event(&ev);
-      continue;
-    }
-
     // Only handle key press (value=1), not release (0) or repeat (2)
     if (value != 1) {
       emit_event(&ev);
@@ -378,13 +425,32 @@ int main(void) {
       continue;
     }
 
-    // SHIFT+PAUSE = Invert selection
+    // SHIFT+PAUSE = Invert selection layout
     if (code == KEY_PAUSE && shift_pressed) {
       invert_selection();
       continue;
     }
 
-    // PAUSE = Manual switch
+    // CTRL+PAUSE = Invert last word case
+    if (code == KEY_PAUSE && ctrl) {
+      if (word_len >= 1) {
+        invert_case_last_word(word_buffer, word_shift, word_len, NULL, 0);
+        word_len = 0;
+        trailing_len = 0;
+      } else if (last_word_len >= 1) {
+        invert_case_last_word(last_word_buffer, last_word_shift, last_word_len,
+                              trailing_buffer, trailing_len);
+      }
+      continue;
+    }
+
+    // ALT+PAUSE = Invert selection case
+    if (code == KEY_PAUSE && alt) {
+      invert_selection_case();
+      continue;
+    }
+
+    // PAUSE = Manual switch (layout)
     if (code == KEY_PAUSE) {
       if (word_len >= 1) {
         perform_manual_switch(word_buffer, word_shift, word_len, NULL, 0);
@@ -394,6 +460,15 @@ int main(void) {
         perform_manual_switch(last_word_buffer, last_word_shift, last_word_len,
                               trailing_buffer, trailing_len);
       }
+      continue;
+    }
+
+    // Bypass for system hotkeys (Ctrl+C, etc.)
+    // We only reset buffer if a non-modifier key is pressed ALONG with a
+    // modifier
+    if (ctrl || alt || meta) {
+      word_len = 0;
+      emit_event(&ev);
       continue;
     }
 

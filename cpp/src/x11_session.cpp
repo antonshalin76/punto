@@ -5,6 +5,8 @@
 
 #include "punto/x11_session.hpp"
 
+#include <X11/XKBlib.h>
+#include <X11/Xlib.h>
 #include <array>
 #include <cstdlib>
 #include <cstring>
@@ -218,6 +220,64 @@ bool X11Session::find_session_env(const std::string &username) {
   }
 
   return !info_.display.empty();
+}
+
+int X11Session::get_current_keyboard_layout() const {
+  if (!initialized_)
+    return -1;
+
+  // Переходим в контекст пользователя
+  if (!switch_to_user())
+    return -1;
+  apply_environment();
+
+  Display *display = XOpenDisplay(nullptr);
+  if (!display) {
+    const char *display_name = std::getenv("DISPLAY");
+    if (display_name) {
+      display = XOpenDisplay(display_name);
+    }
+  }
+
+  int group = -1;
+  if (display) {
+    XkbStateRec state;
+    if (XkbGetState(display, XkbUseCoreKbd, &state) == Success) {
+      group = state.group;
+    }
+    XCloseDisplay(display);
+  }
+
+  switch_to_root();
+  return group;
+}
+
+bool X11Session::set_keyboard_layout(int index) const {
+  if (!initialized_)
+    return false;
+
+  if (!switch_to_user())
+    return false;
+  apply_environment();
+
+  Display *display = XOpenDisplay(nullptr);
+  if (!display) {
+    const char *display_name = std::getenv("DISPLAY");
+    if (display_name) {
+      display = XOpenDisplay(display_name);
+    }
+  }
+
+  bool success = false;
+  if (display) {
+    XkbLockGroup(display, XkbUseCoreKbd, static_cast<unsigned int>(index));
+    XSync(display, False);
+    XCloseDisplay(display);
+    success = true;
+  }
+
+  switch_to_root();
+  return success;
 }
 
 } // namespace punto

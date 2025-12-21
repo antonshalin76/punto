@@ -77,6 +77,12 @@ int main(int argc, char *argv[]) {
   // Загрузка конфигурации
   auto config = punto::load_config();
 
+  // Логирование настроек auto_switch для отладки
+  std::cerr << "[punto] auto_switch: enabled=" << config.auto_switch.enabled
+            << ", threshold=" << config.auto_switch.threshold
+            << ", min_word_len=" << config.auto_switch.min_word_len
+            << ", min_score=" << config.auto_switch.min_score << '\n';
+
   // Запуск event loop
   punto::EventLoop loop{std::move(config)};
 

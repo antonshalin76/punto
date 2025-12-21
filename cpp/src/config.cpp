@@ -38,6 +38,31 @@ std::optional<int> parse_int(std::string_view sv) {
   return std::nullopt;
 }
 
+/// Парсит число с плавающей точкой из строки
+std::optional<double> parse_double(std::string_view sv) {
+  sv = trim(sv);
+  // std::from_chars для double не везде поддерживается, используем strtod
+  std::string str{sv};
+  char *end = nullptr;
+  double value = std::strtod(str.c_str(), &end);
+  if (end == str.c_str() + str.size()) {
+    return value;
+  }
+  return std::nullopt;
+}
+
+/// Парсит булево значение из строки
+std::optional<bool> parse_bool(std::string_view sv) {
+  sv = trim(sv);
+  if (sv == "true" || sv == "yes" || sv == "1" || sv == "on") {
+    return true;
+  }
+  if (sv == "false" || sv == "no" || sv == "0" || sv == "off") {
+    return false;
+  }
+  return std::nullopt;
+}
+
 } // namespace
 
 std::optional<std::chrono::microseconds>
@@ -53,7 +78,9 @@ bool validate_config(const Config &config) {
   // Проверка задержек
   if (config.delays.key_press.count() <= 0 ||
       config.delays.layout_switch.count() <= 0 ||
-      config.delays.retype.count() <= 0) {
+      config.delays.retype.count() <= 0 ||
+      config.delays.turbo_key_press.count() <= 0 ||
+      config.delays.turbo_retype.count() <= 0) {
     return false;
   }
 
@@ -94,6 +121,10 @@ Config load_config(std::string_view path) {
       current_section = "delays";
       continue;
     }
+    if (sv == "auto_switch:" || sv.starts_with("auto_switch:")) {
+      current_section = "auto_switch";
+      continue;
+    }
 
     // Парсинг key: value
     auto colon_pos = sv.find(':');
@@ -122,6 +153,28 @@ Config load_config(std::string_view path) {
           config.delays.layout_switch = *delay;
         } else if (key == "retype") {
           config.delays.retype = *delay;
+        } else if (key == "turbo_key_press") {
+          config.delays.turbo_key_press = *delay;
+        } else if (key == "turbo_retype") {
+          config.delays.turbo_retype = *delay;
+        }
+      }
+    } else if (current_section == "auto_switch") {
+      if (key == "enabled") {
+        if (auto val = parse_bool(value)) {
+          config.auto_switch.enabled = *val;
+        }
+      } else if (key == "threshold") {
+        if (auto val = parse_double(value)) {
+          config.auto_switch.threshold = *val;
+        }
+      } else if (key == "min_word_len") {
+        if (auto val = parse_int(value)) {
+          config.auto_switch.min_word_len = static_cast<std::size_t>(*val);
+        }
+      } else if (key == "min_score") {
+        if (auto val = parse_double(value)) {
+          config.auto_switch.min_score = *val;
         }
       }
     }

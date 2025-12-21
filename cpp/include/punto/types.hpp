@@ -9,12 +9,11 @@
 #pragma once
 
 #include <linux/input.h>
+#include <sys/time.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
-#include <optional>
-#include <span>
-#include <string>
 #include <string_view>
 
 namespace punto {
@@ -38,6 +37,13 @@ inline constexpr std::string_view kConfigPath = "/etc/punto/config.yaml";
 
 /// Значение события клавиши
 enum class KeyState : std::int32_t { Release = 0, Press = 1, Repeat = 2 };
+
+/// Структура для хранения биграммы и её веса (выровнена для SSE)
+struct alignas(4) BigramEntry {
+  char first;
+  char second;
+  std::uint8_t weight;
+};
 
 /// Скан-код клавиши (обёртка над linux/input.h константами)
 using ScanCode = std::uint16_t;

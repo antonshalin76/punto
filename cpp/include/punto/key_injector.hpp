@@ -1,17 +1,12 @@
 /**
  * @file key_injector.hpp
- * @brief Генерация событий ввода для stdout
- *
- * Замена xdotool — генерирует struct input_event напрямую в stdout,
- * который читается interception-tools и передаётся в uinput.
+ * @brief Генератор событий ввода
  */
 
 #pragma once
 
-#include <linux/input.h>
-
 #include <chrono>
-#include <cstdint>
+#include <functional>
 #include <span>
 
 #include "punto/config.hpp"
@@ -20,76 +15,94 @@
 namespace punto {
 
 /**
- * @brief Генератор событий ввода для interception-tools пайплайна
+ * @brief Класс для эмуляции ввода через uinput
  *
- * Записывает структуры input_event в stdout, которые percolate
- * обратно в ядро через uinput. Это zero-overhead замена xdotool.
+ * Использует stdout для записи событий в пайп uinput.
  */
 class KeyInjector {
 public:
+  /**
+   * @brief Конструктор
+   * @param delays Конфигурация задержек
+   */
   explicit KeyInjector(const DelayConfig &delays) noexcept;
-
-  // =========================================================================
-  // Базовые операции
-  // =========================================================================
-
-  /**
-   * @brief Отправляет одиночное событие клавиши
-   * @param code Скан-код клавиши
-   * @param state Состояние (нажатие/отпускание)
-   */
-  void send_key(ScanCode code, KeyState state) const;
-
-  /**
-   * @brief Отправляет нажатие и отпускание клавиши
-   * @param code Скан-код клавиши
-   * @param with_shift Нажать с Shift
-   */
-  void tap_key(ScanCode code, bool with_shift = false) const;
-
-  /**
-   * @brief Отправляет несколько Backspace
-   * @param count Количество Backspace
-   */
-  void send_backspace(std::size_t count) const;
-
-  // =========================================================================
-  // Высокоуровневые операции
-  // =========================================================================
-
-  /**
-   * @brief Перепечатывает буфер с сохранением регистра
-   * @param entries Буфер KeyEntry
-   */
-  void retype_buffer(std::span<const KeyEntry> entries) const;
-
-  /**
-   * @brief Перепечатывает trailing whitespace (пробелы/табы)
-   * @param codes Скан-коды пробелов/табов
-   */
-  void retype_trailing(std::span<const ScanCode> codes) const;
-
-  /**
-   * @brief Отправляет горячую клавишу переключения раскладки
-   * @param modifier Модификатор (Ctrl, Alt, etc.)
-   * @param key Основная клавиша
-   */
-  void send_layout_hotkey(ScanCode modifier, ScanCode key) const;
-
-  /**
-   * @brief Освобождает все зажатые модификаторы
-   */
-  void release_all_modifiers() const;
 
   // =========================================================================
   // Низкоуровневые операции
   // =========================================================================
 
   /**
-   * @brief Пропускает событие без изменений (passthrough)
-   * @param ev Оригинальное событие
+   * @brief Записывает событие в stdout
+   * @param ev Событие для записи
    */
   static void emit_event(const input_event &ev);
+
+  /**
+   * @brief Отправляет событие нажатия/отпускания и SYN
+   * @param code Скан-код
+   * @param state Состояние
+   */
+  void send_key(ScanCode code, KeyState state) const;
+
+  /// Тип функции ожидания (для интеграции с Input Guard)
+  using WaitFunc = std::function<void(std::chrono::microseconds)>;
+
+  /**
+   * @brief Устанавливает функцию ожидания
+   * @param func Функция, которая будет вызываться вместо usleep
+   */
+  void set_wait_func(WaitFunc func) noexcept { wait_func_ = std::move(func); }
+
+  /**
+   * @brief Отправляет нажатие клавиши (Press + Delay + Release + Delay)
+   * @param code Скан-код клавиши
+   * @param with_shift Нужно ли зажимать Shift
+   * @param turbo Использовать ли ускоренные задержки
+   */
+  void tap_key(ScanCode code, bool with_shift = false,
+               bool turbo = false) const;
+
+  // =========================================================================
+  // Высокоуровневые макросы
+  // =========================================================================
+
+  /**
+   * @brief Отправляет N бекспейсов
+   * @param count Количество
+   * @param turbo Использовать ли ускоренные задержки
+   */
+  void send_backspace(std::size_t count, bool turbo = false) const;
+
+  /**
+   * @brief Перепечатывает буфер символов
+   * @param entries Буфер KeyEntry
+   * @param turbo Использовать ли ускоренные задержки
+   */
+  void retype_buffer(std::span<const KeyEntry> entries,
+                     bool turbo = false) const;
+
+  /**
+   * @brief Перепечатывает хвост слова (пробелы и т.д.)
+   * @param codes Список скан-кодов
+   * @param turbo Использовать ли ускоренные задержки
+   */
+  void retype_trailing(std::span<const ScanCode> codes,
+                       bool turbo = false) const;
+
+  /**
+   * @brief Отправляет hotkey для переключения раскладки
+   * @param modifier Модификатор
+   * @param key Клавиша
+   */
+  void send_layout_hotkey(ScanCode modifier, ScanCode key) const;
+
+  /**
+   * @brief Отпускает все модификаторы
+   */
+  void release_all_modifiers() const;
+
+  /// Задержка (использует wait_func_ если установлена, иначе usleep)
+  void delay(std::chrono::microseconds us) const noexcept;
 
 private:
   /**
@@ -97,12 +110,8 @@ private:
    */
   static void send_sync();
 
-  /**
-   * @brief Задержка между событиями
-   */
-  void delay(std::chrono::microseconds us) const noexcept;
-
-  DelayConfig delays_;
+  const DelayConfig &delays_;
+  WaitFunc wait_func_;
 };
 
 } // namespace punto

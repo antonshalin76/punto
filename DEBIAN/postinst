@@ -10,15 +10,9 @@ if [ ! -f /etc/punto/config.yaml ]; then
     cp /usr/share/punto-switcher/config.yaml /etc/punto/config.yaml
 fi
 
-# Установка конфигурации udevmon (если не существует)
-if [ ! -f /etc/interception/udevmon.yaml ]; then
-    cp /usr/share/punto-switcher/udevmon.yaml /etc/interception/udevmon.yaml
-else
-    # Добавить конфигурацию punto если её нет
-    if ! grep -q "punto" /etc/interception/udevmon.yaml; then
-        cat /usr/share/punto-switcher/udevmon.yaml >> /etc/interception/udevmon.yaml
-    fi
-fi
+# Установка конфигурации udevmon
+# Всегда обновляем, так как список клавиш может меняться
+cp /usr/share/punto-switcher/udevmon.yaml /etc/interception/udevmon.yaml
 
 # Включение и запуск сервиса
 systemctl daemon-reload

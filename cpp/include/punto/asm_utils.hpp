@@ -8,8 +8,10 @@
 
 #pragma once
 
-#include <cstddef>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <span>
 
 #include "punto/types.hpp"
@@ -21,37 +23,53 @@ namespace punto::asm_utils {
 // ===========================================================================
 
 #if defined(__x86_64__) && !defined(PUNTO_NO_ASM)
+#include <immintrin.h>
 
 /**
- * @brief Поиск разделителя слова в буфере скан-кодов (ASM версия)
- * @param buffer Буфер скан-кодов
- * @param len Длина буфера
- * @param space_code Скан-код пробела (KEY_SPACE)
- * @param tab_code Скан-код таба (KEY_TAB)
- * @return Индекс первого разделителя, или len если не найден
- *
- * Использует SSE2 для параллельного сравнения.
+ * @brief Поиск веса биграммы с использованием SSE (ASM/Intrinsic)
  */
-[[nodiscard]] inline std::size_t
-find_word_delimiter_asm(const std::uint16_t *buffer, std::size_t len,
-                        std::uint16_t space_code,
-                        std::uint16_t tab_code) noexcept {
+[[nodiscard]] inline std::uint8_t
+sse_find_bigram(const punto::BigramEntry *table, std::size_t table_size,
+                char first, char second) noexcept {
 
-  if (len == 0)
-    return 0;
+  // Упаковываем искомые символы в 32-битное целое (первые 2 байта)
+  uint32_t target = (static_cast<uint32_t>(static_cast<uint8_t>(first))) |
+                    (static_cast<uint32_t>(static_cast<uint8_t>(second)) << 8);
+  __m128i target_vec = _mm_set1_epi32(static_cast<int>(target));
 
-  std::size_t result = len;
+  // Маска для сравнения только первых двух байт (first и second)
+  __m128i mask = _mm_set1_epi32(0x0000FFFF);
+  target_vec = _mm_and_si128(target_vec, mask);
 
-  // Fallback для небольших буферов или невыровненных данных
-  // Полная SSE2 оптимизация может быть добавлена в Phase 3
-  for (std::size_t i = 0; i < len; ++i) {
-    if (buffer[i] == space_code || buffer[i] == tab_code) {
-      result = i;
-      break;
+  for (std::size_t i = 0; i < table_size; i += 4) {
+    // Загружаем 4 биграммы за раз (16 байт)
+    __m128i data =
+        _mm_loadu_si128(reinterpret_cast<const __m128i *>(table + i));
+
+    // Сравниваем только первые 2 байта каждой биграммы
+    __m128i masked_data = _mm_and_si128(data, mask);
+    __m128i cmp = _mm_cmpeq_epi32(masked_data, target_vec);
+
+    int movemask = _mm_movemask_epi8(cmp);
+    if (movemask != 0) {
+      // Нашли совпадение в одной из 4-х биграмм
+      for (std::size_t j = 0; j < 4 && (i + j) < table_size; ++j) {
+        if (table[i + j].first == first && table[i + j].second == second) {
+          return table[i + j].weight;
+        }
+      }
     }
   }
+  return 0;
+}
 
-  return result;
+/**
+ * @brief Чтение системного счетчика тактов процессора (RDTSC)
+ */
+[[nodiscard]] inline uint64_t get_cpu_timestamp() noexcept {
+  uint32_t low, high;
+  __asm__ volatile("rdtsc" : "=a"(low), "=d"(high));
+  return (static_cast<uint64_t>(high) << 32) | static_cast<uint64_t>(low);
 }
 
 /**
@@ -105,7 +123,6 @@ inline void fast_zero_buffer(void *buffer, std::size_t count) noexcept {
 find_word_end(std::span<const KeyEntry> entries) noexcept {
 
   // Извлекаем скан-коды для оптимизированного поиска
-  // (В Phase 3 можно оптимизировать через переупаковку данных)
   for (std::size_t i = 0; i < entries.size(); ++i) {
     if (entries[i].code == KEY_SPACE || entries[i].code == KEY_TAB) {
       return i;

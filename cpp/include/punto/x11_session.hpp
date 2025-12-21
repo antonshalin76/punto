@@ -68,6 +68,19 @@ public:
    */
   bool switch_to_root() const;
 
+  /**
+   * @brief Определяет текущую раскладку клавиатуры
+   * @return 0 = английская (первая), 1 = русская (вторая), -1 = ошибка
+   */
+  [[nodiscard]] int get_current_keyboard_layout() const;
+
+  /**
+   * @brief Устанавливает текущую раскладку клавиатуры
+   * @param index 0 = первая (EN), 1 = вторая (RU)
+   * @return true если успешно
+   */
+  bool set_keyboard_layout(int index) const;
+
 private:
   /**
    * @brief Находит GUI пользователя через loginctl

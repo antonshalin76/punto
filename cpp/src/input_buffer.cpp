@@ -48,6 +48,14 @@ void InputBuffer::reset_all() noexcept {
   current_len_ = 0;
   last_len_ = 0;
   trailing_len_ = 0;
+
+  // Ассемблерная оптимизация для очистки памяти
+  asm_utils::fast_zero_buffer(current_buf_.data(),
+                              current_buf_.size() * sizeof(KeyEntry) / 8);
+  asm_utils::fast_zero_buffer(last_buf_.data(),
+                              last_buf_.size() * sizeof(KeyEntry) / 8);
+  asm_utils::fast_zero_buffer(trailing_buf_.data(),
+                              trailing_buf_.size() * sizeof(ScanCode) / 8);
 }
 
 void InputBuffer::reset_current() noexcept { current_len_ = 0; }

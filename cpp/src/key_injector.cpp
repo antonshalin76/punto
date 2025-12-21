@@ -38,42 +38,55 @@ void KeyInjector::send_key(ScanCode code, KeyState state) const {
   send_sync();
 }
 
-void KeyInjector::tap_key(ScanCode code, bool with_shift) const {
+void KeyInjector::tap_key(ScanCode code, bool with_shift, bool turbo) const {
+  auto retype_delay = turbo ? delays_.turbo_retype : delays_.retype;
+
   if (with_shift) {
     send_key(KEY_LEFTSHIFT, KeyState::Press);
-    delay(delays_.retype / 2);
+    delay(std::chrono::microseconds{10000}); // 10ms hold for modifier
   }
 
   send_key(code, KeyState::Press);
+  delay(std::chrono::microseconds{15000}); // 15ms hold - safe for all apps
   send_key(code, KeyState::Release);
 
   if (with_shift) {
-    delay(delays_.retype / 2);
+    delay(std::chrono::microseconds{5000});
     send_key(KEY_LEFTSHIFT, KeyState::Release);
+    delay(std::chrono::microseconds{5000});
   }
 
-  delay(delays_.retype);
+  delay(retype_delay);
 }
 
-void KeyInjector::send_backspace(std::size_t count) const {
+void KeyInjector::send_backspace(std::size_t count, bool turbo) const {
+  auto retype_delay = turbo ? delays_.turbo_retype : delays_.retype;
+
   for (std::size_t i = 0; i < count; ++i) {
     send_key(KEY_BACKSPACE, KeyState::Press);
+    delay(std::chrono::microseconds{12000}); // 12ms hold for BS
     send_key(KEY_BACKSPACE, KeyState::Release);
-    delay(delays_.retype);
+
+    if (i < count - 1) {
+      delay(retype_delay / 2);
+    }
   }
 }
 
-void KeyInjector::retype_buffer(std::span<const KeyEntry> entries) const {
+void KeyInjector::retype_buffer(std::span<const KeyEntry> entries,
+                                bool turbo) const {
   for (const auto &entry : entries) {
-    tap_key(entry.code, entry.shifted);
+    tap_key(entry.code, entry.shifted, turbo);
   }
 }
 
-void KeyInjector::retype_trailing(std::span<const ScanCode> codes) const {
+void KeyInjector::retype_trailing(std::span<const ScanCode> codes,
+                                  bool turbo) const {
+  auto retype_delay = turbo ? delays_.turbo_retype : delays_.retype;
   for (const auto code : codes) {
     send_key(code, KeyState::Press);
     send_key(code, KeyState::Release);
-    delay(delays_.retype);
+    delay(retype_delay);
   }
 }
 
@@ -107,7 +120,12 @@ void KeyInjector::release_all_modifiers() const {
 }
 
 void KeyInjector::delay(std::chrono::microseconds us) const noexcept {
-  if (us.count() > 0) {
+  if (us.count() <= 0)
+    return;
+
+  if (wait_func_) {
+    wait_func_(us);
+  } else {
     usleep(static_cast<useconds_t>(us.count()));
   }
 }

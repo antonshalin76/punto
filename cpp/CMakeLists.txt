@@ -3,7 +3,7 @@
 # Высокопроизводительный плагин для interception-tools
 # =============================================================================
 cmake_minimum_required(VERSION 3.16)
-project(punto VERSION 2.0.0 LANGUAGES CXX)
+project(punto VERSION 2.1.0 LANGUAGES CXX)
 
 # -----------------------------------------------------------------------------
 # Стандарты и флаги компиляции
@@ -52,6 +52,8 @@ set(PUNTO_SOURCES
     src/text_processor.cpp
     src/clipboard_manager.cpp
     src/x11_session.cpp
+    src/layout_analyzer.cpp
+    src/dictionary.cpp
 )
 
 set(PUNTO_HEADERS
@@ -65,6 +67,9 @@ set(PUNTO_HEADERS
     include/punto/x11_session.hpp
     include/punto/scancode_map.hpp
     include/punto/asm_utils.hpp
+    include/punto/ngram_data.hpp
+    include/punto/layout_analyzer.hpp
+    include/punto/dictionary.hpp
 )
 
 # -----------------------------------------------------------------------------

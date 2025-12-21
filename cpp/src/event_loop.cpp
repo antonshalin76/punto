@@ -23,6 +23,17 @@ bool EventLoop::initialize() {
   if (initialized_)
     return true;
 
+  // Создаём IPC сервер для управления из tray-приложения
+  ipc_server_ = std::make_unique<IpcServer>(
+      ipc_enabled_,
+      [this]() { return reload_config(); }
+  );
+  if (!ipc_server_->start()) {
+    std::cerr << "[punto] Warning: IPC server failed to start. "
+                 "Tray control will be unavailable.\n";
+    // Не фатальная ошибка — базовая функциональность работает
+  }
+
   // Создаём KeyInjector
   injector_ = std::make_unique<KeyInjector>(config_.delays);
 
@@ -233,7 +244,10 @@ void EventLoop::handle_event(const input_event &ev) {
       }
     }
 
-    if (analysis_word.size() >= config_.auto_switch.min_word_len) {
+    // Проверяем, включено ли автопереключение через IPC
+    bool ipc_enabled = ipc_enabled_.load(std::memory_order_relaxed);
+
+    if (ipc_enabled && analysis_word.size() >= config_.auto_switch.min_word_len) {
       bool need_switch = false;
 
       // === ГИБРИДНЫЙ АНАЛИЗ ===
@@ -684,6 +698,41 @@ void EventLoop::action_transliterate_selection() {
   is_processing_macro_ = true;
   process_selection([](std::string_view text) { return transliterate(text); });
   drain_pending_events();
+}
+
+bool EventLoop::reload_config() {
+  std::cerr << "[punto] Reloading configuration...\n";
+
+  // Загружаем новую конфигурацию
+  Config new_config = load_config(config_.config_path.string());
+
+  if (!validate_config(new_config)) {
+    std::cerr << "[punto] Config reload failed: invalid configuration\n";
+    return false;
+  }
+
+  // Обновляем конфигурацию (атомарно для простых полей)
+  config_.delays = new_config.delays;
+  config_.hotkey = new_config.hotkey;
+  config_.auto_switch = new_config.auto_switch;
+  config_.debug_mode = new_config.debug_mode;
+  config_.log_to_syslog = new_config.log_to_syslog;
+
+  // Обновляем KeyInjector с новыми задержками
+  if (injector_) {
+    injector_->update_delays(config_.delays);
+  }
+
+  // Обновляем LayoutAnalyzer с новыми параметрами
+  analyzer_.update_config(config_.auto_switch);
+
+  std::cerr << "[punto] Configuration reloaded successfully\n";
+  std::cerr << "[punto] auto_switch: enabled=" << config_.auto_switch.enabled
+            << ", threshold=" << config_.auto_switch.threshold
+            << ", min_word_len=" << config_.auto_switch.min_word_len
+            << ", min_score=" << config_.auto_switch.min_score << '\n';
+
+  return true;
 }
 
 } // namespace punto

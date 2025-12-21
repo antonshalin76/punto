@@ -28,8 +28,11 @@ inline constexpr std::size_t kMaxWordLen = 256;
 /// Максимальный размер буфера UTF-8 текста
 inline constexpr std::size_t kMaxTextLen = 1024;
 
-/// Путь к конфигурационному файлу
+/// Путь к системному конфигурационному файлу
 inline constexpr std::string_view kConfigPath = "/etc/punto/config.yaml";
+
+/// Путь к пользовательскому конфигу (относительно $HOME)
+inline constexpr std::string_view kUserConfigRelPath = ".config/punto/config.yaml";
 
 // ===========================================================================
 // Типы для работы с событиями ввода

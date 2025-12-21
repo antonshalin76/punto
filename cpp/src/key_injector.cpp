@@ -11,8 +11,12 @@
 
 namespace punto {
 
-KeyInjector::KeyInjector(const DelayConfig &delays) noexcept
-    : delays_{delays} {}
+KeyInjector::KeyInjector(DelayConfig delays) noexcept
+    : delays_{std::move(delays)} {}
+
+void KeyInjector::update_delays(const DelayConfig &delays) noexcept {
+  delays_ = delays;
+}
 
 void KeyInjector::emit_event(const input_event &ev) {
   if (std::fwrite(&ev, sizeof(ev), 1, stdout) != 1) {

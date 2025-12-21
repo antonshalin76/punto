@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -15,6 +16,7 @@
 #include <string>
 
 #include "punto/clipboard_manager.hpp"
+#include "punto/ipc_server.hpp"
 #include "punto/config.hpp"
 #include "punto/dictionary.hpp"
 #include "punto/input_buffer.hpp"
@@ -147,6 +149,19 @@ private:
 
   /// Время последнего замера раскладки
   std::chrono::steady_clock::time_point last_sync_time_;
+
+  // =========================================================================
+  // IPC управление
+  // =========================================================================
+
+  /// Атомарный флаг включения/выключения автопереключения
+  std::atomic<bool> ipc_enabled_{true};
+
+  /// IPC сервер для управления из tray-приложения
+  std::unique_ptr<IpcServer> ipc_server_;
+
+  /// Перезагружает конфигурацию (вызывается из IPC потока)
+  bool reload_config();
 };
 
 } // namespace punto

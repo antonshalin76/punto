@@ -25,7 +25,13 @@ public:
    * @brief Конструктор
    * @param delays Конфигурация задержек
    */
-  explicit KeyInjector(const DelayConfig &delays) noexcept;
+  explicit KeyInjector(DelayConfig delays) noexcept;
+
+  /**
+   * @brief Обновляет конфигурацию задержек (для hot reload)
+   * @param delays Новая конфигурация
+   */
+  void update_delays(const DelayConfig &delays) noexcept;
 
   // =========================================================================
   // Низкоуровневые операции
@@ -110,7 +116,7 @@ private:
    */
   static void send_sync();
 
-  const DelayConfig &delays_;
+  DelayConfig delays_;
   WaitFunc wait_func_;
 };
 

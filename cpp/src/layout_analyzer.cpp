@@ -14,8 +14,12 @@
 
 namespace punto {
 
-LayoutAnalyzer::LayoutAnalyzer(const AutoSwitchConfig &config)
-    : config_(config) {}
+LayoutAnalyzer::LayoutAnalyzer(AutoSwitchConfig config)
+    : config_(std::move(config)) {}
+
+void LayoutAnalyzer::update_config(const AutoSwitchConfig &config) {
+  config_ = config;
+}
 
 bool LayoutAnalyzer::should_switch(std::span<const KeyEntry> word) const {
   // Проверяем базовые условия

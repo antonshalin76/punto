@@ -3,11 +3,19 @@
 Высокопроизводительная реализация Punto Switcher на C++20 для Linux.
 Позволяет исправлять текст, набранный в неправильной раскладке клавиатуры.
 
-![Version](https://img.shields.io/badge/version-2.1.0-blue)
+![Version](https://img.shields.io/badge/version-2.2.0-blue)
 ![C++](https://img.shields.io/badge/C%2B%2B-20-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ## Возможности
+
+### Управление через трей (v2.2)
+
+Иконка `punto-tray` в системном трее позволяет:
+- **Визуальный статус** — видно, включено ли автопереключение
+- **Быстрое вкл/выкл** — без перезапуска сервиса
+- **Настройки** — встроенный модальный диалог (GTK), редактирует `~/.config/punto/config.yaml`
+- **Сохранить** — мгновенное применение (hot reload) без рестарта udevmon
 
 ### Автоматическое переключение (v2.1)
 
@@ -61,9 +69,13 @@ Privet  →  [LCtrl+LAlt+Pause]  →  Привет
 │  ┌─────────────┐ ┌─────────────┐ ┌──────────────────┐       │
 │  │ KeyInjector │ │TextProcessor│ │   X11Session     │       │
 │  └─────────────┘ └─────────────┘ └──────────────────┘       │
-│  ┌───────────────┐ ┌────────────┐                           │
-│  │LayoutAnalyzer │ │ Dictionary │  (v2.1 — автоанализ)      │
-│  └───────────────┘ └────────────┘                           │
+│  ┌───────────────┐ ┌────────────┐ ┌──────────────────┐       │
+│  │LayoutAnalyzer │ │ Dictionary │ │   IpcServer    │       │
+│  └───────────────┘ └────────────┘ └──────────────────┘       │
+│  ┌───────────────┐ ┌────────────┐ ┌──────────────────┐       │
+│  │  punto-tray   │ │            │ │                  │       │
+│  │  (GTK3)       │ │            │ │                  │       │
+│  └───────────────┘ └────────────┘ └──────────────────┘       │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -73,15 +85,16 @@ Privet  →  [LCtrl+LAlt+Pause]  →  Привет
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Ключевые особенности v2.1
+### Ключевые особенности v2.2
 
+- **Управление через трей** — иконка `punto-tray` для быстрого управления
+- **Встроенные настройки** — модальное окно, редактирует `~/.config/punto/config.yaml`
+- **IPC через Unix Socket** — команды GET_STATUS, SET_STATUS, RELOAD
+- **Hot Reload конфига** — применение настроек без перезапуска udevmon
 - **Автопереключение раскладки** — гибридный анализ (словарь + биграммы)
 - **Hunspell словари** — высокая точность определения языка
 - **Zero external dependencies** — никаких Python, xdotool, xclip
-- **Нативный X11 clipboard** — прямой доступ через libX11
 - **< 1ms латентность** — вместо 200-500ms при вызове скриптов
-- **Constexpr lookup tables** — compile-time оптимизация маппингов
-- **RAII и std::span** — безопасное управление памятью
 
 ## Установка
 
@@ -90,7 +103,7 @@ Privet  →  [LCtrl+LAlt+Pause]  →  Привет
 ```bash
 git clone https://github.com/antonshalin76/punto.git
 cd punto
-sudo dpkg -i punto-switcher_2.1.0_amd64.deb
+sudo dpkg -i punto-switcher_2.2.0_amd64.deb
 ```
 
 ### Способ 2: Сборка из исходников
@@ -114,7 +127,7 @@ sudo dnf install gcc-c++ cmake libX11-devel interception-tools xsel
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh
-sudo dpkg -i punto-switcher_2.1.0_amd64.deb
+sudo dpkg -i punto-switcher_2.2.0_amd64.deb
 ```
 
 #### Ручная сборка без пакета
@@ -160,7 +173,9 @@ sudo systemctl start udevmon
 
 ## Настройка
 
-Конфигурационный файл: `/etc/punto/config.yaml`
+Конфигурация по умолчанию: `/etc/punto/config.yaml`
+
+Пользовательский конфиг (используется в приоритете): `~/.config/punto/config.yaml`
 
 ```yaml
 # Хоткей переключения раскладки (ваша системная комбинация)
@@ -184,9 +199,15 @@ auto_switch:
   min_score: 5.0       # Минимальный скор для уверенного решения
 ```
 
-После изменения:
+После изменения можно применить настройки без перезапуска:
 
 ```bash
+# Через tray-приложение: диалог настроек -> "Сохранить" (применяется сразу)
+
+# Или через командную строку:
+echo "RELOAD" | nc -U /var/run/punto.sock
+
+# Или перезапуском сервиса:
 sudo systemctl restart udevmon
 ```
 
@@ -277,6 +298,14 @@ sudo rm -rf /etc/punto
 | hunspell-ru        | любая (опционально) |
 
 ## История изменений
+
+### v2.2.0 — Управление через системный трей
+
+- **punto-tray**: GTK3 приложение с иконкой в трее
+- **IPC сервер**: Unix Domain Socket `/var/run/punto.sock`
+- **Hot Reload**: Перезагрузка конфига без перезапуска udevmon
+- **Атомарное вкл/выкл**: Быстрое отключение автопереключения
+- **Автозапуск**: Desktop entry в `/etc/xdg/autostart/`
 
 ### v2.1.0 — Автопереключение раскладки
 

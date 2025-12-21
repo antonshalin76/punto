@@ -7,7 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 PACKAGE_NAME="punto-switcher"
 BUILD_DIR="build-deb"
 CPP_BUILD_DIR="cpp/build"
@@ -27,6 +27,9 @@ echo "[0/5] Проверка зависимостей..."
 
 # Обязательные пакеты для сборки
 BUILD_DEPS=("build-essential" "cmake" "pkg-config" "libx11-dev")
+
+# Пакеты для сборки tray-приложения (Ayatana для Ubuntu 22.04+)
+TRAY_DEPS=("libgtk-3-dev" "libayatana-appindicator3-dev")
 
 # Опциональные пакеты (словари для автопереключения)
 OPTIONAL_DEPS=("hunspell-en-us" "hunspell-ru")
@@ -63,6 +66,28 @@ else
     echo -e "${GREEN}   Все зависимости для сборки установлены${NC}"
 fi
 
+# Проверяем зависимости для tray-приложения
+MISSING_TRAY_DEPS=()
+for pkg in "${TRAY_DEPS[@]}"; do
+    if ! check_package "$pkg"; then
+        MISSING_TRAY_DEPS+=("$pkg")
+    fi
+done
+
+BUILD_TRAY=true
+if [[ ${#MISSING_TRAY_DEPS[@]} -gt 0 ]]; then
+    echo -e "${YELLOW}   Отсутствуют пакеты для tray: ${MISSING_TRAY_DEPS[*]}${NC}"
+    read -p "   Установить для сборки punto-tray? [Y/n] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        sudo apt-get install -y "${MISSING_TRAY_DEPS[@]}"
+        echo -e "${GREEN}   Зависимости для tray установлены${NC}"
+    else
+        echo -e "${YELLOW}   punto-tray не будет собран${NC}"
+        BUILD_TRAY=false
+    fi
+fi
+
 # Предлагаем установить опциональные зависимости
 if [[ ${#MISSING_OPTIONAL_DEPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}   Опциональные пакеты (словари): ${MISSING_OPTIONAL_DEPS[*]}${NC}"
@@ -93,7 +118,15 @@ if [[ ! -f "cpp/build/punto" ]]; then
     exit 1
 fi
 
-echo -e "${GREEN}   Бинарник собран${NC}: $(file cpp/build/punto | cut -d: -f2)"
+echo -e "${GREEN}   punto собран${NC}: $(file cpp/build/punto | cut -d: -f2)"
+
+# Проверяем tray-приложение
+if [[ "$BUILD_TRAY" == "true" ]] && [[ -f "cpp/build/punto-tray" ]]; then
+    echo -e "${GREEN}   punto-tray собран${NC}: $(file cpp/build/punto-tray | cut -d: -f2)"
+else
+    BUILD_TRAY=false
+    echo -e "${YELLOW}   punto-tray не собран (отсутствуют зависимости GTK3/AppIndicator)${NC}"
+fi
 
 # -----------------------------------------------------------------------------
 # Этап 2: Подготовка структуры пакета
@@ -105,10 +138,19 @@ mkdir -p "$BUILD_DIR/DEBIAN"
 mkdir -p "$BUILD_DIR/usr/local/bin"
 mkdir -p "$BUILD_DIR/etc/punto"
 mkdir -p "$BUILD_DIR/usr/share/punto-switcher"
+mkdir -p "$BUILD_DIR/etc/xdg/autostart"
 
 # Копируем бинарник
 cp cpp/build/punto "$BUILD_DIR/usr/local/bin/"
 chmod 755 "$BUILD_DIR/usr/local/bin/punto"
+
+# Копируем tray-приложение и desktop entry
+if [[ "$BUILD_TRAY" == "true" ]]; then
+    cp cpp/build/punto-tray "$BUILD_DIR/usr/local/bin/"
+    chmod 755 "$BUILD_DIR/usr/local/bin/punto-tray"
+    cp punto-tray.desktop "$BUILD_DIR/etc/xdg/autostart/"
+    echo -e "${GREEN}   punto-tray включён в пакет${NC}"
+fi
 
 # Копируем конфигурацию и udevmon для postinst
 cp config.yaml "$BUILD_DIR/usr/share/punto-switcher/"
@@ -134,6 +176,11 @@ echo "[3/5] Проверка runtime-зависимостей..."
 
 # Зависимости для работы программы
 RUNTIME_DEPS=("interception-tools" "libx11-6" "xsel")
+
+# Дополнительные runtime-зависимости для tray
+if [[ "$BUILD_TRAY" == "true" ]]; then
+    RUNTIME_DEPS+=("libgtk-3-0" "libayatana-appindicator3-1")
+fi
 MISSING_RUNTIME_DEPS=()
 
 for pkg in "${RUNTIME_DEPS[@]}"; do

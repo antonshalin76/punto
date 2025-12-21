@@ -1,0 +1,61 @@
+/**
+ * @file settings_dialog.hpp
+ * @brief Диалог настроек punto
+ */
+
+#pragma once
+
+#include <gtk/gtk.h>
+#include <string>
+
+namespace punto {
+
+/**
+ * @brief Структура для хранения настроек в UI
+ */
+struct SettingsData {
+  // Auto-switch
+  bool auto_enabled = true;
+  double threshold = 3.5;
+  int min_word_len = 2;
+  double min_score = 5.0;
+
+  // Delays
+  int key_press = 12;
+  int layout_switch = 150;
+  int retype = 15;
+  int turbo_key_press = 12;
+  int turbo_retype = 20;
+
+  // Hotkey
+  std::string modifier = "leftctrl";
+  std::string key = "grave";
+};
+
+/**
+ * @brief Класс диалога настроек
+ */
+class SettingsDialog {
+public:
+  /**
+   * @brief Показывает диалог настроек
+   * @param parent Родительское окно (может быть nullptr)
+   * @return true если настройки были сохранены
+   */
+  static bool show(GtkWidget* parent = nullptr);
+
+private:
+  /// Загружает настройки из файла
+  static SettingsData load_settings();
+
+  /// Сохраняет настройки в файл
+  static bool save_settings(const SettingsData& settings);
+
+  /// Получает путь к user config
+  static std::string get_user_config_path();
+
+  /// Создаёт user config если его нет
+  static bool ensure_user_config();
+};
+
+} // namespace punto

@@ -38,7 +38,13 @@ public:
    * @brief Конструктор
    * @param config Конфигурация автопереключения
    */
-  explicit LayoutAnalyzer(const AutoSwitchConfig &config);
+  explicit LayoutAnalyzer(AutoSwitchConfig config);
+
+  /**
+   * @brief Обновляет конфигурацию (для hot reload)
+   * @param config Новая конфигурация
+   */
+  void update_config(const AutoSwitchConfig &config);
 
   /**
    * @brief Определяет, нужно ли переключать раскладку
@@ -87,7 +93,7 @@ private:
   [[nodiscard]] static std::size_t word_to_ascii(std::span<const KeyEntry> word,
                                                  char *buffer);
 
-  const AutoSwitchConfig &config_;
+  AutoSwitchConfig config_;
 };
 
 } // namespace punto

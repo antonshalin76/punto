@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Punto Switcher Tray
+Name[ru]=Punto Switcher Трей
+Comment=System tray application for Punto Switcher control
+Comment[ru]=Приложение в трее для управления Punto Switcher
+Exec=/usr/bin/punto-tray
+Icon=input-keyboard
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=3

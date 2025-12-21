@@ -92,14 +92,44 @@ bool validate_config(const Config &config) {
   return true;
 }
 
+/// Получает путь к user config (~/.config/punto/config.yaml)
+std::string get_user_config_path() {
+  const char* home = std::getenv("HOME");
+  if (home) {
+    return std::string(home) + "/" + std::string(kUserConfigRelPath);
+  }
+  return "";
+}
+
 Config load_config(std::string_view path) {
   Config config;
 
-  std::ifstream file{std::string{path}};
+  // Пробуем сначала user config, потом system config
+  std::string config_path;
+  
+  if (path == kConfigPath) {
+    // Если запрашивается дефолтный путь, пробуем user config первым
+    std::string user_path = get_user_config_path();
+    if (!user_path.empty()) {
+      std::ifstream user_file{user_path};
+      if (user_file.is_open()) {
+        config_path = user_path;
+        std::cerr << "[punto] Using user config: " << user_path << "\n";
+      }
+    }
+  }
+  
+  if (config_path.empty()) {
+    config_path = std::string{path};
+  }
+
+  std::ifstream file{config_path};
   if (!file.is_open()) {
     // Файл не найден — используем дефолты
     return config;
   }
+  
+  config.config_path = config_path;
 
   std::string line;
   std::string current_section;

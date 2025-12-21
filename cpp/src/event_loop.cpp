@@ -4,6 +4,7 @@
  */
 
 #include "punto/event_loop.hpp"
+#include "punto/sound_manager.hpp"
 #include "punto/scancode_map.hpp"
 #include "punto/text_processor.hpp"
 
@@ -47,7 +48,12 @@ bool EventLoop::initialize() {
 
   // Инициализируем X11 сессию
   x11_session_ = std::make_unique<X11Session>();
-  if (!x11_session_->initialize()) {
+  bool x11_ok = x11_session_->initialize();
+
+  // SoundManager зависит от X11Session (uid/gid/env активного пользователя)
+  sound_manager_ = std::make_unique<SoundManager>(*x11_session_, config_.sound);
+
+  if (!x11_ok) {
     std::cerr << "[punto] Предупреждение: X11 сессия не инициализирована. "
                  "Операции с буфером обмена будут недоступны.\n";
     // Не фатальная ошибка — базовая функциональность работает
@@ -203,6 +209,10 @@ void EventLoop::handle_event(const input_event &ev) {
       current_layout_ = (current_layout_ == 0) ? 1 : 0;
       std::cerr << "[punto] USER layout switch -> "
                 << (current_layout_ == 0 ? "EN" : "RU") << "\n";
+
+      if (sound_manager_) {
+        sound_manager_->play_for_layout(current_layout_);
+      }
     }
 
     buffer_.reset_current();
@@ -425,6 +435,10 @@ void EventLoop::switch_layout() {
   // Инвертируем внутреннее состояние
   current_layout_ = (current_layout_ == 0) ? 1 : 0;
   last_sync_time_ = std::chrono::steady_clock::now();
+
+  if (sound_manager_) {
+    sound_manager_->play_for_layout(current_layout_);
+  }
 
   // Эмулируем нажатие горячей клавиши (единственный надежный способ)
   injector_->send_layout_hotkey(config_.hotkey.modifier, config_.hotkey.key);
@@ -715,8 +729,13 @@ bool EventLoop::reload_config() {
   config_.delays = new_config.delays;
   config_.hotkey = new_config.hotkey;
   config_.auto_switch = new_config.auto_switch;
+  config_.sound = new_config.sound;
   config_.debug_mode = new_config.debug_mode;
   config_.log_to_syslog = new_config.log_to_syslog;
+
+  if (sound_manager_) {
+    sound_manager_->set_enabled(config_.sound.enabled);
+  }
 
   // Обновляем KeyInjector с новыми задержками
   if (injector_) {

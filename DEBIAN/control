@@ -1,10 +1,10 @@
 Package: punto-switcher
-Version: 2.2.0
+Version: 2.3.0
 Section: utils
 Priority: optional
 Architecture: amd64
 Depends: interception-tools, libx11-6, xsel
-Recommends: libxcb1, libgtk-3-0, libayatana-appindicator3-1
+Recommends: libxcb1, libgtk-3-0, libayatana-appindicator3-1, pulseaudio-utils, alsa-utils
 Maintainer: Anton Shalin <anton.shalin@gmail.com>
 Description: Punto Switcher для Linux Ubuntu (C++20 версия)
  Высокопроизводительная реализация Punto Switcher для Linux.

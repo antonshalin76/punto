@@ -20,6 +20,9 @@ struct SettingsData {
   int min_word_len = 2;
   double min_score = 5.0;
 
+  // Sound
+  bool sound_enabled = true;
+
   // Delays
   int key_press = 12;
   int layout_switch = 150;
@@ -44,13 +47,13 @@ public:
    */
   static bool show(GtkWidget* parent = nullptr);
 
-private:
-  /// Загружает настройки из файла
+  /// Загружает настройки из файла (используется также tray меню)
   static SettingsData load_settings();
 
-  /// Сохраняет настройки в файл
+  /// Сохраняет настройки в файл (используется также tray меню)
   static bool save_settings(const SettingsData& settings);
 
+private:
   /// Получает путь к user config
   static std::string get_user_config_path();
 

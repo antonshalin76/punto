@@ -86,11 +86,10 @@ void KeyInjector::retype_buffer(std::span<const KeyEntry> entries,
 
 void KeyInjector::retype_trailing(std::span<const ScanCode> codes,
                                   bool turbo) const {
-  auto retype_delay = turbo ? delays_.turbo_retype : delays_.retype;
+  // Для некоторых приложений (в т.ч. терминалов) слишком быстрый press/release
+  // может приводить к потере пробелов/таба. Используем tap_key с hold time.
   for (const auto code : codes) {
-    send_key(code, KeyState::Press);
-    send_key(code, KeyState::Release);
-    delay(retype_delay);
+    tap_key(code, false, turbo);
   }
 }
 

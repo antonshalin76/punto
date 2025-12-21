@@ -51,6 +51,8 @@ public:
 private:
   // Callbacks для пунктов меню
   static void on_toggle_clicked(GtkMenuItem* item, gpointer user_data);
+  static void on_sound_toggle_clicked(GtkMenuItem* item, gpointer user_data);
+  static void on_restart_service_clicked(GtkMenuItem* item, gpointer user_data);
   static void on_settings_clicked(GtkMenuItem* item, gpointer user_data);
   static void on_apply_clicked(GtkMenuItem* item, gpointer user_data);
   static void on_quit_clicked(GtkMenuItem* item, gpointer user_data);
@@ -64,6 +66,12 @@ private:
   /// Обновляет текст пункта меню Toggle
   void update_toggle_label();
 
+  /// Обновляет текст пункта меню Sound Toggle
+  void update_sound_toggle_label();
+
+  /// Обновляет текст пункта меню Service
+  void update_service_label();
+
   /// Создаёт контекстное меню
   GtkWidget* create_menu();
 
@@ -71,9 +79,14 @@ private:
   AppIndicator* indicator_ = nullptr;
   GtkWidget* menu_ = nullptr;
   GtkWidget* toggle_item_ = nullptr;
+  GtkWidget* sound_toggle_item_ = nullptr;
+  GtkWidget* service_item_ = nullptr;
 
   // Текущий статус
   ServiceStatus current_status_ = ServiceStatus::Unknown;
+
+  // Текущий статус звука (берём из user config)
+  bool sound_enabled_ = true;
 
   // ID таймера обновления статуса
   guint status_timer_id_ = 0;

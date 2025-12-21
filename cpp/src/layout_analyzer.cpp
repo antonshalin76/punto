@@ -10,7 +10,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <iostream>
 
 namespace punto {
 
@@ -69,10 +68,6 @@ AnalysisResult LayoutAnalyzer::analyze(std::span<const KeyEntry> word) const {
   // Проверяем минимальный скор — хотя бы один должен быть выше порога
   if (max_score < config_.min_score) {
     result.should_switch = false;
-    // DEBUG
-    std::cerr << "[punto] SKIP: en=" << result.en_score
-              << " ru=" << result.ru_score
-              << " (max < min_score=" << config_.min_score << ")\n";
     return result;
   }
 
@@ -82,18 +77,9 @@ AnalysisResult LayoutAnalyzer::analyze(std::span<const KeyEntry> word) const {
 
     double effective_threshold = config_.threshold;
     result.should_switch = (ratio >= effective_threshold);
-    // DEBUG
-    std::cerr << "[punto] ANALYZE: en=" << result.en_score
-              << " ru=" << result.ru_score << " ratio=" << ratio
-              << " eff_threshold=" << effective_threshold << " -> "
-              << (result.should_switch ? "SWITCH" : "keep") << "\n";
   } else {
     // Если min_score == 0, а max_score > min_score порога → переключаем
     result.should_switch = (max_score >= config_.min_score);
-    // DEBUG
-    std::cerr << "[punto] ANALYZE: en=" << result.en_score
-              << " ru=" << result.ru_score << " -> "
-              << (result.should_switch ? "SWITCH" : "keep") << "\n";
   }
 
   return result;

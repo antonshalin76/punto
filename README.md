@@ -3,29 +3,31 @@
 Высокопроизводительная реализация Punto Switcher на C++20 для Linux.
 Позволяет исправлять текст, набранный в неправильной раскладке клавиатуры.
 
-![Version](https://img.shields.io/badge/version-2.2.0-blue)
+![Version](https://img.shields.io/badge/version-2.3.0-blue)
 ![C++](https://img.shields.io/badge/C%2B%2B-20-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ## Возможности
 
-### Управление через трей (v2.2)
+### Управление через трей (v2.3)
 
 Иконка `punto-tray` в системном трее позволяет:
 - **Визуальный статус** — видно, включено ли автопереключение
-- **Быстрое вкл/выкл** — без перезапуска сервиса
-- **Настройки** — встроенный модальный диалог (GTK), редактирует `~/.config/punto/config.yaml`
-- **Сохранить** — мгновенное применение (hot reload) без рестарта udevmon
+- **Быстрое вкл/выкл** — без перезапуска `udevmon`
+- **Звук вкл/выкл** — переключатель звуковой индикации (пишется в `~/.config/punto/config.yaml`, применяется через RELOAD)
+- **Настройки...** — диалог (GTK3): автопереключение, звук, задержки, хоткей раскладки (`~/.config/punto/config.yaml`)
+- **Перезапуск сервиса** — `systemctl restart udevmon` через `pkexec`
+- **Автозапуск** — desktop entry в `/etc/xdg/autostart/` (если `punto-tray` включён в пакет)
 
-### Автоматическое переключение (v2.1)
+### Автоматическое переключение (v2.1+)
 
-| Режим                | Действие                                                      |
-| -------------------- | ------------------------------------------------------------- |
-| **АВТО** (при пробеле) | Анализирует слово и переключает раскладку если нужно        |
+| Режим                      | Действие                                                         |
+| -------------------------- | ---------------------------------------------------------------- |
+| **АВТО** (при пробеле/табе) | Анализирует слово и переключает раскладку, если это нужно         |
 
 Гибридный анализ:
-- **Словарь** (приоритет) — hunspell словари EN/RU
-- **N-граммы** (fallback) — частотный анализ биграмм
+- **Словарь** (приоритет) — hunspell словари EN/RU (если установлены)
+- **N-граммы** (fallback) — частотный анализ биграмм + триграмм
 
 ### Ручные горячие клавиши
 
@@ -56,7 +58,7 @@ Privet  →  [LCtrl+LAlt+Pause]  →  Привет
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  intercept -g $DEVNODE                                      │
+│  interception -g $DEVNODE                                   |
 │              (перехватывает события клавиатуры)             │
 └─────────────────────────────────────────────────────────────┘
                               │
@@ -85,16 +87,15 @@ Privet  →  [LCtrl+LAlt+Pause]  →  Привет
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Ключевые особенности v2.2
+### Ключевые особенности v2.3
 
-- **Управление через трей** — иконка `punto-tray` для быстрого управления
-- **Встроенные настройки** — модальное окно, редактирует `~/.config/punto/config.yaml`
-- **IPC через Unix Socket** — команды GET_STATUS, SET_STATUS, RELOAD
-- **Hot Reload конфига** — применение настроек без перезапуска udevmon
-- **Автопереключение раскладки** — гибридный анализ (словарь + биграммы)
-- **Hunspell словари** — высокая точность определения языка
-- **Zero external dependencies** — никаких Python, xdotool, xclip
-- **< 1ms латентность** — вместо 200-500ms при вызове скриптов
+- **Управление через трей** — `punto-tray` (GTK3 + AppIndicator/Ayatana)
+- **Настройки + hot reload** — редактирование `~/.config/punto/config.yaml` и мгновенное применение через IPC (без перезапуска `udevmon`)
+- **IPC через Unix Socket** — `/var/run/punto.sock` (GET_STATUS, SET_STATUS, RELOAD)
+- **Автопереключение раскладки** — гибрид: hunspell (если есть) → N-граммы (биграммы+триграммы)
+- **Звуковая индикация** — `paplay`/`aplay` (если доступны)
+- **Нативный X11** — чтение selection напрямую; для записи используется `xsel`
+- **< 1ms латентность** — вместо 200-500ms при вызове скриптовых реализаций
 
 ## Установка
 
@@ -103,22 +104,27 @@ Privet  →  [LCtrl+LAlt+Pause]  →  Привет
 ```bash
 git clone https://github.com/antonshalin76/punto.git
 cd punto
-sudo dpkg -i punto-switcher_2.2.0_amd64.deb
+sudo dpkg -i punto-switcher_2.3.0_amd64.deb
 ```
 
 ### Способ 2: Сборка из исходников
 
 #### Зависимости
 
+> Примечание: `build-deb.sh` рассчитан на Debian/Ubuntu и сам предложит установить зависимости.
+
 ```bash
-# Ubuntu/Debian
-sudo apt install build-essential cmake libx11-dev interception-tools xsel
+# Ubuntu/Debian (минимум для сборки punto)
+sudo apt install build-essential cmake pkg-config libx11-dev interception-tools xsel
 
-# Arch Linux
-sudo pacman -S base-devel cmake libx11 interception-tools xsel
+# Опционально: сборка tray-приложения (GTK3 + AppIndicator/Ayatana)
+sudo apt install libgtk-3-dev libayatana-appindicator3-dev
 
-# Fedora
-sudo dnf install gcc-c++ cmake libX11-devel interception-tools xsel
+# Опционально: словари для более точного авто-определения языка
+sudo apt install hunspell-en-us hunspell-ru
+
+# Опционально: звук при переключении раскладки (paplay/aplay)
+sudo apt install pulseaudio-utils alsa-utils
 ```
 
 #### Сборка
@@ -127,7 +133,7 @@ sudo dnf install gcc-c++ cmake libX11-devel interception-tools xsel
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh
-sudo dpkg -i punto-switcher_2.2.0_amd64.deb
+sudo dpkg -i punto-switcher_2.3.0_amd64.deb
 ```
 
 #### Ручная сборка без пакета
@@ -143,25 +149,13 @@ sudo cp ../../config.yaml /etc/punto/
 
 ### Настройка udevmon
 
-Создайте `/etc/interception/udevmon.yaml`:
+Создайте `/etc/interception/udevmon.yaml` (пример — `udevmon.yaml` в корне репозитория):
 
 ```yaml
-- JOB: "intercept -g $DEVNODE | punto | uinput -d $DEVNODE"
+- JOB: "interception -g $DEVNODE | /usr/local/bin/punto | uinput -d $DEVNODE"
   DEVICE:
     EVENTS:
-      EV_KEY: [KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H,
-               KEY_I, KEY_J, KEY_K, KEY_L, KEY_M, KEY_N, KEY_O, KEY_P,
-               KEY_Q, KEY_R, KEY_S, KEY_T, KEY_U, KEY_V, KEY_W, KEY_X,
-               KEY_Y, KEY_Z, KEY_SPACE, KEY_ENTER, KEY_TAB, KEY_BACKSPACE,
-               KEY_PAUSE, KEY_DOT, KEY_COMMA, KEY_SEMICOLON, KEY_APOSTROPHE,
-               KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_GRAVE, KEY_SLASH,
-               KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTCTRL, KEY_RIGHTCTRL,
-               KEY_LEFTALT, KEY_RIGHTALT, KEY_LEFTMETA, KEY_RIGHTMETA,
-               KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0,
-               KEY_MINUS, KEY_EQUAL, KEY_BACKSLASH,
-               KEY_KP0, KEY_KP1, KEY_KP2, KEY_KP3, KEY_KP4, KEY_KP5,
-               KEY_KP6, KEY_KP7, KEY_KP8, KEY_KP9, KEY_KPDOT,
-               KEY_KPMINUS, KEY_KPPLUS, KEY_KPASTERISK, KEY_KPSLASH, KEY_KPENTER]
+      EV_KEY: [KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H, KEY_I, KEY_J, KEY_K, KEY_L, KEY_M, KEY_N, KEY_O, KEY_P, KEY_Q, KEY_R, KEY_S, KEY_T, KEY_U, KEY_V, KEY_W, KEY_X, KEY_Y, KEY_Z, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0, KEY_MINUS, KEY_EQUAL, KEY_BACKSPACE, KEY_TAB, KEY_ENTER, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTALT, KEY_RIGHTALT, KEY_COMMA, KEY_DOT, KEY_SLASH, KEY_SEMICOLON, KEY_APOSTROPHE, KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_BACKSLASH, KEY_GRAVE, KEY_SPACE, KEY_PAUSE, KEY_LEFT, KEY_RIGHT, KEY_UP, KEY_DOWN, KEY_HOME, KEY_END, KEY_PAGEUP, KEY_PAGEDOWN, KEY_INSERT, KEY_DELETE]
 ```
 
 ### Запуск
@@ -180,8 +174,8 @@ sudo systemctl start udevmon
 ```yaml
 # Хоткей переключения раскладки (ваша системная комбинация)
 hotkey:
-  modifier: leftctrl   # leftctrl, rightctrl, leftalt, rightalt
-  key: grave           # grave (` ~), space, tab, capslock
+  modifier: leftctrl   # leftctrl, rightctrl, leftalt, rightalt, leftshift, rightshift, leftmeta, rightmeta
+  key: grave           # grave (` ~), space, tab, capslock, backslash
 
 # Задержки (в миллисекундах)
 delays:
@@ -197,6 +191,10 @@ auto_switch:
   threshold: 3.5       # Порог срабатывания (разница скоров)
   min_word_len: 2      # Минимальная длина слова для анализа
   min_score: 5.0       # Минимальный скор для уверенного решения
+
+# Звуковая индикация переключения раскладки
+sound:
+  enabled: true
 ```
 
 После изменения можно применить настройки без перезапуска:
@@ -205,7 +203,15 @@ auto_switch:
 # Через tray-приложение: диалог настроек -> "Сохранить" (применяется сразу)
 
 # Или через командную строку:
+
 echo "RELOAD" | nc -U /var/run/punto.sock
+
+# Быстро вкл/выкл автопереключение (не меняя конфиг):
+echo "SET_STATUS 1" | nc -U /var/run/punto.sock
+# echo "SET_STATUS 0" | nc -U /var/run/punto.sock
+
+# Проверить текущий статус:
+echo "GET_STATUS" | nc -U /var/run/punto.sock
 
 # Или перезапуском сервиса:
 sudo systemctl restart udevmon
@@ -223,18 +229,29 @@ punto/
 │   │   ├── config.hpp            # Конфигурация
 │   │   ├── input_buffer.hpp      # Буфер ввода
 │   │   ├── key_injector.hpp      # Генератор input_event
-│   │   ├── clipboard_manager.hpp # X11 clipboard
+│   │   ├── clipboard_manager.hpp # X11 clipboard (частично, запись через xsel)
 │   │   ├── x11_session.hpp       # Управление X11 сессией
+│   │   ├── sound_manager.hpp     # Звуковая индикация (paplay/aplay)
 │   │   ├── text_processor.hpp    # Обработка текста
 │   │   ├── event_loop.hpp        # Главный цикл
-│   │   ├── layout_analyzer.hpp   # Анализатор раскладки (биграммы)
+│   │   ├── layout_analyzer.hpp   # Анализатор раскладки (биграммы+триграммы)
 │   │   ├── dictionary.hpp        # Словарный анализатор (hunspell)
-│   │   ├── ngram_data.hpp        # Данные частотности биграмм
+│   │   ├── ipc_server.hpp        # IPC сервер (/var/run/punto.sock)
+│   │   ├── ipc_client.hpp        # IPC клиент (для tray)
+│   │   ├── tray_app.hpp          # Tray UI
+│   │   ├── settings_dialog.hpp   # Диалог настроек (GTK)
+│   │   ├── ngram_data.hpp        # Данные частотности N-грамм
 │   │   └── asm_utils.hpp         # ASM оптимизации
-│   └── src/                      # Реализации
+│   └── src/
+│       ├── tray/                 # Исходники tray-приложения
+│       └── sound/                # WAV файлы
 ├── DEBIAN/                       # Файлы для deb-пакета
+│   ├── control
+│   ├── postinst
+│   └── prerm
 ├── config.yaml                   # Конфигурация по умолчанию
 ├── udevmon.yaml                  # Пример конфигурации udevmon
+├── punto-tray.desktop            # Autostart entry для tray
 ├── build-deb.sh                  # Скрипт сборки пакета
 └── README.md
 ```
@@ -288,16 +305,26 @@ sudo rm -rf /etc/punto
 
 | Компонент          | Версия              |
 | ------------------ | ------------------- |
-| C++                | 20                  |
-| CMake              | ≥ 3.16              |
-| GCC                | ≥ 10 или Clang ≥ 11 |
-| interception-tools | любая               |
-| libX11             | любая               |
-| xsel               | любая               |
-| hunspell-en-us     | любая (опционально) |
-| hunspell-ru        | любая (опционально) |
+| C++                          | 20                  |
+| CMake                        | ≥ 3.16              |
+| GCC                          | ≥ 10 или Clang ≥ 11 |
+| interception-tools           | любая               |
+| libX11                       | любая               |
+| xsel                         | любая               |
+| libgtk-3-0                   | любая (tray, опционально) |
+| libayatana-appindicator3-1   | любая (tray, опционально) |
+| pulseaudio-utils             | любая (звук, опционально) |
+| alsa-utils                   | любая (звук, опционально) |
+| hunspell-en-us               | любая (опционально) |
+| hunspell-ru                  | любая (опционально) |
 
 ## История изменений
+
+### v2.3.0 — Улучшения tray UI + звук
+
+- **Меню tray**: переключатель звука, пункт перезапуска `udevmon` (через `pkexec`)
+- **Диалог настроек**: вкладки для авто-переключения, звука, задержек и хоткея
+- **SoundManager**: звуковая индикация при переключении раскладки (`paplay` → `aplay`)
 
 ### v2.2.0 — Управление через системный трей
 

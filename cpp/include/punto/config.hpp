@@ -58,11 +58,17 @@ struct AutoSwitchConfig {
   double min_score = 10.0;
 };
 
+/// Настройки звуковой индикации переключения раскладки
+struct SoundConfig {
+  bool enabled = true;
+};
+
 /// Полная конфигурация приложения
 struct Config {
   HotkeyConfig hotkey;
   DelayConfig delays;
   AutoSwitchConfig auto_switch;
+  SoundConfig sound;
   std::filesystem::path config_path{"/etc/punto/config.yaml"};
 
   // Дополнительные параметры (для будущего расширения)

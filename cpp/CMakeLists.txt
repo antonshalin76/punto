@@ -5,6 +5,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(punto VERSION 2.1.0 LANGUAGES CXX)
 
+# Для clangd/IDE: генерируем compile_commands.json
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # -----------------------------------------------------------------------------
 # Стандарты и флаги компиляции
 # -----------------------------------------------------------------------------
@@ -52,6 +55,7 @@ set(PUNTO_SOURCES
     src/text_processor.cpp
     src/clipboard_manager.cpp
     src/x11_session.cpp
+    src/sound_manager.cpp
     src/layout_analyzer.cpp
     src/dictionary.cpp
     src/ipc_server.cpp
@@ -66,6 +70,7 @@ set(PUNTO_HEADERS
     include/punto/text_processor.hpp
     include/punto/clipboard_manager.hpp
     include/punto/x11_session.hpp
+    include/punto/sound_manager.hpp
     include/punto/scancode_map.hpp
     include/punto/asm_utils.hpp
     include/punto/ngram_data.hpp
@@ -104,6 +109,11 @@ install(TARGETS punto DESTINATION bin)
 install(FILES ${CMAKE_SOURCE_DIR}/../config.yaml
         DESTINATION /etc/punto
         RENAME config.yaml.new)
+
+# Звуки переключения раскладки
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/sound/
+        DESTINATION /usr/share/punto-switcher/sounds
+        FILES_MATCHING PATTERN "*.wav")
 
 # -----------------------------------------------------------------------------
 # Tray-приложение (опционально)

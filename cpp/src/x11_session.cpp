@@ -81,9 +81,9 @@ bool X11Session::initialize() {
   if (initialized_)
     return true;
 
-  // Сохраняем оригинальные UID/GID
-  original_uid_ = getuid();
-  original_gid_ = getgid();
+  // Сохраняем оригинальные effective UID/GID
+  original_uid_ = geteuid();
+  original_gid_ = getegid();
 
   // Находим активного пользователя
   auto username = find_active_user();
@@ -104,7 +104,9 @@ bool X11Session::initialize() {
   }
 
   info_.uid = pw->pw_uid;
+  info_.gid = pw->pw_gid;
   info_.home_dir = pw->pw_dir;
+  info_.xdg_runtime_dir = "/run/user/" + std::to_string(info_.uid);
 
   // Находим DISPLAY/XAUTHORITY
   if (!find_session_env(info_.username)) {
@@ -130,19 +132,21 @@ void X11Session::apply_environment() const {
   setenv("XAUTHORITY", info_.xauthority_path.c_str(), 1);
   setenv("HOME", info_.home_dir.c_str(), 1);
   setenv("USER", info_.username.c_str(), 1);
+  setenv("LOGNAME", info_.username.c_str(), 1);
+  setenv("XDG_RUNTIME_DIR", info_.xdg_runtime_dir.c_str(), 1);
 }
 
 bool X11Session::switch_to_user() const {
   if (!initialized_)
     return false;
-  if (getuid() == info_.uid)
+  if (geteuid() == static_cast<uid_t>(info_.uid))
     return true; // Уже этот пользователь
 
   // Сначала gid, потом uid
-  if (setegid(info_.uid) != 0) {
+  if (setegid(static_cast<gid_t>(info_.gid)) != 0) {
     return false;
   }
-  if (seteuid(info_.uid) != 0) {
+  if (seteuid(static_cast<uid_t>(info_.uid)) != 0) {
     // Откатываем gid (best effort, ignoring errors)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-result"
@@ -155,13 +159,14 @@ bool X11Session::switch_to_user() const {
 }
 
 bool X11Session::switch_to_root() const {
-  if (getuid() == 0)
+  if (geteuid() == 0)
     return true; // Уже root
 
-  if (seteuid(original_uid_) != 0) {
+  // Сначала gid, потом uid
+  if (setegid(original_gid_) != 0) {
     return false;
   }
-  if (setegid(original_gid_) != 0) {
+  if (seteuid(original_uid_) != 0) {
     return false;
   }
 
@@ -217,6 +222,10 @@ bool X11Session::find_session_env(const std::string &username) {
 
   if (auto it = env.find("XAUTHORITY"); it != env.end()) {
     info_.xauthority_path = it->second;
+  }
+
+  if (auto it = env.find("XDG_RUNTIME_DIR"); it != env.end()) {
+    info_.xdg_runtime_dir = it->second;
   }
 
   return !info_.display.empty();

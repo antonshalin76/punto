@@ -26,3 +26,7 @@ auto_switch:
   threshold: 3.5
   min_word_len: 2
   min_score: 5.0
+
+# Звуковая индикация переключения раскладки
+sound:
+  enabled: true

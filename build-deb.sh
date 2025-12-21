@@ -7,7 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 PACKAGE_NAME="punto-switcher"
 BUILD_DIR="build-deb"
 CPP_BUILD_DIR="cpp/build"
@@ -17,6 +17,32 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
+
+INSTALL_AFTER_BUILD=false
+for arg in "$@"; do
+    if [[ "$arg" == "--install" ]]; then
+        INSTALL_AFTER_BUILD=true
+    fi
+done
+
+restart_tray() {
+    if [[ "$BUILD_TRAY" != "true" ]]; then
+        return
+    fi
+
+    # Останавливаем старый tray (если запущен)
+    if pgrep -x punto-tray >/dev/null 2>&1; then
+        pkill -x punto-tray 2>/dev/null || true
+        sleep 0.2
+    fi
+
+    # Запускаем tray только если есть GUI окружение
+    if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+        /usr/local/bin/punto-tray >/dev/null 2>&1 &
+    else
+        echo -e "${YELLOW}   DISPLAY/WAYLAND_DISPLAY не найден — пропускаем автозапуск punto-tray${NC}"
+    fi
+}
 
 echo "=== Сборка Punto Switcher v${VERSION} ==="
 
@@ -112,6 +138,11 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake --build . -j$(nproc)
 cd "$SCRIPT_DIR"
 
+# Для IDE/clangd: копируем compile_commands.json в корень репозитория
+if [[ -f "cpp/build/compile_commands.json" ]]; then
+    cp cpp/build/compile_commands.json "$SCRIPT_DIR/compile_commands.json"
+fi
+
 # Проверяем, что бинарник собрался
 if [[ ! -f "cpp/build/punto" ]]; then
     echo "Ошибка: бинарник cpp/build/punto не найден!"
@@ -138,6 +169,7 @@ mkdir -p "$BUILD_DIR/DEBIAN"
 mkdir -p "$BUILD_DIR/usr/local/bin"
 mkdir -p "$BUILD_DIR/etc/punto"
 mkdir -p "$BUILD_DIR/usr/share/punto-switcher"
+mkdir -p "$BUILD_DIR/usr/share/punto-switcher/sounds"
 mkdir -p "$BUILD_DIR/etc/xdg/autostart"
 
 # Копируем бинарник
@@ -156,6 +188,10 @@ fi
 cp config.yaml "$BUILD_DIR/usr/share/punto-switcher/"
 cp udevmon.yaml "$BUILD_DIR/usr/share/punto-switcher/"
 cp config.yaml "$BUILD_DIR/etc/punto/config.yaml.new"
+
+# Копируем звуки переключения раскладки
+cp cpp/src/sound/en_ru.wav "$BUILD_DIR/usr/share/punto-switcher/sounds/"
+cp cpp/src/sound/ru_en.wav "$BUILD_DIR/usr/share/punto-switcher/sounds/"
 
 # Копируем DEBIAN файлы
 cp DEBIAN/control "$BUILD_DIR/DEBIAN/"
@@ -228,6 +264,26 @@ echo "Размер: $(du -h "$OUTPUT_DEB" | cut -f1)"
 echo ""
 echo "Установка: sudo dpkg -i $OUTPUT_DEB"
 echo "Удаление:  sudo dpkg -r $PACKAGE_NAME"
+
+# -----------------------------------------------------------------------------
+# Optional: установка и перезапуск tray
+# -----------------------------------------------------------------------------
+if [[ "$INSTALL_AFTER_BUILD" == "true" ]]; then
+    echo ""
+    echo "Установка пакета..."
+    sudo dpkg -i "$OUTPUT_DEB"
+
+    echo "Перезапуск punto-tray..."
+    restart_tray
+else
+    echo ""
+    read -p "Установить пакет сейчас и перезапустить tray? [Y/n] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+        sudo dpkg -i "$OUTPUT_DEB"
+        restart_tray
+    fi
+fi
 
 # Показываем статус словарей
 if [[ ${#MISSING_OPTIONAL_DEPS[@]} -gt 0 ]]; then

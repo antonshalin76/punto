@@ -20,9 +20,11 @@ namespace punto {
 struct X11SessionInfo {
   std::string username;
   std::uint32_t uid = 0;
+  std::uint32_t gid = 0;
   std::string display;         // e.g., ":0"
   std::string xauthority_path; // e.g., "/run/user/1000/gdm/Xauthority"
   std::string home_dir;
+  std::string xdg_runtime_dir; // e.g., "/run/user/1000"
 };
 
 /**

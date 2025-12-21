@@ -104,6 +104,7 @@ SettingsData SettingsDialog::load_settings() {
     if (trimmed == "hotkey:") { section = "hotkey"; continue; }
     if (trimmed == "delays:") { section = "delays"; continue; }
     if (trimmed == "auto_switch:") { section = "auto_switch"; continue; }
+    if (trimmed == "sound:") { section = "sound"; continue; }
 
     std::string value = parse_value(trimmed);
     if (value.empty()) continue;
@@ -142,6 +143,10 @@ SettingsData SettingsDialog::load_settings() {
           settings.min_score = v;
         }
       }
+    } else if (section == "sound") {
+      if (trimmed.find("enabled:") != std::string::npos) {
+        settings.sound_enabled = (value == "true" || value == "1");
+      }
     }
   }
 
@@ -178,7 +183,10 @@ bool SettingsDialog::save_settings(const SettingsData& settings) {
   file << "  enabled: " << (settings.auto_enabled ? "true" : "false") << "\n";
   file << "  threshold: " << settings.threshold << "\n";
   file << "  min_word_len: " << settings.min_word_len << "\n";
-  file << "  min_score: " << settings.min_score << "\n";
+  file << "  min_score: " << settings.min_score << "\n\n";
+
+  file << "sound:\n";
+  file << "  enabled: " << (settings.sound_enabled ? "true" : "false") << "\n";
 
   file.flush();
   if (!file.good()) {
@@ -250,6 +258,17 @@ bool SettingsDialog::show(GtkWidget* parent) {
   gtk_grid_attach(GTK_GRID(auto_grid), min_score_spin, 1, 2, 1, 1);
 
   gtk_notebook_append_page(GTK_NOTEBOOK(notebook), auto_box, gtk_label_new("Автопереключение"));
+
+  // ===== Вкладка "Звук" =====
+  GtkWidget* sound_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+  gtk_container_set_border_width(GTK_CONTAINER(sound_box), 12);
+
+  GtkWidget* sound_enabled = gtk_check_button_new_with_label(
+      "Включить звуковую индикацию переключения раскладки");
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sound_enabled), settings.sound_enabled);
+  gtk_box_pack_start(GTK_BOX(sound_box), sound_enabled, FALSE, FALSE, 0);
+
+  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), sound_box, gtk_label_new("Звук"));
 
   // ===== Вкладка "Задержки" =====
   GtkWidget* delays_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
@@ -360,6 +379,8 @@ bool SettingsDialog::show(GtkWidget* parent) {
     settings.threshold = gtk_spin_button_get_value(GTK_SPIN_BUTTON(threshold_spin));
     settings.min_word_len = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(min_word_spin));
     settings.min_score = gtk_spin_button_get_value(GTK_SPIN_BUTTON(min_score_spin));
+
+    settings.sound_enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(sound_enabled));
 
     settings.key_press = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(key_press_spin));
     settings.layout_switch = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(layout_spin));

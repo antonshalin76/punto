@@ -155,6 +155,10 @@ Config load_config(std::string_view path) {
       current_section = "auto_switch";
       continue;
     }
+    if (sv == "sound:" || sv.starts_with("sound:")) {
+      current_section = "sound";
+      continue;
+    }
 
     // Парсинг key: value
     auto colon_pos = sv.find(':');
@@ -205,6 +209,12 @@ Config load_config(std::string_view path) {
       } else if (key == "min_score") {
         if (auto val = parse_double(value)) {
           config.auto_switch.min_score = *val;
+        }
+      }
+    } else if (current_section == "sound") {
+      if (key == "enabled") {
+        if (auto val = parse_bool(value)) {
+          config.sound.enabled = *val;
         }
       }
     }

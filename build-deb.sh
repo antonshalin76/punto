@@ -1,69 +1,91 @@
 #!/bin/bash
-# Скрипт сборки deb-пакета Punto Switcher
+# =============================================================================
+# Сборка deb-пакета Punto Switcher v2.0 (C++20)
+# =============================================================================
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VERSION="1.0.4"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+VERSION="2.0.0"
 PACKAGE_NAME="punto-switcher"
-BUILD_DIR="${SCRIPT_DIR}/build-deb"
-DEB_DIR="${BUILD_DIR}/${PACKAGE_NAME}_${VERSION}"
+BUILD_DIR="build-deb"
+CPP_BUILD_DIR="cpp/build"
 
-echo "=== Сборка deb-пакета Punto Switcher v${VERSION} ==="
+echo "=== Сборка Punto Switcher v${VERSION} ==="
 
-# Очистка предыдущей сборки
-rm -rf "${BUILD_DIR}"
-mkdir -p "${DEB_DIR}"
+# -----------------------------------------------------------------------------
+# Этап 1: Сборка C++ бинарника
+# -----------------------------------------------------------------------------
+echo "[1/4] Сборка C++ бинарника..."
 
-# Сборка бинарника
-echo "Компиляция..."
-make -C "${SCRIPT_DIR}" clean
-make -C "${SCRIPT_DIR}"
+mkdir -p cpp/build
+cd cpp/build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . -j$(nproc)
+cd "$SCRIPT_DIR"
 
-# Создание структуры пакета
-echo "Создание структуры пакета..."
+# Проверяем, что бинарник собрался
+if [[ ! -f "cpp/build/punto" ]]; then
+    echo "Ошибка: бинарник cpp/build/punto не найден!"
+    exit 1
+fi
 
-# DEBIAN
-mkdir -p "${DEB_DIR}/DEBIAN"
-cp "${SCRIPT_DIR}/DEBIAN/control" "${DEB_DIR}/DEBIAN/"
-cp "${SCRIPT_DIR}/DEBIAN/postinst" "${DEB_DIR}/DEBIAN/"
-cp "${SCRIPT_DIR}/DEBIAN/prerm" "${DEB_DIR}/DEBIAN/"
-chmod 755 "${DEB_DIR}/DEBIAN/postinst"
-chmod 755 "${DEB_DIR}/DEBIAN/prerm"
+echo "   Бинарник собран: $(file cpp/build/punto | cut -d: -f2)"
 
-# Бинарники -> /usr/local/bin
-mkdir -p "${DEB_DIR}/usr/local/bin"
-cp "${SCRIPT_DIR}/punto" "${DEB_DIR}/usr/local/bin/"
-cp "${SCRIPT_DIR}/punto-switch" "${DEB_DIR}/usr/local/bin/"
-cp "${SCRIPT_DIR}/punto-invert" "${DEB_DIR}/usr/local/bin/"
-cp "${SCRIPT_DIR}/punto-case-invert" "${DEB_DIR}/usr/local/bin/"
-cp "${SCRIPT_DIR}/punto-translit" "${DEB_DIR}/usr/local/bin/"
-chmod 755 "${DEB_DIR}/usr/local/bin/"*
+# -----------------------------------------------------------------------------
+# Этап 2: Подготовка структуры пакета
+# -----------------------------------------------------------------------------
+echo "[2/4] Подготовка структуры пакета..."
 
-# Конфигурации -> /usr/share/punto-switcher
-mkdir -p "${DEB_DIR}/usr/share/punto-switcher"
-cp "${SCRIPT_DIR}/config.yaml" "${DEB_DIR}/usr/share/punto-switcher/"
-cp "${SCRIPT_DIR}/udevmon.yaml" "${DEB_DIR}/usr/share/punto-switcher/"
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR/DEBIAN"
+mkdir -p "$BUILD_DIR/usr/local/bin"
+mkdir -p "$BUILD_DIR/etc/punto"
 
-# Документация -> /usr/share/doc
-mkdir -p "${DEB_DIR}/usr/share/doc/${PACKAGE_NAME}"
-cp "${SCRIPT_DIR}/README.md" "${DEB_DIR}/usr/share/doc/${PACKAGE_NAME}/"
+# Копируем бинарник
+cp cpp/build/punto "$BUILD_DIR/usr/local/bin/"
+chmod 755 "$BUILD_DIR/usr/local/bin/punto"
 
-# Сборка пакета
-echo "Сборка deb-пакета..."
-dpkg-deb --build "${DEB_DIR}"
+# Копируем конфигурацию
+cp config.yaml "$BUILD_DIR/etc/punto/config.yaml.new"
 
-# Перемещение в корень проекта
-mv "${BUILD_DIR}/${PACKAGE_NAME}_${VERSION}.deb" "${SCRIPT_DIR}/punto-ubuntu.deb"
+# Копируем DEBIAN файлы
+cp DEBIAN/control "$BUILD_DIR/DEBIAN/"
+cp DEBIAN/postinst "$BUILD_DIR/DEBIAN/" 2>/dev/null || true
+cp DEBIAN/prerm "$BUILD_DIR/DEBIAN/" 2>/dev/null || true
 
-# Очистка
-rm -rf "${BUILD_DIR}"
+# Устанавливаем права на скрипты
+chmod 755 "$BUILD_DIR/DEBIAN/"*inst 2>/dev/null || true
+chmod 755 "$BUILD_DIR/DEBIAN/"*rm 2>/dev/null || true
 
+# Обновляем версию в control
+sed -i "s/^Version:.*/Version: ${VERSION}/" "$BUILD_DIR/DEBIAN/control"
+
+# -----------------------------------------------------------------------------
+# Этап 3: Сборка пакета
+# -----------------------------------------------------------------------------
+echo "[3/4] Сборка deb-пакета..."
+
+OUTPUT_DEB="${PACKAGE_NAME}_${VERSION}_amd64.deb"
+dpkg-deb --build --root-owner-group "$BUILD_DIR" "$OUTPUT_DEB"
+
+# -----------------------------------------------------------------------------
+# Этап 4: Информация о пакете
+# -----------------------------------------------------------------------------
+echo "[4/4] Информация о пакете:"
+echo ""
+dpkg-deb -I "$OUTPUT_DEB"
+echo ""
+echo "Содержимое:"
+dpkg-deb -c "$OUTPUT_DEB"
 echo ""
 echo "=== Готово! ==="
-echo "Пакет создан: ${SCRIPT_DIR}/punto-ubuntu.deb"
+echo "Пакет: $OUTPUT_DEB"
+echo "Размер: $(du -h "$OUTPUT_DEB" | cut -f1)"
 echo ""
-echo "Для установки выполните:"
-echo "  sudo apt install ./punto-ubuntu.deb"
-echo ""
-echo "Для удаления:"
-echo "  sudo apt remove punto-switcher"
+echo "Установка: sudo dpkg -i $OUTPUT_DEB"
+echo "Удаление:  sudo dpkg -r $PACKAGE_NAME"
+
+# Очистка
+rm -rf "$BUILD_DIR"

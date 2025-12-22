@@ -9,6 +9,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace punto {
 
@@ -55,9 +56,10 @@ public:
 
   /**
    * @brief Отправляет команду перезагрузки конфигурации
+   * @param config_path Абсолютный путь к конфигу; если пусто — сервер сам решит
    * @return true при успехе
    */
-  static bool reload_config();
+  static bool reload_config(const std::string& config_path = {});
 
   /**
    * @brief Проверяет, доступен ли сервис
@@ -66,12 +68,17 @@ public:
   static bool is_service_available();
 
 private:
+  [[nodiscard]] static std::vector<std::string> list_socket_paths();
+
   /**
    * @brief Отправляет команду и получает ответ
    * @param command Команда для отправки
    * @return Ответ сервиса или nullopt при ошибке
    */
   static std::optional<std::string> send_command(const std::string& command);
+
+  [[nodiscard]] static std::optional<std::string>
+  send_command_to_socket(const std::string& command, const std::string& socket_path);
 };
 
 } // namespace punto

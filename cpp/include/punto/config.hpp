@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <string>
 #include <string_view>
 
 #include "punto/types.hpp"
@@ -80,14 +81,32 @@ struct Config {
 // Загрузчик конфигурации
 // ===========================================================================
 
+/// Результат загрузки конфигурации из файла.
+///
+/// В отличие от `load_config()`, это API НЕ делает скрытых фолбэков и
+/// позволяет вызывающему коду принять решение (fail-fast / fallback / UI-ошибка).
+struct ConfigLoadOutcome {
+  Config config;
+  ConfigResult result = ConfigResult::Ok;
+  std::filesystem::path used_path;
+  std::string error;
+};
+
 /**
- * @brief Загружает конфигурацию из YAML файла
+ * @brief Загружает конфигурацию из конкретного файла
+ *
+ * @param path Абсолютный или относительный путь к конфигу
+ * @return ConfigLoadOutcome с кодом результата и сообщением ошибки
+ */
+[[nodiscard]] ConfigLoadOutcome load_config_checked(std::filesystem::path path);
+
+/**
+ * @brief Загружает конфигурацию из YAML файла (best-effort)
  *
  * @param path Путь к конфигурационному файлу
  * @return Config с загруженными или дефолтными значениями
  *
- * В случае ошибки парсинга возвращает конфигурацию с дефолтными значениями
- * и логирует предупреждение в stderr.
+ * Best-effort поведение: при ошибках чтения/валидации возвращает дефолты.
  */
 [[nodiscard]] Config load_config(std::string_view path = kConfigPath);
 

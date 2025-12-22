@@ -43,8 +43,11 @@ struct IpcResult {
  */
 class IpcServer {
 public:
-  /// Callback для запроса перезагрузки конфига
-  using ReloadCallback = std::function<bool()>;
+  /// Callback для запроса перезагрузки конфига.
+  /// Аргументом передается путь к конфигурационному файлу, если он был указан
+  /// в команде RELOAD; иначе пустая строка.
+  /// Важно: callback выполняется в IPC-потоке, поэтому должен быть потокобезопасным.
+  using ReloadCallback = std::function<IpcResult(const std::string&)>;
 
   /**
    * @brief Конструктор
@@ -97,6 +100,10 @@ private:
   std::atomic<bool> running_{false};
   std::jthread server_thread_;
   int server_fd_ = -1;
+
+  // Фактический путь сокета, на котором запущен этот экземпляр.
+  // Может отличаться от kIpcSocketPath, если основной сокет уже занят.
+  std::string socket_path_;
 };
 
 } // namespace punto

@@ -8,6 +8,7 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <string>
 
 #include <glib.h>
 
@@ -28,6 +29,26 @@ constexpr const char* kIconUnknown = "dialog-question";
 
 /// ID приложения для AppIndicator
 constexpr const char* kAppIndicatorId = "punto-switcher";
+
+bool apply_settings_change_with_reload(const SettingsData& old_settings,
+                                      const SettingsData& new_settings) {
+  if (!SettingsDialog::save_settings(new_settings)) {
+    return false;
+  }
+
+  const std::string cfg_path = SettingsDialog::get_user_config_path();
+  if (cfg_path.empty()) {
+    (void)SettingsDialog::save_settings(old_settings);
+    return false;
+  }
+
+  if (!IpcClient::reload_config(cfg_path)) {
+    (void)SettingsDialog::save_settings(old_settings);
+    return false;
+  }
+
+  return true;
+}
 
 } // namespace
 
@@ -185,25 +206,30 @@ void TrayApp::update_service_label() {
   if (!service_item_) {
     return;
   }
-
-  const char* label = "Сервис: перезапустить";
-  if (current_status_ == ServiceStatus::Unknown) {
-    label = "Сервис: запустить";
-  }
-
-  gtk_menu_item_set_label(GTK_MENU_ITEM(service_item_), label);
+  gtk_menu_item_set_label(GTK_MENU_ITEM(service_item_),
+                          "Сервис: перезагрузить конфиг");
 }
 
 void TrayApp::on_toggle_clicked(GtkMenuItem* item, gpointer user_data) {
   (void)item;
   auto* app = static_cast<TrayApp*>(user_data);
 
-  ServiceStatus new_status = IpcClient::toggle_status();
-  if (new_status == ServiceStatus::Unknown) {
-    return;  // переключение не удалось, сохраняем текущее состояние
+  SettingsData old_settings = SettingsDialog::load_settings();
+  SettingsData new_settings = old_settings;
+  new_settings.auto_enabled = !old_settings.auto_enabled;
+
+  if (!apply_settings_change_with_reload(old_settings, new_settings)) {
+    return;
   }
 
-  // Обновляем UI только после успешного ответа от сервиса
+  ServiceStatus new_status = IpcClient::get_status();
+  if (new_status == ServiceStatus::Unknown) {
+    // Изменение применено (RELOAD вернул OK), но мы не можем подтвердить статус.
+    // UI обновится на следующем цикле опроса (таймер GET_STATUS).
+    return;
+  }
+
+  // Обновляем UI только после подтверждения от сервиса.
   app->current_status_ = new_status;
   app->update_icon();
   app->update_toggle_label();
@@ -214,37 +240,38 @@ void TrayApp::on_sound_toggle_clicked(GtkMenuItem* item, gpointer user_data) {
   (void)item;
   auto* app = static_cast<TrayApp*>(user_data);
 
-  SettingsData settings = SettingsDialog::load_settings();
-  settings.sound_enabled = !settings.sound_enabled;
+  SettingsData old_settings = SettingsDialog::load_settings();
+  SettingsData new_settings = old_settings;
+  new_settings.sound_enabled = !old_settings.sound_enabled;
 
-  if (!SettingsDialog::save_settings(settings)) {
+  if (!apply_settings_change_with_reload(old_settings, new_settings)) {
     return;
   }
 
-  // Пробуем применить сразу (если сервис доступен)
-  (void)IpcClient::reload_config();
-
-  app->sound_enabled_ = settings.sound_enabled;
+  app->sound_enabled_ = new_settings.sound_enabled;
   app->update_sound_toggle_label();
+
+  // RELOAD может также синхронизировать статус автопереключения с конфигом.
+  ServiceStatus new_status = IpcClient::get_status();
+  if (new_status != ServiceStatus::Unknown && new_status != app->current_status_) {
+    app->current_status_ = new_status;
+    app->update_icon();
+    app->update_toggle_label();
+  }
 }
 
 void TrayApp::on_restart_service_clicked(GtkMenuItem* item, gpointer user_data) {
   (void)item;
   auto* app = static_cast<TrayApp*>(user_data);
 
-  // Нужны права администратора. pkexec покажет диалог авторизации.
-  GError* error = nullptr;
-  const char* cmd = "/usr/bin/pkexec /usr/bin/systemctl restart udevmon";
-
-  if (!g_spawn_command_line_async(cmd, &error)) {
-    if (error) {
-      g_error_free(error);
-    }
-    return;
+  const std::string cfg_path = SettingsDialog::get_user_config_path();
+  bool success = IpcClient::reload_config(cfg_path);
+  if (success) {
+    app->current_status_ = IpcClient::get_status();
+    app->update_icon();
+    app->update_toggle_label();
+    app->update_service_label();
   }
-
-  // UI обновится таймером on_status_update.
-  (void)app;
 }
 
 void TrayApp::on_settings_clicked(GtkMenuItem* item, gpointer user_data) {
@@ -256,7 +283,8 @@ void TrayApp::on_settings_clicked(GtkMenuItem* item, gpointer user_data) {
 
   if (saved) {
     // Автоматически применяем настройки после сохранения
-    bool success = IpcClient::reload_config();
+    const std::string cfg_path = SettingsDialog::get_user_config_path();
+    bool success = IpcClient::reload_config(cfg_path);
     if (success) {
       // Обновляем статус
       app->current_status_ = IpcClient::get_status();
@@ -274,9 +302,7 @@ void TrayApp::on_settings_clicked(GtkMenuItem* item, gpointer user_data) {
 void TrayApp::on_apply_clicked(GtkMenuItem* item, gpointer user_data) {
   (void)item;
   auto* app = static_cast<TrayApp*>(user_data);
-
-  bool success = IpcClient::reload_config();
-  
+  bool success = IpcClient::reload_config(SettingsDialog::get_user_config_path());
   if (success) {
     // Обновляем статус после перезагрузки
     app->current_status_ = IpcClient::get_status();

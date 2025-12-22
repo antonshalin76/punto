@@ -12,9 +12,12 @@
 #include <poll.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+#include <string>
+#include <string_view>
 
 namespace punto {
 
@@ -76,7 +79,7 @@ bool IpcServer::start() {
     server_loop();
   });
 
-  std::cerr << "[punto-ipc] Server started on " << kIpcSocketPath << "\n";
+  std::cerr << "[punto-ipc] Server started on " << socket_path_ << "\n";
   return true;
 }
 
@@ -101,7 +104,10 @@ void IpcServer::stop() {
   }
 
   // Удаляем файл сокета
-  unlink(kIpcSocketPath);
+  if (!socket_path_.empty()) {
+    unlink(socket_path_.c_str());
+    socket_path_.clear();
+  }
 
   std::cerr << "[punto-ipc] Server stopped\n";
 }
@@ -111,42 +117,123 @@ bool IpcServer::is_running() const noexcept {
 }
 
 int IpcServer::create_socket() {
-  // Удаляем старый сокет, если есть
-  unlink(kIpcSocketPath);
+  auto is_socket_active = [](const char* socket_path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+      // Консервативно: если не можем проверить — считаем сокет "живым",
+      // чтобы не удалить чужой/рабочий путь.
+      return true;
+    }
 
-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (fd < 0) {
-    std::cerr << "[punto-ipc] Failed to create socket: " << strerror(errno) << "\n";
-    return -1;
-  }
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
-  // Настраиваем адрес
-  sockaddr_un addr{};
-  addr.sun_family = AF_UNIX;
-  std::strncpy(addr.sun_path, kIpcSocketPath, sizeof(addr.sun_path) - 1);
+    bool active = false;
+    if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+      active = true;
+    } else {
+      // ECONNREFUSED/ENOENT — вероятно, стейл-файл без слушателя.
+      // Остальные ошибки считаем "живым" (не удаляем).
+      active = !(errno == ECONNREFUSED || errno == ENOENT);
+    }
 
-  // Bind
-  if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-    std::cerr << "[punto-ipc] Failed to bind socket: " << strerror(errno) << "\n";
     close(fd);
-    return -1;
+    return active;
+  };
+
+  auto create_bound_socket = [&](const std::string& socket_path,
+                                 bool unlink_first,
+                                 int* out_errno) -> int {
+    if (unlink_first) {
+      (void)unlink(socket_path.c_str());
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+      if (out_errno) {
+        *out_errno = errno;
+      }
+      std::cerr << "[punto-ipc] Failed to create socket: " << strerror(errno)
+                << "\n";
+      return -1;
+    }
+
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, socket_path.c_str(), sizeof(addr.sun_path) - 1);
+
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+      const int err = errno;
+      if (out_errno) {
+        *out_errno = err;
+      }
+      std::cerr << "[punto-ipc] Failed to bind socket (" << socket_path
+                << "): " << strerror(err) << "\n";
+      close(fd);
+      return -1;
+    }
+
+    // Устанавливаем права доступа: rw для всех (0666)
+    // Это безопасно для локального сокета — позволяет пользователю писать в сокет root'а
+    if (chmod(socket_path.c_str(), 0666) < 0) {
+      std::cerr << "[punto-ipc] Warning: failed to chmod socket (" << socket_path
+                << "): " << strerror(errno) << "\n";
+    }
+
+    if (listen(fd, 5) < 0) {
+      const int err = errno;
+      if (out_errno) {
+        *out_errno = err;
+      }
+      std::cerr << "[punto-ipc] Failed to listen (" << socket_path
+                << "): " << strerror(err) << "\n";
+      close(fd);
+      (void)unlink(socket_path.c_str());
+      return -1;
+    }
+
+    socket_path_ = socket_path;
+    if (out_errno) {
+      *out_errno = 0;
+    }
+    return fd;
+  };
+
+  // 1) Пытаемся поднять основной сокет.
+  int bind_errno = 0;
+  int fd = create_bound_socket(kIpcSocketPath, /*unlink_first=*/false, &bind_errno);
+  if (fd >= 0) {
+    return fd;
   }
 
-  // Устанавливаем права доступа: rw для всех (0666)
-  // Это безопасно для локального сокета — позволяет пользователю писать в сокет root'а
-  if (chmod(kIpcSocketPath, 0666) < 0) {
-    std::cerr << "[punto-ipc] Warning: failed to chmod socket: " << strerror(errno) << "\n";
+  // 2) Если основной сокет занят — не трогаем его (multi-instance),
+  // а поднимаем отдельный сокет для текущего процесса.
+  if (bind_errno == EADDRINUSE) {
+    // Но если файл стейл (нет слушателя), можно безопасно заменить.
+    if (!is_socket_active(kIpcSocketPath)) {
+      std::cerr << "[punto-ipc] Stale primary socket detected, replacing: "
+                << kIpcSocketPath << "\n";
+      (void)unlink(kIpcSocketPath);
+      bind_errno = 0;
+      fd = create_bound_socket(kIpcSocketPath, /*unlink_first=*/false, &bind_errno);
+      if (fd >= 0) {
+        return fd;
+      }
+    }
+
+    const std::string fallback =
+        std::string("/var/run/punto-") + std::to_string(::getpid()) + ".sock";
+    std::cerr << "[punto-ipc] Primary socket busy, using: " << fallback << "\n";
+
+    bind_errno = 0;
+    fd = create_bound_socket(fallback, /*unlink_first=*/true, &bind_errno);
+    if (fd >= 0) {
+      return fd;
+    }
   }
 
-  // Listen
-  if (listen(fd, 5) < 0) {
-    std::cerr << "[punto-ipc] Failed to listen: " << strerror(errno) << "\n";
-    close(fd);
-    unlink(kIpcSocketPath);
-    return -1;
-  }
-
-  return fd;
+  return -1;
 }
 
 void IpcServer::server_loop() {
@@ -245,15 +332,34 @@ IpcResult IpcServer::execute_command(std::string_view cmd) {
   }
 
   case IpcCommand::Reload: {
-    if (reload_callback_) {
-      bool success = reload_callback_();
-      if (success) {
-        std::cerr << "[punto-ipc] Config reloaded successfully\n";
-        return {true, "Config reloaded"};
-      }
-      return {false, "Reload failed"};
+    if (!reload_callback_) {
+      return {false, "Reload not supported"};
     }
-    return {false, "Reload not supported"};
+
+    std::string reload_path;
+    auto space_pos = cmd.find(' ');
+    if (space_pos != std::string_view::npos) {
+      std::string_view arg = trim(cmd.substr(space_pos + 1));
+      reload_path.assign(arg.begin(), arg.end());
+    }
+
+    IpcResult res = reload_callback_(reload_path);
+
+    if (res.success) {
+      std::cerr << "[punto-ipc] Config reloaded successfully\n";
+    } else {
+      std::cerr << "[punto-ipc] Config reload failed";
+      if (!res.message.empty()) {
+        std::cerr << ": " << res.message;
+      }
+      std::cerr << "\n";
+    }
+
+    if (res.message.empty()) {
+      res.message = res.success ? "Config reloaded" : "Reload failed";
+    }
+
+    return res;
   }
 
   case IpcCommand::Shutdown: {

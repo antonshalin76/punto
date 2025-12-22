@@ -6,6 +6,7 @@
 #include "punto/settings_dialog.hpp"
 
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -154,42 +155,64 @@ SettingsData SettingsDialog::load_settings() {
 }
 
 bool SettingsDialog::save_settings(const SettingsData& settings) {
-  ensure_user_config();
-  std::string config_path = get_user_config_path();
-  if (config_path.empty()) {
+  if (!ensure_user_config()) {
     return false;
   }
 
-  std::ofstream file{config_path, std::ios::trunc};
-  if (!file.is_open()) {
+  std::string config_path_str = get_user_config_path();
+  if (config_path_str.empty()) {
     return false;
   }
 
-  file << "# Punto Switcher Configuration\n";
-  file << "# Автоматически сгенерировано punto-tray\n\n";
+  std::filesystem::path config_path{config_path_str};
+  std::filesystem::path tmp_path = config_path;
+  tmp_path += ".tmp";
 
-  file << "hotkey:\n";
-  file << "  modifier: " << settings.modifier << "\n";
-  file << "  key: " << settings.key << "\n\n";
+  {
+    std::ofstream file{tmp_path, std::ios::trunc};
+    if (!file.is_open()) {
+      return false;
+    }
 
-  file << "delays:\n";
-  file << "  key_press: " << settings.key_press << "\n";
-  file << "  layout_switch: " << settings.layout_switch << "\n";
-  file << "  retype: " << settings.retype << "\n";
-  file << "  turbo_key_press: " << settings.turbo_key_press << "\n";
-  file << "  turbo_retype: " << settings.turbo_retype << "\n\n";
+    // Гарантируем точку в числах независимо от локали пользователя.
+    file.imbue(std::locale::classic());
 
-  file << "auto_switch:\n";
-  file << "  enabled: " << (settings.auto_enabled ? "true" : "false") << "\n";
-  file << "  threshold: " << settings.threshold << "\n";
-  file << "  min_word_len: " << settings.min_word_len << "\n";
-  file << "  min_score: " << settings.min_score << "\n\n";
+    file << "# Punto Switcher Configuration\n";
+    file << "# Автоматически сгенерировано punto-tray\n\n";
 
-  file << "sound:\n";
-  file << "  enabled: " << (settings.sound_enabled ? "true" : "false") << "\n";
+    file << "hotkey:\n";
+    file << "  modifier: " << settings.modifier << "\n";
+    file << "  key: " << settings.key << "\n\n";
 
-  file.flush();
-  if (!file.good()) {
+    file << "delays:\n";
+    file << "  key_press: " << settings.key_press << "\n";
+    file << "  layout_switch: " << settings.layout_switch << "\n";
+    file << "  retype: " << settings.retype << "\n";
+    file << "  turbo_key_press: " << settings.turbo_key_press << "\n";
+    file << "  turbo_retype: " << settings.turbo_retype << "\n\n";
+
+    file << "auto_switch:\n";
+    file << "  enabled: " << (settings.auto_enabled ? "true" : "false") << "\n";
+    file << "  threshold: " << settings.threshold << "\n";
+    file << "  min_word_len: " << settings.min_word_len << "\n";
+    file << "  min_score: " << settings.min_score << "\n\n";
+
+    file << "sound:\n";
+    file << "  enabled: " << (settings.sound_enabled ? "true" : "false") << "\n";
+
+    file.flush();
+    if (!file.good()) {
+      return false;
+    }
+  }
+
+  // Атомарно заменяем файл (rename в пределах одной ФС атомарен).
+  std::error_code ec;
+  std::filesystem::rename(tmp_path, config_path, ec);
+  if (ec) {
+    // Best-effort cleanup временного файла.
+    std::error_code rm_ec;
+    std::filesystem::remove(tmp_path, rm_ec);
     return false;
   }
 

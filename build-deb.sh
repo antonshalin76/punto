@@ -7,7 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-VERSION="2.3.0"
+VERSION="2.3.1"
 PACKAGE_NAME="punto-switcher"
 BUILD_DIR="build-deb"
 CPP_BUILD_DIR="cpp/build"

@@ -53,9 +53,10 @@ public:
   /// Сохраняет настройки в файл (используется также tray меню)
   static bool save_settings(const SettingsData& settings);
 
-private:
-  /// Получает путь к user config
+  /// Путь к user config (~/.config/punto/config.yaml)
   static std::string get_user_config_path();
+
+private:
 
   /// Создаёт user config если его нет
   static bool ensure_user_config();

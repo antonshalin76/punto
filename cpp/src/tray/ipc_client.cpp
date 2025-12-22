@@ -10,15 +10,18 @@
 #include <unistd.h>
 #include <poll.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
+#include <vector>
 
 namespace punto {
 
 namespace {
 
 /// Создаёт подключение к серверу
-int connect_to_server() {
+int connect_to_server(const char* socket_path) {
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) {
     return -1;
@@ -26,7 +29,7 @@ int connect_to_server() {
 
   sockaddr_un addr{};
   addr.sun_family = AF_UNIX;
-  std::strncpy(addr.sun_path, IpcClient::kSocketPath, sizeof(addr.sun_path) - 1);
+  std::strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 
   if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
     close(fd);
@@ -38,8 +41,47 @@ int connect_to_server() {
 
 } // namespace
 
-std::optional<std::string> IpcClient::send_command(const std::string& command) {
-  int fd = connect_to_server();
+std::vector<std::string> IpcClient::list_socket_paths() {
+  std::vector<std::string> sockets;
+  sockets.emplace_back(kSocketPath);
+
+  std::vector<std::string> extra;
+
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator("/var/run", ec)) {
+    if (ec) {
+      break;
+    }
+
+    std::error_code type_ec;
+    if (!entry.is_socket(type_ec) || type_ec) {
+      continue;
+    }
+
+    const std::string name = entry.path().filename().string();
+    if (!name.starts_with("punto-") || !name.ends_with(".sock")) {
+      continue;
+    }
+
+    extra.push_back(entry.path().string());
+  }
+
+  std::sort(extra.begin(), extra.end());
+  extra.erase(std::unique(extra.begin(), extra.end()), extra.end());
+
+  for (auto& p : extra) {
+    if (p != kSocketPath) {
+      sockets.push_back(std::move(p));
+    }
+  }
+
+  return sockets;
+}
+
+std::optional<std::string>
+IpcClient::send_command_to_socket(const std::string& command,
+                                 const std::string& socket_path) {
+  int fd = connect_to_server(socket_path.c_str());
   if (fd < 0) {
     return std::nullopt;
   }
@@ -55,7 +97,7 @@ std::optional<std::string> IpcClient::send_command(const std::string& command) {
   // Ждём ответ с таймаутом
   pollfd pfd = {fd, POLLIN, 0};
   int ret = poll(&pfd, 1, kTimeoutMs);
-  
+
   if (ret <= 0) {
     close(fd);
     return std::nullopt;
@@ -79,17 +121,38 @@ std::optional<std::string> IpcClient::send_command(const std::string& command) {
   return response;
 }
 
+std::optional<std::string> IpcClient::send_command(const std::string& command) {
+  return send_command_to_socket(command, kSocketPath);
+}
+
 ServiceStatus IpcClient::get_status() {
-  auto response = send_command("GET_STATUS");
-  if (!response) {
-    return ServiceStatus::Unknown;
+  bool saw_enabled = false;
+  bool saw_disabled = false;
+
+  for (const auto& socket_path : list_socket_paths()) {
+    auto response = send_command_to_socket("GET_STATUS", socket_path);
+    if (!response) {
+      continue;
+    }
+
+    // Ответ: "OK ENABLED" или "OK DISABLED"
+    if (response->find("ENABLED") != std::string::npos) {
+      saw_enabled = true;
+      continue;
+    }
+    if (response->find("DISABLED") != std::string::npos) {
+      saw_disabled = true;
+      continue;
+    }
   }
 
-  // Ответ: "OK ENABLED" или "OK DISABLED"
-  if (response->find("ENABLED") != std::string::npos) {
+  if (saw_enabled && saw_disabled) {
+    return ServiceStatus::Unknown;
+  }
+  if (saw_enabled) {
     return ServiceStatus::Enabled;
   }
-  if (response->find("DISABLED") != std::string::npos) {
+  if (saw_disabled) {
     return ServiceStatus::Disabled;
   }
 
@@ -98,15 +161,22 @@ ServiceStatus IpcClient::get_status() {
 
 bool IpcClient::set_status(bool enabled) {
   std::string command = enabled ? "SET_STATUS 1" : "SET_STATUS 0";
-  auto response = send_command(command);
-  
-  if (!response) {
-    return false;
+
+  int ok_count = 0;
+  for (const auto& socket_path : list_socket_paths()) {
+    auto response = send_command_to_socket(command, socket_path);
+    if (!response) {
+      continue;
+    }
+
+    if (response->find("OK") != std::string::npos ||
+        response->find("ENABLED") != std::string::npos ||
+        response->find("DISABLED") != std::string::npos) {
+      ok_count++;
+    }
   }
 
-  return response->find("OK") != std::string::npos ||
-         response->find("ENABLED") != std::string::npos ||
-         response->find("DISABLED") != std::string::npos;
+  return ok_count > 0;
 }
 
 ServiceStatus IpcClient::toggle_status() {
@@ -124,18 +194,38 @@ ServiceStatus IpcClient::toggle_status() {
   return ServiceStatus::Unknown;
 }
 
-bool IpcClient::reload_config() {
-  auto response = send_command("RELOAD");
-  return response && response->find("OK") != std::string::npos;
+bool IpcClient::reload_config(const std::string& config_path) {
+  std::string cmd = "RELOAD";
+  if (!config_path.empty()) {
+    cmd += " ";
+    cmd += config_path;
+  }
+
+  int ok_count = 0;
+  for (const auto& socket_path : list_socket_paths()) {
+    auto response = send_command_to_socket(cmd, socket_path);
+    if (!response) {
+      continue;
+    }
+
+    if (response->find("OK") != std::string::npos) {
+      ok_count++;
+    }
+  }
+
+  return ok_count > 0;
 }
 
 bool IpcClient::is_service_available() {
-  int fd = connect_to_server();
-  if (fd < 0) {
-    return false;
+  for (const auto& socket_path : list_socket_paths()) {
+    int fd = connect_to_server(socket_path.c_str());
+    if (fd < 0) {
+      continue;
+    }
+    close(fd);
+    return true;
   }
-  close(fd);
-  return true;
+  return false;
 }
 
 } // namespace punto

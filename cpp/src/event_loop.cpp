@@ -16,32 +16,29 @@
 namespace punto {
 
 EventLoop::EventLoop(Config config)
-    : config_{std::move(config)}, analyzer_{config_.auto_switch} {}
+    : config_{std::make_shared<Config>(std::move(config))},
+      analyzer_{std::make_shared<LayoutAnalyzer>(config_->auto_switch)} {
+  ipc_enabled_.store(config_->auto_switch.enabled, std::memory_order_relaxed);
+}
 
 EventLoop::~EventLoop() = default;
 
 bool EventLoop::initialize() {
-  if (initialized_)
+  if (initialized_) {
     return true;
-
-  // Создаём IPC сервер для управления из tray-приложения
-  ipc_server_ = std::make_unique<IpcServer>(
-      ipc_enabled_,
-      [this]() { return reload_config(); }
-  );
-  if (!ipc_server_->start()) {
-    std::cerr << "[punto] Warning: IPC server failed to start. "
-                 "Tray control will be unavailable.\n";
-    // Не фатальная ошибка — базовая функциональность работает
   }
 
-  // Создаём KeyInjector
-  injector_ = std::make_unique<KeyInjector>(config_.delays);
+  // Создаём минимальный KeyInjector из текущего снапшота конфига.
+  // Важно: reload_config() может заменить его на новый.
+  {
+    auto cfg = std::atomic_load(&config_);
+    auto injector = std::make_shared<KeyInjector>(cfg->delays);
+    injector->set_wait_func(
+        [this](std::chrono::microseconds us) { this->wait_and_buffer(us); });
 
-  // Устанавливаем функцию ожидания для инжектора, чтобы Input Guard работал
-  // во время пауз в макросах
-  injector_->set_wait_func(
-      [this](std::chrono::microseconds us) { this->wait_and_buffer(us); });
+    std::shared_ptr<const KeyInjector> injector_const = injector;
+    std::atomic_store(&injector_, std::move(injector_const));
+  }
 
   // Инициализируем словарь для гибридного анализа
   dict_.initialize();
@@ -50,8 +47,21 @@ bool EventLoop::initialize() {
   x11_session_ = std::make_unique<X11Session>();
   bool x11_ok = x11_session_->initialize();
 
+  // После X11 инициализации можем вычислить реальный $HOME активного пользователя
+  // и перечитать ~/.config/... (если существует).
+  {
+    IpcResult res = reload_config();
+    if (!res.success) {
+      std::cerr << "[punto] Warning: initial config reload failed: "
+                << res.message << "\n";
+    }
+  }
+
   // SoundManager зависит от X11Session (uid/gid/env активного пользователя)
-  sound_manager_ = std::make_unique<SoundManager>(*x11_session_, config_.sound);
+  {
+    auto cfg = std::atomic_load(&config_);
+    sound_manager_ = std::make_unique<SoundManager>(*x11_session_, cfg->sound);
+  }
 
   if (!x11_ok) {
     std::cerr << "[punto] Предупреждение: X11 сессия не инициализирована. "
@@ -69,6 +79,17 @@ bool EventLoop::initialize() {
     }
     std::cerr << "[punto] Текущая раскладка: "
               << (current_layout_ == 0 ? "EN" : "RU") << "\n";
+  }
+
+  // Создаём IPC сервер для управления из tray-приложения
+  ipc_server_ = std::make_unique<IpcServer>(ipc_enabled_,
+                                           [this](const std::string &path) {
+                                             return reload_config(path);
+                                           });
+  if (!ipc_server_->start()) {
+    std::cerr << "[punto] Warning: IPC server failed to start. "
+                 "Tray control will be unavailable.\n";
+    // Не фатальная ошибка — базовая функциональность работает
   }
 
   initialized_ = true;
@@ -121,6 +142,8 @@ void EventLoop::handle_event(const input_event &ev) {
   const ScanCode code = ev.code;
   const bool pressed = ev.value != 0;
   const bool is_press = ev.value == 1; // Только первое нажатие, не repeat
+
+  auto cfg = std::atomic_load(&config_);
 
   // =========================================================================
   // Обновление состояния модификаторов
@@ -187,8 +210,8 @@ void EventLoop::handle_event(const input_event &ev) {
   if (modifiers_.any_ctrl() || modifiers_.any_alt() || modifiers_.any_meta()) {
     // Детектируем пользовательское переключение раскладки (Ctrl+`)
     // Это важно для синхронизации current_layout_
-    ScanCode mod_key = config_.hotkey.modifier;
-    ScanCode layout_key = config_.hotkey.key;
+    ScanCode mod_key = cfg->hotkey.modifier;
+    ScanCode layout_key = cfg->hotkey.key;
 
     bool mod_pressed = false;
     if (mod_key == KEY_LEFTCTRL)
@@ -257,7 +280,7 @@ void EventLoop::handle_event(const input_event &ev) {
     // Проверяем, включено ли автопереключение через IPC
     bool ipc_enabled = ipc_enabled_.load(std::memory_order_relaxed);
 
-    if (ipc_enabled && analysis_word.size() >= config_.auto_switch.min_word_len) {
+    if (ipc_enabled && analysis_word.size() >= cfg->auto_switch.min_word_len) {
       bool need_switch = false;
 
       // === ГИБРИДНЫЙ АНАЛИЗ ===
@@ -276,7 +299,8 @@ void EventLoop::handle_event(const input_event &ev) {
         }
       } else if (dict_result == DictResult::Unknown) {
         // 2. Слово не в словаре — используем N-граммный анализ как fallback
-        auto result = analyzer_.analyze(analysis_word);
+        auto analyzer = std::atomic_load(&analyzer_);
+        auto result = analyzer->analyze(analysis_word);
         if (result.should_switch) {
           if (is_en_layout && result.ru_score > result.en_score) {
             std::cerr << "[punto] NGRAM: EN -> RU (en=" << result.en_score
@@ -440,8 +464,14 @@ void EventLoop::switch_layout() {
     sound_manager_->play_for_layout(current_layout_);
   }
 
+  auto cfg = std::atomic_load(&config_);
+  auto injector = std::atomic_load(&injector_);
+  if (!injector) {
+    return;
+  }
+
   // Эмулируем нажатие горячей клавиши (единственный надежный способ)
-  injector_->send_layout_hotkey(config_.hotkey.modifier, config_.hotkey.key);
+  injector->send_layout_hotkey(cfg->hotkey.modifier, cfg->hotkey.key);
 }
 
 void EventLoop::action_invert_layout_word() {
@@ -449,24 +479,30 @@ void EventLoop::action_invert_layout_word() {
   if (word.empty())
     return;
 
+  auto cfg = std::atomic_load(&config_);
+  auto injector = std::atomic_load(&injector_);
+  if (!injector) {
+    return;
+  }
+
   is_processing_macro_ = true;
-  injector_->release_all_modifiers();
-  wait_and_buffer(config_.delays.turbo_key_press);
+  injector->release_all_modifiers();
+  wait_and_buffer(cfg->delays.turbo_key_press);
 
   // Удаляем слово + trailing whitespace (используем turbo)
   std::size_t total_len = word.size() + buffer_.trailing_length();
-  injector_->send_backspace(total_len, true);
+  injector->send_backspace(total_len, true);
 
   // Переключаем раскладку
   switch_layout();
   wait_and_buffer(std::chrono::microseconds{60000}); // Wait for DE/OS
 
   // Перепечатываем с сохранением регистра (turbo)
-  injector_->retype_buffer(word, true);
+  injector->retype_buffer(word, true);
 
   // Восстанавливаем trailing whitespace
   if (buffer_.trailing_length() > 0) {
-    injector_->retype_trailing(buffer_.trailing(), true);
+    injector->retype_trailing(buffer_.trailing(), true);
   }
 
   // 5. Коммитим состояние
@@ -485,12 +521,17 @@ void EventLoop::action_auto_invert_word(std::span<const KeyEntry> word,
   std::cerr << "[punto] AUTO-INVERT: start (len=" << word.size() << ")\n";
   is_processing_macro_ = true;
 
+  auto injector = std::atomic_load(&injector_);
+  if (!injector) {
+    return;
+  }
+
   // 1. Отпускаем всё
-  injector_->release_all_modifiers();
+  injector->release_all_modifiers();
   wait_and_buffer(std::chrono::microseconds{5000});
 
   // 2. Удаляем слово (turbo)
-  injector_->send_backspace(word.size(), true);
+  injector->send_backspace(word.size(), true);
   wait_and_buffer(std::chrono::microseconds{5000});
 
   // 3. Переключаем раскладку
@@ -500,14 +541,14 @@ void EventLoop::action_auto_invert_word(std::span<const KeyEntry> word,
   wait_and_buffer(std::chrono::microseconds{110000});
 
   // 4. Перепечатываем слово (turbo)
-  injector_->retype_buffer(word, true);
+  injector->retype_buffer(word, true);
 
   // 5. Печатаем финализирующий символ, если он есть
   if (trigger_code != 0) {
     // Даем время на завершение перепечатывания слова
     wait_and_buffer(std::chrono::microseconds{25000});
     // Печатаем триггерный символ без turbo для надежности
-    injector_->tap_key(trigger_code, false, false);
+    injector->tap_key(trigger_code, false, false);
   }
 
   std::cerr << "[punto] AUTO-INVERT: done\n";
@@ -519,22 +560,28 @@ void EventLoop::action_invert_case_word() {
   if (word.empty())
     return;
 
+  auto cfg = std::atomic_load(&config_);
+  auto injector = std::atomic_load(&injector_);
+  if (!injector) {
+    return;
+  }
+
   is_processing_macro_ = true;
-  injector_->release_all_modifiers();
-  wait_and_buffer(config_.delays.turbo_key_press);
+  injector->release_all_modifiers();
+  wait_and_buffer(cfg->delays.turbo_key_press);
 
   // Удаляем слово + trailing
   std::size_t total_len = word.size() + buffer_.trailing_length();
-  injector_->send_backspace(total_len, true);
+  injector->send_backspace(total_len, true);
 
   // Перепечатываем с инвертированным регистром
   for (const auto &entry : word) {
-    injector_->tap_key(entry.code, !entry.shifted, true);
+    injector->tap_key(entry.code, !entry.shifted, true);
   }
 
   // Восстанавливаем trailing
   if (buffer_.trailing_length() > 0) {
-    injector_->retype_trailing(buffer_.trailing(), true);
+    injector->retype_trailing(buffer_.trailing(), true);
   }
 
   if (buffer_.current_length() > 0) {
@@ -552,8 +599,14 @@ bool EventLoop::process_selection(
     return false;
   }
 
-  injector_->release_all_modifiers();
-  usleep(static_cast<useconds_t>(config_.delays.key_press.count()));
+  auto cfg = std::atomic_load(&config_);
+  auto injector = std::atomic_load(&injector_);
+  if (!injector) {
+    return false;
+  }
+
+  injector->release_all_modifiers();
+  usleep(static_cast<useconds_t>(cfg->delays.key_press.count()));
 
   bool is_terminal = clipboard_->is_active_window_terminal();
 
@@ -567,19 +620,19 @@ bool EventLoop::process_selection(
       // Удаляем выделенный текст через Backspace
       std::size_t len = text->size();
       for (std::size_t i = 0; i < len; ++i) {
-        injector_->tap_key(KEY_BACKSPACE, false);
+        injector->tap_key(KEY_BACKSPACE, false);
       }
       usleep(100000); // 100ms
     }
   } else {
     // В обычных приложениях: Ctrl+C для копирования
-    injector_->send_key(KEY_LEFTCTRL, KeyState::Press);
+    injector->send_key(KEY_LEFTCTRL, KeyState::Press);
     usleep(20000); // 20ms
-    injector_->send_key(KEY_C, KeyState::Press);
+    injector->send_key(KEY_C, KeyState::Press);
     usleep(20000);
-    injector_->send_key(KEY_C, KeyState::Release);
+    injector->send_key(KEY_C, KeyState::Release);
     usleep(20000);
-    injector_->send_key(KEY_LEFTCTRL, KeyState::Release);
+    injector->send_key(KEY_LEFTCTRL, KeyState::Release);
     usleep(200000); // 200ms для clipboard
 
     text = clipboard_->get_text(Selection::Clipboard);
@@ -599,24 +652,24 @@ bool EventLoop::process_selection(
   // Вставляем
   if (is_terminal) {
     // Ctrl+Shift+V для терминала
-    injector_->send_key(KEY_LEFTCTRL, KeyState::Press);
-    injector_->send_key(KEY_LEFTSHIFT, KeyState::Press);
+    injector->send_key(KEY_LEFTCTRL, KeyState::Press);
+    injector->send_key(KEY_LEFTSHIFT, KeyState::Press);
     usleep(20000);
-    injector_->send_key(KEY_V, KeyState::Press);
+    injector->send_key(KEY_V, KeyState::Press);
     usleep(20000);
-    injector_->send_key(KEY_V, KeyState::Release);
+    injector->send_key(KEY_V, KeyState::Release);
     usleep(20000);
-    injector_->send_key(KEY_LEFTSHIFT, KeyState::Release);
-    injector_->send_key(KEY_LEFTCTRL, KeyState::Release);
+    injector->send_key(KEY_LEFTSHIFT, KeyState::Release);
+    injector->send_key(KEY_LEFTCTRL, KeyState::Release);
   } else {
     // Ctrl+V для обычных приложений
-    injector_->send_key(KEY_LEFTCTRL, KeyState::Press);
+    injector->send_key(KEY_LEFTCTRL, KeyState::Press);
     usleep(20000);
-    injector_->send_key(KEY_V, KeyState::Press);
+    injector->send_key(KEY_V, KeyState::Press);
     usleep(20000);
-    injector_->send_key(KEY_V, KeyState::Release);
+    injector->send_key(KEY_V, KeyState::Release);
     usleep(20000);
-    injector_->send_key(KEY_LEFTCTRL, KeyState::Release);
+    injector->send_key(KEY_LEFTCTRL, KeyState::Release);
   }
 
   return true;
@@ -696,7 +749,8 @@ void EventLoop::action_invert_layout_selection() {
   if (process_selection(
           [](std::string_view text) { return invert_layout(text); })) {
     // Переключаем раскладку после успешной инверсии
-    wait_and_buffer(config_.delays.layout_switch);
+    auto cfg = std::atomic_load(&config_);
+    wait_and_buffer(cfg->delays.layout_switch);
     switch_layout();
   }
   drain_pending_events();
@@ -714,44 +768,90 @@ void EventLoop::action_transliterate_selection() {
   drain_pending_events();
 }
 
-bool EventLoop::reload_config() {
-  std::cerr << "[punto] Reloading configuration...\n";
+IpcResult EventLoop::reload_config(const std::string &config_path) {
+  std::filesystem::path system_path{std::string{kConfigPath}};
+  std::filesystem::path load_path = system_path;
+  bool tried_user = false;
+  bool user_exists = false;
 
-  // Загружаем новую конфигурацию
-  Config new_config = load_config(config_.config_path.string());
+  const bool explicit_path = !config_path.empty();
 
-  if (!validate_config(new_config)) {
-    std::cerr << "[punto] Config reload failed: invalid configuration\n";
-    return false;
+  if (explicit_path) {
+    load_path = std::filesystem::path{config_path};
+    tried_user = true;
+    std::error_code ec;
+    if (!std::filesystem::exists(load_path, ec) || ec) {
+      std::string msg = "Config file not found: " + config_path;
+      std::cerr << "[punto] " << msg << "\\n";
+      return {false, std::move(msg)};
+    }
+    user_exists = true; // путь указан явно и существует
+  } else {
+    std::optional<std::filesystem::path> user_path;
+    if (x11_session_ && x11_session_->is_valid()) {
+      // Обновляем окружение для корректного чтения $HOME из активной сессии
+      x11_session_->apply_environment();
+      const auto &info = x11_session_->info();
+      if (!info.home_dir.empty()) {
+        user_path = std::filesystem::path{info.home_dir} /
+                    std::filesystem::path{std::string{kUserConfigRelPath}};
+      }
+    }
+
+    tried_user = user_path.has_value();
+    if (user_path) {
+      std::error_code ec;
+      user_exists = std::filesystem::exists(*user_path, ec) && !ec;
+      if (user_exists) {
+        load_path = *user_path;
+      }
+    }
   }
 
-  // Обновляем конфигурацию (атомарно для простых полей)
-  config_.delays = new_config.delays;
-  config_.hotkey = new_config.hotkey;
-  config_.auto_switch = new_config.auto_switch;
-  config_.sound = new_config.sound;
-  config_.debug_mode = new_config.debug_mode;
-  config_.log_to_syslog = new_config.log_to_syslog;
+  ConfigLoadOutcome loaded = load_config_checked(load_path);
+  if (loaded.result != ConfigResult::Ok) {
+    std::cerr << "[punto] Config reload failed: " << loaded.error << "\\n";
+    return {false, loaded.error.empty() ? "Config reload failed" : loaded.error};
+  }
+
+  auto new_cfg = std::make_shared<Config>(std::move(loaded.config));
+
+  // Всегда синхронизируем runtime-статус автопереключения с конфигом при RELOAD.
+  // Это делает файл конфигурации единым источником истины и устраняет
+  // рассинхронизацию после SET_STATUS (runtime-only).
+  ipc_enabled_.store(new_cfg->auto_switch.enabled, std::memory_order_relaxed);
+
+  auto new_analyzer = std::make_shared<LayoutAnalyzer>(new_cfg->auto_switch);
+
+  auto new_injector = std::make_shared<KeyInjector>(new_cfg->delays);
+  new_injector->set_wait_func(
+      [this](std::chrono::microseconds us) { this->wait_and_buffer(us); });
+
+  // Публикуем новые снапшоты (без блокировок, безопасно для main loop).
+  std::shared_ptr<const Config> cfg_const = new_cfg;
+  std::shared_ptr<const LayoutAnalyzer> analyzer_const = new_analyzer;
+  std::shared_ptr<const KeyInjector> injector_const = new_injector;
+
+  std::atomic_store(&config_, std::move(cfg_const));
+  std::atomic_store(&analyzer_, std::move(analyzer_const));
+  std::atomic_store(&injector_, std::move(injector_const));
 
   if (sound_manager_) {
-    sound_manager_->set_enabled(config_.sound.enabled);
+    sound_manager_->set_enabled(new_cfg->sound.enabled);
   }
 
-  // Обновляем KeyInjector с новыми задержками
-  if (injector_) {
-    injector_->update_delays(config_.delays);
+  std::cerr << "[punto] Configuration reloaded: " << loaded.used_path << "\n";
+  std::cerr << "[punto] auto_switch: enabled=" << new_cfg->auto_switch.enabled
+            << ", threshold=" << new_cfg->auto_switch.threshold
+            << ", min_word_len=" << new_cfg->auto_switch.min_word_len
+            << ", min_score=" << new_cfg->auto_switch.min_score << '\n';
+
+  std::string message = "Loaded "+loaded.used_path.string();
+  if (!explicit_path && tried_user && !user_exists) {
+    message += " (user config not found; using system config)";
   }
 
-  // Обновляем LayoutAnalyzer с новыми параметрами
-  analyzer_.update_config(config_.auto_switch);
-
-  std::cerr << "[punto] Configuration reloaded successfully\n";
-  std::cerr << "[punto] auto_switch: enabled=" << config_.auto_switch.enabled
-            << ", threshold=" << config_.auto_switch.threshold
-            << ", min_word_len=" << config_.auto_switch.min_word_len
-            << ", min_score=" << config_.auto_switch.min_score << '\n';
-
-  return true;
+  return {true, std::move(message)};
 }
 
 } // namespace punto

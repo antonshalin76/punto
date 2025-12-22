@@ -127,13 +127,16 @@ private:
   // Состояние
   // =========================================================================
 
-  Config config_;
+  // Конфиг и зависящие от него компоненты обновляются через снапшоты,
+  // т.к. reload_config() вызывается из IPC-потока.
+  std::shared_ptr<const Config> config_;
+  std::shared_ptr<const LayoutAnalyzer> analyzer_;
+  std::shared_ptr<const KeyInjector> injector_;
+
   ModifierState modifiers_;
   InputBuffer buffer_;
-  LayoutAnalyzer analyzer_;
   Dictionary dict_;
 
-  std::unique_ptr<KeyInjector> injector_;
   std::unique_ptr<X11Session> x11_session_;
   std::unique_ptr<ClipboardManager> clipboard_;
   std::unique_ptr<SoundManager> sound_manager_;
@@ -164,7 +167,8 @@ private:
   std::unique_ptr<IpcServer> ipc_server_;
 
   /// Перезагружает конфигурацию (вызывается из IPC потока)
-  bool reload_config();
+  /// Если config_path не пуст, пытается загрузить именно этот файл.
+  IpcResult reload_config(const std::string& config_path = {});
 };
 
 } // namespace punto

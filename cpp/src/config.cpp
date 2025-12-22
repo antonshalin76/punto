@@ -7,7 +7,9 @@
 #include "punto/scancode_map.hpp"
 
 #include <charconv>
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -92,44 +94,19 @@ bool validate_config(const Config &config) {
   return true;
 }
 
+namespace {
+
 /// Получает путь к user config (~/.config/punto/config.yaml)
 std::string get_user_config_path() {
-  const char* home = std::getenv("HOME");
+  const char *home = std::getenv("HOME");
   if (home) {
     return std::string(home) + "/" + std::string(kUserConfigRelPath);
   }
   return "";
 }
 
-Config load_config(std::string_view path) {
+Config parse_config_stream(std::istream &file) {
   Config config;
-
-  // Пробуем сначала user config, потом system config
-  std::string config_path;
-  
-  if (path == kConfigPath) {
-    // Если запрашивается дефолтный путь, пробуем user config первым
-    std::string user_path = get_user_config_path();
-    if (!user_path.empty()) {
-      std::ifstream user_file{user_path};
-      if (user_file.is_open()) {
-        config_path = user_path;
-        std::cerr << "[punto] Using user config: " << user_path << "\n";
-      }
-    }
-  }
-  
-  if (config_path.empty()) {
-    config_path = std::string{path};
-  }
-
-  std::ifstream file{config_path};
-  if (!file.is_open()) {
-    // Файл не найден — используем дефолты
-    return config;
-  }
-  
-  config.config_path = config_path;
 
   std::string line;
   std::string current_section;
@@ -220,13 +197,68 @@ Config load_config(std::string_view path) {
     }
   }
 
-  if (!validate_config(config)) {
-    std::cerr << "[punto] Предупреждение: некорректная конфигурация, "
-                 "используются значения по умолчанию\n";
+  return config;
+}
+
+} // namespace
+
+ConfigLoadOutcome load_config_checked(std::filesystem::path path) {
+  ConfigLoadOutcome out;
+  out.used_path = std::move(path);
+
+  if (out.used_path.empty()) {
+    out.result = ConfigResult::FileNotFound;
+    out.error = "Empty config path";
+    return out;
+  }
+
+  std::ifstream file{out.used_path};
+  if (!file.is_open()) {
+    out.result = ConfigResult::FileNotFound;
+    out.error = "Config file not found: " + out.used_path.string();
+    return out;
+  }
+
+  out.config = parse_config_stream(file);
+  out.config.config_path = out.used_path;
+
+  if (!validate_config(out.config)) {
+    out.result = ConfigResult::InvalidValue;
+    out.error = "Invalid configuration in: " + out.used_path.string();
+    out.config = Config{};
+    return out;
+  }
+
+  out.result = ConfigResult::Ok;
+  return out;
+}
+
+Config load_config(std::string_view path) {
+  // Best-effort логика: если запрошен дефолтный путь, пробуем user-config первым.
+  std::filesystem::path effective_path{std::string{path}};
+
+  if (path == kConfigPath) {
+    std::string user_path = get_user_config_path();
+    if (!user_path.empty()) {
+      std::error_code ec;
+      bool exists = std::filesystem::exists(user_path, ec);
+      if (!ec && exists) {
+        effective_path = user_path;
+        std::cerr << "[punto] Using user config: " << user_path << "\n";
+      }
+    }
+  }
+
+  ConfigLoadOutcome out = load_config_checked(effective_path);
+  if (out.result != ConfigResult::Ok) {
+    // Файл не найден/битый — используем дефолты.
+    if (!out.error.empty()) {
+      std::cerr << "[punto] Warning: " << out.error << "\n";
+    }
     return Config{};
   }
 
-  return config;
+  return out.config;
 }
 
 } // namespace punto

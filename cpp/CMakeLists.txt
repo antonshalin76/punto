@@ -3,7 +3,7 @@
 # Высокопроизводительный плагин для interception-tools
 # =============================================================================
 cmake_minimum_required(VERSION 3.16)
-project(punto VERSION 2.1.0 LANGUAGES CXX)
+project(punto VERSION 2.4.0 LANGUAGES CXX)
 
 # Для clangd/IDE: генерируем compile_commands.json
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -134,6 +134,7 @@ if(BUILD_TRAY)
             src/tray/ipc_client.cpp
             src/tray/tray_app.cpp
             src/tray/settings_dialog.cpp
+            src/tray/system_input_settings.cpp
         )
         
         target_include_directories(punto-tray

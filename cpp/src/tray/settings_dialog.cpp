@@ -5,15 +5,18 @@
 
 #include "punto/settings_dialog.hpp"
 
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <sstream>
 #include <locale>
+#include <sstream>
+#include <string_view>
 
 #include <glib.h>
 
+#include "punto/system_input_settings.hpp"
 #include "punto/types.hpp"
 
 namespace punto {
@@ -21,6 +24,199 @@ namespace punto {
 namespace {
 
 constexpr const char* kSystemConfigPath = "/etc/punto/config.yaml";
+
+[[nodiscard]] GtkWidget* make_left_label(const char* text) {
+  GtkWidget* lbl = gtk_label_new(text);
+  gtk_label_set_xalign(GTK_LABEL(lbl), 0);
+  return lbl;
+}
+
+[[nodiscard]] GtkWidget* make_dim_label(const char* text) {
+  GtkWidget* lbl = make_left_label(text);
+  gtk_label_set_line_wrap(GTK_LABEL(lbl), TRUE);
+  gtk_style_context_add_class(gtk_widget_get_style_context(lbl),
+                              GTK_STYLE_CLASS_DIM_LABEL);
+  return lbl;
+}
+
+struct SettingsDialogUiContext {
+  // Auto-switch
+  GtkSpinButton* threshold_spin = nullptr;
+  GtkSpinButton* min_word_spin = nullptr;
+  GtkSpinButton* min_score_spin = nullptr;
+
+  // Delays
+  GtkSpinButton* key_press_spin = nullptr;
+  GtkSpinButton* layout_spin = nullptr;
+  GtkSpinButton* retype_spin = nullptr;
+  GtkSpinButton* turbo_key_spin = nullptr;
+  GtkSpinButton* turbo_retype_spin = nullptr;
+
+  // Hotkey
+  GtkComboBox* modifier_combo = nullptr;
+  GtkComboBox* key_combo = nullptr;
+
+  // UI
+  GtkWidget* hotkey_hint_label = nullptr;
+  GtkWidget* save_button = nullptr;
+
+  SettingsData initial;
+};
+
+[[nodiscard]] std::string hotkey_supported_combos_text(std::string_view active_backend) {
+  std::string backend_line = "Текущий backend: ";
+  if (active_backend.empty()) {
+    backend_line += "<не определён>";
+  } else {
+    backend_line += std::string{active_backend};
+  }
+
+  // Важно: перечисляем именно те комбинации, которые программа умеет применить.
+  // GNOME: используем gsettings keybindings.
+  // X11: используем XKB grp:*_toggle через setxkbmap.
+  std::string text;
+  text += backend_line;
+  text += "\n\n";
+
+  text += "GNOME (gsettings):\n";
+  text += "  - 1 модификатор (Ctrl/Alt/Shift/Super) + 1 клавиша\n";
+  text += "  - Поддерживаемые клавиши в UI: `, Space, Tab, Backslash, CapsLock, а также Shift/Ctrl/Alt/Super\n\n";
+
+  text += "X11 (setxkbmap, grp:*_toggle):\n";
+  text += "  - Alt+Shift (left/right варианты)\n";
+  text += "  - Ctrl+Shift (left/right варианты)\n";
+  text += "  - Ctrl+Alt\n";
+  text += "  - Alt+Space\n";
+  text += "  - Ctrl+Space\n";
+  text += "  - Win+Space\n";
+  text += "  - Shift+CapsLock\n";
+
+  return text;
+}
+
+[[nodiscard]] bool nearly_equal_double(double a, double b) {
+  return std::abs(a - b) < 1e-9;
+}
+
+[[nodiscard]] bool non_hotkey_changed(const SettingsData& a, const SettingsData& b) {
+  if (!nearly_equal_double(a.threshold, b.threshold)) return true;
+  if (a.min_word_len != b.min_word_len) return true;
+  if (!nearly_equal_double(a.min_score, b.min_score)) return true;
+
+  if (a.key_press != b.key_press) return true;
+  if (a.layout_switch != b.layout_switch) return true;
+  if (a.retype != b.retype) return true;
+  if (a.turbo_key_press != b.turbo_key_press) return true;
+  if (a.turbo_retype != b.turbo_retype) return true;
+
+  return false;
+}
+
+[[nodiscard]] SettingsData read_non_hotkey_from_ui(const SettingsDialogUiContext& ctx) {
+  SettingsData out = ctx.initial;
+
+  if (ctx.threshold_spin) {
+    out.threshold = gtk_spin_button_get_value(ctx.threshold_spin);
+  }
+  if (ctx.min_word_spin) {
+    out.min_word_len = gtk_spin_button_get_value_as_int(ctx.min_word_spin);
+  }
+  if (ctx.min_score_spin) {
+    out.min_score = gtk_spin_button_get_value(ctx.min_score_spin);
+  }
+
+  if (ctx.key_press_spin) {
+    out.key_press = gtk_spin_button_get_value_as_int(ctx.key_press_spin);
+  }
+  if (ctx.layout_spin) {
+    out.layout_switch = gtk_spin_button_get_value_as_int(ctx.layout_spin);
+  }
+  if (ctx.retype_spin) {
+    out.retype = gtk_spin_button_get_value_as_int(ctx.retype_spin);
+  }
+  if (ctx.turbo_key_spin) {
+    out.turbo_key_press = gtk_spin_button_get_value_as_int(ctx.turbo_key_spin);
+  }
+  if (ctx.turbo_retype_spin) {
+    out.turbo_retype = gtk_spin_button_get_value_as_int(ctx.turbo_retype_spin);
+  }
+
+  return out;
+}
+
+[[nodiscard]] LayoutToggle read_selected_hotkey(const SettingsDialogUiContext& ctx) {
+  LayoutToggle selected;
+  if (!ctx.modifier_combo || !ctx.key_combo) {
+    return selected;
+  }
+
+  const gchar* mod_id = gtk_combo_box_get_active_id(ctx.modifier_combo);
+  const gchar* key_id = gtk_combo_box_get_active_id(ctx.key_combo);
+  if (mod_id) {
+    selected.modifier = mod_id;
+  }
+  if (key_id) {
+    selected.key = key_id;
+  }
+
+  return selected;
+}
+
+static void update_settings_dialog_state(SettingsDialogUiContext* ctx) {
+  if (!ctx || !ctx->hotkey_hint_label || !ctx->save_button) {
+    return;
+  }
+
+  SettingsData candidate = read_non_hotkey_from_ui(*ctx);
+  LayoutToggle selected = read_selected_hotkey(*ctx);
+  const auto validation = SystemInputSettings::validate_layout_toggle(selected);
+
+  const bool backend_known = !validation.backend.empty();
+  const bool hotkey_selected = !selected.modifier.empty() && !selected.key.empty();
+  const bool hotkey_changed = hotkey_selected &&
+                              (selected.modifier != ctx->initial.modifier ||
+                               selected.key != ctx->initial.key);
+  const bool hotkey_applicable = validation.result == SystemInputResult::Ok;
+
+  // Если backend определён и хоткей НЕ применим — изменения хоткея игнорируем.
+  const bool will_save_hotkey = hotkey_changed && (!backend_known || hotkey_applicable);
+
+  const bool dirty = non_hotkey_changed(candidate, ctx->initial) || will_save_hotkey;
+  gtk_widget_set_sensitive(ctx->save_button, dirty);
+
+  std::string text = hotkey_supported_combos_text(validation.backend);
+  text += "\n\nВыбрано: ";
+  text += selected.modifier.empty() ? "<модификатор?>" : selected.modifier;
+  text += " + ";
+  text += selected.key.empty() ? "<клавиша?>" : selected.key;
+
+  if (!backend_known) {
+    text += "\nСтатус: backend не определён (значение сохранится в конфиг; в систему применить нельзя)";
+  } else if (hotkey_applicable) {
+    if (hotkey_changed) {
+      text += "\nСтатус: применимо (изменение будет применено в систему при сохранении)";
+    } else {
+      text += "\nСтатус: применимо";
+    }
+  } else {
+    text += "\nСтатус: НЕ применимо";
+    if (hotkey_changed) {
+      text += "\nИзменение хоткея будет проигнорировано при сохранении (остальные параметры сохранятся).";
+    }
+    if (!validation.error.empty()) {
+      text += "\n";
+      text += validation.error;
+    }
+  }
+
+  gtk_label_set_text(GTK_LABEL(ctx->hotkey_hint_label), text.c_str());
+}
+
+static void on_any_setting_changed(GtkWidget* widget, gpointer user_data) {
+  (void)widget;
+  auto* ctx = static_cast<SettingsDialogUiContext*>(user_data);
+  update_settings_dialog_state(ctx);
+}
 
 /// Вспомогательная функция trim
 std::string trim(const std::string& str) {
@@ -220,8 +416,14 @@ bool SettingsDialog::save_settings(const SettingsData& settings) {
 }
 
 bool SettingsDialog::show(GtkWidget* parent) {
+  static GtkWidget* s_dialog_instance = nullptr;
+  if (s_dialog_instance) {
+    gtk_window_present(GTK_WINDOW(s_dialog_instance));
+    return false;
+  }
+
   // Загружаем текущие настройки
-  SettingsData settings = load_settings();
+  const SettingsData initial_settings = load_settings();
 
   // Создаём диалог
   GtkWidget* dialog = gtk_dialog_new_with_buttons(
@@ -232,7 +434,16 @@ bool SettingsDialog::show(GtkWidget* parent) {
       "_Сохранить", GTK_RESPONSE_ACCEPT,
       nullptr);
 
-  gtk_window_set_default_size(GTK_WINDOW(dialog), 400, -1);
+  s_dialog_instance = dialog;
+
+  gtk_window_set_default_size(GTK_WINDOW(dialog), 440, -1);
+  gtk_window_set_position(GTK_WINDOW(dialog), GTK_WIN_POS_CENTER);
+
+  GtkWidget* save_button = gtk_dialog_get_widget_for_response(
+      GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT);
+  if (save_button) {
+    gtk_widget_set_sensitive(save_button, FALSE);
+  }
 
   GtkWidget* content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
   gtk_container_set_border_width(GTK_CONTAINER(content), 12);
@@ -241,111 +452,177 @@ bool SettingsDialog::show(GtkWidget* parent) {
   GtkWidget* notebook = gtk_notebook_new();
   gtk_box_pack_start(GTK_BOX(content), notebook, TRUE, TRUE, 0);
 
+  SettingsDialogUiContext ui_ctx;
+  ui_ctx.initial = initial_settings;
+  ui_ctx.save_button = save_button;
+
   // ===== Вкладка "Автопереключение" =====
   GtkWidget* auto_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
   gtk_container_set_border_width(GTK_CONTAINER(auto_box), 12);
 
-  // Enabled checkbox
-  GtkWidget* auto_enabled = gtk_check_button_new_with_label("Включить автопереключение");
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(auto_enabled), settings.auto_enabled);
-  gtk_box_pack_start(GTK_BOX(auto_box), auto_enabled, FALSE, FALSE, 0);
+  GtkWidget* auto_note = make_dim_label(
+      "Включение/выключение автопереключения — в меню трея.");
+  gtk_box_pack_start(GTK_BOX(auto_box), auto_note, FALSE, FALSE, 0);
 
   // Grid для параметров
   GtkWidget* auto_grid = gtk_grid_new();
-  gtk_grid_set_row_spacing(GTK_GRID(auto_grid), 6);
+  gtk_grid_set_row_spacing(GTK_GRID(auto_grid), 4);
   gtk_grid_set_column_spacing(GTK_GRID(auto_grid), 12);
   gtk_box_pack_start(GTK_BOX(auto_box), auto_grid, FALSE, FALSE, 8);
 
   // Threshold
-  gtk_grid_attach(GTK_GRID(auto_grid), gtk_label_new("Порог срабатывания:"), 0, 0, 1, 1);
+  GtkWidget* threshold_lbl = make_left_label("Порог срабатывания:");
+  gtk_grid_attach(GTK_GRID(auto_grid), threshold_lbl, 0, 0, 1, 1);
   GtkWidget* threshold_spin = gtk_spin_button_new_with_range(0.5, 10.0, 0.1);
   gtk_spin_button_set_digits(GTK_SPIN_BUTTON(threshold_spin), 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(threshold_spin), settings.threshold);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(threshold_spin), initial_settings.threshold);
   gtk_spin_button_set_increments(GTK_SPIN_BUTTON(threshold_spin), 0.1, 0.1);
   gtk_spin_button_set_snap_to_ticks(GTK_SPIN_BUTTON(threshold_spin), FALSE);
   gtk_grid_attach(GTK_GRID(auto_grid), threshold_spin, 1, 0, 1, 1);
+  GtkWidget* threshold_desc = make_dim_label(
+      "Диапазон: 0.5–10.0. Чем выше значение — тем реже срабатывает автопереключение.");
+  gtk_grid_attach(GTK_GRID(auto_grid), threshold_desc, 0, 1, 2, 1);
 
   // Min word len
-  gtk_grid_attach(GTK_GRID(auto_grid), gtk_label_new("Мин. длина слова:"), 0, 1, 1, 1);
+  GtkWidget* min_word_lbl = make_left_label("Мин. длина слова:");
+  gtk_grid_attach(GTK_GRID(auto_grid), min_word_lbl, 0, 2, 1, 1);
   GtkWidget* min_word_spin = gtk_spin_button_new_with_range(1, 10, 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(min_word_spin), settings.min_word_len);
-  gtk_grid_attach(GTK_GRID(auto_grid), min_word_spin, 1, 1, 1, 1);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(min_word_spin), initial_settings.min_word_len);
+  gtk_grid_attach(GTK_GRID(auto_grid), min_word_spin, 1, 2, 1, 1);
+  GtkWidget* min_word_desc = make_dim_label(
+      "Диапазон: 1–10. Слова короче этого значения не анализируются.");
+  gtk_grid_attach(GTK_GRID(auto_grid), min_word_desc, 0, 3, 2, 1);
 
   // Min score
-  gtk_grid_attach(GTK_GRID(auto_grid), gtk_label_new("Мин. уверенность:"), 0, 2, 1, 1);
+  GtkWidget* min_score_lbl = make_left_label("Мин. уверенность:");
+  gtk_grid_attach(GTK_GRID(auto_grid), min_score_lbl, 0, 4, 1, 1);
   GtkWidget* min_score_spin = gtk_spin_button_new_with_range(0.0, 20.0, 0.1);
   gtk_spin_button_set_digits(GTK_SPIN_BUTTON(min_score_spin), 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(min_score_spin), settings.min_score);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(min_score_spin), initial_settings.min_score);
   gtk_spin_button_set_increments(GTK_SPIN_BUTTON(min_score_spin), 0.1, 0.1);
   gtk_spin_button_set_snap_to_ticks(GTK_SPIN_BUTTON(min_score_spin), FALSE);
-  gtk_grid_attach(GTK_GRID(auto_grid), min_score_spin, 1, 2, 1, 1);
+  gtk_grid_attach(GTK_GRID(auto_grid), min_score_spin, 1, 4, 1, 1);
+  GtkWidget* min_score_desc = make_dim_label(
+      "Диапазон: 0.0–20.0. Чем выше значение — тем осторожнее решение о переключении.");
+  gtk_grid_attach(GTK_GRID(auto_grid), min_score_desc, 0, 5, 2, 1);
 
-  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), auto_box, gtk_label_new("Автопереключение"));
+  ui_ctx.threshold_spin = GTK_SPIN_BUTTON(threshold_spin);
+  ui_ctx.min_word_spin = GTK_SPIN_BUTTON(min_word_spin);
+  ui_ctx.min_score_spin = GTK_SPIN_BUTTON(min_score_spin);
 
-  // ===== Вкладка "Звук" =====
-  GtkWidget* sound_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-  gtk_container_set_border_width(GTK_CONTAINER(sound_box), 12);
+  g_signal_connect(threshold_spin, "value-changed", G_CALLBACK(on_any_setting_changed), &ui_ctx);
+  g_signal_connect(min_word_spin, "value-changed", G_CALLBACK(on_any_setting_changed), &ui_ctx);
+  g_signal_connect(min_score_spin, "value-changed", G_CALLBACK(on_any_setting_changed), &ui_ctx);
 
-  GtkWidget* sound_enabled = gtk_check_button_new_with_label(
-      "Включить звуковую индикацию переключения раскладки");
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sound_enabled), settings.sound_enabled);
-  gtk_box_pack_start(GTK_BOX(sound_box), sound_enabled, FALSE, FALSE, 0);
-
-  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), sound_box, gtk_label_new("Звук"));
+  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), auto_box,
+                           gtk_label_new("Автопереключение"));
 
   // ===== Вкладка "Задержки" =====
   GtkWidget* delays_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
   gtk_container_set_border_width(GTK_CONTAINER(delays_box), 12);
 
+  GtkWidget* delays_note = make_dim_label(
+      "Задержки влияют на совместимость: слишком маленькие значения могут приводить к пропускам в отдельных приложениях.");
+  gtk_box_pack_start(GTK_BOX(delays_box), delays_note, FALSE, FALSE, 0);
+
   GtkWidget* delays_grid = gtk_grid_new();
-  gtk_grid_set_row_spacing(GTK_GRID(delays_grid), 6);
+  gtk_grid_set_row_spacing(GTK_GRID(delays_grid), 4);
   gtk_grid_set_column_spacing(GTK_GRID(delays_grid), 12);
   gtk_box_pack_start(GTK_BOX(delays_box), delays_grid, FALSE, FALSE, 0);
 
   // Key press
-  gtk_grid_attach(GTK_GRID(delays_grid), gtk_label_new("Нажатие клавиши (мс):"), 0, 0, 1, 1);
+  GtkWidget* key_press_lbl = make_left_label("Нажатие клавиши (мс):");
+  gtk_grid_attach(GTK_GRID(delays_grid), key_press_lbl, 0, 0, 1, 1);
   GtkWidget* key_press_spin = gtk_spin_button_new_with_range(1, 100, 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(key_press_spin), settings.key_press);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(key_press_spin), initial_settings.key_press);
   gtk_grid_attach(GTK_GRID(delays_grid), key_press_spin, 1, 0, 1, 1);
+  GtkWidget* key_press_desc = make_dim_label(
+      "Диапазон: 1–100. Задержка между нажатием и отпусканием клавиши при эмуляции.");
+  gtk_grid_attach(GTK_GRID(delays_grid), key_press_desc, 0, 1, 2, 1);
 
   // Layout switch
-  gtk_grid_attach(GTK_GRID(delays_grid), gtk_label_new("Переключение раскладки (мс):"), 0, 1, 1, 1);
+  GtkWidget* layout_lbl = make_left_label("Переключение раскладки (мс):");
+  gtk_grid_attach(GTK_GRID(delays_grid), layout_lbl, 0, 2, 1, 1);
   GtkWidget* layout_spin = gtk_spin_button_new_with_range(10, 500, 10);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(layout_spin), settings.layout_switch);
-  gtk_grid_attach(GTK_GRID(delays_grid), layout_spin, 1, 1, 1, 1);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(layout_spin), initial_settings.layout_switch);
+  gtk_grid_attach(GTK_GRID(delays_grid), layout_spin, 1, 2, 1, 1);
+  GtkWidget* layout_desc = make_dim_label(
+      "Диапазон: 10–500. Пауза после отправки хоткея смены раскладки.");
+  gtk_grid_attach(GTK_GRID(delays_grid), layout_desc, 0, 3, 2, 1);
 
   // Retype
-  gtk_grid_attach(GTK_GRID(delays_grid), gtk_label_new("Перепечатывание (мс):"), 0, 2, 1, 1);
+  GtkWidget* retype_lbl = make_left_label("Перепечатывание (мс):");
+  gtk_grid_attach(GTK_GRID(delays_grid), retype_lbl, 0, 4, 1, 1);
   GtkWidget* retype_spin = gtk_spin_button_new_with_range(1, 100, 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(retype_spin), settings.retype);
-  gtk_grid_attach(GTK_GRID(delays_grid), retype_spin, 1, 2, 1, 1);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(retype_spin), initial_settings.retype);
+  gtk_grid_attach(GTK_GRID(delays_grid), retype_spin, 1, 4, 1, 1);
+  GtkWidget* retype_desc = make_dim_label(
+      "Диапазон: 1–100. Пауза между символами при перепечатывании.");
+  gtk_grid_attach(GTK_GRID(delays_grid), retype_desc, 0, 5, 2, 1);
 
   // Separator
-  gtk_box_pack_start(GTK_BOX(delays_box), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 4);
-  gtk_box_pack_start(GTK_BOX(delays_box), gtk_label_new("Турбо-режим (для автокоррекции):"), FALSE, FALSE, 0);
+  gtk_box_pack_start(GTK_BOX(delays_box),
+                     gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
+                     FALSE, FALSE, 6);
+  gtk_box_pack_start(GTK_BOX(delays_box), make_left_label("Турбо-режим:"), FALSE, FALSE, 0);
 
   GtkWidget* turbo_grid = gtk_grid_new();
-  gtk_grid_set_row_spacing(GTK_GRID(turbo_grid), 6);
+  gtk_grid_set_row_spacing(GTK_GRID(turbo_grid), 4);
   gtk_grid_set_column_spacing(GTK_GRID(turbo_grid), 12);
   gtk_box_pack_start(GTK_BOX(delays_box), turbo_grid, FALSE, FALSE, 4);
 
   // Turbo key press
-  gtk_grid_attach(GTK_GRID(turbo_grid), gtk_label_new("Турбо нажатие (мс):"), 0, 0, 1, 1);
+  GtkWidget* turbo_key_lbl = make_left_label("Турбо нажатие (мс):");
+  gtk_grid_attach(GTK_GRID(turbo_grid), turbo_key_lbl, 0, 0, 1, 1);
   GtkWidget* turbo_key_spin = gtk_spin_button_new_with_range(1, 100, 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(turbo_key_spin), settings.turbo_key_press);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(turbo_key_spin), initial_settings.turbo_key_press);
   gtk_grid_attach(GTK_GRID(turbo_grid), turbo_key_spin, 1, 0, 1, 1);
+  GtkWidget* turbo_key_desc = make_dim_label(
+      "Диапазон: 1–100. Задержка нажатия в turbo-режиме (быстрее, но менее надёжно).");
+  gtk_grid_attach(GTK_GRID(turbo_grid), turbo_key_desc, 0, 1, 2, 1);
 
   // Turbo retype
-  gtk_grid_attach(GTK_GRID(turbo_grid), gtk_label_new("Турбо перепечатка (мс):"), 0, 1, 1, 1);
+  GtkWidget* turbo_retype_lbl = make_left_label("Турбо перепечатка (мс):");
+  gtk_grid_attach(GTK_GRID(turbo_grid), turbo_retype_lbl, 0, 2, 1, 1);
   GtkWidget* turbo_retype_spin = gtk_spin_button_new_with_range(1, 100, 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(turbo_retype_spin), settings.turbo_retype);
-  gtk_grid_attach(GTK_GRID(turbo_grid), turbo_retype_spin, 1, 1, 1, 1);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(turbo_retype_spin), initial_settings.turbo_retype);
+  gtk_grid_attach(GTK_GRID(turbo_grid), turbo_retype_spin, 1, 2, 1, 1);
+  GtkWidget* turbo_retype_desc = make_dim_label(
+      "Диапазон: 1–100. Пауза между символами в turbo-режиме.");
+  gtk_grid_attach(GTK_GRID(turbo_grid), turbo_retype_desc, 0, 3, 2, 1);
 
-  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), delays_box, gtk_label_new("Задержки"));
+  ui_ctx.key_press_spin = GTK_SPIN_BUTTON(key_press_spin);
+  ui_ctx.layout_spin = GTK_SPIN_BUTTON(layout_spin);
+  ui_ctx.retype_spin = GTK_SPIN_BUTTON(retype_spin);
+  ui_ctx.turbo_key_spin = GTK_SPIN_BUTTON(turbo_key_spin);
+  ui_ctx.turbo_retype_spin = GTK_SPIN_BUTTON(turbo_retype_spin);
+
+  g_signal_connect(key_press_spin, "value-changed", G_CALLBACK(on_any_setting_changed), &ui_ctx);
+  g_signal_connect(layout_spin, "value-changed", G_CALLBACK(on_any_setting_changed), &ui_ctx);
+  g_signal_connect(retype_spin, "value-changed", G_CALLBACK(on_any_setting_changed), &ui_ctx);
+  g_signal_connect(turbo_key_spin, "value-changed", G_CALLBACK(on_any_setting_changed), &ui_ctx);
+  g_signal_connect(turbo_retype_spin, "value-changed", G_CALLBACK(on_any_setting_changed), &ui_ctx);
+
+  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), delays_box,
+                           gtk_label_new("Задержки"));
 
   // ===== Вкладка "Горячие клавиши" =====
   GtkWidget* hotkey_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
   gtk_container_set_border_width(GTK_CONTAINER(hotkey_box), 12);
+
+  GtkWidget* builtin_label = make_left_label(
+      "Встроенные горячие клавиши:\n"
+      "  Pause — инвертировать раскладку слова\n"
+      "  Shift+Pause — инвертировать раскладку выделения\n"
+      "  Ctrl+Pause — инвертировать регистр слова\n"
+      "  Alt+Pause — инвертировать регистр выделения\n"
+      "  LCtrl+LAlt+Pause — транслитерировать выделение");
+  gtk_label_set_line_wrap(GTK_LABEL(builtin_label), TRUE);
+  gtk_box_pack_start(GTK_BOX(hotkey_box), builtin_label, FALSE, FALSE, 0);
+
+  gtk_box_pack_start(GTK_BOX(hotkey_box),
+                     gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
+                     FALSE, FALSE, 6);
 
   GtkWidget* hotkey_grid = gtk_grid_new();
   gtk_grid_set_row_spacing(GTK_GRID(hotkey_grid), 6);
@@ -353,42 +630,86 @@ bool SettingsDialog::show(GtkWidget* parent) {
   gtk_box_pack_start(GTK_BOX(hotkey_box), hotkey_grid, FALSE, FALSE, 0);
 
   // Modifier combo
-  gtk_grid_attach(GTK_GRID(hotkey_grid), gtk_label_new("Модификатор:"), 0, 0, 1, 1);
+  gtk_grid_attach(GTK_GRID(hotkey_grid), make_left_label("Модификатор:"), 0, 0, 1, 1);
   GtkWidget* modifier_combo = gtk_combo_box_text_new();
   gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(modifier_combo), "leftctrl", "Left Ctrl");
   gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(modifier_combo), "rightctrl", "Right Ctrl");
   gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(modifier_combo), "leftalt", "Left Alt");
   gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(modifier_combo), "rightalt", "Right Alt");
+  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(modifier_combo), "leftshift", "Left Shift");
+  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(modifier_combo), "rightshift", "Right Shift");
   gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(modifier_combo), "leftmeta", "Left Super");
   gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(modifier_combo), "rightmeta", "Right Super");
-  gtk_combo_box_set_active_id(GTK_COMBO_BOX(modifier_combo), settings.modifier.c_str());
+  gtk_combo_box_set_active_id(GTK_COMBO_BOX(modifier_combo), initial_settings.modifier.c_str());
   gtk_grid_attach(GTK_GRID(hotkey_grid), modifier_combo, 1, 0, 1, 1);
 
   // Key combo
-  gtk_grid_attach(GTK_GRID(hotkey_grid), gtk_label_new("Клавиша:"), 0, 1, 1, 1);
+  gtk_grid_attach(GTK_GRID(hotkey_grid), make_left_label("Клавиша:"), 0, 1, 1, 1);
   GtkWidget* key_combo = gtk_combo_box_text_new();
   gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(key_combo), "grave", "` (Grave)");
   gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(key_combo), "space", "Space");
   gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(key_combo), "tab", "Tab");
+  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(key_combo), "backslash", "\\ (Backslash)");
   gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(key_combo), "capslock", "Caps Lock");
-  gtk_combo_box_set_active_id(GTK_COMBO_BOX(key_combo), settings.key.c_str());
+
+  // Модификаторы тоже могут выступать "второй клавишей" (Alt+Shift, Ctrl+Alt и т.п.)
+  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(key_combo), "leftshift", "Left Shift");
+  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(key_combo), "rightshift", "Right Shift");
+  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(key_combo), "leftalt", "Left Alt");
+  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(key_combo), "rightalt", "Right Alt");
+  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(key_combo), "leftctrl", "Left Ctrl");
+  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(key_combo), "rightctrl", "Right Ctrl");
+  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(key_combo), "leftmeta", "Left Super");
+  gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(key_combo), "rightmeta", "Right Super");
+
+  gtk_combo_box_set_active_id(GTK_COMBO_BOX(key_combo), initial_settings.key.c_str());
   gtk_grid_attach(GTK_GRID(hotkey_grid), key_combo, 1, 1, 1, 1);
 
-  // Примечание
-  GtkWidget* note_label = gtk_label_new(
-      "Примечание: это хоткей переключения раскладки,\n"
-      "который punto эмулирует. Должен совпадать\n"
-      "с системными настройками.");
-  gtk_label_set_xalign(GTK_LABEL(note_label), 0);
-  gtk_widget_set_margin_top(note_label, 12);
-  PangoAttrList* attrs = pango_attr_list_new();
-  pango_attr_list_insert(attrs, pango_attr_style_new(PANGO_STYLE_ITALIC));
-  pango_attr_list_insert(attrs, pango_attr_scale_new(0.9));
-  gtk_label_set_attributes(GTK_LABEL(note_label), attrs);
-  pango_attr_list_unref(attrs);
+  ui_ctx.modifier_combo = GTK_COMBO_BOX(modifier_combo);
+  ui_ctx.key_combo = GTK_COMBO_BOX(key_combo);
+
+  g_signal_connect(modifier_combo, "changed", G_CALLBACK(on_any_setting_changed), &ui_ctx);
+  g_signal_connect(key_combo, "changed", G_CALLBACK(on_any_setting_changed), &ui_ctx);
+
+  // Подсказка: какие комбинации применимы в GNOME/X11 + применимость выбранного значения.
+  GtkWidget* hotkey_hint_label = gtk_label_new("");
+  gtk_label_set_xalign(GTK_LABEL(hotkey_hint_label), 0);
+  gtk_label_set_line_wrap(GTK_LABEL(hotkey_hint_label), TRUE);
+  gtk_widget_set_margin_top(hotkey_hint_label, 8);
+  gtk_box_pack_start(GTK_BOX(hotkey_box), hotkey_hint_label, FALSE, FALSE, 0);
+  ui_ctx.hotkey_hint_label = hotkey_hint_label;
+
+  GtkWidget* note_label = make_dim_label(
+      "Примечание: это хоткей переключения раскладки, который punto эмулирует.\n"
+      "Он должен совпадать с системными настройками.\n"
+      "KDE/Plasma: автоматическая синхронизация пока не поддерживается.");
+  gtk_widget_set_margin_top(note_label, 8);
   gtk_box_pack_start(GTK_BOX(hotkey_box), note_label, FALSE, FALSE, 0);
 
-  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), hotkey_box, gtk_label_new("Горячие клавиши"));
+  // Текущий системный хоткей (информативно)
+  const auto sys = SystemInputSettings::read_layout_toggle();
+  std::string sys_text;
+  if (sys.result == SystemInputResult::Ok && sys.toggle) {
+    sys_text = "Сейчас в системе (" + sys.backend + "): " + sys.toggle->modifier +
+               " + " + sys.toggle->key;
+  } else if (sys.result == SystemInputResult::Unsupported) {
+    sys_text = "Сейчас в системе (" + sys.backend + "): " +
+               (sys.raw.empty() ? std::string{"<unknown>"} : sys.raw) +
+               "\n" + sys.error;
+  } else {
+    sys_text = "Системный хоткей недоступен: " + sys.error;
+  }
+
+  GtkWidget* sys_label = make_left_label(sys_text.c_str());
+  gtk_label_set_line_wrap(GTK_LABEL(sys_label), TRUE);
+  gtk_widget_set_margin_top(sys_label, 8);
+  gtk_box_pack_start(GTK_BOX(hotkey_box), sys_label, FALSE, FALSE, 0);
+
+  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), hotkey_box,
+                           gtk_label_new("Горячие клавиши"));
+
+  // Первичное состояние кнопки "Сохранить" + подсказки.
+  update_settings_dialog_state(&ui_ctx);
 
   // Показываем диалог
   gtk_widget_show_all(dialog);
@@ -397,29 +718,77 @@ bool SettingsDialog::show(GtkWidget* parent) {
 
   bool saved = false;
   if (response == GTK_RESPONSE_ACCEPT) {
-    // Читаем значения из виджетов
-    settings.auto_enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(auto_enabled));
-    settings.threshold = gtk_spin_button_get_value(GTK_SPIN_BUTTON(threshold_spin));
-    settings.min_word_len = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(min_word_spin));
-    settings.min_score = gtk_spin_button_get_value(GTK_SPIN_BUTTON(min_score_spin));
+    SettingsData new_settings = initial_settings;
 
-    settings.sound_enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(sound_enabled));
+    // Читаем значения из виджетов (без "Звук" и без enable-флага авто-переключения).
+    new_settings.threshold = gtk_spin_button_get_value(GTK_SPIN_BUTTON(threshold_spin));
+    new_settings.min_word_len = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(min_word_spin));
+    new_settings.min_score = gtk_spin_button_get_value(GTK_SPIN_BUTTON(min_score_spin));
 
-    settings.key_press = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(key_press_spin));
-    settings.layout_switch = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(layout_spin));
-    settings.retype = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(retype_spin));
-    settings.turbo_key_press = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(turbo_key_spin));
-    settings.turbo_retype = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(turbo_retype_spin));
+    new_settings.key_press = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(key_press_spin));
+    new_settings.layout_switch = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(layout_spin));
+    new_settings.retype = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(retype_spin));
+    new_settings.turbo_key_press = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(turbo_key_spin));
+    new_settings.turbo_retype = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(turbo_retype_spin));
 
     const gchar* mod_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(modifier_combo));
     const gchar* key_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(key_combo));
-    if (mod_id) settings.modifier = mod_id;
-    if (key_id) settings.key = key_id;
 
-    saved = save_settings(settings);
+    LayoutToggle selected_hotkey;
+    if (mod_id) selected_hotkey.modifier = mod_id;
+    if (key_id) selected_hotkey.key = key_id;
+
+    const bool hotkey_changed = !selected_hotkey.modifier.empty() &&
+                               !selected_hotkey.key.empty() &&
+                               (selected_hotkey.modifier != initial_settings.modifier ||
+                                selected_hotkey.key != initial_settings.key);
+
+    const auto validation = SystemInputSettings::validate_layout_toggle(selected_hotkey);
+    const bool backend_known = !validation.backend.empty();
+    const bool hotkey_applicable = validation.result == SystemInputResult::Ok;
+
+    // Если хоткей НЕ применим для текущего backend — не сохраняем изменения хоткея.
+    const bool save_hotkey = hotkey_changed && (!backend_known || hotkey_applicable);
+    if (save_hotkey) {
+      new_settings.modifier = selected_hotkey.modifier;
+      new_settings.key = selected_hotkey.key;
+    }
+
+    const bool dirty = non_hotkey_changed(new_settings, initial_settings) || save_hotkey;
+    if (dirty) {
+      saved = save_settings(new_settings);
+
+      // Хоткей применяем в систему только если он изменён и применим.
+      if (saved && hotkey_changed && backend_known && hotkey_applicable) {
+        const auto res = SystemInputSettings::write_layout_toggle(
+            LayoutToggle{new_settings.modifier, new_settings.key});
+        if (res.result != SystemInputResult::Ok) {
+          std::string msg = "Не удалось применить хоткей в системе.";
+          if (!res.backend.empty()) {
+            msg += "\nBackend: ";
+            msg += res.backend;
+          }
+          if (!res.error.empty()) {
+            msg += "\n";
+            msg += res.error;
+          }
+
+          GtkWidget* warn = gtk_message_dialog_new(
+              GTK_WINDOW(dialog),
+              GTK_DIALOG_MODAL,
+              GTK_MESSAGE_WARNING,
+              GTK_BUTTONS_OK,
+              "%s",
+              msg.c_str());
+          (void)gtk_dialog_run(GTK_DIALOG(warn));
+          gtk_widget_destroy(warn);
+        }
+      }
+    }
   }
 
   gtk_widget_destroy(dialog);
+  s_dialog_instance = nullptr;
   return saved;
 }
 

@@ -3,20 +3,22 @@
 Высокопроизводительная реализация Punto Switcher на C++20 для Linux.
 Позволяет исправлять текст, набранный в неправильной раскладке клавиатуры.
 
-![Version](https://img.shields.io/badge/version-2.3.0-blue)
+![Version](https://img.shields.io/badge/version-2.4.0-blue)
 ![C++](https://img.shields.io/badge/C%2B%2B-20-orange)
-![License](https://img.shields.io/badge/license-MIT-green)
+![License](https://img.shields.io/badge/license-Personal%20Use%20Only-red)
 
 ## Возможности
 
-### Управление через трей (v2.3)
+### Управление через трей (v2.4)
 
 Иконка `punto-tray` в системном трее позволяет:
 - **Визуальный статус** — видно, включено ли автопереключение
-- **Быстрое вкл/выкл** — без перезапуска `udevmon`
-- **Звук вкл/выкл** — переключатель звуковой индикации (пишется в `~/.config/punto/config.yaml`, применяется через RELOAD)
+- **Автопереключение (toggle)** — быстро вкл/выкл без перезапуска `udevmon`
+- **Звук (toggle)** — вкл/выкл звуковой индикации (пишется в `~/.config/punto/config.yaml`, применяется через RELOAD)
 - **Настройки...** — диалог (GTK3): автопереключение, звук, задержки, хоткей раскладки (`~/.config/punto/config.yaml`)
-- **Перезапуск сервиса** — `systemctl restart udevmon` через `pkexec`
+  - **Синхронизация хоткея с системой**: GNOME (через gsettings) и Generic X11 (через setxkbmap / XKB grp:*_toggle)
+  - Вкладка «Горячие клавиши» показывает, какие комбинации применимы для GNOME и для X11
+- **О программе** — окно со справкой/версией
 - **Автозапуск** — desktop entry в `/etc/xdg/autostart/` (если `punto-tray` включён в пакет)
 
 ### Автоматическое переключение (v2.1+)
@@ -87,9 +89,10 @@ Privet  →  [LCtrl+LAlt+Pause]  →  Привет
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Ключевые особенности v2.3
+### Ключевые особенности v2.4
 
-- **Управление через трей** — `punto-tray` (GTK3 + AppIndicator/Ayatana)
+- **Управление через трей** — `punto-tray` (GTK3 + AppIndicator/Ayatana), toggle-пункты, "О программе"
+- **Синхронизация хоткея раскладки с системой** — GNOME (gsettings) и Generic X11 (setxkbmap / XKB grp:*_toggle)
 - **Настройки + hot reload** — редактирование `~/.config/punto/config.yaml` и мгновенное применение через IPC (без перезапуска `udevmon`)
 - **IPC через Unix Socket** — `/var/run/punto.sock` (GET_STATUS, SET_STATUS, RELOAD)
 - **Автопереключение раскладки** — гибрид: hunspell (если есть) → N-граммы (биграммы+триграммы)
@@ -104,7 +107,7 @@ Privet  →  [LCtrl+LAlt+Pause]  →  Привет
 ```bash
 git clone https://github.com/antonshalin76/punto.git
 cd punto
-sudo dpkg -i punto-switcher_2.3.0_amd64.deb
+sudo dpkg -i punto-switcher_2.4.0_amd64.deb
 ```
 
 ### Способ 2: Сборка из исходников
@@ -133,7 +136,7 @@ sudo apt install pulseaudio-utils alsa-utils
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh
-sudo dpkg -i punto-switcher_2.3.0_amd64.deb
+sudo dpkg -i punto-switcher_2.4.0_amd64.deb
 ```
 
 #### Ручная сборка без пакета
@@ -175,7 +178,7 @@ sudo systemctl start udevmon
 # Хоткей переключения раскладки (ваша системная комбинация)
 hotkey:
   modifier: leftctrl   # leftctrl, rightctrl, leftalt, rightalt, leftshift, rightshift, leftmeta, rightmeta
-  key: grave           # grave (` ~), space, tab, capslock, backslash
+  key: grave           # grave (` ~), space, tab, backslash, capslock, а также left/right: shift/ctrl/alt/meta
 
 # Задержки (в миллисекундах)
 delays:
@@ -196,6 +199,19 @@ auto_switch:
 sound:
   enabled: true
 ```
+
+### Синхронизация хоткея с системой
+
+- **GNOME**: применяется автоматически через `gsettings`.
+- **Generic X11**: применяется через `setxkbmap` (XKB `grp:*_toggle`). Поддерживаются только:
+  - Alt+Shift
+  - Ctrl+Shift
+  - Ctrl+Alt
+  - Alt+Space
+  - Ctrl+Space
+  - Win+Space
+  - Shift+CapsLock
+- **KDE/Plasma**: автоматическая синхронизация пока не поддерживается (настройте хоткей в системе вручную).
 
 После изменения можно применить настройки без перезапуска:
 
@@ -292,7 +308,9 @@ sudo apt install hunspell-en-us hunspell-ru
 
 ### Переключение раскладки не срабатывает
 
-Проверьте, что хоткей в `/etc/punto/config.yaml` соответствует вашей системной комбинации переключения раскладки.
+1. Проверьте, что хоткей в `~/.config/punto/config.yaml` (или `/etc/punto/config.yaml`) соответствует вашей системной комбинации.
+2. В `punto-tray` откройте "Настройки..." → вкладка "Горячие клавиши" и убедитесь, что выбранная комбинация "применима" для вашего backend (GNOME/X11).
+3. Если у вас KDE/Plasma или Wayland-ограничения — настройте хоткей в системе вручную и выставьте такое же значение в конфиге.
 
 ## Удаление
 
@@ -319,6 +337,12 @@ sudo rm -rf /etc/punto
 | hunspell-ru                  | любая (опционально) |
 
 ## История изменений
+
+### v2.4.0 — Синхронизация системного хоткея + модернизация UI
+
+- **Tray menu**: toggle-пункты вместо "вкл/выкл", убран пункт "Сервис", добавлено "О программе"
+- **Настройки**: переключатели в виде button toggle, вкладка хоткеев показывает применимость комбинаций для GNOME/X11 и пытается применить хоткей в систему
+- **Лицензия**: смена на Personal Use Only (см. `LICENSE`)
 
 ### v2.3.0 — Улучшения tray UI + звук
 
@@ -357,7 +381,7 @@ sudo rm -rf /etc/punto
 
 ## Лицензия
 
-MIT License
+Personal Use Only — см. файл `LICENSE`.
 
 ## Автор
 

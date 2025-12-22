@@ -325,7 +325,7 @@ void TrayApp::on_about_clicked(GtkMenuItem *item, gpointer user_data) {
   gtk_container_set_border_width(GTK_CONTAINER(content), 14);
 
   const char *text = "Punto Switcher for Linux\n"
-                     "Version 2.4.0\n"
+                     "Version 2.5.0\n"
                      "Лицензия: Personal Use Only\n"
                      "Автор: Anton Shalin\n"
                      "email: anton.shalin@gmail.com";

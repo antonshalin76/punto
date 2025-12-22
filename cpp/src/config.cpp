@@ -91,6 +91,12 @@ bool validate_config(const Config &config) {
     return false;
   }
 
+  // Проверка параметров автопереключения
+  if (config.auto_switch.max_rollback_words == 0 ||
+      config.auto_switch.max_rollback_words > 50) {
+    return false;
+  }
+
   return true;
 }
 
@@ -186,6 +192,10 @@ Config parse_config_stream(std::istream &file) {
       } else if (key == "min_score") {
         if (auto val = parse_double(value)) {
           config.auto_switch.min_score = *val;
+        }
+      } else if (key == "max_rollback_words") {
+        if (auto val = parse_int(value)) {
+          config.auto_switch.max_rollback_words = static_cast<std::size_t>(*val);
         }
       }
     } else if (current_section == "sound") {

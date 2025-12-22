@@ -1,13 +1,13 @@
 #!/bin/bash
 # =============================================================================
-# Сборка deb-пакета Punto Switcher v2.4.0 (C++20)
+# Сборка deb-пакета Punto Switcher v2.5.0 (C++20 версия)
 # =============================================================================
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-VERSION="2.4.0"
+VERSION="2.5.0"
 PACKAGE_NAME="punto-switcher"
 BUILD_DIR="build-deb"
 CPP_BUILD_DIR="cpp/build"

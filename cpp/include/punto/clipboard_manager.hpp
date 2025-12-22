@@ -11,7 +11,6 @@
 #include <X11/Xlib.h>
 
 #include <chrono>
-#include <memory>
 #include <optional>
 #include <string>
 

@@ -44,6 +44,7 @@ struct SettingsDialogUiContext {
   GtkSpinButton* threshold_spin = nullptr;
   GtkSpinButton* min_word_spin = nullptr;
   GtkSpinButton* min_score_spin = nullptr;
+  GtkSpinButton* max_rollback_words_spin = nullptr;
 
   // Delays
   GtkSpinButton* key_press_spin = nullptr;
@@ -102,6 +103,7 @@ struct SettingsDialogUiContext {
   if (!nearly_equal_double(a.threshold, b.threshold)) return true;
   if (a.min_word_len != b.min_word_len) return true;
   if (!nearly_equal_double(a.min_score, b.min_score)) return true;
+  if (a.max_rollback_words != b.max_rollback_words) return true;
 
   if (a.key_press != b.key_press) return true;
   if (a.layout_switch != b.layout_switch) return true;
@@ -123,6 +125,10 @@ struct SettingsDialogUiContext {
   }
   if (ctx.min_score_spin) {
     out.min_score = gtk_spin_button_get_value(ctx.min_score_spin);
+  }
+  if (ctx.max_rollback_words_spin) {
+    out.max_rollback_words =
+        gtk_spin_button_get_value_as_int(ctx.max_rollback_words_spin);
   }
 
   if (ctx.key_press_spin) {
@@ -339,6 +345,8 @@ SettingsData SettingsDialog::load_settings() {
         if (parse_double_clocale(value, v)) {
           settings.min_score = v;
         }
+      } else if (trimmed.find("max_rollback_words:") != std::string::npos) {
+        settings.max_rollback_words = std::stoi(value);
       }
     } else if (section == "sound") {
       if (trimmed.find("enabled:") != std::string::npos) {
@@ -391,7 +399,8 @@ bool SettingsDialog::save_settings(const SettingsData& settings) {
     file << "  enabled: " << (settings.auto_enabled ? "true" : "false") << "\n";
     file << "  threshold: " << settings.threshold << "\n";
     file << "  min_word_len: " << settings.min_word_len << "\n";
-    file << "  min_score: " << settings.min_score << "\n\n";
+    file << "  min_score: " << settings.min_score << "\n";
+    file << "  max_rollback_words: " << settings.max_rollback_words << "\n\n";
 
     file << "sound:\n";
     file << "  enabled: " << (settings.sound_enabled ? "true" : "false") << "\n";
@@ -506,13 +515,26 @@ bool SettingsDialog::show(GtkWidget* parent) {
       "Диапазон: 0.0–20.0. Чем выше значение — тем осторожнее решение о переключении.");
   gtk_grid_attach(GTK_GRID(auto_grid), min_score_desc, 0, 5, 2, 1);
 
+  // Max rollback words
+  GtkWidget* rollback_lbl = make_left_label("Макс. откат слов:");
+  gtk_grid_attach(GTK_GRID(auto_grid), rollback_lbl, 0, 6, 1, 1);
+  GtkWidget* rollback_spin = gtk_spin_button_new_with_range(1, 50, 1);
+  gtk_spin_button_set_value(GTK_SPIN_BUTTON(rollback_spin),
+                            initial_settings.max_rollback_words);
+  gtk_grid_attach(GTK_GRID(auto_grid), rollback_spin, 1, 6, 1, 1);
+  GtkWidget* rollback_desc = make_dim_label(
+      "Диапазон: 1–50. Сколько последних слов можно откатывать, чтобы исправить слово даже при задержке анализа.");
+  gtk_grid_attach(GTK_GRID(auto_grid), rollback_desc, 0, 7, 2, 1);
+
   ui_ctx.threshold_spin = GTK_SPIN_BUTTON(threshold_spin);
   ui_ctx.min_word_spin = GTK_SPIN_BUTTON(min_word_spin);
   ui_ctx.min_score_spin = GTK_SPIN_BUTTON(min_score_spin);
+  ui_ctx.max_rollback_words_spin = GTK_SPIN_BUTTON(rollback_spin);
 
   g_signal_connect(threshold_spin, "value-changed", G_CALLBACK(on_any_setting_changed), &ui_ctx);
   g_signal_connect(min_word_spin, "value-changed", G_CALLBACK(on_any_setting_changed), &ui_ctx);
   g_signal_connect(min_score_spin, "value-changed", G_CALLBACK(on_any_setting_changed), &ui_ctx);
+  g_signal_connect(rollback_spin, "value-changed", G_CALLBACK(on_any_setting_changed), &ui_ctx);
 
   gtk_notebook_append_page(GTK_NOTEBOOK(notebook), auto_box,
                            gtk_label_new("Автопереключение"));
@@ -724,6 +746,8 @@ bool SettingsDialog::show(GtkWidget* parent) {
     new_settings.threshold = gtk_spin_button_get_value(GTK_SPIN_BUTTON(threshold_spin));
     new_settings.min_word_len = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(min_word_spin));
     new_settings.min_score = gtk_spin_button_get_value(GTK_SPIN_BUTTON(min_score_spin));
+    new_settings.max_rollback_words =
+        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(rollback_spin));
 
     new_settings.key_press = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(key_press_spin));
     new_settings.layout_switch = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(layout_spin));

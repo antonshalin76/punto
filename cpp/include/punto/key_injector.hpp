@@ -6,6 +6,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <functional>
 #include <span>
 
@@ -42,6 +43,12 @@ public:
    * @param ev Событие для записи
    */
   static void emit_event(const input_event &ev);
+
+  /**
+   * @brief Записывает пачку событий в stdout одним системным вызовом
+   * @param events Пачка событий
+   */
+  static void emit_events(std::span<const input_event> events);
 
   /**
    * @brief Отправляет событие нажатия/отпускания и SYN
@@ -111,10 +118,7 @@ public:
   void delay(std::chrono::microseconds us) const noexcept;
 
 private:
-  /**
-   * @brief Отправляет EV_SYN для синхронизации
-   */
-  static void send_sync();
+  static void write_all_or_die(int fd, const void *data, std::size_t bytes);
 
   DelayConfig delays_;
   WaitFunc wait_func_;

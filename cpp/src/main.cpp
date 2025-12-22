@@ -27,7 +27,7 @@ void signal_handler(int sig) {
 }
 
 void print_version() {
-  std::cout << "Punto Switcher 2.4.0 (C++20)\n"
+  std::cout << "Punto Switcher 2.5.0 (C++20)\n"
             << "Высокопроизводительный плагин для interception-tools\n"
             << "https://github.com/antonshalin76/punto\n";
 }
@@ -81,7 +81,9 @@ int main(int argc, char *argv[]) {
   std::cerr << "[punto] auto_switch: enabled=" << config.auto_switch.enabled
             << ", threshold=" << config.auto_switch.threshold
             << ", min_word_len=" << config.auto_switch.min_word_len
-            << ", min_score=" << config.auto_switch.min_score << '\n';
+            << ", min_score=" << config.auto_switch.min_score
+            << ", max_rollback_words=" << config.auto_switch.max_rollback_words
+            << '\n';
 
   // Запуск event loop
   punto::EventLoop loop{std::move(config)};

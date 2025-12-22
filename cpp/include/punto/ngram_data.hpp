@@ -299,7 +299,10 @@ inline constexpr std::array<BigramEntry, 128> kRuBigrams = {{
  */
 [[nodiscard]] inline std::uint8_t lookup_en_bigram(char first,
                                                    char second) noexcept {
-#if defined(__x86_64__) && !defined(PUNTO_NO_ASM)
+#if defined(__x86_64__) && !defined(PUNTO_NO_ASM) && defined(__AVX2__)
+  return asm_utils::avx2_find_bigram(kEnBigrams.data(), kEnBigrams.size(), first,
+                                     second);
+#elif defined(__x86_64__) && !defined(PUNTO_NO_ASM)
   return asm_utils::sse_find_bigram(kEnBigrams.data(), kEnBigrams.size(), first,
                                     second);
 #else
@@ -320,7 +323,10 @@ inline constexpr std::array<BigramEntry, 128> kRuBigrams = {{
  */
 [[nodiscard]] inline std::uint8_t lookup_ru_bigram(char first,
                                                    char second) noexcept {
-#if defined(__x86_64__) && !defined(PUNTO_NO_ASM)
+#if defined(__x86_64__) && !defined(PUNTO_NO_ASM) && defined(__AVX2__)
+  return asm_utils::avx2_find_bigram(kRuBigrams.data(), kRuBigrams.size(), first,
+                                     second);
+#elif defined(__x86_64__) && !defined(PUNTO_NO_ASM)
   return asm_utils::sse_find_bigram(kRuBigrams.data(), kRuBigrams.size(), first,
                                     second);
 #else

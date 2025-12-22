@@ -19,6 +19,7 @@ struct SettingsData {
   double threshold = 3.5;
   int min_word_len = 2;
   double min_score = 5.0;
+  int max_rollback_words = 5;
 
   // Sound
   bool sound_enabled = true;

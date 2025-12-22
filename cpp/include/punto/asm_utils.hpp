@@ -63,6 +63,57 @@ sse_find_bigram(const punto::BigramEntry *table, std::size_t table_size,
   return 0;
 }
 
+#if defined(__AVX2__)
+/**
+ * @brief Поиск веса биграммы с использованием AVX2 (256-bit)
+ *
+ * Обрабатывает 8 BigramEntry (по 4 байта) за итерацию.
+ */
+[[nodiscard]] inline std::uint8_t
+avx2_find_bigram(const punto::BigramEntry *table, std::size_t table_size,
+                 char first, char second) noexcept {
+
+  uint32_t target = (static_cast<uint32_t>(static_cast<uint8_t>(first))) |
+                    (static_cast<uint32_t>(static_cast<uint8_t>(second)) << 8);
+
+  __m256i target_vec = _mm256_set1_epi32(static_cast<int>(target & 0x0000FFFF));
+  __m256i mask = _mm256_set1_epi32(0x0000FFFF);
+
+  std::size_t i = 0;
+  for (; i + 8 <= table_size; i += 8) {
+    __m256i data = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i *>(table + i));
+
+    __m256i masked_data = _mm256_and_si256(data, mask);
+    __m256i cmp = _mm256_cmpeq_epi32(masked_data, target_vec);
+
+    int movemask = _mm256_movemask_epi8(cmp);
+    if (movemask != 0) {
+      // Проверяем совпавшие lane'ы (по 4 бита на lane).
+      for (std::size_t j = 0; j < 8; ++j) {
+        const int lane_mask = (0xF << static_cast<int>(j * 4));
+        if ((movemask & lane_mask) == lane_mask) {
+          const std::size_t idx = i + j;
+          if (idx < table_size && table[idx].first == first &&
+              table[idx].second == second) {
+            return table[idx].weight;
+          }
+        }
+      }
+    }
+  }
+
+  // Хвост
+  for (; i < table_size; ++i) {
+    if (table[i].first == first && table[i].second == second) {
+      return table[i].weight;
+    }
+  }
+
+  return 0;
+}
+#endif
+
 /**
  * @brief Чтение системного счетчика тактов процессора (RDTSC)
  */

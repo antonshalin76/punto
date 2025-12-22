@@ -5,9 +5,13 @@
 
 #include "punto/key_injector.hpp"
 
-#include <cstdio>
+#include <cerrno>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <unistd.h>
+
+#include <iostream>
 
 namespace punto {
 
@@ -18,28 +22,56 @@ void KeyInjector::update_delays(const DelayConfig &delays) noexcept {
   delays_ = delays;
 }
 
-void KeyInjector::emit_event(const input_event &ev) {
-  if (std::fwrite(&ev, sizeof(ev), 1, stdout) != 1) {
+void KeyInjector::write_all_or_die(int fd, const void *data,
+                                  std::size_t bytes) {
+  const std::uint8_t *p = static_cast<const std::uint8_t *>(data);
+  std::size_t remaining = bytes;
+
+  while (remaining > 0) {
+    ssize_t n = ::write(fd, p, remaining);
+    if (n > 0) {
+      p += static_cast<std::size_t>(n);
+      remaining -= static_cast<std::size_t>(n);
+      continue;
+    }
+
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+
+    const int e = errno;
+    std::cerr << "[punto] KeyInjector: write failed (fd=" << fd
+              << " bytes=" << bytes << " remaining=" << remaining
+              << ") errno=" << e << " (" << std::strerror(e) << ")\n";
     std::exit(1);
   }
-  std::fflush(stdout);
 }
 
-void KeyInjector::send_sync() {
-  input_event ev{};
-  ev.type = EV_SYN;
-  ev.code = SYN_REPORT;
-  ev.value = 0;
-  emit_event(ev);
+void KeyInjector::emit_events(std::span<const input_event> events) {
+  if (events.empty()) {
+    return;
+  }
+
+  write_all_or_die(STDOUT_FILENO, events.data(),
+                   events.size() * sizeof(input_event));
+}
+
+void KeyInjector::emit_event(const input_event &ev) {
+  emit_events(std::span<const input_event>{&ev, 1});
 }
 
 void KeyInjector::send_key(ScanCode code, KeyState state) const {
-  input_event ev{};
-  ev.type = EV_KEY;
-  ev.code = code;
-  ev.value = static_cast<std::int32_t>(state);
-  emit_event(ev);
-  send_sync();
+  input_event evs[2]{};
+
+  evs[0].type = EV_KEY;
+  evs[0].code = code;
+  evs[0].value = static_cast<std::int32_t>(state);
+
+  evs[1].type = EV_SYN;
+  evs[1].code = SYN_REPORT;
+  evs[1].value = 0;
+
+  emit_events(std::span<const input_event>{evs, 2});
 }
 
 void KeyInjector::tap_key(ScanCode code, bool with_shift, bool turbo) const {

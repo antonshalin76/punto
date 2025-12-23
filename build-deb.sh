@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Сборка deb-пакета Punto Switcher v2.5.1 (C++20 версия)
+# Сборка deb-пакета Punto Switcher v2.6.0 (C++20 версия)
 # =============================================================================
 set -e
 
@@ -66,6 +66,22 @@ check_package() {
     dpkg -s "$1" &>/dev/null
 }
 
+APT_UPDATED=0
+apt_update_once() {
+    if [[ $APT_UPDATED -eq 0 ]]; then
+        sudo apt-get update -qq
+        APT_UPDATED=1
+    fi
+}
+
+apt_install() {
+    if [[ $# -eq 0 ]]; then
+        return 0
+    fi
+    apt_update_once
+    sudo apt-get install -y "$@"
+}
+
 # Проверяем обязательные зависимости
 MISSING_BUILD_DEPS=()
 for pkg in "${BUILD_DEPS[@]}"; do
@@ -86,8 +102,7 @@ done
 if [[ ${#MISSING_BUILD_DEPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}   Отсутствуют пакеты для сборки: ${MISSING_BUILD_DEPS[*]}${NC}"
     echo "   Установка..."
-    sudo apt-get update -qq
-    sudo apt-get install -y "${MISSING_BUILD_DEPS[@]}"
+    apt_install "${MISSING_BUILD_DEPS[@]}"
     echo -e "${GREEN}   Зависимости для сборки установлены${NC}"
 else
     echo -e "${GREEN}   Все зависимости для сборки установлены${NC}"
@@ -104,27 +119,26 @@ done
 BUILD_TRAY=true
 if [[ ${#MISSING_TRAY_DEPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}   Отсутствуют пакеты для tray: ${MISSING_TRAY_DEPS[*]}${NC}"
-    read -p "   Установить для сборки punto-tray? [Y/n] " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-        sudo apt-get install -y "${MISSING_TRAY_DEPS[@]}"
+    echo "   Установка..."
+
+    if apt_install "${MISSING_TRAY_DEPS[@]}"; then
         echo -e "${GREEN}   Зависимости для tray установлены${NC}"
     else
-        echo -e "${YELLOW}   punto-tray не будет собран${NC}"
+        echo -e "${YELLOW}   Предупреждение: не удалось установить зависимости для tray. punto-tray не будет собран.${NC}" >&2
         BUILD_TRAY=false
     fi
 fi
 
-# Предлагаем установить опциональные зависимости
+# Устанавливаем опциональные зависимости (словари)
 if [[ ${#MISSING_OPTIONAL_DEPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}   Опциональные пакеты (словари): ${MISSING_OPTIONAL_DEPS[*]}${NC}"
-    read -p "   Установить словари для автопереключения? [Y/n] " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-        sudo apt-get install -y "${MISSING_OPTIONAL_DEPS[@]}"
+    echo "   Установка..."
+
+    if apt_install "${MISSING_OPTIONAL_DEPS[@]}"; then
         echo -e "${GREEN}   Словари установлены${NC}"
+        MISSING_OPTIONAL_DEPS=()
     else
-        echo "   Пропускаем установку словарей"
+        echo -e "${YELLOW}   Предупреждение: не удалось установить словари. Автопереключение может быть менее точным.${NC}" >&2
     fi
 fi
 
@@ -244,15 +258,9 @@ done
 
 if [[ ${#MISSING_RUNTIME_DEPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}   Отсутствуют runtime-пакеты: ${MISSING_RUNTIME_DEPS[*]}${NC}"
-    echo "   Эти пакеты нужны для работы punto-switcher."
-    read -p "   Установить сейчас? [Y/n] " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-        sudo apt-get install -y "${MISSING_RUNTIME_DEPS[@]}"
-        echo -e "${GREEN}   Runtime-зависимости установлены${NC}"
-    else
-        echo -e "${YELLOW}   Предупреждение: пакет может не работать без этих зависимостей${NC}"
-    fi
+    echo "   Эти пакеты нужны для работы punto-switcher. Установка..."
+    apt_install "${MISSING_RUNTIME_DEPS[@]}"
+    echo -e "${GREEN}   Runtime-зависимости установлены${NC}"
 else
     echo -e "${GREEN}   Все runtime-зависимости установлены${NC}"
 fi

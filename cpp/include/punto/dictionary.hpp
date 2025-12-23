@@ -8,10 +8,17 @@
 
 #pragma once
 
+#include <memory>
 #include <span>
 #include <string>
-#include <unordered_set>
+#include <vector>
 
+#ifdef HAVE_HUNSPELL
+#include <hunspell/hunspell.hxx>
+#endif
+
+#include "punto/bloom_filter.hpp"
+#include "punto/hasher.hpp"
 #include "punto/types.hpp"
 
 namespace punto {
@@ -27,9 +34,11 @@ enum class DictResult {
 /**
  * @brief Словарный анализатор языка
  *
- * Загружает словари из hunspell файлов:
- * - /usr/share/hunspell/en_US.dic — английские слова
- * - /usr/share/hunspell/ru_RU.dic — русские слова (конвертируются в QWERTY)
+ * Использует libhunspell для проверки словоформ с учётом:
+ * - Падежей, склонений, времён, родов и т.п.
+ * - Аффиксов из .aff файлов
+ * 
+ * Двусторонняя проверка: конвертирует слово в обе раскладки и ищет в словарях.
  */
 class Dictionary {
 public:
@@ -55,22 +64,36 @@ public:
    * @brief Возвращает размер EN словаря
    */
   [[nodiscard]] std::size_t en_size() const noexcept {
-    return en_words_.size();
+    return en_hashes_.size();
   }
 
   /**
    * @brief Возвращает размер RU словаря
    */
   [[nodiscard]] std::size_t ru_size() const noexcept {
-    return ru_words_.size();
+    return ru_hashes_.size();
+  }
+
+  /**
+   * @brief Статистика Bloom Filter (для телеметрии)
+   */
+  [[nodiscard]] double en_bloom_fill() const noexcept {
+    return en_bloom_.fill_ratio();
+  }
+  [[nodiscard]] double ru_bloom_fill() const noexcept {
+    return ru_bloom_.fill_ratio();
   }
 
 private:
   /**
-   * @brief Конвертирует буфер скан-кодов в строку (lowercase)
+   * @brief Проверяет наличие хеша в отсортированном векторе
+   * @param hash Хеш слова
+   * @param hashes Отсортированный вектор хешей
+   * @return true если найден
    */
-  [[nodiscard]] static std::string
-  entries_to_key(std::span<const KeyEntry> entries);
+  [[nodiscard]] static bool
+  hash_exists(std::uint64_t hash,
+              const std::vector<std::uint64_t> &hashes) noexcept;
 
   /**
    * @brief Загружает английский словарь из hunspell
@@ -94,9 +117,44 @@ private:
   [[nodiscard]] static std::string
   cyrillic_to_qwerty(const std::string &cyrillic);
 
-  std::unordered_set<std::string> en_words_;
-  std::unordered_set<std::string> ru_words_; // QWERTY-последовательности
+  /**
+   * @brief Финализирует хеши после загрузки всех словарей
+   * 
+   * Сортирует и удаляет дубликаты для эффективного бинарного поиска.
+   */
+  void finalize_hashes();
+
+  /**
+   * @brief Конвертирует QWERTY в кириллицу (UTF-8)
+   * @param qwerty ASCII строка (QWERTY клавиши)
+   * @return UTF-8 строка с кириллицей
+   */
+  [[nodiscard]] static std::string qwerty_to_cyrillic(const std::string &qwerty);
+
+  /**
+   * @brief Проверяет слово через hunspell (c учётом словоформ)
+   * @param word Слово для проверки
+   * @param is_english true для EN словаря, false для RU
+   * @return true если слово корректно
+   */
+  [[nodiscard]] bool check_hunspell(const std::string &word, bool is_english) const;
+
+  // Bloom Filters для быстрого отсечения (Level 0)
+  BloomFilter en_bloom_;
+  BloomFilter ru_bloom_;
+
+  // Отсортированные векторы хешей (Level 1-2) — резервный метод
+  std::vector<std::uint64_t> en_hashes_;
+  std::vector<std::uint64_t> ru_hashes_;
+
+#ifdef HAVE_HUNSPELL
+  // Hunspell для проверки словоформ
+  std::unique_ptr<Hunspell> hunspell_en_;
+  std::unique_ptr<Hunspell> hunspell_ru_;
+#endif
+
   bool initialized_ = false;
+  bool hunspell_available_ = false;
 };
 
 } // namespace punto

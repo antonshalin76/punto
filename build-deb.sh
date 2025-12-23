@@ -7,7 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-VERSION="2.5.1"
+VERSION="2.6.0"
 PACKAGE_NAME="punto-switcher"
 BUILD_DIR="build-deb"
 CPP_BUILD_DIR="cpp/build"
@@ -52,13 +52,16 @@ echo "=== Сборка Punto Switcher v${VERSION} ==="
 echo "[1/6] Проверка зависимостей..."
 
 # Обязательные пакеты для сборки
-BUILD_DEPS=("build-essential" "cmake" "pkg-config" "libx11-dev")
+# libhunspell-dev для поддержки словарей (падежи, склонения, время)
+BUILD_DEPS=("build-essential" "cmake" "pkg-config" "libx11-dev" "libhunspell-dev")
 
 # Пакеты для сборки tray-приложения (Ayatana для Ubuntu 22.04+)
 TRAY_DEPS=("libgtk-3-dev" "libayatana-appindicator3-dev")
 
 # Опциональные пакеты (словари для автопереключения)
-OPTIONAL_DEPS=("hunspell-en-us" "hunspell-ru")
+# hunspell-en-us, hunspell-ru — базовые словари
+# wamerican-huge — расширенный английский словарь (~300k слов)
+OPTIONAL_DEPS=("hunspell" "hunspell-en-us" "hunspell-ru" "wamerican-huge")
 
 # Функция проверки установленного пакета
 check_package() {

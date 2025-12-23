@@ -46,6 +46,9 @@ AnalysisResult LayoutAnalyzer::analyze(std::span<const KeyEntry> word) const {
   result.en_score = calculate_score(word, Language::English);
   result.ru_score = calculate_score(word, Language::Russian);
 
+  // Подсчитываем невалидные биграммы
+  count_invalid_bigrams(word, result.en_invalid_count, result.ru_invalid_count);
+
   // Определяем вероятный язык
   if (result.ru_score > result.en_score) {
     result.likely_lang = Language::Russian;
@@ -224,6 +227,36 @@ std::size_t LayoutAnalyzer::word_to_ascii(std::span<const KeyEntry> word,
 
   buffer[len] = '\0';
   return len;
+}
+
+void LayoutAnalyzer::count_invalid_bigrams(std::span<const KeyEntry> word,
+                                           std::size_t &en_invalid,
+                                           std::size_t &ru_invalid) {
+  en_invalid = 0;
+  ru_invalid = 0;
+
+  if (word.size() < 2) {
+    return;
+  }
+
+  char buffer[kMaxWordLen];
+  std::size_t len = word_to_ascii(word, buffer);
+
+  if (len < 2) {
+    return;
+  }
+
+  for (std::size_t i = 0; i + 1 < len; ++i) {
+    char first = buffer[i];
+    char second = buffer[i + 1];
+
+    if (is_invalid_en_bigram(first, second)) {
+      ++en_invalid;
+    }
+    if (is_invalid_ru_bigram(first, second)) {
+      ++ru_invalid;
+    }
+  }
 }
 
 } // namespace punto

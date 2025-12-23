@@ -147,16 +147,46 @@ private:
       DictResult dict_result = dict_->lookup(analysis_span);
 
       if (dict_result == DictResult::English) {
+        // Слово найдено в EN словаре → переключать только если мы в RU раскладке
         res.need_switch = !is_en_layout;
       } else if (dict_result == DictResult::Russian) {
+        // Слово найдено в RU словаре → переключать только если мы в EN раскладке
         res.need_switch = is_en_layout;
       } else if (dict_result == DictResult::Unknown) {
+        // Слово не найдено ни в одном словаре — используем N-граммы + анализ невалидных биграмм
+        //
+        // Логика принятия решения:
+        // 1. Если слово содержит невалидные биграммы для одного языка, но не для другого —
+        //    это сильный сигнал о неправильной раскладке.
+        // 2. N-граммы используются как дополнительный сигнал.
+        // 3. Для RU→EN требуем более строгие условия (нет невалидных EN биграмм).
+        //
         LayoutAnalyzer analyzer(task.cfg);
         AnalysisResult ar = analyzer.analyze(analysis_span);
-        if (ar.should_switch) {
-          if (is_en_layout && ar.ru_score > ar.en_score) {
+
+        if (is_en_layout) {
+          // EN раскладка → возможно пользователь набирает русское слово
+          // Переключаем на RU если:
+          // - N-граммы показывают ru_score > en_score, ИЛИ
+          // - Есть невалидные EN биграммы и нет невалидных RU биграмм
+          bool ngram_suggests_ru = ar.should_switch && ar.ru_score > ar.en_score;
+          bool invalid_suggests_ru = (ar.en_invalid_count > 0 && ar.ru_invalid_count == 0);
+          bool invalid_balance_ru = (ar.en_invalid_count > ar.ru_invalid_count);
+
+          if (ngram_suggests_ru || invalid_suggests_ru || 
+              (invalid_balance_ru && ar.ru_score >= ar.en_score)) {
             res.need_switch = true;
-          } else if (!is_en_layout && ar.en_score > ar.ru_score) {
+          }
+        } else {
+          // RU раскладка → возможно пользователь набирает английское слово
+          // Переключаем на EN если:
+          // - N-граммы показывают en_score > ru_score, И
+          // - НЕТ невалидных EN биграмм (слово выглядит как валидное английское)
+          bool ngram_suggests_en = ar.should_switch && ar.en_score > ar.ru_score;
+          bool looks_like_valid_en = (ar.en_invalid_count == 0);
+          bool invalid_suggests_en = (ar.ru_invalid_count > 0 && ar.en_invalid_count == 0);
+
+          if ((ngram_suggests_en && looks_like_valid_en) || invalid_suggests_en) {
             res.need_switch = true;
           }
         }

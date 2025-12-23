@@ -337,10 +337,11 @@ void TrayApp::on_about_clicked(GtkMenuItem *item, gpointer user_data) {
 
   const char *markup =
       "<b>Punto Switcher for Linux</b>\n"
-      "Version 2.5.1\n"
+      "Version 2.6.0\n"
       "Лицензия: Personal Use Only\n"
       "Автор: Anton Shalin\n"
-      "email: <a href=\"mailto:anton.shalin@gmail.com\">anton.shalin@gmail.com</a>\n";
+      "email: <a "
+      "href=\"mailto:anton.shalin@gmail.com\">anton.shalin@gmail.com</a>\n";
 
   GtkWidget *label = gtk_label_new(nullptr);
   gtk_label_set_markup(GTK_LABEL(label), markup);
@@ -349,8 +350,8 @@ void TrayApp::on_about_clicked(GtkMenuItem *item, gpointer user_data) {
   gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
   gtk_box_pack_start(GTK_BOX(content), label, FALSE, FALSE, 0);
 
-  g_signal_connect(label, "activate-link", G_CALLBACK(on_about_label_activate_link),
-                   dialog);
+  g_signal_connect(label, "activate-link",
+                   G_CALLBACK(on_about_label_activate_link), dialog);
 
   g_signal_connect(dialog, "response", G_CALLBACK(on_about_dialog_response),
                    &s_about_dialog);

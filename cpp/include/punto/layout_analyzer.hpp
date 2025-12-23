@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <span>
 
 #include "punto/config.hpp"
@@ -20,8 +21,10 @@ enum class Language { English, Russian };
 
 /// Результат анализа слова
 struct AnalysisResult {
-  double en_score = 0.0; // Скор для английской раскладки
-  double ru_score = 0.0; // Скор для русской раскладки
+  double en_score = 0.0;           // Скор для английской раскладки
+  double ru_score = 0.0;           // Скор для русской раскладки
+  std::size_t en_invalid_count = 0; // Количество невалидных EN биграмм
+  std::size_t ru_invalid_count = 0; // Количество невалидных RU биграмм
   Language likely_lang = Language::English;
   bool should_switch = false;
 };
@@ -62,6 +65,16 @@ public:
    */
   [[nodiscard]] double calculate_score(std::span<const KeyEntry> word,
                                        Language lang) const;
+
+  /**
+   * @brief Подсчитывает невалидные биграммы для обоих языков
+   * @param word Буфер слова
+   * @param en_invalid Выходной параметр: кол-во невалидных EN биграмм
+   * @param ru_invalid Выходной параметр: кол-во невалидных RU биграмм
+   */
+  static void count_invalid_bigrams(std::span<const KeyEntry> word,
+                                    std::size_t &en_invalid,
+                                    std::size_t &ru_invalid);
 
 private:
   /**

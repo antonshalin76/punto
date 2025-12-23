@@ -3,7 +3,7 @@
 # Высокопроизводительный плагин для interception-tools
 # =============================================================================
 cmake_minimum_required(VERSION 3.16)
-project(punto VERSION 2.5.1 LANGUAGES CXX)
+project(punto VERSION 2.6.0 LANGUAGES CXX)
 
 # Для clangd/IDE: генерируем compile_commands.json
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -39,6 +39,15 @@ find_package(PkgConfig REQUIRED)
 # X11 для работы с буфером обмена
 pkg_check_modules(X11 REQUIRED x11)
 pkg_check_modules(XCB xcb)
+
+# Hunspell для проверки орфографии с учётом словоформ (падежи, склонения, времена)
+pkg_check_modules(HUNSPELL hunspell)
+if(HUNSPELL_FOUND)
+    add_compile_definitions(HAVE_HUNSPELL)
+    message(STATUS "Hunspell found: ${HUNSPELL_VERSION}")
+else()
+    message(STATUS "Hunspell not found - using hash-based dictionary only")
+endif()
 
 # Опционально: ICU для продвинутой работы с Unicode
 # find_package(ICU COMPONENTS uc data)
@@ -91,11 +100,13 @@ target_include_directories(punto
     PRIVATE 
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${X11_INCLUDE_DIRS}
+        ${HUNSPELL_INCLUDE_DIRS}
 )
 
 target_link_libraries(punto 
     PRIVATE 
         ${X11_LIBRARIES}
+        ${HUNSPELL_LIBRARIES}
 )
 
 # Если XCB найден, используем его

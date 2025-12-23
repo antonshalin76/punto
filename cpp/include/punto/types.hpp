@@ -25,9 +25,6 @@ namespace punto {
 /// Максимальная длина слова (в скан-кодах)
 inline constexpr std::size_t kMaxWordLen = 256;
 
-/// Максимальный размер буфера UTF-8 текста
-inline constexpr std::size_t kMaxTextLen = 1024;
-
 /// Путь к системному конфигурационному файлу
 inline constexpr std::string_view kConfigPath = "/etc/punto/config.yaml";
 

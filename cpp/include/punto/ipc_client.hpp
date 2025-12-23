@@ -49,12 +49,6 @@ public:
   static bool set_status(bool enabled);
 
   /**
-   * @brief Переключает статус сервиса
-   * @return Новый статус или Unknown при ошибке
-   */
-  static ServiceStatus toggle_status();
-
-  /**
    * @brief Отправляет команду перезагрузки конфигурации
    * @param config_path Абсолютный путь к конфигу; если пусто — сервер сам решит
    * @return true при успехе

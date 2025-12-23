@@ -15,9 +15,6 @@ namespace punto {
 
 namespace {
 
-/// Путь к системному конфигурационному файлу
-constexpr const char *kSystemConfigPath = "/etc/punto/config.yaml";
-
 void on_about_dialog_response(GtkDialog *dialog, gint response_id,
                               gpointer user_data) {
   (void)response_id;
@@ -26,6 +23,20 @@ void on_about_dialog_response(GtkDialog *dialog, gint response_id,
     *instance = nullptr;
   }
   gtk_widget_destroy(GTK_WIDGET(dialog));
+}
+
+gboolean on_about_label_activate_link(GtkLabel *label, gchar *uri,
+                                      gpointer user_data) {
+  (void)label;
+  auto *parent = GTK_WINDOW(user_data);
+
+  GError *error = nullptr;
+  (void)gtk_show_uri_on_window(parent, uri, GDK_CURRENT_TIME, &error);
+  if (error) {
+    g_error_free(error);
+  }
+
+  return TRUE; // мы обработали ссылку
 }
 
 /// Интервал обновления статуса (мс)
@@ -324,16 +335,22 @@ void TrayApp::on_about_clicked(GtkMenuItem *item, gpointer user_data) {
   GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
   gtk_container_set_border_width(GTK_CONTAINER(content), 14);
 
-  const char *text = "Punto Switcher for Linux\n"
-                     "Version 2.5.0\n"
-                     "Лицензия: Personal Use Only\n"
-                     "Автор: Anton Shalin\n"
-                     "email: anton.shalin@gmail.com";
+  const char *markup =
+      "<b>Punto Switcher for Linux</b>\n"
+      "Version 2.5.1\n"
+      "Лицензия: Personal Use Only\n"
+      "Автор: Anton Shalin\n"
+      "email: <a href=\"mailto:anton.shalin@gmail.com\">anton.shalin@gmail.com</a>\n";
 
-  GtkWidget *label = gtk_label_new(text);
+  GtkWidget *label = gtk_label_new(nullptr);
+  gtk_label_set_markup(GTK_LABEL(label), markup);
   gtk_label_set_xalign(GTK_LABEL(label), 0);
-  gtk_label_set_selectable(GTK_LABEL(label), FALSE);
+  gtk_label_set_selectable(GTK_LABEL(label), TRUE);
+  gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
   gtk_box_pack_start(GTK_BOX(content), label, FALSE, FALSE, 0);
+
+  g_signal_connect(label, "activate-link", G_CALLBACK(on_about_label_activate_link),
+                   dialog);
 
   g_signal_connect(dialog, "response", G_CALLBACK(on_about_dialog_response),
                    &s_about_dialog);

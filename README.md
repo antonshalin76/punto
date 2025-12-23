@@ -3,7 +3,7 @@
 Высокопроизводительная реализация Punto Switcher на C++20 для Linux.
 Позволяет исправлять текст, набранный в неправильной раскладке клавиатуры.
 
-![Version](https://img.shields.io/badge/version-2.5.0-blue)
+![Version](https://img.shields.io/badge/version-2.5.1-blue)
 ![C++](https://img.shields.io/badge/C%2B%2B-20-orange)
 ![License](https://img.shields.io/badge/license-Personal%20Use%20Only-red)
 
@@ -160,7 +160,7 @@ sudo apt install pulseaudio-utils alsa-utils
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh
-sudo dpkg -i punto-switcher_2.5.0_amd64.deb
+sudo dpkg -i punto-switcher_2.5.1_amd64.deb
 ```
 
 #### Ручная сборка без пакета
@@ -366,6 +366,12 @@ sudo rm -rf /etc/punto
 | hunspell-ru                  | любая (опционально) |
 
 ## История изменений
+
+### v2.5.1 — Рефакторинг и мелкие улучшения
+
+- Удалён мёртвый код (неиспользуемые методы/поля/константы).
+- Окно «О программе»: email кликабелен и доступен для копирования.
+- build-deb.sh: запуск unit-тестов перед сборкой пакета (с очисткой test build-dir).
 
 ### v2.5.0 — Асинхронное автопереключение + повышение надёжности
 

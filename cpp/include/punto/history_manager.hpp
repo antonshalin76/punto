@@ -168,15 +168,6 @@ public:
     return w;
   }
 
-  [[nodiscard]] std::optional<HistoryWord> find_word(std::uint64_t task_id) const {
-    for (const auto &w : words_) {
-      if (w.task_id == task_id) {
-        return w;
-      }
-    }
-    return std::nullopt;
-  }
-
   /// Возвращает копию токенов в диапазоне [from_pos, to_pos).
   [[nodiscard]] bool get_range(std::uint64_t from_pos, std::uint64_t to_pos,
                               std::vector<KeyEntry> &out) const {

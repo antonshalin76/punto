@@ -100,8 +100,4 @@ std::size_t InputBuffer::trailing_length() const noexcept {
   return trailing_len_;
 }
 
-bool InputBuffer::has_data() const noexcept {
-  return current_len_ > 0 || last_len_ > 0;
-}
-
 } // namespace punto

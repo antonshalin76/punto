@@ -106,9 +106,6 @@ public:
   /// Длина trailing whitespace
   [[nodiscard]] std::size_t trailing_length() const noexcept;
 
-  /// Проверка наличия данных для инверсии
-  [[nodiscard]] bool has_data() const noexcept;
-
 private:
   WordBuffer current_buf_{};
   WordBuffer last_buf_{};

@@ -78,10 +78,6 @@ struct Config {
   AutoSwitchConfig auto_switch;
   SoundConfig sound;
   std::filesystem::path config_path{"/etc/punto/config.yaml"};
-
-  // Дополнительные параметры (для будущего расширения)
-  bool debug_mode = false;
-  bool log_to_syslog = true;
 };
 
 // ===========================================================================

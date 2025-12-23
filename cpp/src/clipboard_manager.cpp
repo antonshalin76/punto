@@ -85,7 +85,6 @@ bool ClipboardManager::open() {
   atom_clipboard_ = XInternAtom(display_, "CLIPBOARD", False);
   atom_primary_ = XInternAtom(display_, "PRIMARY", False);
   atom_utf8_string_ = XInternAtom(display_, "UTF8_STRING", False);
-  atom_targets_ = XInternAtom(display_, "TARGETS", False);
 
   return true;
 }

@@ -110,7 +110,6 @@ private:
   Atom atom_clipboard_ = None;
   Atom atom_primary_ = None;
   Atom atom_utf8_string_ = None;
-  Atom atom_targets_ = None;
 };
 
 } // namespace punto

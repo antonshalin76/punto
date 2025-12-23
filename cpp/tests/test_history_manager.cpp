@@ -1,15 +1,27 @@
 #include "punto/history_manager.hpp"
 
-#include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <vector>
+
+namespace {
+
+[[noreturn]] void test_fail(const char* expr, const char* file, int line) {
+  std::cerr << "TEST FAIL: " << expr << " (" << file << ":" << line << ")\n";
+  std::abort();
+}
+
+#define CHECK(expr) \
+  do { \
+    if (!(expr)) { \
+      test_fail(#expr, __FILE__, __LINE__); \
+    } \
+  } while (0)
 
 using punto::HistoryManager;
 using punto::KeyEntry;
 using punto::ScanCode;
-
-namespace {
 
 constexpr ScanCode kA = 30; // arbitrary, not used for mapping in tests
 constexpr ScanCode kB = 48;
@@ -19,30 +31,30 @@ constexpr ScanCode kSpace = KEY_SPACE;
 void test_push_pop_cursor() {
   HistoryManager hm{5};
 
-  assert(hm.base_pos() == 0);
-  assert(hm.cursor_pos() == 0);
+  CHECK(hm.base_pos() == 0);
+  CHECK(hm.cursor_pos() == 0);
 
   hm.push_token(KeyEntry{kA, false});
   hm.push_token(KeyEntry{kB, true});
   hm.push_token(KeyEntry{kC, false});
 
-  assert(hm.base_pos() == 0);
-  assert(hm.cursor_pos() == 3);
+  CHECK(hm.base_pos() == 0);
+  CHECK(hm.cursor_pos() == 3);
 
   bool ok = hm.pop_token();
-  assert(ok);
-  assert(hm.cursor_pos() == 2);
+  CHECK(ok);
+  CHECK(hm.cursor_pos() == 2);
 
   ok = hm.pop_token();
-  assert(ok);
-  assert(hm.cursor_pos() == 1);
+  CHECK(ok);
+  CHECK(hm.cursor_pos() == 1);
 
   ok = hm.pop_token();
-  assert(ok);
-  assert(hm.cursor_pos() == 0);
+  CHECK(ok);
+  CHECK(hm.cursor_pos() == 0);
 
   ok = hm.pop_token();
-  assert(!ok);
+  CHECK(!ok);
 }
 
 void test_get_range() {
@@ -55,16 +67,16 @@ void test_get_range() {
 
   std::vector<KeyEntry> out;
   bool ok = hm.get_range(0, 3, out);
-  assert(ok);
-  assert(out.size() == 3);
-  assert(out[0].code == kA);
-  assert(out[1].code == kB);
-  assert(out[2].code == kC);
+  CHECK(ok);
+  CHECK(out.size() == 3);
+  CHECK(out[0].code == kA);
+  CHECK(out[1].code == kB);
+  CHECK(out[2].code == kC);
 
   ok = hm.get_range(3, 4, out);
-  assert(ok);
-  assert(out.size() == 1);
-  assert(out[0].code == kSpace);
+  CHECK(ok);
+  CHECK(out.size() == 1);
+  CHECK(out[0].code == kSpace);
 }
 
 void test_length_invariant_math_like_apply_correction() {
@@ -87,23 +99,25 @@ void test_length_invariant_math_like_apply_correction() {
   hm.push_token(KeyEntry{kSpace, false}); // 6
 
   const std::uint64_t cursor = hm.cursor_pos();
-  assert(cursor == 7);
+  CHECK(cursor == 7);
 
   std::vector<KeyEntry> tail;
   bool ok = hm.get_range(end_pos, cursor, tail);
-  assert(ok);
+  CHECK(ok);
 
   const std::size_t word_len = static_cast<std::size_t>(end_pos - start_pos);
   const std::size_t erase = static_cast<std::size_t>(cursor - start_pos);
   const std::size_t expected_retype = word_len + tail.size();
 
-  assert(word_len == 3);
-  assert(tail.size() == 4);
-  assert(erase == 7);
-  assert(expected_retype == erase);
+  CHECK(word_len == 3);
+  CHECK(tail.size() == 4);
+  CHECK(erase == 7);
+  CHECK(expected_retype == erase);
 }
 
 } // namespace
+
+#undef CHECK
 
 int main() {
   test_push_pop_cursor();

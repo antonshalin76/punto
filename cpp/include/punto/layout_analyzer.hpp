@@ -41,12 +41,6 @@ public:
   explicit LayoutAnalyzer(AutoSwitchConfig config);
 
   /**
-   * @brief Обновляет конфигурацию (для hot reload)
-   * @param config Новая конфигурация
-   */
-  void update_config(const AutoSwitchConfig &config);
-
-  /**
    * @brief Определяет, нужно ли переключать раскладку
    * @param word Буфер слова (скан-коды с информацией о Shift)
    * @return true если слово вероятно набрано в неправильной раскладке

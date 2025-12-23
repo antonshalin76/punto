@@ -179,21 +179,6 @@ bool IpcClient::set_status(bool enabled) {
   return ok_count > 0;
 }
 
-ServiceStatus IpcClient::toggle_status() {
-  ServiceStatus current = get_status();
-  
-  if (current == ServiceStatus::Unknown) {
-    return ServiceStatus::Unknown;
-  }
-
-  bool new_state = (current == ServiceStatus::Disabled);
-  if (set_status(new_state)) {
-    return new_state ? ServiceStatus::Enabled : ServiceStatus::Disabled;
-  }
-
-  return ServiceStatus::Unknown;
-}
-
 bool IpcClient::reload_config(const std::string& config_path) {
   std::string cmd = "RELOAD";
   if (!config_path.empty()) {

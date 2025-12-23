@@ -12,7 +12,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <span>
 
 #include "punto/types.hpp"
 
@@ -162,27 +161,6 @@ inline void fast_zero_buffer(void *buffer, std::size_t count) noexcept {
 #endif
 
 // ===========================================================================
-// Высокоуровневые обёртки
-// ===========================================================================
-
-/**
- * @brief Находит первый разделитель слова в буфере KeyEntry
- * @param entries Буфер KeyEntry
- * @return Индекс первого разделителя или размер буфера
- */
-[[nodiscard]] inline std::size_t
-find_word_end(std::span<const KeyEntry> entries) noexcept {
-
-  // Извлекаем скан-коды для оптимизированного поиска
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    if (entries[i].code == KEY_SPACE || entries[i].code == KEY_TAB) {
-      return i;
-    }
-  }
-  return entries.size();
-}
-
-// ===========================================================================
 // Prefetch hints для оптимизации кэша
 // ===========================================================================
 
@@ -190,13 +168,6 @@ find_word_end(std::span<const KeyEntry> entries) noexcept {
 inline void prefetch_read(const void *addr) noexcept {
 #if defined(__GNUC__) || defined(__clang__)
   __builtin_prefetch(addr, 0, 3);
-#endif
-}
-
-/// Prefetch данные для записи (L1 кэш)
-inline void prefetch_write(const void *addr) noexcept {
-#if defined(__GNUC__) || defined(__clang__)
-  __builtin_prefetch(addr, 1, 3);
 #endif
 }
 

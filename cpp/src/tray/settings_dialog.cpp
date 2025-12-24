@@ -288,6 +288,14 @@ std::string parse_value(const std::string &line) {
   return trim(line.substr(pos + 1));
 }
 
+/// Извлекает ключ (до первого двоеточия) из строки YAML
+std::string parse_key(const std::string &line) {
+  auto pos = line.find(':');
+  if (pos == std::string::npos)
+    return "";
+  return trim(line.substr(0, pos));
+}
+
 /// Парсит double в независимости от локали (использует C locale)
 bool parse_double_clocale(const std::string &text, double &out) {
   std::istringstream ss(text);
@@ -379,54 +387,55 @@ SettingsData SettingsDialog::load_settings() {
     if (value.empty())
       continue;
 
+    std::string key = parse_key(trimmed);
+    if (key.empty())
+      continue;
+
     if (section == "hotkey") {
-      if (trimmed.find("modifier:") != std::string::npos) {
+      if (key == "modifier") {
         settings.modifier = value;
-      } else if (trimmed.find("key:") != std::string::npos) {
+      } else if (key == "key") {
         settings.key = value;
       }
     } else if (section == "delays") {
-      if (trimmed.find("key_press:") != std::string::npos) {
+      if (key == "key_press") {
         settings.key_press = std::stoi(value);
-      } else if (trimmed.find("layout_switch:") != std::string::npos) {
+      } else if (key == "layout_switch") {
         settings.layout_switch = std::stoi(value);
-      } else if (trimmed.find("retype:") != std::string::npos &&
-                 trimmed.find("turbo") == std::string::npos) {
+      } else if (key == "retype") {
         settings.retype = std::stoi(value);
-      } else if (trimmed.find("turbo_key_press:") != std::string::npos) {
+      } else if (key == "turbo_key_press") {
         settings.turbo_key_press = std::stoi(value);
-      } else if (trimmed.find("turbo_retype:") != std::string::npos) {
+      } else if (key == "turbo_retype") {
         settings.turbo_retype = std::stoi(value);
       }
     } else if (section == "auto_switch") {
-      if (trimmed.find("enabled:") != std::string::npos) {
+      if (key == "enabled") {
         settings.auto_enabled = (value == "true" || value == "1");
-      } else if (trimmed.find("threshold:") != std::string::npos) {
+      } else if (key == "threshold") {
         double v{};
         if (parse_double_clocale(value, v)) {
           settings.threshold = v;
         }
-      } else if (trimmed.find("min_word_len:") != std::string::npos) {
+      } else if (key == "min_word_len") {
         settings.min_word_len = std::stoi(value);
-      } else if (trimmed.find("min_score:") != std::string::npos) {
+      } else if (key == "min_score") {
         double v{};
         if (parse_double_clocale(value, v)) {
           settings.min_score = v;
         }
-      } else if (trimmed.find("max_rollback_words:") != std::string::npos) {
+      } else if (key == "max_rollback_words") {
         settings.max_rollback_words = std::stoi(value);
-      } else if (trimmed.find("typo_correction_enabled:") !=
-                 std::string::npos) {
+      } else if (key == "typo_correction_enabled") {
         settings.typo_correction_enabled = (value == "true" || value == "1");
-      } else if (trimmed.find("max_typo_diff:") != std::string::npos) {
+      } else if (key == "max_typo_diff") {
         settings.max_typo_diff = std::stoi(value);
-      } else if (trimmed.find("sticky_shift_correction_enabled:") !=
-                 std::string::npos) {
+      } else if (key == "sticky_shift_correction_enabled") {
         settings.sticky_shift_correction_enabled =
             (value == "true" || value == "1");
       }
     } else if (section == "sound") {
-      if (trimmed.find("enabled:") != std::string::npos) {
+      if (key == "enabled") {
         settings.sound_enabled = (value == "true" || value == "1");
       }
     }

@@ -4,8 +4,8 @@
  */
 
 #include "punto/event_loop.hpp"
-#include "punto/sound_manager.hpp"
 #include "punto/scancode_map.hpp"
+#include "punto/sound_manager.hpp"
 #include "punto/text_processor.hpp"
 
 #include <cerrno>
@@ -50,8 +50,8 @@ bool EventLoop::initialize() {
   x11_session_ = std::make_unique<X11Session>();
   bool x11_ok = x11_session_->initialize();
 
-  // После X11 инициализации можем вычислить реальный $HOME активного пользователя
-  // и перечитать ~/.config/... (если существует).
+  // После X11 инициализации можем вычислить реальный $HOME активного
+  // пользователя и перечитать ~/.config/... (если существует).
   {
     IpcResult res = reload_config();
     if (!res.success) {
@@ -100,10 +100,9 @@ bool EventLoop::initialize() {
   }
 
   // Создаём IPC сервер для управления из tray-приложения
-  ipc_server_ = std::make_unique<IpcServer>(ipc_enabled_,
-                                           [this](const std::string &path) {
-                                             return reload_config(path);
-                                           });
+  ipc_server_ = std::make_unique<IpcServer>(
+      ipc_enabled_,
+      [this](const std::string &path) { return reload_config(path); });
   if (!ipc_server_->start()) {
     std::cerr << "[punto] Warning: IPC server failed to start. "
                  "Tray control will be unavailable.\n";
@@ -140,7 +139,8 @@ int EventLoop::run() {
 
   while (true) {
     // Важно: даже если пользователь перестал печатать, мы должны
-    // применять готовые результаты анализа (иначе автоинверсия может не сработать).
+    // применять готовые результаты анализа (иначе автоинверсия может не
+    // сработать).
     process_ready_results();
 
     pfd.revents = 0;
@@ -405,7 +405,8 @@ void EventLoop::handle_event(const input_event &ev) {
     meta.end_pos = delim_pos;
 
     if (meta.end_pos < meta.word.size()) {
-      // Не должно происходить, но fail-fast: не ставим задачу, чтобы не сломать sequencer.
+      // Не должно происходить, но fail-fast: не ставим задачу, чтобы не сломать
+      // sequencer.
       WordResult res;
       res.task_id = task_id;
       res.need_switch = false;
@@ -416,7 +417,8 @@ void EventLoop::handle_event(const input_event &ev) {
       return;
     }
 
-    meta.start_pos = meta.end_pos - static_cast<std::uint64_t>(meta.word.size());
+    meta.start_pos =
+        meta.end_pos - static_cast<std::uint64_t>(meta.word.size());
 
     pending_words_[task_id] = meta;
 
@@ -638,8 +640,8 @@ bool EventLoop::set_layout(int target_layout, bool play_sound) {
 
     bool ok = x11_session_->set_keyboard_layout(target_layout);
 
-    // Важно: set_keyboard_layout() в некоторых окружениях может возвращать успех,
-    // но фактически раскладка не меняется. Проверяем состоянием XKB.
+    // Важно: set_keyboard_layout() в некоторых окружениях может возвращать
+    // успех, но фактически раскладка не меняется. Проверяем состоянием XKB.
     int os_layout = x11_session_->get_current_keyboard_layout();
     if (ok && os_layout == target_layout) {
       current_layout_ = target_layout;
@@ -665,7 +667,8 @@ bool EventLoop::set_layout(int target_layout, bool play_sound) {
 
     // Best-effort: сверяемся с ОС после хоткея.
     // Важно: сразу после переключения XKB state может обновиться с задержкой,
-    // поэтому не «откатываем» внутреннее состояние назад, если ОС ещё не успела.
+    // поэтому не «откатываем» внутреннее состояние назад, если ОС ещё не
+    // успела.
     if (x11_session_ && x11_session_->is_valid()) {
       x11_session_->apply_environment();
       int os_layout = x11_session_->get_current_keyboard_layout();
@@ -675,8 +678,7 @@ bool EventLoop::set_layout(int target_layout, bool play_sound) {
           last_sync_time_ = std::chrono::steady_clock::now();
         } else {
           std::cerr << "[punto] Layout SYNC(hotkey): os_layout=" << os_layout
-                    << " expected=" << target_layout
-                    << " (may be delayed)\n";
+                    << " expected=" << target_layout << " (may be delayed)\n";
         }
       }
     }
@@ -926,8 +928,9 @@ void EventLoop::wait_and_buffer(std::chrono::microseconds us) {
             static bool warned = false;
             if (!warned) {
               warned = true;
-              std::cerr << "[punto] Input Guard(wait): pending_events overflow cap="
-                        << kPendingEventsCap << " (dropping input events)\n";
+              std::cerr
+                  << "[punto] Input Guard(wait): pending_events overflow cap="
+                  << kPendingEventsCap << " (dropping input events)\n";
             }
           }
         }
@@ -987,7 +990,8 @@ void EventLoop::flush_pending_release_frames() {
     }
 
     // Mixed frame: try to forward ONLY those EV_KEY releases that correspond
-    // to keys already pressed in the app (key_down_ == true). Keep everything else.
+    // to keys already pressed in the app (key_down_ == true). Keep everything
+    // else.
     bool forwarded_any = false;
 
     for (const auto &e : frame) {
@@ -1109,20 +1113,71 @@ void EventLoop::process_ready_results() {
       break;
     }
 
-    WordResult res = it->second;
+    WordResult res = std::move(it->second);
     ready_results_.erase(it);
 
-    if (res.need_switch) {
+    // Проверяем, нужна ли какая-либо коррекция
+    const bool has_correction =
+        (res.correction_type != CorrectionType::NoCorrection);
+
+    if (has_correction) {
       std::cerr << "[punto] Async-DECISION: task_id=" << res.task_id
                 << " word_len=" << res.word_len
                 << " analysis_len=" << res.analysis_len
+                << " correction_type=" << static_cast<int>(res.correction_type)
                 << " queue_us=" << res.queue_us
                 << " analysis_us=" << res.analysis_us << "\n";
 
       auto mit = pending_words_.find(res.task_id);
       if (mit != pending_words_.end()) {
-        const int target_layout = (mit->second.layout_at_boundary == 0) ? 1 : 0;
-        apply_correction(mit->second, target_layout);
+        // Определяем тип коррекции и вызываем соответствующий метод
+        switch (res.correction_type) {
+        case CorrectionType::LayoutSwitch: {
+          // Стандартное переключение раскладки (v2.6 логика)
+          const int target_layout =
+              (mit->second.layout_at_boundary == 0) ? 1 : 0;
+          apply_correction(mit->second, target_layout);
+          break;
+        }
+
+        case CorrectionType::StickyShiftFix: {
+          // Исправление регистра БЕЗ смены раскладки (ПРивет -> Привет)
+          if (res.correction.has_value()) {
+            apply_case_correction(mit->second, res.correction.value());
+          }
+          break;
+        }
+
+        case CorrectionType::CombinedFix: {
+          // Комбинированное исправление: смена раскладки + исправление регистра
+          // (GHbdtn -> Привет)
+          if (res.correction.has_value()) {
+            const int target_layout =
+                (mit->second.layout_at_boundary == 0) ? 1 : 0;
+            apply_combined_correction(mit->second, target_layout,
+                                      res.correction.value());
+          }
+          break;
+        }
+
+        case CorrectionType::TypoFix: {
+          // Исправление опечатки (v2.7+)
+          // Используем ту же логику, что и для case fix —
+          // она поддерживает разную длину слов
+          if (res.correction.has_value()) {
+            std::cerr << "[punto] TYPO-FIX: task_id=" << res.task_id
+                      << " original_len=" << mit->second.word.size()
+                      << " corrected_len=" << res.correction.value().size()
+                      << "\n";
+            apply_case_correction(mit->second, res.correction.value());
+          }
+          break;
+        }
+
+        case CorrectionType::NoCorrection:
+        default:
+          break;
+        }
       } else {
         std::cerr << "[punto] Async: missing meta for task_id=" << res.task_id
                   << " (skip)\n";
@@ -1155,13 +1210,11 @@ void EventLoop::process_ready_results() {
               << " max_queue_us=" << telemetry_.queue_us_max
               << " avg_analysis_us=" << avg_analysis
               << " max_analysis_us=" << telemetry_.analysis_us_max
-              << " corrections=" << corr
-              << " avg_macro_us=" << avg_macro
+              << " corrections=" << corr << " avg_macro_us=" << avg_macro
               << " max_macro_us=" << telemetry_.correction_us_max
               << " avg_tail_len=" << avg_tail
               << " max_tail_len=" << telemetry_.tail_len_max
-              << " xkb_set=" << (xkb_set_available_ ? "on" : "off")
-              << "\n";
+              << " xkb_set=" << (xkb_set_available_ ? "on" : "off") << "\n";
 
     telemetry_.last_report_at = now;
 
@@ -1180,7 +1233,8 @@ void EventLoop::process_ready_results() {
   }
 }
 
-void EventLoop::apply_correction(const PendingWordMeta &meta, int target_layout) {
+void EventLoop::apply_correction(const PendingWordMeta &meta,
+                                 int target_layout) {
   if (meta.word.empty()) {
     return;
   }
@@ -1197,16 +1251,17 @@ void EventLoop::apply_correction(const PendingWordMeta &meta, int target_layout)
   const std::uint64_t base = history_.base_pos();
 
   if (meta.start_pos < base || meta.end_pos > cursor) {
-    std::cerr << "[punto] Async: history window miss for task_id=" << meta.task_id
-              << " (base=" << base << " end=" << cursor << " start="
-              << meta.start_pos << " word_end=" << meta.end_pos << ")\n";
+    std::cerr << "[punto] Async: history window miss for task_id="
+              << meta.task_id << " (base=" << base << " end=" << cursor
+              << " start=" << meta.start_pos << " word_end=" << meta.end_pos
+              << ")\n";
     return;
   }
 
   // Tail = всё после слова (включая разделитель) до текущей позиции.
   if (!history_.get_range(meta.end_pos, cursor, tail_scratch_)) {
-    std::cerr << "[punto] Async: failed to get tail for task_id=" << meta.task_id
-              << "\n";
+    std::cerr << "[punto] Async: failed to get tail for task_id="
+              << meta.task_id << "\n";
     return;
   }
 
@@ -1223,15 +1278,15 @@ void EventLoop::apply_correction(const PendingWordMeta &meta, int target_layout)
   }
 
   const bool has_delim =
-      !tail_scratch_.empty() &&
-      (tail_scratch_.front().code == KEY_SPACE || tail_scratch_.front().code == KEY_TAB);
+      !tail_scratch_.empty() && (tail_scratch_.front().code == KEY_SPACE ||
+                                 tail_scratch_.front().code == KEY_TAB);
   const ScanCode delim_code = has_delim ? tail_scratch_.front().code : 0;
 
   const std::span<const KeyEntry> tail_after_delim =
-      has_delim
-          ? std::span<const KeyEntry>{tail_scratch_.data() + 1,
-                                      tail_scratch_.size() - 1}
-          : std::span<const KeyEntry>{tail_scratch_.data(), tail_scratch_.size()};
+      has_delim ? std::span<const KeyEntry>{tail_scratch_.data() + 1,
+                                            tail_scratch_.size() - 1}
+                : std::span<const KeyEntry>{tail_scratch_.data(),
+                                            tail_scratch_.size()};
 
   bool tail_layout_invariant = true;
   for (const KeyEntry &e : tail_after_delim) {
@@ -1242,9 +1297,10 @@ void EventLoop::apply_correction(const PendingWordMeta &meta, int target_layout)
   }
 
   std::cerr << "[punto] Async-CORRECT: task_id=" << meta.task_id
-            << " word_len=" << meta.word.size() << " tail_len="
-            << tail_scratch_.size() << " delim="
-            << (has_delim ? (delim_code == KEY_SPACE ? "SPACE" : "TAB") : "<none>")
+            << " word_len=" << meta.word.size()
+            << " tail_len=" << tail_scratch_.size() << " delim="
+            << (has_delim ? (delim_code == KEY_SPACE ? "SPACE" : "TAB")
+                          : "<none>")
             << " tail_invariant=" << (tail_layout_invariant ? 1 : 0) << "\n";
 
   is_processing_macro_ = true;
@@ -1258,8 +1314,9 @@ void EventLoop::apply_correction(const PendingWordMeta &meta, int target_layout)
   injector->release_all_modifiers();
 
   // Даем физическим key-release шанс прийти в stdin.
-  // Иначе мы можем инжектировать нажатия, пока клавиша ещё "зажата" для приложения
-  // (особенно последняя буква и SPACE), и тогда press будет проигнорирован.
+  // Иначе мы можем инжектировать нажатия, пока клавиша ещё "зажата" для
+  // приложения (особенно последняя буква и SPACE), и тогда press будет
+  // проигнорирован.
   wait_and_buffer(cfg->delays.key_press + std::chrono::microseconds{30000});
   flush_pending_release_frames();
 
@@ -1284,12 +1341,14 @@ void EventLoop::apply_correction(const PendingWordMeta &meta, int target_layout)
     return true;
   };
 
-  // Важно: если мы не можем реально переключить раскладку, лучше не удалять текст.
-  // Иначе получим «звук есть, а коррекция не произошла» или испортим хвост.
+  // Важно: если мы не можем реально переключить раскладку, лучше не удалять
+  // текст. Иначе получим «звук есть, а коррекция не произошла» или испортим
+  // хвост.
   if (tail_layout_invariant) {
     if (!set_layout(target_layout, false)) {
-      std::cerr << "[punto] Async: failed to set target layout=" << target_layout
-                << " for task_id=" << meta.task_id << " (skip)\n";
+      std::cerr << "[punto] Async: failed to set target layout="
+                << target_layout << " for task_id=" << meta.task_id
+                << " (skip)\n";
       return;
     }
     wait_and_buffer(cfg->delays.layout_switch);
@@ -1299,8 +1358,9 @@ void EventLoop::apply_correction(const PendingWordMeta &meta, int target_layout)
   } else {
     // Preflight: проверяем оба направления переключения до удаления.
     if (!set_layout(target_layout, false)) {
-      std::cerr << "[punto] Async: failed to set target layout=" << target_layout
-                << " for task_id=" << meta.task_id << " (skip)\n";
+      std::cerr << "[punto] Async: failed to set target layout="
+                << target_layout << " for task_id=" << meta.task_id
+                << " (skip)\n";
       return;
     }
     wait_and_buffer(cfg->delays.layout_switch);
@@ -1386,10 +1446,9 @@ void EventLoop::apply_correction(const PendingWordMeta &meta, int target_layout)
   }
 
   const auto macro_end = std::chrono::steady_clock::now();
-  const auto macro_us =
-      std::chrono::duration_cast<std::chrono::microseconds>(macro_end -
-                                                           macro_start)
-          .count();
+  const auto macro_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            macro_end - macro_start)
+                            .count();
 
   telemetry_.corrections++;
   telemetry_.correction_us_sum += static_cast<std::uint64_t>(macro_us);
@@ -1403,6 +1462,247 @@ void EventLoop::apply_correction(const PendingWordMeta &meta, int target_layout)
   }
 
   std::cerr << "[punto] Async-MACRO: task_id=" << meta.task_id
+            << " macro_us=" << macro_us << "\n";
+}
+
+void EventLoop::apply_case_correction(
+    const PendingWordMeta &meta, const std::vector<KeyEntry> &corrected_word) {
+
+  if (meta.word.empty() || corrected_word.empty()) {
+    return;
+  }
+
+  auto cfg = std::atomic_load(&config_);
+  auto injector = std::atomic_load(&injector_);
+  if (!injector) {
+    return;
+  }
+
+  const std::uint64_t cursor = history_.cursor_pos();
+  const std::uint64_t base = history_.base_pos();
+
+  if (meta.start_pos < base || meta.end_pos > cursor) {
+    std::cerr
+        << "[punto] Async: history window miss for case correction task_id="
+        << meta.task_id << "\n";
+    return;
+  }
+
+  // Tail = всё после слова до текущей позиции
+  if (!history_.get_range(meta.end_pos, cursor, tail_scratch_)) {
+    std::cerr
+        << "[punto] Async: failed to get tail for case correction task_id="
+        << meta.task_id << "\n";
+    return;
+  }
+
+  const std::uint64_t erase64 = cursor - meta.start_pos;
+  const std::size_t erase = static_cast<std::size_t>(erase64);
+
+  // Для case correction длина может совпадать с исходной
+  // (ПРивет -> Привет имеют одинаковую длину)
+
+  std::cerr << "[punto] Async-CASE-FIX: task_id=" << meta.task_id
+            << " word_len=" << meta.word.size()
+            << " corrected_len=" << corrected_word.size()
+            << " tail_len=" << tail_scratch_.size() << "\n";
+
+  is_processing_macro_ = true;
+  struct DrainGuard {
+    EventLoop *self;
+    ~DrainGuard() { self->drain_pending_events(); }
+  } drain_guard{this};
+
+  const auto macro_start = std::chrono::steady_clock::now();
+
+  injector->release_all_modifiers();
+  wait_and_buffer(cfg->delays.key_press + std::chrono::microseconds{30000});
+  flush_pending_release_frames();
+  wait_and_buffer(cfg->delays.turbo_key_press);
+  flush_pending_release_frames();
+
+  // 1) Удаляем слово + хвост
+  injector->send_backspace(erase, true);
+  flush_pending_release_frames();
+
+  // 2) Печатаем исправленное слово (с правильным регистром)
+  injector->retype_buffer(
+      std::span<const KeyEntry>{corrected_word.data(), corrected_word.size()},
+      true);
+
+  // 3) Печатаем хвост
+  if (!tail_scratch_.empty()) {
+    // Разделитель
+    const bool has_delim = (tail_scratch_.front().code == KEY_SPACE ||
+                            tail_scratch_.front().code == KEY_TAB);
+    const ScanCode delim_code = has_delim ? tail_scratch_.front().code : 0;
+
+    if (has_delim && delim_code != 0) {
+      flush_pending_release_frames();
+      wait_and_buffer(cfg->delays.key_press);
+      injector->tap_key(delim_code, false, false);
+    }
+
+    const std::span<const KeyEntry> tail_after_delim =
+        has_delim ? std::span<const KeyEntry>{tail_scratch_.data() + 1,
+                                              tail_scratch_.size() - 1}
+                  : std::span<const KeyEntry>{tail_scratch_.data(),
+                                              tail_scratch_.size()};
+
+    if (!tail_after_delim.empty()) {
+      injector->retype_buffer(tail_after_delim, true);
+    }
+  }
+
+  const auto macro_end = std::chrono::steady_clock::now();
+  const auto macro_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            macro_end - macro_start)
+                            .count();
+
+  telemetry_.corrections++;
+  telemetry_.correction_us_sum += static_cast<std::uint64_t>(macro_us);
+  if (static_cast<std::uint64_t>(macro_us) > telemetry_.correction_us_max) {
+    telemetry_.correction_us_max = static_cast<std::uint64_t>(macro_us);
+  }
+
+  std::cerr << "[punto] Async-CASE-MACRO: task_id=" << meta.task_id
+            << " macro_us=" << macro_us << "\n";
+}
+
+void EventLoop::apply_combined_correction(
+    const PendingWordMeta &meta, int target_layout,
+    const std::vector<KeyEntry> &corrected_word) {
+
+  if (meta.word.empty() || corrected_word.empty()) {
+    return;
+  }
+
+  auto cfg = std::atomic_load(&config_);
+  auto injector = std::atomic_load(&injector_);
+  if (!injector) {
+    return;
+  }
+
+  const std::uint64_t cursor = history_.cursor_pos();
+  const std::uint64_t base = history_.base_pos();
+
+  if (meta.start_pos < base || meta.end_pos > cursor) {
+    std::cerr
+        << "[punto] Async: history window miss for combined correction task_id="
+        << meta.task_id << "\n";
+    return;
+  }
+
+  if (!history_.get_range(meta.end_pos, cursor, tail_scratch_)) {
+    std::cerr
+        << "[punto] Async: failed to get tail for combined correction task_id="
+        << meta.task_id << "\n";
+    return;
+  }
+
+  const std::uint64_t erase64 = cursor - meta.start_pos;
+  const std::size_t erase = static_cast<std::size_t>(erase64);
+
+  std::cerr << "[punto] Async-COMBINED-FIX: task_id=" << meta.task_id
+            << " word_len=" << meta.word.size()
+            << " corrected_len=" << corrected_word.size()
+            << " tail_len=" << tail_scratch_.size()
+            << " target_layout=" << target_layout << "\n";
+
+  is_processing_macro_ = true;
+  struct DrainGuard {
+    EventLoop *self;
+    ~DrainGuard() { self->drain_pending_events(); }
+  } drain_guard{this};
+
+  const auto macro_start = std::chrono::steady_clock::now();
+
+  injector->release_all_modifiers();
+  wait_and_buffer(cfg->delays.key_press + std::chrono::microseconds{30000});
+  flush_pending_release_frames();
+  wait_and_buffer(cfg->delays.turbo_key_press);
+  flush_pending_release_frames();
+
+  // Переключаем раскладку ПЕРЕД удалением
+  if (!set_layout(target_layout, false)) {
+    std::cerr << "[punto] Async: failed to set target layout=" << target_layout
+              << " for combined correction task_id=" << meta.task_id
+              << " (skip)\n";
+    return;
+  }
+  wait_and_buffer(cfg->delays.layout_switch);
+
+  // 1) Удаляем слово + хвост
+  injector->send_backspace(erase, true);
+  flush_pending_release_frames();
+
+  // 2) Печатаем исправленное слово в целевой раскладке
+  injector->retype_buffer(
+      std::span<const KeyEntry>{corrected_word.data(), corrected_word.size()},
+      true);
+
+  // 3) Печатаем хвост
+  if (!tail_scratch_.empty()) {
+    const bool has_delim = (tail_scratch_.front().code == KEY_SPACE ||
+                            tail_scratch_.front().code == KEY_TAB);
+    const ScanCode delim_code = has_delim ? tail_scratch_.front().code : 0;
+
+    if (has_delim && delim_code != 0) {
+      flush_pending_release_frames();
+      wait_and_buffer(cfg->delays.key_press);
+      injector->tap_key(delim_code, false, false);
+    }
+
+    const std::span<const KeyEntry> tail_after_delim =
+        has_delim ? std::span<const KeyEntry>{tail_scratch_.data() + 1,
+                                              tail_scratch_.size() - 1}
+                  : std::span<const KeyEntry>{tail_scratch_.data(),
+                                              tail_scratch_.size()};
+
+    if (!tail_after_delim.empty()) {
+      // Хвост может быть в другой раскладке - нужно вернуться назад
+      const int original_layout = meta.layout_at_boundary;
+
+      // Проверяем, есть ли буквы в хвосте
+      bool tail_has_letters = false;
+      for (const auto &e : tail_after_delim) {
+        if (e.code != KEY_SPACE && e.code != KEY_TAB) {
+          tail_has_letters = true;
+          break;
+        }
+      }
+
+      if (tail_has_letters) {
+        (void)set_layout(original_layout, false);
+        wait_and_buffer(cfg->delays.layout_switch);
+      }
+
+      injector->retype_buffer(tail_after_delim, true);
+
+      // Возвращаем целевую раскладку
+      if (tail_has_letters) {
+        (void)set_layout(target_layout, false);
+        wait_and_buffer(cfg->delays.layout_switch);
+      }
+    }
+  }
+
+  if (sound_manager_) {
+    sound_manager_->play_for_layout(target_layout);
+  }
+
+  const auto macro_end = std::chrono::steady_clock::now();
+  const auto macro_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            macro_end - macro_start)
+                            .count();
+
+  telemetry_.corrections++;
+  telemetry_.correction_us_sum += static_cast<std::uint64_t>(macro_us);
+  if (static_cast<std::uint64_t>(macro_us) > telemetry_.correction_us_max) {
+    telemetry_.correction_us_max = static_cast<std::uint64_t>(macro_us);
+  }
+
+  std::cerr << "[punto] Async-COMBINED-MACRO: task_id=" << meta.task_id
             << " macro_us=" << macro_us << "\n";
 }
 
@@ -1473,13 +1773,14 @@ IpcResult EventLoop::reload_config(const std::string &config_path) {
   ConfigLoadOutcome loaded = load_config_checked(load_path);
   if (loaded.result != ConfigResult::Ok) {
     std::cerr << "[punto] Config reload failed: " << loaded.error << "\\n";
-    return {false, loaded.error.empty() ? "Config reload failed" : loaded.error};
+    return {false,
+            loaded.error.empty() ? "Config reload failed" : loaded.error};
   }
 
   auto new_cfg = std::make_shared<Config>(std::move(loaded.config));
 
-  // Всегда синхронизируем runtime-статус автопереключения с конфигом при RELOAD.
-  // Это делает файл конфигурации единым источником истины и устраняет
+  // Всегда синхронизируем runtime-статус автопереключения с конфигом при
+  // RELOAD. Это делает файл конфигурации единым источником истины и устраняет
   // рассинхронизацию после SET_STATUS (runtime-only).
   ipc_enabled_.store(new_cfg->auto_switch.enabled, std::memory_order_relaxed);
 
@@ -1507,10 +1808,10 @@ IpcResult EventLoop::reload_config(const std::string &config_path) {
             << ", threshold=" << new_cfg->auto_switch.threshold
             << ", min_word_len=" << new_cfg->auto_switch.min_word_len
             << ", min_score=" << new_cfg->auto_switch.min_score
-            << ", max_rollback_words=" << new_cfg->auto_switch.max_rollback_words
-            << '\n';
+            << ", max_rollback_words="
+            << new_cfg->auto_switch.max_rollback_words << '\n';
 
-  std::string message = "Loaded "+loaded.used_path.string();
+  std::string message = "Loaded " + loaded.used_path.string();
   if (!explicit_path && tried_user && !user_exists) {
     message += " (user config not found; using system config)";
   }

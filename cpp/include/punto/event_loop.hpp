@@ -22,11 +22,11 @@
 
 #include "punto/analysis_worker_pool.hpp"
 #include "punto/clipboard_manager.hpp"
-#include "punto/ipc_server.hpp"
 #include "punto/config.hpp"
 #include "punto/dictionary.hpp"
 #include "punto/history_manager.hpp"
 #include "punto/input_buffer.hpp"
+#include "punto/ipc_server.hpp"
 #include "punto/key_injector.hpp"
 #include "punto/layout_analyzer.hpp"
 #include "punto/types.hpp"
@@ -120,7 +120,8 @@ private:
   /// Используется как fallback, если XKB недоступен.
   void switch_layout(bool play_sound);
 
-  /// Устанавливает раскладку (0/1) через XKB (XkbLockGroup) с fallback на hotkey.
+  /// Устанавливает раскладку (0/1) через XKB (XkbLockGroup) с fallback на
+  /// hotkey.
   /// @param target_layout 0 = EN, 1 = RU
   /// @param play_sound Проигрывать ли звук (только для финального переключения)
   /// @return true если удалось применить переключение
@@ -141,16 +142,18 @@ private:
   void drain_pending_events();
 
   /// Во время макроса мы буферизуем ввод. Если макрос стартует очень быстро,
-  /// key-release (в т.ч. для SPACE/последней буквы) может оказаться в pending_events_,
-  /// и тогда инжектируемые нажатия этой же клавиши могут быть проигнорированы,
-  /// потому что для приложения клавиша всё ещё "зажата".
+  /// key-release (в т.ч. для SPACE/последней буквы) может оказаться в
+  /// pending_events_, и тогда инжектируемые нажатия этой же клавиши могут быть
+  /// проигнорированы, потому что для приложения клавиша всё ещё "зажата".
   ///
   /// Этот метод "пропускает" наружу только те фреймы (до SYN_REPORT),
-  /// которые НЕ содержат EV_KEY press/repeat (т.е. только release и служебные события).
-  /// Фреймы с press/repeat остаются в очереди и будут обработаны после макроса.
+  /// которые НЕ содержат EV_KEY press/repeat (т.е. только release и служебные
+  /// события). Фреймы с press/repeat остаются в очереди и будут обработаны
+  /// после макроса.
   void flush_pending_release_frames();
 
-  /// Проверяет готовые результаты анализа и (при необходимости) применяет коррекции
+  /// Проверяет готовые результаты анализа и (при необходимости) применяет
+  /// коррекции
   void process_ready_results();
 
   struct PendingWordMeta {
@@ -164,7 +167,18 @@ private:
     std::chrono::steady_clock::time_point boundary_at{};
   };
 
+  /// Применяет коррекцию раскладки (v2.6 логика)
   void apply_correction(const PendingWordMeta &meta, int target_layout);
+
+  /// Применяет коррекцию только регистра БЕЗ смены раскладки (sticky shift fix)
+  /// Например: ПРивет -> Привет в той же раскладке
+  void apply_case_correction(const PendingWordMeta &meta,
+                             const std::vector<KeyEntry> &corrected_word);
+
+  /// Применяет комбинированную коррекцию: смена раскладки + исправление
+  /// регистра Например: GHbdtn -> Привет (EN -> RU + case fix)
+  void apply_combined_correction(const PendingWordMeta &meta, int target_layout,
+                                 const std::vector<KeyEntry> &corrected_word);
 
   // =========================================================================
   // Состояние
@@ -252,7 +266,7 @@ private:
 
   /// Перезагружает конфигурацию (вызывается из IPC потока)
   /// Если config_path не пуст, пытается загрузить именно этот файл.
-  IpcResult reload_config(const std::string& config_path = {});
+  IpcResult reload_config(const std::string &config_path = {});
 };
 
 } // namespace punto

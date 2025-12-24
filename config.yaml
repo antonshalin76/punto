@@ -1,5 +1,6 @@
 # Punto Switcher Configuration
 # Путь по умолчанию: /etc/punto/config.yaml
+# Config version: 2.7.0
 
 # Хоткей переключения раскладки
 # Доступные модификаторы: leftctrl, rightctrl, leftalt, rightalt, leftshift, rightshift
@@ -27,6 +28,11 @@ auto_switch:
   min_word_len: 2
   min_score: 5.0
   max_rollback_words: 5
+  
+  # Исправление опечаток (v2.7+)
+  typo_correction_enabled: false     # Исправление опечаток (перестановки, замены, пропуски, дубли)
+  max_typo_diff: 2                  # Максимальное расстояние редактирования (1-2)
+  sticky_shift_correction_enabled: true  # Исправление залипшего Shift (ПРивет -> Привет)
 
 # Звуковая индикация переключения раскладки
 sound:

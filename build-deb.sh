@@ -1,13 +1,13 @@
 #!/bin/bash
 # =============================================================================
-# Сборка deb-пакета Punto Switcher v2.6.0 (C++20 версия)
+# Сборка deb-пакета Punto Switcher v2.7.0 (C++20 версия)
 # =============================================================================
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-VERSION="2.6.0"
+VERSION="2.7.0"
 PACKAGE_NAME="punto-switcher"
 BUILD_DIR="build-deb"
 CPP_BUILD_DIR="cpp/build"
@@ -189,8 +189,12 @@ mkdir -p "$BUILD_DIR/usr/share/punto-switcher"
 mkdir -p "$BUILD_DIR/usr/share/punto-switcher/sounds"
 mkdir -p "$BUILD_DIR/etc/xdg/autostart"
 
-# Копируем бинарник
-cp cpp/build/punto "$BUILD_DIR/usr/local/bin/"
+# Копируем бинарник daemon
+cp cpp/build/punto "$BUILD_DIR/usr/local/bin/punto-daemon"
+chmod 755 "$BUILD_DIR/usr/local/bin/punto-daemon"
+
+# Копируем CLI wrapper
+cp punto-cli.sh "$BUILD_DIR/usr/local/bin/punto"
 chmod 755 "$BUILD_DIR/usr/local/bin/punto"
 
 # Копируем tray-приложение и desktop entry

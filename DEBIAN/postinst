@@ -5,9 +5,44 @@ set -e
 mkdir -p /etc/punto
 mkdir -p /etc/interception
 
-# Установка конфигурации (если не существует)
-if [ ! -f /etc/punto/config.yaml ]; then
-    cp /usr/share/punto-switcher/config.yaml /etc/punto/config.yaml
+# Определяем версию пакета
+PKG_VERSION="2.7.0"
+CONFIG_FILE="/etc/punto/config.yaml"
+NEW_CONFIG="/usr/share/punto-switcher/config.yaml"
+
+# Функция для получения версии из конфига
+get_config_version() {
+    if [ -f "$1" ]; then
+        # Ищем строку вида "# Config version: X.X.X" в первых 10 строках
+        grep -m1 "# Config version:" "$1" 2>/dev/null | sed 's/.*: //' || echo "0.0.0"
+    else
+        echo "0.0.0"
+    fi
+}
+
+# Проверяем нужно ли обновить конфиг
+if [ -f "$CONFIG_FILE" ]; then
+    CURRENT_VERSION=$(get_config_version "$CONFIG_FILE")
+    NEW_VERSION=$(get_config_version "$NEW_CONFIG")
+    
+    echo "Текущая версия конфига: $CURRENT_VERSION"
+    echo "Новая версия конфига: $NEW_VERSION"
+    
+    # Если конфиг старый или версии нет - обновляем
+    if [ "$CURRENT_VERSION" != "$NEW_VERSION" ] || [ "$CURRENT_VERSION" = "0.0.0" ]; then
+        BACKUP_FILE="/etc/punto/config.yaml.backup-$(date +%Y%m%d-%H%M%S)"
+        echo "Обновление конфигурации..."
+        echo "  Backup: $BACKUP_FILE"
+        cp "$CONFIG_FILE" "$BACKUP_FILE"
+        cp "$NEW_CONFIG" "$CONFIG_FILE"
+        echo "  ✓ Конфиг обновлён (старый сохранён в backup)"
+    else
+        echo "  Конфиг актуальный, обновление не требуется"
+    fi
+else
+    # Первая установка
+    echo "Установка начального конфига..."
+    cp "$NEW_CONFIG" "$CONFIG_FILE"
 fi
 
 # Установка конфигурации udevmon

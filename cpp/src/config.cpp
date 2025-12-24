@@ -6,8 +6,8 @@
 #include "punto/config.hpp"
 #include "punto/scancode_map.hpp"
 
-#include <charconv>
 #include <cctype>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -195,7 +195,20 @@ Config parse_config_stream(std::istream &file) {
         }
       } else if (key == "max_rollback_words") {
         if (auto val = parse_int(value)) {
-          config.auto_switch.max_rollback_words = static_cast<std::size_t>(*val);
+          config.auto_switch.max_rollback_words =
+              static_cast<std::size_t>(*val);
+        }
+      } else if (key == "typo_correction_enabled") {
+        if (auto val = parse_bool(value)) {
+          config.auto_switch.typo_correction_enabled = *val;
+        }
+      } else if (key == "max_typo_diff") {
+        if (auto val = parse_int(value)) {
+          config.auto_switch.max_typo_diff = static_cast<std::size_t>(*val);
+        }
+      } else if (key == "sticky_shift_correction_enabled") {
+        if (auto val = parse_bool(value)) {
+          config.auto_switch.sticky_shift_correction_enabled = *val;
         }
       }
     } else if (current_section == "sound") {
@@ -244,7 +257,8 @@ ConfigLoadOutcome load_config_checked(std::filesystem::path path) {
 }
 
 Config load_config(std::string_view path) {
-  // Best-effort логика: если запрошен дефолтный путь, пробуем user-config первым.
+  // Best-effort логика: если запрошен дефолтный путь, пробуем user-config
+  // первым.
   std::filesystem::path effective_path{std::string{path}};
 
   if (path == kConfigPath) {

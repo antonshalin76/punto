@@ -100,6 +100,30 @@ inline constexpr std::array<char, 256> kScancodeToChar = [] {
   return code < kScancodeToChar.size() && kScancodeToChar[code] != '\0';
 }
 
+/// Проверка, является ли скан-код клавишей, которая генерирует БУКВУ
+/// (для EN раскладки — a-z, для RU раскладки — а-я включая б, ю)
+[[nodiscard]] constexpr bool is_typeable_letter(std::uint16_t code) noexcept {
+  // Буквы A-Z
+  if (code >= KEY_Q && code <= KEY_P)
+    return true; // Q-P row
+  if (code >= KEY_A && code <= KEY_L)
+    return true; // A-L row
+  if (code >= KEY_Z && code <= KEY_M)
+    return true; // Z-M row
+  // Русские буквы на небуквенных клавишах EN:
+  // [ = х, ] = ъ, ; = ж, ' = э
+  if (code == KEY_LEFTBRACE || code == KEY_RIGHTBRACE ||
+      code == KEY_SEMICOLON || code == KEY_APOSTROPHE)
+    return true;
+  // , = б, . = ю (важно для русского!)
+  if (code == KEY_COMMA || code == KEY_DOT)
+    return true;
+  // ` = ё
+  if (code == KEY_GRAVE)
+    return true;
+  return false;
+}
+
 // ===========================================================================
 // Маппинг EN -> RU (QWERTY -> ЙЦУКЕН)
 // ===========================================================================

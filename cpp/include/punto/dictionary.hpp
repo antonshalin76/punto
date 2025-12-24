@@ -18,7 +18,6 @@
 #endif
 
 #include "punto/bloom_filter.hpp"
-#include "punto/hasher.hpp"
 #include "punto/types.hpp"
 
 namespace punto {
@@ -37,7 +36,7 @@ enum class DictResult {
  * Использует libhunspell для проверки словоформ с учётом:
  * - Падежей, склонений, времён, родов и т.п.
  * - Аффиксов из .aff файлов
- * 
+ *
  * Двусторонняя проверка: конвертирует слово в обе раскладки и ищет в словарях.
  */
 class Dictionary {
@@ -74,14 +73,44 @@ public:
     return ru_hashes_.size();
   }
 
-  /**
-   * @brief Статистика Bloom Filter (для телеметрии)
-   */
   [[nodiscard]] double en_bloom_fill() const noexcept {
     return en_bloom_.fill_ratio();
   }
   [[nodiscard]] double ru_bloom_fill() const noexcept {
     return ru_bloom_.fill_ratio();
+  }
+
+  /**
+   * @brief Проверяет, доступен ли Hunspell для предложений
+   */
+  [[nodiscard]] bool is_hunspell_available() const noexcept {
+    return hunspell_available_;
+  }
+
+  /**
+   * @brief Генерирует предложения исправления для слова
+   *
+   * Использует Hunspell suggest() для генерации кандидатов.
+   * Работает только если Hunspell доступен.
+   *
+   * @param word Слово с ошибкой (ASCII для EN, UTF-8 для RU)
+   * @param is_english true для EN словаря, false для RU
+   * @param max_suggestions Максимальное количество предложений
+   * @return Список предложений (UTF-8)
+   */
+  [[nodiscard]] std::vector<std::string>
+  suggest(const std::string &word, bool is_english,
+          std::size_t max_suggestions = 10) const;
+
+  /**
+   * @brief Проверяет правильность слова через Hunspell
+   *
+   * @param word Слово для проверки (UTF-8)
+   * @param is_english true для EN словаря, false для RU
+   * @return true если слово правильное
+   */
+  [[nodiscard]] bool spell(const std::string &word, bool is_english) const {
+    return check_hunspell(word, is_english);
   }
 
 private:
@@ -119,7 +148,7 @@ private:
 
   /**
    * @brief Финализирует хеши после загрузки всех словарей
-   * 
+   *
    * Сортирует и удаляет дубликаты для эффективного бинарного поиска.
    */
   void finalize_hashes();
@@ -129,7 +158,8 @@ private:
    * @param qwerty ASCII строка (QWERTY клавиши)
    * @return UTF-8 строка с кириллицей
    */
-  [[nodiscard]] static std::string qwerty_to_cyrillic(const std::string &qwerty);
+  [[nodiscard]] static std::string
+  qwerty_to_cyrillic(const std::string &qwerty);
 
   /**
    * @brief Проверяет слово через hunspell (c учётом словоформ)
@@ -137,7 +167,8 @@ private:
    * @param is_english true для EN словаря, false для RU
    * @return true если слово корректно
    */
-  [[nodiscard]] bool check_hunspell(const std::string &word, bool is_english) const;
+  [[nodiscard]] bool check_hunspell(const std::string &word,
+                                    bool is_english) const;
 
   // Bloom Filters для быстрого отсечения (Level 0)
   BloomFilter en_bloom_;

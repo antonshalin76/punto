@@ -1,5 +1,5 @@
 Package: punto-switcher
-Version: 2.6.0
+Version: 2.7.0
 Section: utils
 Priority: optional
 Architecture: amd64
@@ -9,13 +9,7 @@ Maintainer: Anton Shalin <anton.shalin@gmail.com>
 Description: Punto Switcher для Linux Ubuntu (C++20 версия)
  Высокопроизводительная реализация Punto Switcher для Linux.
  Позволяет исправлять текст в неправильной раскладке,
- регистре или транслитерировать его.
- .
- Версия 2.4 — обновлён tray UI и добавлена синхронизация хоткея:
-   - Toggle-пункты в меню трея + окно "О программе"
-   - Синхронизация хоткея переключения раскладки (GNOME/X11)
-   - Горячая перезагрузка конфигурации
-   - IPC через Unix Domain Socket
+ регистре, исправлять опечатки или транслитерировать его.
  .
  Возможности:
    - АВТО-переключение раскладки (при вводе слова)
@@ -25,4 +19,6 @@ Description: Punto Switcher для Linux Ubuntu (C++20 версия)
    - Инверсия регистра слова (Ctrl+Pause)
    - Инверсия регистра выделения (Alt+Pause)
    - Транслитерация выделения (LCtrl+LAlt+Pause)
+   - Автоматическое исправление регистра (Sticky Shift Fix)
+   - Автоматическое исправление опечаток (Typo Fix)
    - Минимальное потребление ресурсов

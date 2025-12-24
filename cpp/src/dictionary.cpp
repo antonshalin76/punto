@@ -165,8 +165,8 @@ std::string Dictionary::cyrillic_to_qwerty(const std::string &cyrillic) {
   return result;
 }
 
-bool Dictionary::hash_exists(std::uint64_t hash,
-                             const std::vector<std::uint64_t> &hashes) noexcept {
+bool Dictionary::hash_exists(
+    std::uint64_t hash, const std::vector<std::uint64_t> &hashes) noexcept {
   // Бинарный поиск в отсортированном векторе
   // O(log N) с отличной cache locality
   return std::binary_search(hashes.begin(), hashes.end(), hash);
@@ -199,7 +199,8 @@ std::size_t Dictionary::load_en_dictionary(const std::string &path) {
     std::string word = is_hunspell ? extract_word(line) : line;
 
     // Убираем пробелы в начале/конце
-    while (!word.empty() && (word.back() == '\r' || word.back() == '\n' || word.back() == ' ')) {
+    while (!word.empty() &&
+           (word.back() == '\r' || word.back() == '\n' || word.back() == ' ')) {
       word.pop_back();
     }
     while (!word.empty() && (word.front() == ' ')) {
@@ -250,7 +251,8 @@ std::size_t Dictionary::load_ru_dictionary(const std::string &path) {
     std::string word = is_hunspell ? extract_word(line) : line;
 
     // Убираем пробелы в начале/конце
-    while (!word.empty() && (word.back() == '\r' || word.back() == '\n' || word.back() == ' ')) {
+    while (!word.empty() &&
+           (word.back() == '\r' || word.back() == '\n' || word.back() == ' ')) {
       word.pop_back();
     }
     while (!word.empty() && (word.front() == ' ')) {
@@ -290,7 +292,7 @@ bool Dictionary::initialize() {
   // Инициализируем Hunspell для проверки словоформ (падежи, склонения, времена)
   std::ifstream test_en(kEnAffPath);
   std::ifstream test_ru(kRuAffPath);
-  
+
   if (test_en.good()) {
     try {
       hunspell_en_ = std::make_unique<Hunspell>(kEnAffPath, kEnDicPathHunspell);
@@ -299,7 +301,7 @@ bool Dictionary::initialize() {
       std::cerr << "[punto] Hunspell EN init failed\n";
     }
   }
-  
+
   if (test_ru.good()) {
     try {
       hunspell_ru_ = std::make_unique<Hunspell>(kRuAffPath, kRuDicPathHunspell);
@@ -308,10 +310,11 @@ bool Dictionary::initialize() {
       std::cerr << "[punto] Hunspell RU init failed\n";
     }
   }
-  
+
   hunspell_available_ = (hunspell_en_ != nullptr || hunspell_ru_ != nullptr);
   if (hunspell_available_) {
-    std::cerr << "[punto] Hunspell enabled: full word forms support (cases, declensions, tenses)\n";
+    std::cerr << "[punto] Hunspell enabled: full word forms support (cases, "
+                 "declensions, tenses)\n";
   }
 #endif
 
@@ -319,7 +322,8 @@ bool Dictionary::initialize() {
   for (const char *path : kEnDictPaths) {
     std::size_t loaded = load_en_dictionary(path);
     if (loaded > 0) {
-      std::cerr << "[punto] Loaded EN dict: " << path << " (+" << loaded << " words)\n";
+      std::cerr << "[punto] Loaded EN dict: " << path << " (+" << loaded
+                << " words)\n";
       en_count += loaded;
     }
   }
@@ -328,7 +332,8 @@ bool Dictionary::initialize() {
   for (const char *path : kRuDictPaths) {
     std::size_t loaded = load_ru_dictionary(path);
     if (loaded > 0) {
-      std::cerr << "[punto] Loaded RU dict: " << path << " (+" << loaded << " words)\n";
+      std::cerr << "[punto] Loaded RU dict: " << path << " (+" << loaded
+                << " words)\n";
       ru_count += loaded;
     }
   }
@@ -338,10 +343,12 @@ bool Dictionary::initialize() {
 
   initialized_ = (en_count > 0 || ru_count > 0 || hunspell_available_);
 
-  std::cerr << "[punto] Dictionary: EN=" << en_hashes_.size() << " RU=" << ru_hashes_.size()
-            << " unique words (hash-based)\n";
-  std::cerr << "[punto] Bloom fill: EN=" << static_cast<int>(en_bloom_.fill_ratio() * 100)
-            << "% RU=" << static_cast<int>(ru_bloom_.fill_ratio() * 100) << "%\n";
+  std::cerr << "[punto] Dictionary: EN=" << en_hashes_.size()
+            << " RU=" << ru_hashes_.size() << " unique words (hash-based)\n";
+  std::cerr << "[punto] Bloom fill: EN="
+            << static_cast<int>(en_bloom_.fill_ratio() * 100)
+            << "% RU=" << static_cast<int>(ru_bloom_.fill_ratio() * 100)
+            << "%\n";
   std::cerr << "[punto] Hash memory: EN=" << (en_hashes_.size() * 8 / 1024)
             << "KB RU=" << (ru_hashes_.size() * 8 / 1024) << "KB\n";
 
@@ -397,13 +404,13 @@ DictResult Dictionary::lookup(std::span<const KeyEntry> entries) const {
   if (hunspell_available_) {
     // Проверка 1: это английское слово? (ascii_word как есть)
     in_en = check_hunspell(ascii_word, true);
-    
+
     // Проверка 2: это русское слово? (конвертируем QWERTY -> кириллица)
     std::string cyrillic_word = qwerty_to_cyrillic(ascii_word);
     if (!cyrillic_word.empty()) {
       in_ru = check_hunspell(cyrillic_word, false);
     }
-    
+
     // Если hunspell дал результат — возвращаем
     if (in_en || in_ru) {
       if (in_en && in_ru) {
@@ -463,7 +470,7 @@ std::string Dictionary::qwerty_to_cyrillic(const std::string &qwerty) {
     if (lower >= 'A' && lower <= 'Z') {
       lower = static_cast<char>(lower + 32);
     }
-    
+
     bool found = false;
     for (const auto &entry : kQwertyMap) {
       if (entry.qwerty == lower) {
@@ -472,7 +479,7 @@ std::string Dictionary::qwerty_to_cyrillic(const std::string &qwerty) {
         break;
       }
     }
-    
+
     if (!found) {
       // Неизвестный символ — не конвертируем
       return "";
@@ -482,7 +489,8 @@ std::string Dictionary::qwerty_to_cyrillic(const std::string &qwerty) {
   return result;
 }
 
-bool Dictionary::check_hunspell(const std::string &word, bool is_english) const {
+bool Dictionary::check_hunspell(const std::string &word,
+                                bool is_english) const {
 #ifdef HAVE_HUNSPELL
   if (is_english && hunspell_en_) {
     return hunspell_en_->spell(word) != 0;
@@ -495,6 +503,43 @@ bool Dictionary::check_hunspell(const std::string &word, bool is_english) const 
   (void)is_english;
 #endif
   return false;
+}
+
+std::vector<std::string>
+Dictionary::suggest(const std::string &word, bool is_english,
+                    std::size_t max_suggestions) const {
+
+  std::vector<std::string> result;
+
+#ifdef HAVE_HUNSPELL
+  Hunspell *hs = nullptr;
+  if (is_english && hunspell_en_) {
+    hs = hunspell_en_.get();
+  } else if (!is_english && hunspell_ru_) {
+    hs = hunspell_ru_.get();
+  }
+
+  if (hs == nullptr) {
+    return result;
+  }
+
+  // Hunspell::suggest возвращает список предложений
+  std::vector<std::string> suggestions = hs->suggest(word);
+
+  // Ограничиваем количество результатов
+  std::size_t count = std::min(suggestions.size(), max_suggestions);
+  result.reserve(count);
+
+  for (std::size_t i = 0; i < count; ++i) {
+    result.push_back(std::move(suggestions[i]));
+  }
+#else
+  (void)word;
+  (void)is_english;
+  (void)max_suggestions;
+#endif
+
+  return result;
 }
 
 } // namespace punto

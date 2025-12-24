@@ -3,7 +3,7 @@
 Высокопроизводительная реализация Punto Switcher на C++20 для Linux.
 Позволяет исправлять текст, набранный в неправильной раскладке клавиатуры.
 
-![Version](https://img.shields.io/badge/version-2.6.0-blue)
+![Version](https://img.shields.io/badge/version-2.7.0-blue)
 ![C++](https://img.shields.io/badge/C%2B%2B-20-orange)
 ![License](https://img.shields.io/badge/license-Personal%20Use%20Only-red)
 
@@ -40,6 +40,27 @@
 - **Словари** (приоритет) — hunspell (en_US, ru_RU), wamerican-huge, scowl и др.
 - **N-граммы** (fallback только EN→RU) — частотный анализ биграмм + триграмм
 - **Защита от ложных срабатываний** — RU→EN только по словарю
+
+#### v2.7: исправление залипшего Shift + typo fix + CLI
+
+- **Sticky Shift Fix**: автоматическое исправление ошибок регистра:
+  - `ПРивет` → `Привет` (паттерн UU+L+: несколько заглавных в начале)
+  - `кОЛБАСА` → `Колбаса` (паттерн L+U+: Caps Lock)
+  - `GHbdtn` → `Привет` (комбинированное: смена раскладки + регистр)
+  - **Смешанный регистр НЕ исправляется** (например, `СНиП`)
+- **Typo Fix**: автоматическое исправление опечаток:
+  - `ппривет` → `привет` (удаление дублей)
+  - Использует Hunspell spell() для проверки правильности слова
+  - Защита от ложных срабатываний: правильные слова не изменяются
+- **CLI wrapper**: удобное управление сервисом:
+  - `punto start` — запуск сервиса (backend + frontend)
+  - `punto stop` — остановка сервиса
+  - `punto restart` — перезапуск с перезагрузкой конфига
+  - `punto status` — показать статус
+- **Новые настройки**:
+  - `sticky_shift_correction_enabled` — вкл/выкл исправление регистра
+  - `typo_correction_enabled` — вкл/выкл исправление опечаток
+  - `max_typo_diff` — максимальное расстояние редактирования (1-2)
 
 ### Ручные горячие клавиши
 
@@ -161,7 +182,7 @@ sudo apt install pulseaudio-utils alsa-utils
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh
-sudo dpkg -i punto-switcher_2.6.0_amd64.deb
+sudo dpkg -i punto-switcher_2.7.0_amd64.deb
 ```
 
 #### Ручная сборка без пакета
@@ -180,13 +201,24 @@ sudo cp ../../config.yaml /etc/punto/
 Создайте `/etc/interception/udevmon.yaml` (пример — `udevmon.yaml` в корне репозитория):
 
 ```yaml
-- JOB: "interception -g $DEVNODE | /usr/local/bin/punto | uinput -d $DEVNODE"
+- JOB: "interception -g $DEVNODE | /usr/local/bin/punto-daemon | uinput -d $DEVNODE"
   DEVICE:
     EVENTS:
       EV_KEY: [KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H, KEY_I, KEY_J, KEY_K, KEY_L, KEY_M, KEY_N, KEY_O, KEY_P, KEY_Q, KEY_R, KEY_S, KEY_T, KEY_U, KEY_V, KEY_W, KEY_X, KEY_Y, KEY_Z, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0, KEY_MINUS, KEY_EQUAL, KEY_BACKSPACE, KEY_TAB, KEY_ENTER, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTALT, KEY_RIGHTALT, KEY_COMMA, KEY_DOT, KEY_SLASH, KEY_SEMICOLON, KEY_APOSTROPHE, KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_BACKSLASH, KEY_GRAVE, KEY_SPACE, KEY_PAUSE, KEY_LEFT, KEY_RIGHT, KEY_UP, KEY_DOWN, KEY_HOME, KEY_END, KEY_PAGEUP, KEY_PAGEDOWN, KEY_INSERT, KEY_DELETE]
 ```
 
 ### Запуск
+
+#### С помощью CLI (рекомендуется)
+
+```bash
+punto start     # Запуск сервиса (backend + frontend)
+punto status    # Проверка статуса
+punto restart   # Перезапуск (после изменения конфига)
+punto stop      # Остановка
+```
+
+#### Вручную через systemd
 
 ```bash
 sudo systemctl enable udevmon
@@ -285,6 +317,7 @@ punto/
 │   │   ├── history_manager.hpp   # История токенов для rollback/replay (async)
 │   │   ├── concurrent_queue.hpp  # Потокобезопасная очередь (worker pool)
 │   │   ├── analysis_worker_pool.hpp # Пул воркеров анализа (async)
+│   │   ├── typo_corrector.hpp    # Алгоритмы исправления опечаток
 │   │   ├── ngram_data.hpp        # Данные частотности N-грамм
 │   │   └── asm_utils.hpp         # ASM/AVX2 оптимизации
 │   └── src/
@@ -296,6 +329,7 @@ punto/
 │   └── prerm
 ├── config.yaml                   # Конфигурация по умолчанию
 ├── udevmon.yaml                  # Пример конфигурации udevmon
+├── punto-cli.sh                  # CLI wrapper для управления сервисом
 ├── punto-tray.desktop            # Autostart entry для tray
 ├── build-deb.sh                  # Скрипт сборки пакета
 └── README.md
@@ -368,6 +402,32 @@ sudo rm -rf /etc/punto
 | wamerican-huge             | любая (опционально)       |
 
 ## История изменений
+
+### v2.7.0 — Typo Fix + Sticky Shift + CLI
+
+- **Typo Fix**: автоматическое исправление опечаток:
+  - `ппривет` → `привет` (удаление дублей букв)
+  - Расстояние Дамерау-Левенштейна (перестановки, вставки, удаления, замены)
+  - Интеграция с Hunspell spell() для проверки правильности
+  - **Защита от ложных срабатываний**: правильные слова не изменяются
+- **Sticky Shift Fix**: автоматическое исправление ошибок регистра:
+  - `ПРивет` → `Привет` (паттерн UU+L+)
+  - `кОЛБАСА` → `Колбаса` (паттерн L+U+)
+  - `GHbdtn` → `Привет` (комбинированное: смена раскладки + регистр)
+  - Смешанный регистр (`СНиП`) НЕ исправляется
+- **CLI wrapper `punto`** для удобного управления:
+  - `punto start/stop/restart/status`
+  - Запускает backend (udevmon) + frontend (punto-tray)
+- **Новые настройки конфигурации**:
+  - `sticky_shift_correction_enabled` — вкл/выкл исправление регистра
+  - `typo_correction_enabled` — вкл/выкл исправление опечаток
+  - `max_typo_diff` — максимальное расстояние редактирования (1-2)
+- **Автоматическое обновление конфига**: при обновлении пакета старый конфиг сохраняется в backup
+- **Рефакторинг**:
+  - Новый модуль `typo_corrector.hpp/cpp`
+  - `CorrectionType` enum для телеметрии
+  - Расширен `WordResult` полем `correction`
+  - Бинарник переименован в `punto-daemon`, CLI wrapper — `punto`
 
 ### v2.6.0 — libhunspell + полная поддержка словоформ
 

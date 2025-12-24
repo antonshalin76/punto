@@ -264,16 +264,43 @@ private:
         AnalysisResult ar = analyzer.analyze(analysis_span);
 
         if (ar.should_switch) {
-          bool ngram_suggests_en =
-              ar.should_switch && ar.en_score > ar.ru_score;
+          // Определяем, какой язык предполагает N-gram анализ
+          bool ngram_suggests_en = (ar.en_score > ar.ru_score);
+          bool ngram_suggests_ru = (ar.ru_score > ar.en_score);
+
           bool looks_like_valid_en = (ar.en_invalid_count == 0);
+          bool looks_like_valid_ru = (ar.ru_invalid_count == 0);
+
+          // Дополнительные признаки на основе invalid биграмм
           bool invalid_suggests_en =
               (ar.ru_invalid_count > 0 && ar.en_invalid_count == 0);
+          bool invalid_suggests_ru =
+              (ar.en_invalid_count > 0 && ar.ru_invalid_count == 0);
+
+          // КРИТИЧНО: Переключаем раскладку ТОЛЬКО если текущая раскладка
+          // не соответствует предполагаемому языку слова.
+          //
+          // Если N-gram предполагает EN, но мы УЖЕ в EN → не переключаем.
+          // Если N-gram предполагает RU, но мы УЖЕ в RU → не переключаем.
 
           if ((ngram_suggests_en && looks_like_valid_en) ||
               invalid_suggests_en) {
-            res.need_switch = true;
-            res.correction_type = CorrectionType::LayoutSwitch;
+            // Слово похоже на английское
+            if (!is_en_layout) {
+              // Мы в RU раскладке, но слово английское → переключаем на EN
+              res.need_switch = true;
+              res.correction_type = CorrectionType::LayoutSwitch;
+            }
+            // else: мы уже в EN, слово английское → ничего не делаем
+          } else if ((ngram_suggests_ru && looks_like_valid_ru) ||
+                     invalid_suggests_ru) {
+            // Слово похоже на русское
+            if (is_en_layout) {
+              // Мы в EN раскладке, но слово русское → переключаем на RU
+              res.need_switch = true;
+              res.correction_type = CorrectionType::LayoutSwitch;
+            }
+            // else: мы уже в RU, слово русское → ничего не делаем
           }
         }
       }

@@ -1,13 +1,15 @@
 /**
  * @file history_manager.hpp
- * @brief История набранного текста (последние N слов) для безопасного rollback/replay
+ * @brief История набранного текста (последние N слов) для безопасного
+ * rollback/replay
  *
  * Хранит поток "токенов" на уровне KeyEntry (код клавиши + shifted),
  * а также метаданные последних слов (координаты в этом потоке).
  *
  * Важно:
  * - История отражает то, что было ПРОПУЩЕНО в stdout (т.е. применено к тексту).
- * - Инжектируемые макросы (backspace/retype) НЕ должны повторно пушить токены в историю.
+ * - Инжектируемые макросы (backspace/retype) НЕ должны повторно пушить токены в
+ * историю.
  */
 
 #pragma once
@@ -33,9 +35,14 @@ struct HistoryWord {
   std::uint64_t delim_pos = 0; // позиция разделителя
   ScanCode delimiter = 0;      // KEY_SPACE / KEY_TAB
 
+  // Определённый язык слова для контекстного окна
+  // 0 = Unknown, 1 = English, 2 = Russian
+  std::uint8_t detected_language = 0;
+
   [[nodiscard]] constexpr std::size_t word_len() const noexcept {
-    return (end_pos >= start_pos) ? static_cast<std::size_t>(end_pos - start_pos)
-                                  : 0U;
+    return (end_pos >= start_pos)
+               ? static_cast<std::size_t>(end_pos - start_pos)
+               : 0U;
   }
 
   [[nodiscard]] constexpr std::size_t total_len_with_delim() const noexcept {
@@ -60,7 +67,9 @@ public:
   [[nodiscard]] std::size_t max_words() const noexcept { return max_words_; }
 
   [[nodiscard]] std::uint64_t base_pos() const noexcept { return base_pos_; }
-  [[nodiscard]] std::uint64_t cursor_pos() const noexcept { return cursor_pos_; }
+  [[nodiscard]] std::uint64_t cursor_pos() const noexcept {
+    return cursor_pos_;
+  }
 
   [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
 
@@ -105,11 +114,12 @@ public:
     --size_;
     --cursor_pos_;
 
-    // Если backspace задел разделитель/слово из истории — удаляем последнее слово.
+    // Если backspace задел разделитель/слово из истории — удаляем последнее
+    // слово.
     while (!words_.empty()) {
       const HistoryWord &w = words_.back();
-      // delim_pos указывает на позицию разделителя. Если cursor_pos <= delim_pos,
-      // значит разделитель был удалён (или мы откатились дальше).
+      // delim_pos указывает на позицию разделителя. Если cursor_pos <=
+      // delim_pos, значит разделитель был удалён (или мы откатились дальше).
       if (cursor_pos_ <= w.delim_pos) {
         words_.pop_back();
         continue;
@@ -170,7 +180,7 @@ public:
 
   /// Возвращает копию токенов в диапазоне [from_pos, to_pos).
   [[nodiscard]] bool get_range(std::uint64_t from_pos, std::uint64_t to_pos,
-                              std::vector<KeyEntry> &out) const {
+                               std::vector<KeyEntry> &out) const {
     out.clear();
 
     if (from_pos > to_pos) {
@@ -192,6 +202,44 @@ public:
     }
 
     return true;
+  }
+
+  /// Возвращает преобладающий язык в последних N словах (контекстное окно)
+  /// @param window_size Размер окна (количество последних слов)
+  /// @return 0 = Unknown/Mixed, 1 = English, 2 = Russian
+  [[nodiscard]] std::uint8_t
+  get_context_language(std::size_t window_size = 3) const {
+    std::size_t en_count = 0;
+    std::size_t ru_count = 0;
+
+    const std::size_t words_count = words_.size();
+    const std::size_t start_idx =
+        (words_count > window_size) ? words_count - window_size : 0;
+
+    for (std::size_t i = start_idx; i < words_count; ++i) {
+      if (words_[i].detected_language == 1) {
+        ++en_count;
+      } else if (words_[i].detected_language == 2) {
+        ++ru_count;
+      }
+    }
+
+    // Возвращаем преобладающий язык если все слова одного языка
+    if (en_count > 0 && ru_count == 0) {
+      return 1; // English
+    }
+    if (ru_count > 0 && en_count == 0) {
+      return 2; // Russian
+    }
+
+    return 0; // Mixed или Unknown
+  }
+
+  /// Обновляет detected_language для последнего слова
+  void update_last_word_language(std::uint8_t lang) {
+    if (!words_.empty()) {
+      words_.back().detected_language = lang;
+    }
   }
 
 private:

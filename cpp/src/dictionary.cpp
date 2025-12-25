@@ -38,6 +38,60 @@ constexpr const char *kRuDictPaths[] = {
     "/usr/share/dict/russian",
 };
 
+// Встроенные IT-термины (не всегда есть в стандартных словарях)
+// clang-format off
+constexpr const char *kBuiltinITTerms[] = {
+    // Containerization & Orchestration
+    "docker", "dockerfile", "kubernetes", "kubectl", "helm", "podman",
+    "containerd", "minikube", "kube", "pods", "deployments", "ingress",
+    
+    // Cloud & DevOps
+    "nginx", "apache", "redis", "memcached", "elasticsearch", "kibana",
+    "grafana", "prometheus", "terraform", "ansible", "jenkins", "gitlab",
+    "github", "bitbucket", "circleci", "travis", "argocd", "fluxcd",
+    
+    // Programming Languages & Runtimes
+    "python", "nodejs", "java", "golang", "rust", "typescript", "javascript",
+    "kotlin", "scala", "ruby", "perl", "php", "swift", "cpp", "csharp",
+    
+    // Databases
+    "postgres", "postgresql", "mysql", "mariadb", "mongodb", "cassandra",
+    "sqlite", "dynamodb", "firestore", "cockroachdb", "tidb", "clickhouse",
+    
+    // Web & Frameworks
+    "react", "angular", "vue", "svelte", "nextjs", "nuxt", "nestjs",
+    "django", "flask", "fastapi", "express", "springboot", "laravel",
+    "webpack", "vite", "rollup", "esbuild", "parcel", "tailwind",
+    
+    // Infrastructure & Cloud
+    "aws", "gcp", "azure", "digitalocean", "linode", "vultr", "heroku",
+    "netlify", "vercel", "cloudflare", "nginx", "haproxy", "traefik",
+    
+    // Version Control & Collaboration
+    "git", "gitflow", "github", "gitlab", "bitbucket", "jira", "confluence",
+    "slack", "discord", "zoom", "teams", "notion", "linear",
+    
+    // Monitoring & Logging
+    "datadog", "newrelic", "splunk", "logstash", "fluentd", "jaeger",
+    "zipkin", "opentelemetry", "pagerduty", "opsgenie",
+    
+    // Security
+    "oauth", "jwt", "saml", "keycloak", "vault", "hashicorp",
+    "ssl", "tls", "vpn", "wireguard", "ipsec",
+    
+    // Common IT Terms
+    "api", "rest", "graphql", "grpc", "websocket", "http", "https",
+    "json", "yaml", "xml", "csv", "protobuf", "avro",
+    "localhost", "backend", "frontend", "fullstack", "devops", "sre",
+    "microservices", "monolith", "serverless", "faas", "paas", "iaas",
+    "cicd", "pipeline", "workflow", "cron", "daemon", "systemd",
+    "sudo", "chmod", "chown", "grep", "awk", "sed", "curl", "wget",
+    "bash", "zsh", "fish", "vim", "neovim", "emacs", "vscode",
+    "linux", "ubuntu", "debian", "centos", "fedora", "alpine",
+    "macos", "windows", "wsl", "homebrew", "apt", "yum", "dnf",
+};
+// clang-format on
+
 // Минимальная и максимальная длина слов для загрузки
 constexpr std::size_t kDictMinWordLen = 2;
 constexpr std::size_t kDictMaxWordLen = 20;
@@ -336,6 +390,25 @@ bool Dictionary::initialize() {
                 << " words)\n";
       ru_count += loaded;
     }
+  }
+
+  // Загружаем встроенные IT-термины (docker, kubernetes, etc)
+  std::size_t it_count = 0;
+  for (const char *term : kBuiltinITTerms) {
+    std::string word_str(term);
+    if (word_str.size() >= kDictMinWordLen &&
+        word_str.size() <= kDictMaxWordLen) {
+      std::string lower = to_lowercase_ascii(word_str);
+      std::uint64_t hash = Hasher::hash_string(lower);
+      en_hashes_.push_back(hash);
+      en_bloom_.add(lower);
+      ++it_count;
+    }
+  }
+  if (it_count > 0) {
+    std::cerr << "[punto] Loaded built-in IT terms: +" << it_count
+              << " words\n";
+    en_count += it_count;
   }
 
   // Сортируем и удаляем дубликаты после загрузки всех словарей

@@ -13,6 +13,89 @@
 
 namespace punto {
 
+namespace {
+
+/// Проверяет, является ли буквенный скан-код гласной (EN или RU)
+[[nodiscard]] bool is_vowel_key(ScanCode code) noexcept {
+  // EN гласные: a, e, i, o, u
+  // RU гласные: а(f), е(t), ё(`), и(b), о(j), у(e), ы(s), э('), ю(.), я(z)
+  switch (code) {
+  // EN гласные
+  case KEY_A:
+  case KEY_E:
+  case KEY_I:
+  case KEY_O:
+  case KEY_U:
+  // RU гласные (QWERTY коды)
+  case KEY_F:          // а
+  case KEY_T:          // е
+  case KEY_B:          // и
+  case KEY_J:          // о
+  case KEY_S:          // ы
+  case KEY_APOSTROPHE: // э
+  case KEY_DOT:        // ю
+  case KEY_Z:          // я
+  case KEY_GRAVE:      // ё
+    return true;
+  default:
+    return false;
+  }
+}
+
+/// Подсчитывает количество гласных в слове
+[[nodiscard]] std::size_t
+count_vowels(std::span<const KeyEntry> word) noexcept {
+  std::size_t count = 0;
+  for (const auto &entry : word) {
+    if (is_vowel_key(entry.code)) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+/// Проверяет, похоже ли слово на аббревиатуру
+/// Аббревиатуры обычно короткие (2-5 букв) и содержат мало гласных
+[[nodiscard]] bool
+is_likely_abbreviation(std::span<const KeyEntry> word) noexcept {
+  // Только короткие слова (2-5 символов)
+  if (word.size() < 2 || word.size() > 5) {
+    return false;
+  }
+
+  // Подсчитываем гласные и заглавные
+  std::size_t vowel_count = count_vowels(word);
+  std::size_t upper_count = 0;
+  std::size_t letter_count = 0;
+
+  for (const auto &entry : word) {
+    if (is_typeable_letter(entry.code)) {
+      ++letter_count;
+      if (entry.shifted) {
+        ++upper_count;
+      }
+    }
+  }
+
+  // Если слово короткое (2-4 буквы) и мало гласных (0-1) — вероятно
+  // аббревиатура Примеры: ДНК (0 гласных), СНГ (0), API (1), URL (1), СНиП (1)
+  if (letter_count >= 2 && letter_count <= 4 && vowel_count <= 1) {
+    // Дополнительная проверка: большинство букв заглавные
+    if (upper_count >= letter_count / 2) {
+      return true;
+    }
+  }
+
+  // Также аббревиатуры: 2-3 буквы и все заглавные
+  if (letter_count >= 2 && letter_count <= 3 && upper_count == letter_count) {
+    return true;
+  }
+
+  return false;
+}
+
+} // namespace
+
 // ===========================================================================
 // Определение паттернов регистра
 // ===========================================================================
@@ -20,6 +103,11 @@ namespace punto {
 CasePattern detect_case_pattern(std::span<const KeyEntry> word) {
   if (word.empty()) {
     return CasePattern::Unknown;
+  }
+
+  // ВАЖНО: Пропускаем вероятные аббревиатуры (СНиП, ДНК, API)
+  if (is_likely_abbreviation(word)) {
+    return CasePattern::Mixed; // Mixed означает "не исправлять"
   }
 
   // Подсчитываем позиции заглавных и строчных букв

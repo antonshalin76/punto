@@ -30,6 +30,7 @@
 #include "punto/key_injector.hpp"
 #include "punto/layout_analyzer.hpp"
 #include "punto/types.hpp"
+#include "punto/undo_detector.hpp"
 #include "punto/x11_session.hpp"
 
 namespace punto {
@@ -204,6 +205,9 @@ private:
   // Async pipeline: история + пул анализа
   HistoryManager history_{5};
   AnalysisWorkerPool analysis_pool_{dict_};
+
+  /// Детектор отмены коррекции — запоминает слова, которые пользователь отменил
+  UndoDetector undo_detector_;
 
   std::uint64_t next_task_id_ = 0;
   std::uint64_t next_apply_task_id_ = 0;

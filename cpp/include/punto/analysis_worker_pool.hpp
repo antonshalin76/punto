@@ -20,6 +20,7 @@
 #include "punto/dictionary.hpp"
 #include "punto/layout_analyzer.hpp"
 #include "punto/scancode_map.hpp"
+#include "punto/smart_bypass.hpp"
 #include "punto/types.hpp"
 #include "punto/typo_corrector.hpp"
 
@@ -149,6 +150,17 @@ private:
       std::span<const KeyEntry> analysis_span(task.word.data(),
                                               task.analysis_len);
 
+      // =========================================================================
+      // Этап 0: Smart Bypass — определяем, нужно ли пропускать РЕГИСТРОВЫЕ
+      // исправления (sticky shift). Layout switch всегда разрешён!
+      // =========================================================================
+      BypassReason bypass_reason =
+          should_bypass(analysis_span, task.cfg.min_word_len);
+
+      // bypass_case_fix = true означает, что мы НЕ будем исправлять регистр
+      // (sticky shift), но БУДЕМ переключать раскладку при необходимости
+      const bool bypass_case_fix = (bypass_reason != BypassReason::None);
+
       const bool is_en_layout = (task.layout_at_boundary == 0);
 
       // =========================================================================
@@ -159,14 +171,14 @@ private:
       // Если слово найдено в словаре — проверяем sticky shift и layout switch
       if (dict_result == DictResult::English) {
         if (!is_en_layout) {
-          // EN слово в RU раскладке -> переключаем
+          // EN слово в RU раскладке -> переключаем (bypass НЕ блокирует!)
           res.need_switch = true;
           res.correction_type = CorrectionType::LayoutSwitch;
           finish_and_push(res, t0);
           continue;
         }
-        // EN слово в EN раскладке -> проверяем sticky shift
-        if (task.cfg.sticky_shift_correction_enabled) {
+        // EN слово в EN раскладке -> проверяем sticky shift (если не bypass)
+        if (!bypass_case_fix && task.cfg.sticky_shift_correction_enabled) {
           if (try_sticky_shift_fix(analysis_span, res)) {
             finish_and_push(res, t0);
             continue;
@@ -174,8 +186,9 @@ private:
         }
       } else if (dict_result == DictResult::Russian) {
         if (is_en_layout) {
-          // RU слово в EN раскладке -> проверяем combined fix или layout switch
-          if (task.cfg.sticky_shift_correction_enabled) {
+          // RU слово в EN раскладке -> переключаем (bypass НЕ блокирует!)
+          // Но combined fix (layout + case) блокируется bypass
+          if (!bypass_case_fix && task.cfg.sticky_shift_correction_enabled) {
             CasePattern pattern = detect_case_pattern(analysis_span);
             if (pattern == CasePattern::StickyShiftUU ||
                 pattern == CasePattern::StickyShiftLU) {
@@ -187,13 +200,14 @@ private:
               continue;
             }
           }
+          // Просто layout switch без исправления регистра
           res.need_switch = true;
           res.correction_type = CorrectionType::LayoutSwitch;
           finish_and_push(res, t0);
           continue;
         }
-        // RU слово в RU раскладке -> проверяем sticky shift
-        if (task.cfg.sticky_shift_correction_enabled) {
+        // RU слово в RU раскладке -> проверяем sticky shift (если не bypass)
+        if (!bypass_case_fix && task.cfg.sticky_shift_correction_enabled) {
           if (try_sticky_shift_fix(analysis_span, res)) {
             finish_and_push(res, t0);
             continue;

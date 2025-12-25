@@ -3,7 +3,7 @@
 # Высокопроизводительный плагин для interception-tools
 # =============================================================================
 cmake_minimum_required(VERSION 3.16)
-project(punto VERSION 2.7.1 LANGUAGES CXX)
+project(punto VERSION 2.7.2 LANGUAGES CXX)
 
 # Для clangd/IDE: генерируем compile_commands.json
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -69,6 +69,7 @@ set(PUNTO_SOURCES
     src/dictionary.cpp
     src/ipc_server.cpp
     src/typo_corrector.cpp
+    src/smart_bypass.cpp
 )
 
 set(PUNTO_HEADERS
@@ -91,6 +92,8 @@ set(PUNTO_HEADERS
     include/punto/concurrent_queue.hpp
     include/punto/analysis_worker_pool.hpp
     include/punto/typo_corrector.hpp
+    include/punto/smart_bypass.hpp
+    include/punto/undo_detector.hpp
 )
 
 # -----------------------------------------------------------------------------

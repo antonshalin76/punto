@@ -3,7 +3,7 @@
 Высокопроизводительная реализация Punto Switcher на C++20 для Linux.
 Позволяет исправлять текст, набранный в неправильной раскладке клавиатуры.
 
-![Version](https://img.shields.io/badge/version-2.7.1-blue)
+![Version](https://img.shields.io/badge/version-2.7.2-blue)
 ![C++](https://img.shields.io/badge/C%2B%2B-20-orange)
 ![License](https://img.shields.io/badge/license-Personal%20Use%20Only-red)
 
@@ -182,7 +182,7 @@ sudo apt install pulseaudio-utils alsa-utils
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh
-sudo dpkg -i punto-switcher_2.7.1_amd64.deb
+sudo dpkg -i punto-switcher_2.7.2_amd64.deb
 ```
 
 #### Ручная сборка без пакета
@@ -402,6 +402,22 @@ sudo rm -rf /etc/punto
 | wamerican-huge             | любая (опционально)       |
 
 ## История изменений
+
+### v2.7.2 — Улучшение точности
+
+- **Smart Bypass**: пропуск регистровых исправлений для технических слов
+  - URL (`https://`, `www.`, `@`)
+  - Пути (`/home/user`, `.config`)  
+  - camelCase, PascalCase, snake_case
+  - **Важно**: layout switch по-прежнему работает!
+- **Исключения аббревиатур**: СНиП, ДНК, API не исправляются
+  - Эвристика: короткие слова (2-5 символов) с ≤1 гласной
+- **Детектор Undo**: сессионные исключения
+  - 3+ Backspace после коррекции → слово добавляется в исключения
+  - Исключения действуют до перезапуска сервиса
+- **Контекстное окно**: инфраструктура для учёта языка предыдущих слов
+- **Расширение N-грамм**: 128 → 256 записей для EN и RU
+- **IT-словарь**: +150 технических терминов (docker, kubernetes, python, react...)
 
 ### v2.7.1 — Исправление CPU spin
 

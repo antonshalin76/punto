@@ -299,6 +299,12 @@ void EventLoop::handle_event(const input_event &ev) {
   if (code == KEY_BACKSPACE) {
     buffer_.pop_char();
     (void)history_.pop_token();
+
+    // Детектируем отмену коррекции (быстрые Backspace сразу после auto-fix)
+    if (undo_detector_.on_backspace(std::chrono::steady_clock::now())) {
+      std::cerr << "[punto] Undo detected! Word added to session exclusions\n";
+    }
+
     emit_passthrough_event(ev);
     return;
   }
@@ -543,6 +549,10 @@ void EventLoop::handle_event(const input_event &ev) {
   if (is_letter_key(code)) {
     buffer_.push_char(code, modifiers_.any_shift());
     history_.push_token(KeyEntry{code, modifiers_.any_shift()});
+
+    // Сбрасываем счётчик backspace при наборе буквы
+    undo_detector_.on_key_typed();
+
     emit_passthrough_event(ev);
     return;
   }
@@ -1188,6 +1198,29 @@ void EventLoop::process_ready_results() {
 
       auto mit = pending_words_.find(res.task_id);
       if (mit != pending_words_.end()) {
+        // Проверяем, не находится ли слово в сессионных исключениях
+        // (пользователь ранее отменял коррекцию этого слова)
+        std::string word_ascii;
+        for (const auto &entry : mit->second.word) {
+          if (entry.code < kScancodeToChar.size()) {
+            char c = kScancodeToChar[entry.code];
+            if (c >= 'A' && c <= 'Z') {
+              c = static_cast<char>(c + 32);
+            }
+            if (c != '\0') {
+              word_ascii += c;
+            }
+          }
+        }
+
+        if (undo_detector_.is_excluded(word_ascii)) {
+          std::cerr << "[punto] Skipping correction for excluded word: "
+                    << word_ascii << "\n";
+          pending_words_.erase(res.task_id);
+          ++next_apply_task_id_;
+          continue;
+        }
+
         // Определяем тип коррекции и вызываем соответствующий метод
         switch (res.correction_type) {
         case CorrectionType::LayoutSwitch: {
@@ -1195,6 +1228,7 @@ void EventLoop::process_ready_results() {
           const int target_layout =
               (mit->second.layout_at_boundary == 0) ? 1 : 0;
           apply_correction(mit->second, target_layout);
+          undo_detector_.on_correction_applied(res.task_id, word_ascii);
           break;
         }
 
@@ -1202,6 +1236,7 @@ void EventLoop::process_ready_results() {
           // Исправление регистра БЕЗ смены раскладки (ПРивет -> Привет)
           if (res.correction.has_value()) {
             apply_case_correction(mit->second, res.correction.value());
+            undo_detector_.on_correction_applied(res.task_id, word_ascii);
           }
           break;
         }
@@ -1214,6 +1249,7 @@ void EventLoop::process_ready_results() {
                 (mit->second.layout_at_boundary == 0) ? 1 : 0;
             apply_combined_correction(mit->second, target_layout,
                                       res.correction.value());
+            undo_detector_.on_correction_applied(res.task_id, word_ascii);
           }
           break;
         }
@@ -1228,6 +1264,7 @@ void EventLoop::process_ready_results() {
                       << " corrected_len=" << res.correction.value().size()
                       << "\n";
             apply_case_correction(mit->second, res.correction.value());
+            undo_detector_.on_correction_applied(res.task_id, word_ascii);
           }
           break;
         }

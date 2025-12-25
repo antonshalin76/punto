@@ -18,16 +18,19 @@
 
 namespace {
 
-volatile sig_atomic_t g_running = 1;
+// Указатель на EventLoop для корректной остановки из signal handler
+punto::EventLoop *g_event_loop = nullptr;
 
 void signal_handler(int sig) {
   if (sig == SIGINT || sig == SIGTERM) {
-    g_running = 0;
+    if (g_event_loop) {
+      g_event_loop->request_stop();
+    }
   }
 }
 
 void print_version() {
-  std::cout << "Punto Switcher 2.7.0 (C++20)\n"
+  std::cout << "Punto Switcher 2.7.1 (C++20)\n"
             << "Высокопроизводительный плагин для interception-tools\n"
             << "https://github.com/antonshalin76/punto\n";
 }
@@ -88,5 +91,13 @@ int main(int argc, char *argv[]) {
   // Запуск event loop
   punto::EventLoop loop{std::move(config)};
 
-  return loop.run();
+  // Регистрируем EventLoop для signal handler
+  g_event_loop = &loop;
+
+  int result = loop.run();
+
+  // Сбрасываем указатель после завершения
+  g_event_loop = nullptr;
+
+  return result;
 }

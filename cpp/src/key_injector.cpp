@@ -23,7 +23,7 @@ void KeyInjector::update_delays(const DelayConfig &delays) noexcept {
 }
 
 void KeyInjector::write_all_or_die(int fd, const void *data,
-                                  std::size_t bytes) {
+                                   std::size_t bytes) {
   const std::uint8_t *p = static_cast<const std::uint8_t *>(data);
   std::size_t remaining = bytes;
 
@@ -79,17 +79,17 @@ void KeyInjector::tap_key(ScanCode code, bool with_shift, bool turbo) const {
 
   if (with_shift) {
     send_key(KEY_LEFTSHIFT, KeyState::Press);
-    delay(std::chrono::microseconds{10000}); // 10ms hold for modifier
+    delay(delays_.modifier_hold); // Конфигурируемая задержка для модификатора
   }
 
   send_key(code, KeyState::Press);
-  delay(std::chrono::microseconds{15000}); // 15ms hold - safe for all apps
+  delay(delays_.key_hold); // Конфигурируемое удержание клавиши
   send_key(code, KeyState::Release);
 
   if (with_shift) {
-    delay(std::chrono::microseconds{5000});
+    delay(delays_.modifier_release);
     send_key(KEY_LEFTSHIFT, KeyState::Release);
-    delay(std::chrono::microseconds{5000});
+    delay(delays_.modifier_release);
   }
 
   delay(retype_delay);
@@ -100,7 +100,7 @@ void KeyInjector::send_backspace(std::size_t count, bool turbo) const {
 
   for (std::size_t i = 0; i < count; ++i) {
     send_key(KEY_BACKSPACE, KeyState::Press);
-    delay(std::chrono::microseconds{12000}); // 12ms hold for BS
+    delay(delays_.backspace_hold); // Конфигурируемое удержание Backspace
     send_key(KEY_BACKSPACE, KeyState::Release);
 
     if (i < count - 1) {

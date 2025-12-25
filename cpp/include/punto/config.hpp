@@ -36,10 +36,24 @@ struct DelayConfig {
   std::chrono::microseconds key_press{20000};      // 20ms
   std::chrono::microseconds layout_switch{100000}; // 100ms
   std::chrono::microseconds retype{3000};          // 3ms между символами
+
+  // Турбо-задержки для автокоррекции.
+  // ВАЖНО: слишком малые значения приводят к гонке символов в медленных
+  // приложениях (Electron, Java). Минимальные безопасные значения: 15ms/35ms.
   std::chrono::microseconds turbo_key_press{
-      2000}; // 2ms для автостирания/печати
+      15000}; // 15ms для автостирания/печати
   std::chrono::microseconds turbo_retype{
-      5000}; // 5ms пауза между символами в turbo
+      35000}; // 35ms пауза между символами в turbo
+
+  // Детальные настройки для tap_key (эмуляция нажатия клавиши)
+  // Эти параметры влияют на надёжность ввода в разных приложениях
+  std::chrono::microseconds key_hold{
+      20000}; // 20ms удержание клавиши между press и release
+  std::chrono::microseconds modifier_hold{
+      15000}; // 15ms удержание модификатора (Shift) перед клавишей
+  std::chrono::microseconds modifier_release{
+      8000}; // 8ms задержка после отпускания модификатора
+  std::chrono::microseconds backspace_hold{18000}; // 18ms удержание Backspace
 };
 
 /// Настройки автоматического переключения раскладки

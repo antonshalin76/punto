@@ -63,6 +63,13 @@ public:
   bool initialize();
 
   /**
+   * @brief Запрашивает остановку цикла обработки событий
+   *
+   * Thread-safe. Может вызываться из signal handler.
+   */
+  void request_stop() noexcept;
+
+  /**
    * @brief Запускает главный цикл
    * @return Код возврата (0 = успех)
    *
@@ -260,6 +267,9 @@ private:
 
   /// Атомарный флаг включения/выключения автопереключения
   std::atomic<bool> ipc_enabled_{true};
+
+  /// Атомарный флаг запроса остановки (от signal handler)
+  std::atomic<bool> stop_requested_{false};
 
   /// IPC сервер для управления из tray-приложения
   std::unique_ptr<IpcServer> ipc_server_;

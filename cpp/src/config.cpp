@@ -82,7 +82,11 @@ bool validate_config(const Config &config) {
       config.delays.layout_switch.count() <= 0 ||
       config.delays.retype.count() <= 0 ||
       config.delays.turbo_key_press.count() <= 0 ||
-      config.delays.turbo_retype.count() <= 0) {
+      config.delays.turbo_retype.count() <= 0 ||
+      config.delays.key_hold.count() <= 0 ||
+      config.delays.modifier_hold.count() <= 0 ||
+      config.delays.modifier_release.count() <= 0 ||
+      config.delays.backspace_hold.count() <= 0) {
     return false;
   }
 
@@ -174,6 +178,14 @@ Config parse_config_stream(std::istream &file) {
           config.delays.turbo_key_press = *delay;
         } else if (key == "turbo_retype") {
           config.delays.turbo_retype = *delay;
+        } else if (key == "key_hold") {
+          config.delays.key_hold = *delay;
+        } else if (key == "modifier_hold") {
+          config.delays.modifier_hold = *delay;
+        } else if (key == "modifier_release") {
+          config.delays.modifier_release = *delay;
+        } else if (key == "backspace_hold") {
+          config.delays.backspace_hold = *delay;
         }
       }
     } else if (current_section == "auto_switch") {

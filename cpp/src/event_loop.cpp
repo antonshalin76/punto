@@ -113,6 +113,10 @@ bool EventLoop::initialize() {
   return true;
 }
 
+void EventLoop::request_stop() noexcept {
+  stop_requested_.store(true, std::memory_order_relaxed);
+}
+
 int EventLoop::run() {
   if (!initialize()) {
     std::cerr << "[punto] Failed to initialize event loop\n";
@@ -137,7 +141,37 @@ int EventLoop::run() {
 
   pollfd pfd{STDIN_FILENO, POLLIN, 0};
 
-  while (true) {
+  // Время последней попытки повторной инициализации X11
+  auto last_x11_retry_time = std::chrono::steady_clock::now();
+  constexpr auto kX11RetryInterval = std::chrono::seconds{3};
+
+  // Главный цикл: проверяем флаг остановки на каждой итерации
+  while (!stop_requested_.load(std::memory_order_relaxed)) {
+    // Ленивая повторная инициализация X11 если не удалось при старте (Bug #3)
+    if (!x11_session_->is_valid()) {
+      auto now = std::chrono::steady_clock::now();
+      if (now - last_x11_retry_time >= kX11RetryInterval) {
+        last_x11_retry_time = now;
+        std::cerr << "[punto] Attempting X11 re-initialization...\n";
+        if (x11_session_->initialize()) {
+          // X11 теперь доступен — создаём зависимые компоненты
+          clipboard_ = std::make_unique<ClipboardManager>(*x11_session_);
+          x11_session_->apply_environment();
+          current_layout_ = x11_session_->get_current_keyboard_layout();
+          if (current_layout_ < 0) {
+            current_layout_ = 0;
+          }
+          std::cerr << "[punto] X11 re-initialized, layout: "
+                    << (current_layout_ == 0 ? "EN" : "RU") << "\n";
+
+          // Пересоздаём SoundManager с новыми данными X11Session
+          auto cfg = std::atomic_load(&config_);
+          sound_manager_ =
+              std::make_unique<SoundManager>(*x11_session_, cfg->sound);
+        }
+      }
+    }
+
     // Важно: даже если пользователь перестал печатать, мы должны
     // применять готовые результаты анализа (иначе автоинверсия может не
     // сработать).
@@ -146,14 +180,31 @@ int EventLoop::run() {
     pfd.revents = 0;
     int ret = poll(&pfd, 1, 1); // 1ms тик
 
-    if (ret > 0 && (pfd.revents & POLLIN)) {
-      if (std::fread(&ev, sizeof(ev), 1, stdin) != 1) {
-        break; // EOF или ошибка
+    if (ret > 0) {
+      // Проверяем флаги закрытия канала или ошибки.
+      // POLLHUP возникает когда udevmon закрывает пайп (остановка сервиса).
+      // Если установлен POLLIN вместе с POLLHUP, сначала читаем оставшиеся
+      // данные.
+      if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+        // Если данных нет (только HUP/ERR), выходим из цикла
+        if (!(pfd.revents & POLLIN)) {
+          std::cerr << "[punto] stdin closed (revents=0x" << std::hex
+                    << pfd.revents << std::dec << "), exiting gracefully\n";
+          break;
+        }
+        // Иначе сначала читаем оставшиеся данные, а выйдем на следующей
+        // итерации
       }
-      handle_event(ev);
-      // После обработки события ещё раз проверим результаты.
-      process_ready_results();
-      continue;
+
+      if (pfd.revents & POLLIN) {
+        if (std::fread(&ev, sizeof(ev), 1, stdin) != 1) {
+          break; // EOF или ошибка
+        }
+        handle_event(ev);
+        // После обработки события ещё раз проверим результаты.
+        process_ready_results();
+        continue;
+      }
     }
 
     if (ret == 0) {
@@ -162,12 +213,14 @@ int EventLoop::run() {
 
     if (ret < 0) {
       if (errno == EINTR) {
+        // Сигнал прервал poll — проверяем флаг остановки на следующей итерации
         continue;
       }
       break;
     }
   }
 
+  std::cerr << "[punto] Event loop terminated gracefully\n";
   return 0;
 }
 
@@ -747,7 +800,12 @@ void EventLoop::action_auto_invert_word(std::span<const KeyEntry> word,
 
   // 2. Удаляем слово (turbo)
   injector->send_backspace(word.size(), true);
-  wait_and_buffer(std::chrono::microseconds{5000});
+
+  // КРИТИЧЕСКАЯ ПАУЗА: даём приложению время обработать все Backspace
+  // и обновить позицию курсора перед началом ввода новых символов.
+  // Без этой паузы в медленных приложениях (Electron, Java Swing)
+  // возникает гонка: новые символы вводятся до того, как удалены старые.
+  wait_and_buffer(std::chrono::microseconds{60000}); // 60ms
 
   // 3. Переключаем раскладку
   switch_layout(true);

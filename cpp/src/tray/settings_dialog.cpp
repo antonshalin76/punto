@@ -644,7 +644,7 @@ bool SettingsDialog::show(GtkWidget *parent) {
 
   // Typo correction
   GtkWidget *typo_check = gtk_check_button_new_with_label(
-      "Исправлять опечатки (перестановки, пропуски, дубли)");
+      "Исправлять опечатки (перестановки, пропуски, дубли) beta");
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(typo_check),
                                initial_settings.typo_correction_enabled);
   gtk_grid_attach(GTK_GRID(typo_grid), typo_check, 0, 1, 2, 1);

@@ -3,7 +3,7 @@
 Высокопроизводительная реализация Punto Switcher на C++20 для Linux.
 Позволяет исправлять текст, набранный в неправильной раскладке клавиатуры.
 
-![Version](https://img.shields.io/badge/version-2.7.3-blue)
+![Version](https://img.shields.io/badge/version-2.7.4-blue)
 ![C++](https://img.shields.io/badge/C%2B%2B-20-orange)
 ![License](https://img.shields.io/badge/license-Personal%20Use%20Only-red)
 
@@ -182,7 +182,7 @@ sudo apt install pulseaudio-utils alsa-utils
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh
-sudo dpkg -i punto-switcher_2.7.3_amd64.deb
+sudo dpkg -i punto-switcher_2.7.4_amd64.deb
 ```
 
 #### Ручная сборка без пакета
@@ -402,6 +402,12 @@ sudo rm -rf /etc/punto
 | wamerican-huge             | любая (опционально)       |
 
 ## История изменений
+
+### v2.7.4 — Исправление привязки к login screen (GDM)
+
+- **Сервис больше не "прилипает" к greeter-сессии** (gdm/lightdm) после boot.
+- **Автоматическое переподключение к активной user-сессии** после логина/логаута.
+- **Пересоздание X11/Audio-зависимых компонентов** (clipboard, звук) при смене сессии.
 
 ### v2.7.3 — Персистентный Undo Detector
 

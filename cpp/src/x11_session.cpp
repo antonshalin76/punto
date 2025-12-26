@@ -7,20 +7,77 @@
 
 #include <X11/XKBlib.h>
 #include <X11/Xlib.h>
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <pwd.h>
+#include <sstream>
 #include <unistd.h>
 #include <unordered_map>
+#include <vector>
 
 namespace punto {
 
 namespace {
 
-/// Выполняет команду и возвращает stdout
+[[nodiscard]] bool is_ascii_space(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+[[nodiscard]] std::string trim_copy(std::string s) {
+  while (!s.empty() && is_ascii_space(s.front())) {
+    s.erase(s.begin());
+  }
+  while (!s.empty() && is_ascii_space(s.back())) {
+    s.pop_back();
+  }
+  return s;
+}
+
+[[nodiscard]] std::vector<std::string> split_lines(const std::string &s) {
+  std::vector<std::string> out;
+  std::istringstream iss(s);
+  std::string line;
+  while (std::getline(iss, line)) {
+    line = trim_copy(std::move(line));
+    if (!line.empty()) {
+      out.push_back(std::move(line));
+    }
+  }
+  return out;
+}
+
+[[nodiscard]] bool is_digits(const std::string &s) {
+  return !s.empty() &&
+         std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
+}
+
+[[nodiscard]] bool is_greeter_username(std::string_view u) {
+  return (u == "gdm" || u == "lightdm" || u == "sddm");
+}
+
+[[nodiscard]] bool is_safe_shell_username(std::string_view u) {
+  if (u.empty()) {
+    return false;
+  }
+  for (char ch : u) {
+    const unsigned char c = static_cast<unsigned char>(ch);
+    if (std::isalnum(c) != 0) {
+      continue;
+    }
+    if (c == '_' || c == '-' || c == '.') {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+/// Выполняет команду и возвращает stdout (в конце без \n/\r)
 std::string exec_command(const std::string &cmd) {
   std::array<char, 256> buffer{};
   std::string result;
@@ -29,13 +86,11 @@ std::string exec_command(const std::string &cmd) {
   if (!pipe)
     return "";
 
-  while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) !=
-         nullptr) {
+  while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
     result += buffer.data();
   }
   pclose(pipe);
 
-  // Удаляем trailing newline
   while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
     result.pop_back();
   }
@@ -43,14 +98,30 @@ std::string exec_command(const std::string &cmd) {
   return result;
 }
 
+/// Парсит вывод "KEY=VALUE" в map.
+[[nodiscard]] std::unordered_map<std::string, std::string>
+parse_key_value_lines(const std::string &s) {
+  std::unordered_map<std::string, std::string> out;
+  for (const auto &line : split_lines(s)) {
+    const std::size_t eq = line.find('=');
+    if (eq == std::string::npos) {
+      continue;
+    }
+    std::string key = line.substr(0, eq);
+    std::string value = line.substr(eq + 1);
+    out.emplace(std::move(key), std::move(value));
+  }
+  return out;
+}
+
 /// Читает переменные окружения из /proc/<pid>/environ
-std::unordered_map<std::string, std::string>
-read_proc_environ(const std::string &pid) {
+std::unordered_map<std::string, std::string> read_proc_environ(const std::string &pid) {
   std::unordered_map<std::string, std::string> env;
 
   std::ifstream file("/proc/" + pid + "/environ", std::ios::binary);
-  if (!file)
+  if (!file) {
     return env;
+  }
 
   std::string content((std::istreambuf_iterator<char>(file)),
                       std::istreambuf_iterator<char>());
@@ -58,8 +129,9 @@ read_proc_environ(const std::string &pid) {
   std::size_t start = 0;
   while (start < content.size()) {
     std::size_t end = content.find('\0', start);
-    if (end == std::string::npos)
+    if (end == std::string::npos) {
       break;
+    }
 
     std::string_view entry(content.data() + start, end - start);
     auto eq_pos = entry.find('=');
@@ -78,75 +150,314 @@ read_proc_environ(const std::string &pid) {
 } // namespace
 
 bool X11Session::initialize() {
-  if (initialized_)
+  if (initialized_.load(std::memory_order_acquire)) {
     return true;
+  }
 
-  // Сохраняем оригинальные effective UID/GID
+  // Сохраняем оригинальные effective UID/GID (root-контекст).
   original_uid_ = geteuid();
   original_gid_ = getegid();
 
-  // Находим активного пользователя
-  auto username = find_active_user();
-  if (!username) {
-    std::cerr
-        << "[punto] Ошибка: не удалось найти активного GUI пользователя\n";
+  std::optional<ActiveSession> active = find_active_session_loginctl();
+
+  std::string username;
+  std::string session_id;
+  std::string leader_pid;
+
+  if (active) {
+    username = active->username;
+    session_id = active->session_id;
+    leader_pid = active->leader_pid;
+  } else {
+    auto u = find_active_user_fallback();
+    if (!u) {
+      std::cerr << "[punto] Ошибка: не удалось найти активного GUI пользователя\n";
+      return false;
+    }
+    username = *u;
+  }
+
+  if (username.empty() || is_greeter_username(username)) {
+    // Greeter (gdm/lightdm/sddm) не считаем рабочей GUI-сессией.
     return false;
   }
 
-  info_.username = *username;
-
-  // Получаем информацию о пользователе
-  struct passwd *pw = getpwnam(info_.username.c_str());
+  struct passwd *pw = getpwnam(username.c_str());
   if (!pw) {
-    std::cerr << "[punto] Ошибка: пользователь " << info_.username
+    std::cerr << "[punto] Ошибка: пользователь " << username
               << " не найден в системе\n";
     return false;
   }
 
-  info_.uid = pw->pw_uid;
-  info_.gid = pw->pw_gid;
-  info_.home_dir = pw->pw_dir;
-  info_.xdg_runtime_dir = "/run/user/" + std::to_string(info_.uid);
+  X11SessionInfo next;
+  next.session_id = std::move(session_id);
+  next.username = std::move(username);
+  next.uid = pw->pw_uid;
+  next.gid = pw->pw_gid;
+  if (pw->pw_dir) {
+    next.home_dir = pw->pw_dir;
+  }
+  next.xdg_runtime_dir = "/run/user/" + std::to_string(next.uid);
 
-  // Находим DISPLAY/XAUTHORITY
-  if (!find_session_env(info_.username)) {
-    // Устанавливаем дефолты
-    info_.display = ":0";
-    info_.xauthority_path =
-        "/run/user/" + std::to_string(info_.uid) + "/gdm/Xauthority";
+  bool env_ok = false;
+  if (!leader_pid.empty()) {
+    env_ok = find_session_env_by_pid(leader_pid, next);
+  }
+  if (!env_ok) {
+    env_ok = find_session_env_by_user(next.username, next);
   }
 
-  initialized_ = true;
+  if (!env_ok || next.display.empty()) {
+    // Не поднимаем "валидную" сессию без DISPLAY — иначе сервис прилипнет
+    // к нерабочему контексту и не будет пытаться реинициализироваться.
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    info_ = std::move(next);
+  }
+  initialized_.store(true, std::memory_order_release);
+
+  // Healthcheck: проверяем, что реально можем подключиться к X.
+  if (!verify_x11_access()) {
+    reset();
+    return false;
+  }
+
   return true;
 }
 
-bool X11Session::is_valid() const noexcept { return initialized_; }
+X11Session::RefreshResult X11Session::refresh() {
+  // Сохраняем текущий effective UID/GID (нужно для корректного switch_to_root()).
+  original_uid_ = geteuid();
+  original_gid_ = getegid();
 
-const X11SessionInfo &X11Session::info() const noexcept { return info_; }
+  std::optional<ActiveSession> active = find_active_session_loginctl();
+
+  if (!active) {
+    // systemd/loginctl может быть недоступен — используем fallback.
+    const bool was_valid = initialized_.load(std::memory_order_acquire);
+
+    auto fallback_user = find_active_user_fallback();
+    if (!fallback_user) {
+      if (was_valid) {
+        reset();
+        return RefreshResult::Invalidated;
+      }
+      return RefreshResult::Unchanged;
+    }
+
+    // Если имя совпадает с текущим — просто пытаемся обновить env через user-scan.
+    const X11SessionInfo cur = info();
+    if (was_valid && cur.username == *fallback_user) {
+      X11SessionInfo next = cur;
+      const bool env_ok = find_session_env_by_user(next.username, next);
+      if (env_ok && !next.display.empty()) {
+        const bool env_changed = (cur.display != next.display ||
+                                  cur.xauthority_path != next.xauthority_path ||
+                                  cur.xdg_runtime_dir != next.xdg_runtime_dir);
+        if (env_changed) {
+          {
+            std::lock_guard<std::mutex> lock(mu_);
+            info_ = std::move(next);
+          }
+          if (!verify_x11_access()) {
+            reset();
+            return RefreshResult::Invalidated;
+          }
+          return RefreshResult::Updated;
+        }
+      }
+      return RefreshResult::Unchanged;
+    }
+
+    // Имя изменилось (или ранее было невалидно) — переинициализируемся.
+    reset();
+    if (initialize()) {
+      return RefreshResult::Updated;
+    }
+
+    // Не удалось инициализироваться — остаёмся в невалидном состоянии.
+    if (was_valid) {
+      return RefreshResult::Invalidated;
+    }
+    return RefreshResult::Unchanged;
+  }
+
+  if (active->username.empty() || is_greeter_username(active->username)) {
+    const bool was_valid = initialized_.load(std::memory_order_acquire);
+    if (was_valid) {
+      reset();
+      return RefreshResult::Invalidated;
+    }
+    return RefreshResult::Unchanged;
+  }
+
+  X11SessionInfo cur;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    cur = info_;
+  }
+
+  const bool same_session = (!cur.session_id.empty() &&
+                             cur.session_id == active->session_id &&
+                             cur.username == active->username);
+
+  // Всегда перечитываем env: DISPLAY/XAUTHORITY/XDG_RUNTIME_DIR могут измениться
+  // в рамках одной логин-сессии (ранняя стадия после логина).
+  X11SessionInfo next = cur;
+  next.session_id = active->session_id;
+  next.username = active->username;
+
+  // Всегда обновляем uid/gid/home для текущего активного пользователя.
+  struct passwd *pw = getpwnam(next.username.c_str());
+  if (!pw) {
+    const bool was_valid = initialized_.load(std::memory_order_acquire);
+    if (was_valid) {
+      reset();
+      return RefreshResult::Invalidated;
+    }
+    return RefreshResult::Unchanged;
+  }
+
+  next.uid = pw->pw_uid;
+  next.gid = pw->pw_gid;
+  next.home_dir = (pw->pw_dir != nullptr) ? pw->pw_dir : std::string{};
+  next.xdg_runtime_dir = "/run/user/" + std::to_string(next.uid);
+
+  bool env_ok = false;
+  if (!active->leader_pid.empty()) {
+    env_ok = find_session_env_by_pid(active->leader_pid, next);
+  }
+  if (!env_ok) {
+    env_ok = find_session_env_by_user(next.username, next);
+  }
+
+  if (!env_ok || next.display.empty()) {
+    const bool was_valid = initialized_.load(std::memory_order_acquire);
+    if (was_valid) {
+      reset();
+      return RefreshResult::Invalidated;
+    }
+    return RefreshResult::Unchanged;
+  }
+
+  const bool env_changed = (cur.display != next.display ||
+                            cur.xauthority_path != next.xauthority_path ||
+                            cur.xdg_runtime_dir != next.xdg_runtime_dir ||
+                            cur.username != next.username ||
+                            cur.session_id != next.session_id);
+
+  if (!env_changed && same_session && initialized_.load(std::memory_order_acquire)) {
+    return RefreshResult::Unchanged;
+  }
+
+  // Применяем обновление атомарно.
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    info_ = std::move(next);
+  }
+  initialized_.store(true, std::memory_order_release);
+
+  if (!verify_x11_access()) {
+    reset();
+    return RefreshResult::Invalidated;
+  }
+
+  return RefreshResult::Updated;
+}
+
+void X11Session::reset() noexcept {
+  initialized_.store(false, std::memory_order_release);
+
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    info_ = X11SessionInfo{};
+  }
+
+  // Не оставляем стейл-окружение от предыдущей сессии.
+  unsetenv("DISPLAY");
+  unsetenv("XAUTHORITY");
+  unsetenv("HOME");
+  unsetenv("USER");
+  unsetenv("LOGNAME");
+  unsetenv("XDG_RUNTIME_DIR");
+}
+
+bool X11Session::is_valid() const noexcept {
+  return initialized_.load(std::memory_order_acquire);
+}
+
+X11SessionInfo X11Session::info() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return info_;
+}
 
 void X11Session::apply_environment() const {
-  if (!initialized_)
+  if (!initialized_.load(std::memory_order_acquire)) {
     return;
+  }
 
-  setenv("DISPLAY", info_.display.c_str(), 1);
-  setenv("XAUTHORITY", info_.xauthority_path.c_str(), 1);
-  setenv("HOME", info_.home_dir.c_str(), 1);
-  setenv("USER", info_.username.c_str(), 1);
-  setenv("LOGNAME", info_.username.c_str(), 1);
-  setenv("XDG_RUNTIME_DIR", info_.xdg_runtime_dir.c_str(), 1);
+  X11SessionInfo snap;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    snap = info_;
+  }
+
+  if (!snap.display.empty()) {
+    setenv("DISPLAY", snap.display.c_str(), 1);
+  } else {
+    unsetenv("DISPLAY");
+  }
+
+  if (!snap.xauthority_path.empty()) {
+    setenv("XAUTHORITY", snap.xauthority_path.c_str(), 1);
+  } else {
+    unsetenv("XAUTHORITY");
+  }
+
+  if (!snap.home_dir.empty()) {
+    setenv("HOME", snap.home_dir.c_str(), 1);
+  } else {
+    unsetenv("HOME");
+  }
+
+  if (!snap.username.empty()) {
+    setenv("USER", snap.username.c_str(), 1);
+    setenv("LOGNAME", snap.username.c_str(), 1);
+  } else {
+    unsetenv("USER");
+    unsetenv("LOGNAME");
+  }
+
+  if (!snap.xdg_runtime_dir.empty()) {
+    setenv("XDG_RUNTIME_DIR", snap.xdg_runtime_dir.c_str(), 1);
+  } else {
+    unsetenv("XDG_RUNTIME_DIR");
+  }
 }
 
 bool X11Session::switch_to_user() const {
-  if (!initialized_)
-    return false;
-  if (geteuid() == static_cast<uid_t>(info_.uid))
-    return true; // Уже этот пользователь
-
-  // Сначала gid, потом uid
-  if (setegid(static_cast<gid_t>(info_.gid)) != 0) {
+  if (!initialized_.load(std::memory_order_acquire)) {
     return false;
   }
-  if (seteuid(static_cast<uid_t>(info_.uid)) != 0) {
+
+  X11SessionInfo snap;
+  {
+    std::lock_guard<std::mutex> lock(mu_);
+    snap = info_;
+  }
+
+  if (geteuid() == static_cast<uid_t>(snap.uid)) {
+    return true;
+  }
+
+  // Сначала gid, потом uid
+  if (setegid(static_cast<gid_t>(snap.gid)) != 0) {
+    return false;
+  }
+  if (seteuid(static_cast<uid_t>(snap.uid)) != 0) {
     // Откатываем gid (best effort, ignoring errors)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-result"
@@ -173,39 +484,131 @@ bool X11Session::switch_to_root() const {
   return true;
 }
 
-std::optional<std::string> X11Session::find_active_user() {
-  // Метод 1: loginctl (systemd)
-  std::string user = exec_command("loginctl list-sessions 2>/dev/null | grep "
-                                  "'seat0' | awk '{print $3}' | head -n 1");
+std::optional<X11Session::ActiveSession> X11Session::find_active_session_loginctl() {
+  const std::string out =
+      exec_command("loginctl list-sessions --no-legend --no-pager 2>/dev/null");
+  if (out.empty()) {
+    return std::nullopt;
+  }
 
-  if (!user.empty()) {
+  for (const auto &line : split_lines(out)) {
+    std::istringstream iss(line);
+    std::string sid;
+    std::string uid;
+    std::string user;
+    std::string seat;
+
+    iss >> sid >> uid >> user >> seat;
+    if (sid.empty() || user.empty() || seat.empty()) {
+      continue;
+    }
+    if (seat != "seat0") {
+      continue;
+    }
+    if (!is_digits(sid)) {
+      continue;
+    }
+
+    const std::string show = exec_command(
+        "loginctl show-session " + sid +
+        " -p Active -p Class -p Name -p Leader --no-pager 2>/dev/null");
+    if (show.empty()) {
+      continue;
+    }
+
+    auto kv = parse_key_value_lines(show);
+
+    const auto it_active = kv.find("Active");
+    const auto it_class = kv.find("Class");
+    const auto it_name = kv.find("Name");
+    const auto it_leader = kv.find("Leader");
+
+    const std::string active = (it_active != kv.end()) ? it_active->second : "";
+    const std::string cls = (it_class != kv.end()) ? it_class->second : "";
+    const std::string name = (it_name != kv.end()) ? it_name->second : user;
+    const std::string leader = (it_leader != kv.end()) ? it_leader->second : "";
+
+    if (active != "yes") {
+      continue;
+    }
+    if (cls != "user") {
+      // Greeter/manager сессии не используем.
+      continue;
+    }
+    if (name.empty() || is_greeter_username(name)) {
+      continue;
+    }
+
+    ActiveSession s;
+    s.session_id = sid;
+    s.username = name;
+    if (is_digits(leader)) {
+      s.leader_pid = leader;
+    }
+    return s;
+  }
+
+  return std::nullopt;
+}
+
+std::optional<std::string> X11Session::find_active_user_fallback() {
+  // Метод 1: who
+  std::string user =
+      exec_command("who 2>/dev/null | grep '(:0)' | awk '{print $1}' | head -n 1");
+  if (!user.empty() && !is_greeter_username(user) && user != "root") {
     return user;
   }
 
-  // Метод 2: who
-  user = exec_command(
-      "who 2>/dev/null | grep '(:0)' | awk '{print $1}' | head -n 1");
-  if (!user.empty()) {
-    return user;
-  }
-
-  // Метод 3: владелец /dev/tty1 или консоли
+  // Метод 2: владелец /dev/tty1 или консоли
   user = exec_command("stat -c '%U' /dev/tty1 2>/dev/null");
-  if (!user.empty() && user != "root") {
+  if (!user.empty() && user != "root" && !is_greeter_username(user)) {
     return user;
   }
 
   return std::nullopt;
 }
 
-bool X11Session::find_session_env(const std::string &username) {
-  // Ищем процесс gnome-session или kde пользователя
-  std::string pid =
-      exec_command("pgrep -u " + username +
-                   " 'gnome-session|plasma' 2>/dev/null | head -n 1");
+bool X11Session::find_session_env_by_pid(const std::string &pid, X11SessionInfo &out) {
+  if (!is_digits(pid)) {
+    return false;
+  }
+
+  auto env = read_proc_environ(pid);
+  if (env.empty()) {
+    return false;
+  }
+
+  if (auto it = env.find("DISPLAY"); it != env.end()) {
+    out.display = it->second;
+  }
+
+  if (auto it = env.find("XAUTHORITY"); it != env.end()) {
+    out.xauthority_path = it->second;
+  }
+
+  if (auto it = env.find("XDG_RUNTIME_DIR"); it != env.end()) {
+    out.xdg_runtime_dir = it->second;
+  }
+
+  return !out.display.empty();
+}
+
+bool X11Session::find_session_env_by_user(const std::string &username,
+                                         X11SessionInfo &out) {
+  if (username.empty() || is_greeter_username(username)) {
+    return false;
+  }
+  if (!is_safe_shell_username(username)) {
+    return false;
+  }
+
+  // Ищем процесс gnome-session или KDE пользователя.
+  std::string pid = exec_command("pgrep -u " + username +
+                                 " 'gnome-session|plasma|plasmashell' "
+                                 "2>/dev/null | head -n 1");
 
   if (pid.empty()) {
-    // Fallback: ищем любой X-клиент
+    // Fallback: gnome-shell (в т.ч. Wayland)
     pid = exec_command("pgrep -u " + username +
                        " -f '^/usr/bin/gnome-shell' 2>/dev/null | head -n 1");
   }
@@ -214,26 +617,44 @@ bool X11Session::find_session_env(const std::string &username) {
     return false;
   }
 
-  auto env = read_proc_environ(pid);
+  return find_session_env_by_pid(pid, out);
+}
 
-  if (auto it = env.find("DISPLAY"); it != env.end()) {
-    info_.display = it->second;
+bool X11Session::verify_x11_access() const {
+  if (!initialized_.load(std::memory_order_acquire)) {
+    return false;
   }
 
-  if (auto it = env.find("XAUTHORITY"); it != env.end()) {
-    info_.xauthority_path = it->second;
+  // Переходим в контекст пользователя.
+  if (!switch_to_user()) {
+    return false;
+  }
+  apply_environment();
+
+  Display *display = XOpenDisplay(nullptr);
+  if (!display) {
+    const char *display_name = std::getenv("DISPLAY");
+    if (display_name) {
+      display = XOpenDisplay(display_name);
+    }
   }
 
-  if (auto it = env.find("XDG_RUNTIME_DIR"); it != env.end()) {
-    info_.xdg_runtime_dir = it->second;
+  bool ok = false;
+  if (display) {
+    // Минимальная операция, чтобы убедиться, что соединение реально живое.
+    XkbStateRec state;
+    ok = (XkbGetState(display, XkbUseCoreKbd, &state) == Success);
+    XCloseDisplay(display);
   }
 
-  return !info_.display.empty();
+  switch_to_root();
+  return ok;
 }
 
 int X11Session::get_current_keyboard_layout() const {
-  if (!initialized_)
+  if (!initialized_.load(std::memory_order_acquire)) {
     return -1;
+  }
 
   // Переходим в контекст пользователя
   if (!switch_to_user())
@@ -262,8 +683,9 @@ int X11Session::get_current_keyboard_layout() const {
 }
 
 bool X11Session::set_keyboard_layout(int index) const {
-  if (!initialized_)
+  if (!initialized_.load(std::memory_order_acquire)) {
     return false;
+  }
 
   if (!switch_to_user())
     return false;

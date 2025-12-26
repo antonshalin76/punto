@@ -1,6 +1,6 @@
 # Punto Switcher Configuration
 # Путь по умолчанию: /etc/punto/config.yaml
-# Config version: 2.7.3
+# Config version: 2.7.4
 
 # Хоткей переключения раскладки
 # Доступные модификаторы: leftctrl, rightctrl, leftalt, rightalt, leftshift, rightshift

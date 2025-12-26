@@ -8,9 +8,13 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
+
+#include <sys/types.h>
 
 namespace punto {
 
@@ -18,6 +22,10 @@ namespace punto {
  * @brief Информация о GUI сессии пользователя
  */
 struct X11SessionInfo {
+  // Идентификатор логин-сессии systemd (loginctl), если доступен.
+  // Используется для детекта смены сессии после логина/логаута.
+  std::string session_id;
+
   std::string username;
   std::uint32_t uid = 0;
   std::uint32_t gid = 0;
@@ -35,6 +43,12 @@ struct X11SessionInfo {
  */
 class X11Session {
 public:
+  enum class RefreshResult {
+    Unchanged,
+    Updated,
+    Invalidated,
+  };
+
   /**
    * @brief Инициализирует сессию, находя активного GUI пользователя
    * @return true если сессия найдена и инициализирована
@@ -42,14 +56,27 @@ public:
   bool initialize();
 
   /**
+   * @brief Переопределяет активную GUI-сессию и при необходимости переинициализирует
+   *
+   * Используется, чтобы не «прилипать» к greeter (gdm/lightdm) на этапе boot
+   * и корректно переживать logout/login.
+   */
+  [[nodiscard]] RefreshResult refresh();
+
+  /**
+   * @brief Сбрасывает состояние (сессия считается невалидной)
+   */
+  void reset() noexcept;
+
+  /**
    * @brief Проверяет, инициализирована ли сессия
    */
   [[nodiscard]] bool is_valid() const noexcept;
 
   /**
-   * @brief Возвращает информацию о сессии
+   * @brief Возвращает снапшот информации о сессии (thread-safe)
    */
-  [[nodiscard]] const X11SessionInfo &info() const noexcept;
+  [[nodiscard]] X11SessionInfo info() const;
 
   /**
    * @brief Устанавливает переменные окружения для X11 операций
@@ -84,18 +111,40 @@ public:
   bool set_keyboard_layout(int index) const;
 
 private:
+  struct ActiveSession {
+    std::string session_id;
+    std::string username;
+    std::string leader_pid;
+  };
+
   /**
-   * @brief Находит GUI пользователя через loginctl
+   * @brief Находит активную user-сессию на seat0 через loginctl
    */
-  std::optional<std::string> find_active_user();
+  std::optional<ActiveSession> find_active_session_loginctl();
+
+  /**
+   * @brief Fallback: находит пользователя (who/tty1)
+   */
+  std::optional<std::string> find_active_user_fallback();
 
   /**
    * @brief Находит DISPLAY/XAUTHORITY из /proc/<pid>/environ
    */
-  bool find_session_env(const std::string &username);
+  bool find_session_env_by_pid(const std::string &pid, X11SessionInfo &out);
 
+  /**
+   * @brief Fallback: ищем env по процессам пользователя
+   */
+  bool find_session_env_by_user(const std::string &username, X11SessionInfo &out);
+
+  /**
+   * @brief Проверяет доступ к X серверу (минимальный healthcheck)
+   */
+  [[nodiscard]] bool verify_x11_access() const;
+
+  mutable std::mutex mu_;
   X11SessionInfo info_;
-  bool initialized_ = false;
+  std::atomic<bool> initialized_{false};
   uid_t original_uid_ = 0;
   gid_t original_gid_ = 0;
 };

@@ -82,8 +82,11 @@ bool EventLoop::initialize() {
   }
 
   if (!x11_ok) {
-    std::cerr << "[punto] Предупреждение: X11 сессия не инициализирована. "
-                 "Операции с буфером обмена будут недоступны.\n";
+    std::cerr
+        << "[punto] Предупреждение: X11 сессия не инициализирована (нет активной "
+           "user-сессии или недоступен DISPLAY/XAUTHORITY).\n"
+        << "[punto] Ожидается на экране логина: сервис автоматически "
+           "перепривяжется после входа пользователя.\n";
     // Не фатальная ошибка — базовая функциональность работает
   } else {
     // Создаём ClipboardManager
@@ -141,35 +144,88 @@ int EventLoop::run() {
 
   pollfd pfd{STDIN_FILENO, POLLIN, 0};
 
-  // Время последней попытки повторной инициализации X11
-  auto last_x11_retry_time = std::chrono::steady_clock::now();
-  constexpr auto kX11RetryInterval = std::chrono::seconds{3};
+  // Время последней проверки/обновления X11-сессии.
+  // Нужен для фикса "прилипание к GDM" на буте и корректной работы после logout/login.
+  auto last_x11_check_time = std::chrono::steady_clock::now();
+  constexpr auto kX11CheckInterval = std::chrono::seconds{3};
+
+  bool x11_wait_log_emitted = false;
+
+  auto rebuild_x11_deps = [&]() {
+    // Смена GUI-сессии может менять источник конфигурации (~/.config/...)
+    // поэтому всегда делаем best-effort reload.
+    {
+      IpcResult res = reload_config();
+      if (!res.success) {
+        std::cerr << "[punto] Warning: config reload after X11 refresh failed: "
+                  << res.message << "\n";
+      }
+    }
+
+    // На новой сессии пробуем снова включить прямой XKB set.
+    xkb_set_available_ = true;
+
+    {
+      const X11SessionInfo info = x11_session_->info();
+      std::cerr << "[punto] X11 session: id=" << info.session_id
+                << " user=" << info.username << " display=" << info.display
+                << "\n";
+    }
+
+    // Пересоздаём Clipboard/Sound (они завязаны на DISPLAY/XDG_RUNTIME_DIR/uid).
+    clipboard_ = std::make_unique<ClipboardManager>(*x11_session_);
+
+    auto cfg = std::atomic_load(&config_);
+    sound_manager_ = std::make_unique<SoundManager>(*x11_session_, cfg->sound);
+
+    // Синхронизируем раскладку.
+    x11_session_->apply_environment();
+    current_layout_ = x11_session_->get_current_keyboard_layout();
+    if (current_layout_ < 0) {
+      current_layout_ = 0;
+    }
+    std::cerr << "[punto] X11 session refreshed, layout: "
+              << (current_layout_ == 0 ? "EN" : "RU") << "\n";
+
+    last_sync_time_ = std::chrono::steady_clock::now();
+  };
+
+  auto teardown_x11_deps = [&]() {
+    clipboard_.reset();
+    sound_manager_.reset();
+    // Не трогаем current_layout_: оно используется как внутренний стейт,
+    // но без валидной X11-сессии операции set/get всё равно станут no-op.
+  };
 
   // Главный цикл: проверяем флаг остановки на каждой итерации
   while (!stop_requested_.load(std::memory_order_relaxed)) {
-    // Ленивая повторная инициализация X11 если не удалось при старте (Bug #3)
-    if (!x11_session_->is_valid()) {
-      auto now = std::chrono::steady_clock::now();
-      if (now - last_x11_retry_time >= kX11RetryInterval) {
-        last_x11_retry_time = now;
-        std::cerr << "[punto] Attempting X11 re-initialization...\n";
-        if (x11_session_->initialize()) {
-          // X11 теперь доступен — создаём зависимые компоненты
-          clipboard_ = std::make_unique<ClipboardManager>(*x11_session_);
-          x11_session_->apply_environment();
-          current_layout_ = x11_session_->get_current_keyboard_layout();
-          if (current_layout_ < 0) {
-            current_layout_ = 0;
-          }
-          std::cerr << "[punto] X11 re-initialized, layout: "
-                    << (current_layout_ == 0 ? "EN" : "RU") << "\n";
+    // Периодически проверяем, не сменилась ли активная user-сессия.
+    {
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last_x11_check_time >= kX11CheckInterval) {
+        last_x11_check_time = now;
 
-          // Пересоздаём SoundManager с новыми данными X11Session
-          auto cfg = std::atomic_load(&config_);
-          sound_manager_ =
-              std::make_unique<SoundManager>(*x11_session_, cfg->sound);
+        const X11Session::RefreshResult rr = x11_session_->refresh();
+        if (rr == X11Session::RefreshResult::Updated) {
+          rebuild_x11_deps();
+        } else if (rr == X11Session::RefreshResult::Invalidated) {
+          teardown_x11_deps();
+          std::cerr << "[punto] X11 session invalidated (no active user session)\n";
         }
       }
+    }
+
+    // Одноразовый лог "ждём user-сессию" (чтобы не спамить в journalctl).
+    // На экране логина активна greeter-сессия (Class=greeter) и X11 контекст
+    // пользователя ещё недоступен.
+    if (!x11_session_->is_valid()) {
+      if (!x11_wait_log_emitted) {
+        x11_wait_log_emitted = true;
+        std::cerr << "[punto] X11: активная пользовательская сессия не обнаружена "
+                     "(возможно экран логина). Ожидаю входа пользователя...\n";
+      }
+    } else {
+      x11_wait_log_emitted = false;
     }
 
     // Важно: даже если пользователь перестал печатать, мы должны
@@ -1846,9 +1902,9 @@ IpcResult EventLoop::reload_config(const std::string &config_path) {
   } else {
     std::optional<std::filesystem::path> user_path;
     if (x11_session_ && x11_session_->is_valid()) {
-      // Обновляем окружение для корректного чтения $HOME из активной сессии
-      x11_session_->apply_environment();
-      const auto &info = x11_session_->info();
+      // Важно: reload_config() может выполняться из IPC-потока.
+      // Не трогаем процессное окружение (setenv) здесь, берём снапшот данных.
+      const X11SessionInfo info = x11_session_->info();
       if (!info.home_dir.empty()) {
         user_path = std::filesystem::path{info.home_dir} /
                     std::filesystem::path{std::string{kUserConfigRelPath}};

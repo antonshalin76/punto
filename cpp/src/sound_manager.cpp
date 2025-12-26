@@ -91,7 +91,7 @@ SoundManager::SoundManager(const X11Session &x11_session, const SoundConfig &con
     return;
   }
 
-  const X11SessionInfo &info = x11_session_.info();
+  const X11SessionInfo info = x11_session_.info();
 
   user_uid_ = static_cast<uid_t>(info.uid);
   user_gid_ = static_cast<gid_t>(info.gid);

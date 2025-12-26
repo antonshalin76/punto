@@ -21,8 +21,8 @@ enum class Language { English, Russian };
 
 /// Результат анализа слова
 struct AnalysisResult {
-  double en_score = 0.0;           // Скор для английской раскладки
-  double ru_score = 0.0;           // Скор для русской раскладки
+  double en_score = 0.0;            // Скор для английской раскладки
+  double ru_score = 0.0;            // Скор для русской раскладки
   std::size_t en_invalid_count = 0; // Количество невалидных EN биграмм
   std::size_t ru_invalid_count = 0; // Количество невалидных RU биграмм
   Language likely_lang = Language::English;
@@ -76,6 +76,13 @@ public:
                                     std::size_t &en_invalid,
                                     std::size_t &ru_invalid);
 
+  /**
+   * @brief Проверяет, содержит ли слово цифры или спецсимволы
+   * @param word Буфер слова
+   * @return true если слово содержит нежелательные символы
+   */
+  [[nodiscard]] static bool has_invalid_chars(std::span<const KeyEntry> word);
+
 private:
   /**
    * @brief Конвертирует скан-код в ASCII символ (нижний регистр)
@@ -83,13 +90,6 @@ private:
    * @return Символ или '\0' если не буква
    */
   [[nodiscard]] static char scancode_to_lowercase(ScanCode code);
-
-  /**
-   * @brief Проверяет, содержит ли слово цифры или спецсимволы
-   * @param word Буфер слова
-   * @return true если слово содержит нежелательные символы
-   */
-  [[nodiscard]] static bool has_invalid_chars(std::span<const KeyEntry> word);
 
   /**
    * @brief Конвертирует буфер в строку ASCII символов

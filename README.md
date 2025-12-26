@@ -3,7 +3,7 @@
 Высокопроизводительная реализация Punto Switcher на C++20 для Linux.
 Позволяет исправлять текст, набранный в неправильной раскладке клавиатуры.
 
-![Version](https://img.shields.io/badge/version-2.7.4-blue)
+![Version](https://img.shields.io/badge/version-2.7.5-blue)
 ![C++](https://img.shields.io/badge/C%2B%2B-20-orange)
 ![License](https://img.shields.io/badge/license-Personal%20Use%20Only-red)
 
@@ -182,7 +182,7 @@ sudo apt install pulseaudio-utils alsa-utils
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh
-sudo dpkg -i punto-switcher_2.7.4_amd64.deb
+sudo dpkg -i punto-switcher_2.7.5_amd64.deb
 ```
 
 #### Ручная сборка без пакета
@@ -402,6 +402,14 @@ sudo rm -rf /etc/punto
 | wamerican-huge             | любая (опционально)       |
 
 ## История изменений
+
+### v2.7.5 — Исправление ложного переключения при вводе чисел
+
+- **Исправлен баг ложного автопереключения для чисел**:
+  - Ввод чисел ("123", "2024", "3.14") больше не вызывает переключение раскладки
+  - Добавлена проверка `has_invalid_chars` в `AnalysisWorkerPool` перед обращением к словарю
+  - Синхронизировано поведение асинхронного воркера с логикой `LayoutAnalyzer::should_switch()`
+  - Цифры теперь корректно распознаются как нейтральные символы для целей определения раскладки
 
 ### v2.7.4 — Исправление привязки к login screen (GDM)
 

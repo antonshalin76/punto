@@ -100,8 +100,10 @@ public:
   void send_layout_hotkey(ScanCode modifier, ScanCode key) const;
 
   /**
-   * @brief Вставка из clipboard (Ctrl+V / Ctrl+Shift+V)
-   * @param is_terminal true если активное окно — терминал
+   * @brief Вставка текста из буфера обмена
+   *
+   * - is_terminal=true: Ctrl+Shift+V
+   * - is_terminal=false: Shift+Insert
    */
   void send_paste(bool is_terminal) const;
 

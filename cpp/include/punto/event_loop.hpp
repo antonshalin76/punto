@@ -150,6 +150,14 @@ private:
   [[nodiscard]] bool paste_text_oneshot(std::string_view text,
                                        bool restore_clipboard = true);
 
+  /// Если paste делается через Ctrl+Shift+V, то в ряде терминалов хоткей
+  /// распознаётся по keysym и зависит от раскладки.
+  ///
+  /// Для устойчивости временно переключаемся на EN (layout=0) перед paste и
+  /// возвращаем прежнюю раскладку после.
+  [[nodiscard]] std::optional<int>
+  maybe_switch_layout_to_en_for_terminal_paste(bool is_terminal);
+
   /// Удаляет `backspace_count` символов и вставляет `text` через oneshot paste.
   ///
   /// @param final_layout если задано (0/1) — стараемся установить раскладку

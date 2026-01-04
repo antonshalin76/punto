@@ -46,7 +46,15 @@ cmake --build cpp/build -j"$(nproc)"
 
 ### Тесты
 
-Автоматического набора unit/integration тестов (CTest/GoogleTest и т.п.) в репозитории сейчас нет.
+Есть простые unit-тесты через CTest (`cpp/tests/test_main.cpp`):
+
+```bash
+cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+cmake --build cpp/build -j"$(nproc)"
+ctest --test-dir cpp/build --output-on-failure
+```
+
+Интеграционных тестов пока нет.
 
 Практический smoke-test делается через реальный pipeline interception-tools (требует root) или через установленный сервис `udevmon`.
 

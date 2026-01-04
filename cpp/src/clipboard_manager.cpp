@@ -4,57 +4,18 @@
  */
 
 #include "punto/clipboard_manager.hpp"
+#include "punto/terminal_detection.hpp"
 
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 
-#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <iostream>
 #include <thread>
 
 namespace punto {
-
-namespace {
-
-/// Список терминальных эмуляторов
-constexpr std::array kTerminalClasses = {"gnome-terminal",
-                                         "gnome-terminal-server",
-                                         "konsole",
-                                         "xterm",
-                                         "urxvt",
-                                         "terminator",
-                                         "tilix",
-                                         "alacritty",
-                                         "kitty",
-                                         "terminology",
-                                         "xfce4-terminal",
-                                         "mate-terminal",
-                                         "lxterminal",
-                                         "qterminal",
-                                         "sakura",
-                                         "termite",
-                                         "st",
-                                         "foot"};
-
-/// Проверяет, содержит ли строка подстроку (case insensitive)
-bool contains_ci(const std::string &haystack, std::string_view needle) {
-  if (needle.empty())
-    return true;
-  if (haystack.size() < needle.size())
-    return false;
-
-  auto it = std::search(haystack.begin(), haystack.end(), needle.begin(),
-                        needle.end(), [](char a, char b) {
-                          return std::tolower(static_cast<unsigned char>(a)) ==
-                                 std::tolower(static_cast<unsigned char>(b));
-                        });
-  return it != haystack.end();
-}
-
-} // namespace
 
 ClipboardManager::ClipboardManager(X11Session &session,
                                    std::chrono::milliseconds timeout)
@@ -225,29 +186,52 @@ bool ClipboardManager::is_active_window_terminal() {
   if (active_window == None)
     return false;
 
-  // Получаем WM_CLASS
-  XClassHint class_hint;
-  if (XGetClassHint(display_, active_window, &class_hint) == 0) {
-    return false;
-  }
-
+  // Получаем WM_CLASS (instance/class)
+  //
+  // Важно: иногда _NET_ACTIVE_WINDOW может указывать на дочернее окно.
+  // Тогда WM_CLASS хранится на родителе. Делаем небольшой подъём по дереву.
   std::string wm_class;
-  if (class_hint.res_class) {
-    wm_class = class_hint.res_class;
-    XFree(class_hint.res_class);
-  }
-  if (class_hint.res_name) {
-    XFree(class_hint.res_name);
-  }
+  std::string wm_instance;
 
-  // Проверяем, является ли это терминалом
-  for (const auto &terminal : kTerminalClasses) {
-    if (contains_ci(wm_class, terminal)) {
-      return true;
+  Window w = active_window;
+  for (int depth = 0; depth < 8 && w != None; ++depth) {
+    XClassHint class_hint;
+    if (XGetClassHint(display_, w, &class_hint) != 0) {
+      if (class_hint.res_class) {
+        wm_class = class_hint.res_class;
+        XFree(class_hint.res_class);
+      }
+      if (class_hint.res_name) {
+        wm_instance = class_hint.res_name;
+        XFree(class_hint.res_name);
+      }
+
+      // Если нашли хоть что-то — достаточно.
+      if (!wm_class.empty() || !wm_instance.empty()) {
+        break;
+      }
     }
+
+    // Поднимаемся к родителю.
+    Window root_ret = None;
+    Window parent_ret = None;
+    Window *children = nullptr;
+    unsigned int nchildren = 0;
+
+    if (XQueryTree(display_, w, &root_ret, &parent_ret, &children, &nchildren) == 0) {
+      break;
+    }
+    if (children) {
+      XFree(children);
+    }
+
+    if (parent_ret == None || parent_ret == w) {
+      break;
+    }
+    w = parent_ret;
   }
 
-  return false;
+  return is_terminal_wm_class(wm_instance, wm_class);
 }
 
 } // namespace punto

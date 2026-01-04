@@ -140,24 +140,36 @@ void KeyInjector::send_paste(bool is_terminal) const {
   // Важно: предполагаем, что вызывающий код уже отпустил "чужие" модификаторы.
   delay(kKeyPress);
 
-  send_key(KEY_LEFTCTRL, KeyState::Press);
   if (is_terminal) {
+    // Терминалы (включая некоторые встроенные/кастомные) часто используют
+    // Ctrl+Shift+V для paste.
+    send_key(KEY_LEFTCTRL, KeyState::Press);
     send_key(KEY_LEFTSHIFT, KeyState::Press);
-  }
+    delay(kKeyPress);
 
-  delay(kKeyPress);
+    send_key(KEY_V, KeyState::Press);
+    delay(kKeyHold);
+    send_key(KEY_V, KeyState::Release);
 
-  send_key(KEY_V, KeyState::Press);
-  delay(kKeyHold);
-  send_key(KEY_V, KeyState::Release);
-
-  delay(kKeyPress);
-
-  if (is_terminal) {
+    delay(kKeyPress);
     send_key(KEY_LEFTSHIFT, KeyState::Release);
+    send_key(KEY_LEFTCTRL, KeyState::Release);
+    delay(kKeyPress);
+    return;
   }
-  send_key(KEY_LEFTCTRL, KeyState::Release);
 
+  // Для обычных приложений и терминалов внутри IDE (которые не детектируются как
+  // терминал по WM_CLASS) Shift+Insert — более универсальный paste hotkey.
+  send_key(KEY_LEFTSHIFT, KeyState::Press);
+  delay(kKeyPress);
+
+  send_key(KEY_INSERT, KeyState::Press);
+  delay(kKeyHold);
+  send_key(KEY_INSERT, KeyState::Release);
+
+  delay(kKeyPress);
+
+  send_key(KEY_LEFTSHIFT, KeyState::Release);
   delay(kKeyPress);
 }
 

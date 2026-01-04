@@ -30,3 +30,5 @@ build-deb/
 
 # clangd cache
 .cache/
+
+WARP.md

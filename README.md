@@ -182,7 +182,7 @@ sudo apt install pulseaudio-utils alsa-utils
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh
-sudo dpkg -i punto-switcher_2.8.0_amd64.deb
+sudo dpkg -i punto-switcher_2.8.1_amd64.deb
 ```
 
 #### Ручная сборка без пакета
@@ -396,6 +396,15 @@ sudo rm -rf /etc/punto
 | wamerican-huge             | любая (опционально)       |
 
 ## История изменений
+
+### v2.8.1 — Исправление oneshot вставки в терминалах
+
+- **Исправлена вставка в терминалах** после oneshot-замены:
+  - расширена детекция терминальных окон по `WM_CLASS` (instance/class);
+  - добавлен подъём по дереву окон (активным может быть дочерний window);
+  - paste выполняется через layout-независимый hotkey `Shift+Insert`;
+  - перед paste выставляются оба selection: `CLIPBOARD` и `PRIMARY`;
+  - увеличены паузы вокруг `Clipboard+Paste`, чтобы избежать гонок и раннего restore.
 
 ### v2.8.0 — Oneshot замена через Clipboard+Paste + удаление delays
 

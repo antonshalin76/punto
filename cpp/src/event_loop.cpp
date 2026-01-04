@@ -18,6 +18,36 @@
 
 namespace punto {
 
+namespace {
+
+struct OneshotPasteWaits {
+  std::chrono::microseconds pre_paste;
+  std::chrono::microseconds post_paste;
+  std::chrono::microseconds after_backspace;
+};
+
+[[nodiscard]] constexpr OneshotPasteWaits oneshot_paste_waits(
+    bool is_terminal) noexcept {
+  if (is_terminal) {
+    return {
+        /*pre_paste=*/std::chrono::microseconds{150000},
+        /*post_paste=*/std::chrono::microseconds{250000},
+        /*after_backspace=*/std::chrono::microseconds{60000},
+    };
+  }
+
+  return {
+      /*pre_paste=*/std::chrono::microseconds{100000},
+      // В некоторых приложениях (особенно IDE) обработка paste может быть
+      // асинхронной. Даем больше времени, чтобы не восстановить CLIPBOARD слишком
+      // рано.
+      /*post_paste=*/std::chrono::microseconds{250000},
+      /*after_backspace=*/std::chrono::microseconds{0},
+  };
+}
+
+} // namespace
+
 EventLoop::EventLoop(Config config)
     : config_{std::make_shared<Config>(std::move(config))},
       analyzer_{std::make_shared<LayoutAnalyzer>(config_->auto_switch)} {
@@ -808,6 +838,39 @@ bool EventLoop::set_layout(int target_layout, bool play_sound) {
   return false;
 }
 
+std::optional<int> EventLoop::maybe_switch_layout_to_en_for_terminal_paste(
+    bool is_terminal) {
+  if (!is_terminal) {
+    return std::nullopt;
+  }
+
+  // 0 = EN, 1 = RU. По умолчанию используем текущий внутренний стейт,
+  // но если есть валидная X11-сессия — уточняем у ОС.
+  int before = current_layout_;
+
+  if (x11_session_ && x11_session_->is_valid()) {
+    x11_session_->apply_environment();
+    const int os_layout = x11_session_->get_current_keyboard_layout();
+    if (os_layout == 0 || os_layout == 1) {
+      before = os_layout;
+    }
+  }
+
+  if (before == 0) {
+    return std::nullopt;
+  }
+  if (before != 1) {
+    // Неизвестное значение — не меняем раскладку.
+    return std::nullopt;
+  }
+
+  // В терминалах Ctrl+Shift+V может быть чувствителен к раскладке,
+  // поэтому временно ставим EN.
+  (void)set_layout(/*target_layout=*/0, /*play_sound=*/false);
+
+  return before; // restore to RU
+}
+
 bool EventLoop::paste_text_oneshot(std::string_view text,
                                   bool restore_clipboard) {
   if (!clipboard_) {
@@ -820,9 +883,10 @@ bool EventLoop::paste_text_oneshot(std::string_view text,
     return false;
   }
 
-  // Определяем, какой hotkey paste использовать.
   const bool is_terminal = clipboard_->is_active_window_terminal();
 
+  // Пытаемся сохранить CLIPBOARD (best-effort), чтобы не ломать пользовательский
+  // буфер обмена.
   std::optional<std::string> prev_clip;
   if (restore_clipboard) {
     prev_clip = clipboard_->get_text(Selection::Clipboard);
@@ -833,23 +897,64 @@ bool EventLoop::paste_text_oneshot(std::string_view text,
     }
   }
 
-  const ClipboardResult set_res =
+  // Для Shift+Insert нам нужен PRIMARY, но для Ctrl+Shift+V достаточно CLIPBOARD.
+  std::optional<std::string> prev_primary;
+  if (!is_terminal) {
+    prev_primary = clipboard_->get_text(Selection::Primary);
+  }
+
+  const ClipboardResult set_clip =
       clipboard_->set_text(Selection::Clipboard, text);
-  if (set_res != ClipboardResult::Ok) {
+  if (set_clip != ClipboardResult::Ok) {
     std::cerr << "[punto] Clipboard: failed to set CLIPBOARD (res="
-              << static_cast<int>(set_res) << ")\n";
+              << static_cast<int>(set_clip) << ")\n";
     return false;
+  }
+
+  if (!is_terminal) {
+    const ClipboardResult set_primary =
+        clipboard_->set_text(Selection::Primary, text);
+    if (set_primary != ClipboardResult::Ok) {
+      std::cerr << "[punto] Clipboard: failed to set PRIMARY (res="
+                << static_cast<int>(set_primary) << ")\n";
+      return false;
+    }
   }
 
   // Даём X11/xsel шанс обновить CLIPBOARD, иначе приложение может прочитать
   // старое значение.
-  wait_and_buffer(std::chrono::microseconds{100000});
+  //
+  // В терминалах (и в целом в «медленных» UI-циклах) запрос буфера обмена может
+  // приходить с задержкой.
+  const OneshotPasteWaits waits = oneshot_paste_waits(is_terminal);
+
+  wait_and_buffer(waits.pre_paste);
 
   injector->release_all_modifiers();
+
+  // Для Ctrl+Shift+V в некоторых терминалах нужен EN layout.
+  const std::optional<int> restore_layout =
+      maybe_switch_layout_to_en_for_terminal_paste(is_terminal);
+
   injector->send_paste(is_terminal);
 
   // Даем приложению время запросить содержимое clipboard.
-  wait_and_buffer(std::chrono::microseconds{100000});
+  wait_and_buffer(waits.post_paste);
+
+  if (restore_layout.has_value()) {
+    (void)set_layout(*restore_layout, /*play_sound=*/false);
+  }
+
+  // Восстанавливаем PRIMARY только если трогали его.
+  if (!is_terminal) {
+    if (prev_primary.has_value()) {
+      (void)clipboard_->set_text(Selection::Primary, *prev_primary);
+    } else {
+      // Если PRIMARY не удаётся прочитать (нет selection owner / таймаут),
+      // лучше не оставлять в PRIMARY подстановочный текст.
+      (void)clipboard_->set_text(Selection::Primary, "");
+    }
+  }
 
   if (restore_clipboard && prev_clip.has_value()) {
     (void)clipboard_->set_text(Selection::Clipboard, *prev_clip);
@@ -872,11 +977,10 @@ bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
     return false;
   }
 
-  // Определяем, какой hotkey paste использовать.
   const bool is_terminal = clipboard_->is_active_window_terminal();
 
   // Важно: стараемся НЕ удалять текст, пока не убедились, что можем выставить
-  // CLIPBOARD для вставки.
+  // буфер для вставки.
   std::optional<std::string> prev_clip = clipboard_->get_text(Selection::Clipboard);
   if (!prev_clip.has_value()) {
     std::cerr << "[punto] Clipboard: cannot read CLIPBOARD for restore "
@@ -884,16 +988,37 @@ bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
     return false;
   }
 
-  const ClipboardResult set_res =
+  // PRIMARY нужен только для Shift+Insert.
+  std::optional<std::string> prev_primary;
+  if (!is_terminal) {
+    prev_primary = clipboard_->get_text(Selection::Primary);
+  }
+
+  const ClipboardResult set_clip =
       clipboard_->set_text(Selection::Clipboard, text);
-  if (set_res != ClipboardResult::Ok) {
+  if (set_clip != ClipboardResult::Ok) {
     std::cerr << "[punto] Clipboard: failed to set CLIPBOARD (res="
-              << static_cast<int>(set_res) << ")\n";
+              << static_cast<int>(set_clip) << ")\n";
     return false;
   }
 
+  if (!is_terminal) {
+    const ClipboardResult set_primary =
+        clipboard_->set_text(Selection::Primary, text);
+    if (set_primary != ClipboardResult::Ok) {
+      std::cerr << "[punto] Clipboard: failed to set PRIMARY (res="
+                << static_cast<int>(set_primary) << ")\n";
+      return false;
+    }
+  }
+
   // Даём X11/xsel шанс обновить CLIPBOARD.
-  wait_and_buffer(std::chrono::microseconds{100000});
+  //
+  // В терминалах часто есть дополнительная задержка между hotkey paste и
+  // фактическим запросом clipboard.
+  const OneshotPasteWaits waits = oneshot_paste_waits(is_terminal);
+
+  wait_and_buffer(waits.pre_paste);
 
   // Важно: replace вызывается только из main thread в режиме macro.
   injector->release_all_modifiers();
@@ -906,20 +1031,41 @@ bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
   if (backspace_count > 0) {
     injector->send_backspace(backspace_count, true);
     flush_pending_release_frames();
+
+    // КРИТИЧЕСКАЯ ПАУЗА: терминалы/TTY UI иногда применяют Backspace не мгновенно.
+    // Без паузы Paste может прийти до фактического удаления символов.
+    if (waits.after_backspace.count() > 0) {
+      wait_and_buffer(waits.after_backspace);
+    }
   }
+
+  // Для Ctrl+Shift+V в некоторых терминалах нужен EN layout.
+  const std::optional<int> restore_layout =
+      maybe_switch_layout_to_en_for_terminal_paste(is_terminal);
 
   injector->send_paste(is_terminal);
 
   // Даем приложению время запросить содержимое clipboard.
-  wait_and_buffer(std::chrono::microseconds{100000});
+  wait_and_buffer(waits.post_paste);
 
   if (prev_clip.has_value()) {
     (void)clipboard_->set_text(Selection::Clipboard, *prev_clip);
   }
 
+  // Восстанавливаем PRIMARY только если трогали его.
+  if (!is_terminal) {
+    if (prev_primary.has_value()) {
+      (void)clipboard_->set_text(Selection::Primary, *prev_primary);
+    } else {
+      (void)clipboard_->set_text(Selection::Primary, "");
+    }
+  }
+
   if (final_layout.has_value()) {
     // Best-effort: если не получилось — текст всё равно уже вставлен.
     (void)set_layout(*final_layout, play_sound);
+  } else if (restore_layout.has_value()) {
+    (void)set_layout(*restore_layout, /*play_sound=*/false);
   }
 
   return true;
@@ -1099,18 +1245,37 @@ bool EventLoop::process_selection(
 
   const std::string transformed = transform(*text);
 
-  const ClipboardResult set_res =
+  const ClipboardResult set_clip =
       clipboard_->set_text(Selection::Clipboard, transformed);
-  if (set_res != ClipboardResult::Ok) {
+  if (set_clip != ClipboardResult::Ok) {
     std::cerr << "[punto] Clipboard: failed to set CLIPBOARD (res="
-              << static_cast<int>(set_res) << ")\n";
+              << static_cast<int>(set_clip) << ")\n";
     return false;
   }
 
-  // Даём X11/xsel шанс обновить CLIPBOARD.
-  wait_and_buffer(std::chrono::microseconds{100000});
+  const ClipboardResult set_primary =
+      clipboard_->set_text(Selection::Primary, transformed);
+  if (set_primary != ClipboardResult::Ok) {
+    std::cerr << "[punto] Clipboard: failed to set PRIMARY (res="
+              << static_cast<int>(set_primary) << ")\n";
+    return false;
+  }
+
+  // Даём X11/xsel шанс обновить selections.
+  wait_and_buffer(std::chrono::microseconds{150000});
+
+  // Для Ctrl+Shift+V в некоторых терминалах нужен EN layout.
+  const std::optional<int> restore_layout =
+      maybe_switch_layout_to_en_for_terminal_paste(is_terminal);
 
   injector->send_paste(is_terminal);
+
+  // Даем приложению время запросить содержимое clipboard.
+  wait_and_buffer(std::chrono::microseconds{250000});
+
+  if (restore_layout.has_value()) {
+    (void)set_layout(*restore_layout, /*play_sound=*/false);
+  }
 
   return true;
 }

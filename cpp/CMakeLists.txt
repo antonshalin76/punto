@@ -3,7 +3,7 @@
 # Высокопроизводительный плагин для interception-tools
 # =============================================================================
 cmake_minimum_required(VERSION 3.16)
-project(punto VERSION 2.8.0 LANGUAGES CXX)
+project(punto VERSION 2.8.1 LANGUAGES CXX)
 
 # Для clangd/IDE: генерируем compile_commands.json
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -63,6 +63,7 @@ set(PUNTO_SOURCES
     src/config.cpp
     src/text_processor.cpp
     src/clipboard_manager.cpp
+    src/terminal_detection.cpp
     src/x11_session.cpp
     src/sound_manager.cpp
     src/layout_analyzer.cpp
@@ -80,6 +81,7 @@ set(PUNTO_HEADERS
     include/punto/config.hpp
     include/punto/text_processor.hpp
     include/punto/clipboard_manager.hpp
+    include/punto/terminal_detection.hpp
     include/punto/x11_session.hpp
     include/punto/sound_manager.hpp
     include/punto/scancode_map.hpp
@@ -209,6 +211,7 @@ if(BUILD_TESTING)
     add_executable(punto-tests
         tests/test_main.cpp
         src/text_processor.cpp
+        src/terminal_detection.cpp
     )
 
     target_include_directories(punto-tests

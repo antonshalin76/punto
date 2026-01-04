@@ -175,56 +175,130 @@ private:
       }
 
       // =========================================================================
-      // Этап 1: Словарная проверка
+      // Этап 1: Словарная проверка (строго по словарям)
+      //
+      // Требование:
+      //  - если слова НЕТ в словаре текущей раскладки, но ЕСТЬ в противоположной
+      //    → переключаем раскладку (word inversion);
+      //  - если слова ЕСТЬ в текущей, но НЕТ в противоположной → НЕ переключаем;
+      //  - если слова НЕТ в обеих → НЕ переключаем;
+      //  - если слова ЕСТЬ в обеих → дополнительно решаем по N-граммам.
       // =========================================================================
       DictResult dict_result = dict_->lookup(analysis_span);
 
-      // Если слово найдено в словаре — проверяем sticky shift и layout switch
-      if (dict_result == DictResult::English) {
-        if (!is_en_layout) {
-          // EN слово в RU раскладке -> переключаем (bypass НЕ блокирует!)
-          res.need_switch = true;
-          res.correction_type = CorrectionType::LayoutSwitch;
-          finish_and_push(res, t0);
-          continue;
-        }
-        // EN слово в EN раскладке -> проверяем sticky shift (если не bypass)
+      const bool in_en_dict = (dict_result == DictResult::English ||
+                               dict_result == DictResult::Both);
+      const bool in_ru_dict = (dict_result == DictResult::Russian ||
+                               dict_result == DictResult::Both);
+
+      const bool in_current_dict = is_en_layout ? in_en_dict : in_ru_dict;
+      const bool in_opposite_dict = is_en_layout ? in_ru_dict : in_en_dict;
+
+      // Case A: !in_current && in_opposite -> переключаем
+      if (!in_current_dict && in_opposite_dict) {
+        // Combined fix (layout + case) блокируется bypass.
         if (!bypass_case_fix && task.cfg.sticky_shift_correction_enabled) {
-          if (try_sticky_shift_fix(analysis_span, res)) {
+          CasePattern pattern = detect_case_pattern(analysis_span);
+          if (pattern == CasePattern::StickyShiftUU ||
+              pattern == CasePattern::StickyShiftLU) {
+            res.need_switch = true;
+            res.correction_type = CorrectionType::CombinedFix;
+            res.correction = make_title_case(analysis_span);
             finish_and_push(res, t0);
             continue;
           }
         }
-      } else if (dict_result == DictResult::Russian) {
-        if (is_en_layout) {
-          // RU слово в EN раскладке -> переключаем (bypass НЕ блокирует!)
-          // Но combined fix (layout + case) блокируется bypass
-          if (!bypass_case_fix && task.cfg.sticky_shift_correction_enabled) {
-            CasePattern pattern = detect_case_pattern(analysis_span);
-            if (pattern == CasePattern::StickyShiftUU ||
-                pattern == CasePattern::StickyShiftLU) {
-              // Combined: layout switch + case fix
-              res.need_switch = true;
-              res.correction_type = CorrectionType::CombinedFix;
-              res.correction = make_title_case(analysis_span);
-              finish_and_push(res, t0);
-              continue;
-            }
-          }
-          // Просто layout switch без исправления регистра
-          res.need_switch = true;
-          res.correction_type = CorrectionType::LayoutSwitch;
-          finish_and_push(res, t0);
-          continue;
-        }
-        // RU слово в RU раскладке -> проверяем sticky shift (если не bypass)
-        if (!bypass_case_fix && task.cfg.sticky_shift_correction_enabled) {
-          if (try_sticky_shift_fix(analysis_span, res)) {
-            finish_and_push(res, t0);
-            continue;
-          }
-        }
+
+        res.need_switch = true;
+        res.correction_type = CorrectionType::LayoutSwitch;
+        finish_and_push(res, t0);
+        continue;
       }
+
+      // Case B: in_current && !in_opposite -> не переключаем
+      if (in_current_dict && !in_opposite_dict) {
+        // Но sticky shift fix в текущей раскладке по-прежнему возможен.
+        if (!bypass_case_fix && task.cfg.sticky_shift_correction_enabled) {
+          if (try_sticky_shift_fix(analysis_span, res)) {
+            finish_and_push(res, t0);
+            continue;
+          }
+        }
+
+        finish_and_push(res, t0);
+        continue;
+      }
+
+      // Case D: слово есть в обоих словарях -> решаем через N-граммы
+      if (in_current_dict && in_opposite_dict) {
+        LayoutAnalyzer analyzer(task.cfg);
+        AnalysisResult ar = analyzer.analyze(analysis_span);
+
+        bool switch_target_is_en = false;
+        bool should_switch_by_ngram = false;
+
+        if (ar.should_switch) {
+          const bool ngram_suggests_en = (ar.en_score > ar.ru_score);
+          const bool ngram_suggests_ru = (ar.ru_score > ar.en_score);
+
+          const bool looks_like_valid_en = (ar.en_invalid_count == 0);
+          const bool looks_like_valid_ru = (ar.ru_invalid_count == 0);
+
+          // Дополнительные признаки на основе invalid биграмм
+          const bool invalid_suggests_en =
+              (ar.ru_invalid_count > 0 && ar.en_invalid_count == 0);
+          const bool invalid_suggests_ru =
+              (ar.en_invalid_count > 0 && ar.ru_invalid_count == 0);
+
+          if ((ngram_suggests_en && looks_like_valid_en) || invalid_suggests_en) {
+            should_switch_by_ngram = true;
+            switch_target_is_en = true;
+          } else if ((ngram_suggests_ru && looks_like_valid_ru) ||
+                     invalid_suggests_ru) {
+            should_switch_by_ngram = true;
+            switch_target_is_en = false;
+          }
+        }
+
+        if (should_switch_by_ngram) {
+          // Переключаем только если текущая раскладка не соответствует цели.
+          if ((switch_target_is_en && !is_en_layout) ||
+              (!switch_target_is_en && is_en_layout)) {
+            res.need_switch = true;
+
+            // Если есть sticky shift — делаем CombinedFix.
+            if (!bypass_case_fix && task.cfg.sticky_shift_correction_enabled) {
+              CasePattern pattern = detect_case_pattern(analysis_span);
+              if (pattern == CasePattern::StickyShiftUU ||
+                  pattern == CasePattern::StickyShiftLU) {
+                res.correction_type = CorrectionType::CombinedFix;
+                res.correction = make_title_case(analysis_span);
+              } else {
+                res.correction_type = CorrectionType::LayoutSwitch;
+              }
+            } else {
+              res.correction_type = CorrectionType::LayoutSwitch;
+            }
+
+            finish_and_push(res, t0);
+            continue;
+          }
+        }
+
+        // N-gram не требует переключения — можно сделать sticky shift fix.
+        if (!bypass_case_fix && task.cfg.sticky_shift_correction_enabled) {
+          if (try_sticky_shift_fix(analysis_span, res)) {
+            finish_and_push(res, t0);
+            continue;
+          }
+        }
+
+        finish_and_push(res, t0);
+        continue;
+      }
+
+      // Case C: слова нет в обоих словарях -> раскладку НЕ переключаем.
+      // (можно продолжить на typo fix)
 
       // =========================================================================
       // Этап 2: Слово Unknown — пробуем typo fix
@@ -241,8 +315,8 @@ private:
           bool is_correct = dict_->spell(word_str, is_en_layout);
 
           if (is_correct) {
-            // Слово правильное, не нужно исправлять (N-gram модель не знала
-            // его) Переходим к N-gram анализу для layout switch
+            // Слово корректное — не исправляем.
+            // Важно: для Unknown слов раскладку больше НЕ переключаем (требование).
           } else {
             // Слово неправильное, запрашиваем предложения
             std::vector<std::string> suggestions =
@@ -277,55 +351,6 @@ private:
             if (res.correction_type == CorrectionType::TypoFix) {
               continue;
             }
-          }
-        }
-      }
-
-      // =========================================================================
-      // Этап 3: N-gram анализ для layout switch (если слово Unknown)
-      // =========================================================================
-      if (dict_result == DictResult::Unknown) {
-        LayoutAnalyzer analyzer(task.cfg);
-        AnalysisResult ar = analyzer.analyze(analysis_span);
-
-        if (ar.should_switch) {
-          // Определяем, какой язык предполагает N-gram анализ
-          bool ngram_suggests_en = (ar.en_score > ar.ru_score);
-          bool ngram_suggests_ru = (ar.ru_score > ar.en_score);
-
-          bool looks_like_valid_en = (ar.en_invalid_count == 0);
-          bool looks_like_valid_ru = (ar.ru_invalid_count == 0);
-
-          // Дополнительные признаки на основе invalid биграмм
-          bool invalid_suggests_en =
-              (ar.ru_invalid_count > 0 && ar.en_invalid_count == 0);
-          bool invalid_suggests_ru =
-              (ar.en_invalid_count > 0 && ar.ru_invalid_count == 0);
-
-          // КРИТИЧНО: Переключаем раскладку ТОЛЬКО если текущая раскладка
-          // не соответствует предполагаемому языку слова.
-          //
-          // Если N-gram предполагает EN, но мы УЖЕ в EN → не переключаем.
-          // Если N-gram предполагает RU, но мы УЖЕ в RU → не переключаем.
-
-          if ((ngram_suggests_en && looks_like_valid_en) ||
-              invalid_suggests_en) {
-            // Слово похоже на английское
-            if (!is_en_layout) {
-              // Мы в RU раскладке, но слово английское → переключаем на EN
-              res.need_switch = true;
-              res.correction_type = CorrectionType::LayoutSwitch;
-            }
-            // else: мы уже в EN, слово английское → ничего не делаем
-          } else if ((ngram_suggests_ru && looks_like_valid_ru) ||
-                     invalid_suggests_ru) {
-            // Слово похоже на русское
-            if (is_en_layout) {
-              // Мы в EN раскладке, но слово русское → переключаем на RU
-              res.need_switch = true;
-              res.correction_type = CorrectionType::LayoutSwitch;
-            }
-            // else: мы уже в RU, слово русское → ничего не делаем
           }
         }
       }

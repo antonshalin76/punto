@@ -1,9 +1,9 @@
 Package: punto-switcher
-Version: 2.8.1
+Version: 2.8.2
 Section: utils
 Priority: optional
 Architecture: amd64
-Depends: interception-tools, libx11-6, xsel
+Depends: interception-tools, libx11-6
 Recommends: libxcb1, libgtk-3-0, libayatana-appindicator3-1, pulseaudio-utils, alsa-utils
 Maintainer: Anton Shalin <anton.shalin@gmail.com>
 Description: Punto Switcher для Linux Ubuntu (C++20 версия)
@@ -19,6 +19,7 @@ Description: Punto Switcher для Linux Ubuntu (C++20 версия)
    - Инверсия регистра слова (Ctrl+Pause)
    - Инверсия регистра выделения (Alt+Pause)
    - Транслитерация выделения (LCtrl+LAlt+Pause)
+   - Undo последнего исправления (Ctrl+Z)
    - Автоматическое исправление регистра (Sticky Shift Fix)
    - Автоматическое исправление опечаток (Typo Fix)
    - Минимальное потребление ресурсов

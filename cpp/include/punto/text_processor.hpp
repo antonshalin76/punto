@@ -129,6 +129,31 @@ utf8_char_len(unsigned char first_byte) noexcept {
 [[nodiscard]] bool is_cyrillic_char(std::string_view utf8_char);
 
 /**
+ * @brief Подсчитывает количество UTF-8 codepoint (символов) в строке.
+ *
+ * Важно: это количество Unicode scalar value (по границам UTF-8), а не байт.
+ * Используется для расчёта количества Backspace при undo/replace.
+ */
+[[nodiscard]] inline std::size_t utf8_codepoint_count(std::string_view text) noexcept {
+  std::size_t count = 0;
+  std::size_t i = 0;
+
+  while (i < text.size()) {
+    const std::size_t len = utf8_char_len(static_cast<unsigned char>(text[i]));
+    if (len == 0 || i + len > text.size()) {
+      // Невалидный байт — пропускаем один байт.
+      ++i;
+      continue;
+    }
+
+    ++count;
+    i += len;
+  }
+
+  return count;
+}
+
+/**
  * @brief Проверяет, является ли символ латинским
  * @param c ASCII символ
  * @return true если это латинская буква

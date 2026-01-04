@@ -1,13 +1,13 @@
 #!/bin/bash
 # =============================================================================
-# Сборка deb-пакета Punto Switcher v2.8.1 (C++20 версия)
+# Сборка deb-пакета Punto Switcher v2.8.2 (C++20 версия)
 # =============================================================================
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-VERSION="2.8.1"
+VERSION="2.8.2"
 PACKAGE_NAME="punto-switcher"
 BUILD_DIR="build-deb"
 CPP_BUILD_DIR="cpp/build"
@@ -232,7 +232,7 @@ sed -i "s/^Version:.*/Version: ${VERSION}/" "$BUILD_DIR/DEBIAN/control"
 echo "[4/6] Проверка runtime-зависимостей..."
 
 # Зависимости для работы программы
-RUNTIME_DEPS=("interception-tools" "libx11-6" "xsel")
+RUNTIME_DEPS=("interception-tools" "libx11-6")
 
 # Дополнительные runtime-зависимости для tray
 if [[ "$BUILD_TRAY" == "true" ]]; then

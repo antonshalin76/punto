@@ -15,6 +15,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -120,6 +121,10 @@ private:
   /// Транслитерирует выделенный текст
   void action_transliterate_selection();
 
+  /// Undo последнего исправления (авто/ручного). Возвращает true, если undo
+  /// выполнен и событие должно быть поглощено.
+  [[nodiscard]] bool action_undo_last_correction();
+
   // =========================================================================
   // Вспомогательные методы
   // =========================================================================
@@ -140,8 +145,9 @@ private:
                             std::span<const ScanCode> trailing);
 
   /// Обрабатывает selection (копирование, трансформация, вставка)
-  bool
-  process_selection(std::function<std::string(std::string_view)> transform);
+  bool process_selection(
+      std::function<std::string(std::string_view)> transform,
+      std::optional<int> restore_layout_for_undo);
 
   /// Вставляет текст одной операцией через Clipboard + Paste.
   ///
@@ -166,6 +172,12 @@ private:
                                          std::string_view text,
                                          std::optional<int> final_layout,
                                          bool play_sound);
+
+  /// Запоминает последнюю коррекцию для Ctrl+Z undo.
+  void set_last_undo_record(std::string original_text,
+                            std::string_view inserted_text,
+                            std::optional<int> restore_layout,
+                            bool is_auto_correction);
 
   /// Ожидает указанное время, буферизуя входящие события
   void wait_and_buffer(std::chrono::microseconds us);
@@ -285,6 +297,30 @@ private:
 
   /// Флаг выполнения макроса (автокоррекции)
   bool is_processing_macro_ = false;
+
+  /// Если перехватили Ctrl+Z и НЕ пропустили press наружу, то все события Z
+  /// (repeat/release) до первого release нужно проглотить, иначе приложение
+  /// увидит "release без press".
+  bool swallow_z_until_release_ = false;
+
+  struct UndoRecord {
+    std::string original_text;
+    std::size_t inserted_len = 0; // сколько Backspace нужно для удаления вставки
+    std::optional<int> restore_layout; // 0/1, если нужно вернуть раскладку
+
+    bool is_auto_correction = false; // если true — можно писать в UndoDetector
+
+    std::chrono::steady_clock::time_point applied_at{};
+    std::uint64_t user_seq_at_apply = 0;
+  };
+
+  /// Последняя корректировка, которую можно откатить через Ctrl+Z.
+  std::optional<UndoRecord> last_undo_;
+
+  /// Монотонный счётчик "значимых" key-press (все кроме модификаторов).
+  /// Используется, чтобы Ctrl+Z не перехватывался, если после исправления
+  /// был другой ввод.
+  std::uint64_t user_seq_ = 0;
 
   /// Время последнего замера раскладки
   std::chrono::steady_clock::time_point last_sync_time_;

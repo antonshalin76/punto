@@ -31,7 +31,10 @@ enum class Selection {
  * @brief Нативный менеджер буфера обмена X11
  *
  * Обеспечивает прямой доступ к X11 selections без вызова внешних утилит.
- * Использует RAII для управления X11 ресурсами.
+ *
+ * Важно: в X11 данные selection хранятся у владельца selection.
+ * Поэтому после set_text() процесс должен обслуживать SelectionRequest события,
+ * иначе вставка в приложения работать не будет.
  */
 class ClipboardManager {
 public:
@@ -67,6 +70,14 @@ public:
   [[nodiscard]] bool is_open() const noexcept;
 
   /**
+   * @brief Обрабатывает входящие X11 события (SelectionRequest/SelectionClear)
+   *
+   * Должен вызываться регулярно из main loop (и во время макросов/ожиданий),
+   * чтобы буфер обмена работал стабильно.
+   */
+  void pump_events();
+
+  /**
    * @brief Читает текст из selection
    * @param sel Тип selection (Primary или Clipboard)
    * @return Текст или nullopt при ошибке/таймауте
@@ -95,10 +106,14 @@ private:
    */
   Atom get_selection_atom(Selection sel) const;
 
-  /**
-   * @brief Ожидание SelectionNotify события
-   */
-  bool wait_for_selection_notify(Atom selection);
+  /// Обрабатывает SelectionRequest (когда другое приложение запрашивает данные).
+  void handle_selection_request(const XSelectionRequestEvent &req);
+
+  /// Обрабатывает SelectionClear (когда мы теряем ownership selection).
+  void handle_selection_clear(const XSelectionClearEvent &ev);
+
+  /// Ожидание SelectionNotify события (для get_text).
+  bool wait_for_selection_notify(Atom property);
 
   X11Session &session_;
   std::chrono::milliseconds timeout_;
@@ -110,6 +125,16 @@ private:
   Atom atom_clipboard_ = None;
   Atom atom_primary_ = None;
   Atom atom_utf8_string_ = None;
+  Atom atom_targets_ = None;
+  Atom atom_text_plain_ = None;
+  Atom atom_text_plain_utf8_ = None;
+
+  // Данные selection, которыми владеет punto (X11 selection owner).
+  // Важно: пустая строка — валидное значение (можно "очистить" selection).
+  std::string clipboard_text_;
+  std::string primary_text_;
+  bool owns_clipboard_ = false;
+  bool owns_primary_ = false;
 };
 
 } // namespace punto

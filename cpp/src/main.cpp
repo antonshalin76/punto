@@ -30,7 +30,7 @@ void signal_handler(int sig) {
 }
 
 void print_version() {
-  std::cout << "Punto Switcher 2.8.1 (C++20)\n"
+  std::cout << "Punto Switcher 2.8.2 (C++20)\n"
             << "Высокопроизводительный плагин для interception-tools\n"
             << "https://github.com/antonshalin76/punto\n";
 }
@@ -48,6 +48,7 @@ void print_usage(const char *argv0) {
             << "  Ctrl+Pause         Инвертировать регистр слова\n"
             << "  Alt+Pause          Инвертировать регистр выделения\n"
             << "  LCtrl+LAlt+Pause   Транслитерировать выделение\n"
+            << "  Ctrl+Z             Отменить последнее исправление Punto (короткое окно после исправления)\n"
             << "\n"
             << "Конфигурация: /etc/punto/config.yaml\n";
 }

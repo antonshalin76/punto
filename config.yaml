@@ -1,6 +1,6 @@
 # Punto Switcher Configuration
 # Путь по умолчанию: /etc/punto/config.yaml
-# Config version: 2.8.1
+# Config version: 2.8.2
 
 # Хоткей переключения раскладки
 # Доступные модификаторы: leftctrl, rightctrl, leftalt, rightalt, leftshift, rightshift
@@ -10,7 +10,8 @@ hotkey:
   key: grave
 
 # Автоматическое переключение раскладки при нажатии пробела
-# Гибридный анализ: словарь (приоритет) + N-граммы (fallback)
+# Анализ: словарь (приоритет) + N-граммы только для слов, которые есть в обоих словарях
+# (если слова нет в словарях — раскладка не меняется)
 auto_switch:
   enabled: true
   threshold: 3.5

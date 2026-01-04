@@ -229,6 +229,11 @@ int EventLoop::run() {
 
   // Главный цикл: проверяем флаг остановки на каждой итерации
   while (!stop_requested_.load(std::memory_order_relaxed)) {
+    // Обслуживаем X11 selection ownership (clipboard/primary).
+    if (clipboard_) {
+      clipboard_->pump_events();
+    }
+
     // Периодически проверяем, не сменилась ли активная user-сессия.
     {
       const auto now = std::chrono::steady_clock::now();
@@ -349,6 +354,15 @@ void EventLoop::handle_event(const input_event &ev) {
   const bool pressed = ev.value != 0;
   const bool is_press = ev.value == 1; // Только первое нажатие, не repeat
 
+  // Если мы перехватили Ctrl+Z и не отдали press наружу, то все последующие
+  // repeat/release для Z нужно проглотить (иначе приложение увидит release без press).
+  if (code == KEY_Z && swallow_z_until_release_) {
+    if (!pressed) {
+      swallow_z_until_release_ = false;
+    }
+    return;
+  }
+
   auto cfg = std::atomic_load(&config_);
 
   // Применяем изменения max_rollback_words безопасно (только в main thread).
@@ -377,6 +391,24 @@ void EventLoop::handle_event(const input_event &ev) {
     emit_passthrough_event(ev);
     return;
   }
+
+  // Ctrl+Z: Undo последнего исправления. Перехватываем только если:
+  //  - есть валидная запись последней коррекции;
+  //  - после неё не было другого ввода;
+  //  - прошло мало времени.
+  // Иначе Ctrl+Z пропускается в приложение как обычный системный хоткей.
+  if (code == KEY_Z && modifiers_.any_ctrl() && !modifiers_.any_alt() &&
+      !modifiers_.any_meta()) {
+    if (action_undo_last_correction()) {
+      swallow_z_until_release_ = true;
+      return;
+    }
+  }
+
+  // Любой key-press (кроме модификаторов) считаем "разрывом" для undo.
+  // Ctrl+Z обработан выше и сюда не попадает.
+  ++user_seq_;
+  last_undo_.reset();
 
   // =========================================================================
   // Backspace
@@ -921,7 +953,7 @@ bool EventLoop::paste_text_oneshot(std::string_view text,
     }
   }
 
-  // Даём X11/xsel шанс обновить CLIPBOARD, иначе приложение может прочитать
+  // Даём X11 шанс обновить CLIPBOARD, иначе приложение может прочитать
   // старое значение.
   //
   // В терминалах (и в целом в «медленных» UI-циклах) запрос буфера обмена может
@@ -1012,7 +1044,7 @@ bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
     }
   }
 
-  // Даём X11/xsel шанс обновить CLIPBOARD.
+  // Даём X11 шанс обновить CLIPBOARD.
   //
   // В терминалах часто есть дополнительная задержка между hotkey paste и
   // фактическим запросом clipboard.
@@ -1071,13 +1103,111 @@ bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
   return true;
 }
 
+void EventLoop::set_last_undo_record(std::string original_text,
+                                   std::string_view inserted_text,
+                                   std::optional<int> restore_layout,
+                                   bool is_auto_correction) {
+  UndoRecord rec;
+  rec.original_text = std::move(original_text);
+  rec.inserted_len = utf8_codepoint_count(inserted_text);
+  rec.restore_layout = restore_layout;
+  rec.is_auto_correction = is_auto_correction;
+  rec.applied_at = std::chrono::steady_clock::now();
+  rec.user_seq_at_apply = user_seq_;
+
+  last_undo_ = std::move(rec);
+}
+
+bool EventLoop::action_undo_last_correction() {
+  if (!last_undo_.has_value()) {
+    return false;
+  }
+
+  // Перехватываем Ctrl+Z только в узком окне времени.
+  // Иначе это должен быть обычный undo приложения.
+  static constexpr auto kUndoWindow = std::chrono::milliseconds{2500};
+
+  const auto now = std::chrono::steady_clock::now();
+  if (last_undo_->applied_at.time_since_epoch().count() == 0 ||
+      now - last_undo_->applied_at > kUndoWindow) {
+    last_undo_.reset();
+    return false;
+  }
+
+  // Если после исправления был любой другой key-press — не перехватываем.
+  if (last_undo_->user_seq_at_apply != user_seq_) {
+    last_undo_.reset();
+    return false;
+  }
+
+  auto injector = std::atomic_load(&injector_);
+  if (!injector) {
+    last_undo_.reset();
+    return false;
+  }
+
+  // Переносим запись в локальную переменную (и очищаем state) до выполнения
+  // макроса — чтобы не переиспользовать её в случае реэнтранси.
+  UndoRecord rec = std::move(*last_undo_);
+  last_undo_.reset();
+
+  if (rec.inserted_len == 0 && !rec.original_text.empty()) {
+    // Некорректное состояние: нечего удалять, но есть что вставлять.
+    // Лучше не делать ничего, чем повредить текст.
+    return false;
+  }
+
+  // Undo — это макрос переписывания текста; сбрасываем async-состояние.
+  pending_words_.clear();
+  ready_results_.clear();
+  next_apply_task_id_ = next_task_id_;
+  history_.reset();
+  buffer_.reset_all();
+
+  is_processing_macro_ = true;
+  struct DrainGuard {
+    EventLoop *self;
+    ~DrainGuard() { self->drain_pending_events(); }
+  } drain_guard{this};
+
+  std::cerr << "[punto] Undo: start (erase=" << rec.inserted_len
+            << " restore_layout="
+            << (rec.restore_layout.has_value() ? std::to_string(*rec.restore_layout)
+                                               : std::string{"-"})
+            << ")\n";
+
+  const bool ok = replace_text_oneshot(
+      rec.inserted_len, rec.original_text,
+      /*final_layout=*/rec.restore_layout,
+      /*play_sound=*/false);
+  if (!ok) {
+    std::cerr << "[punto] Undo: oneshot replace failed (skip)\n";
+    return false;
+  }
+
+  if (rec.is_auto_correction) {
+    // Ctrl+Z как явный сигнал "отменяю автокоррекцию" → пишем слово в exclusions.
+    undo_detector_.on_undo();
+  }
+
+  std::cerr << "[punto] Undo: done\n";
+  return true;
+}
+
 void EventLoop::action_invert_layout_word() {
   auto word = buffer_.get_active_word();
-  if (word.empty())
+  if (word.empty()) {
     return;
+  }
+
+  const int restore_layout_for_undo = current_layout_;
 
   // Важно: слово инвертируем относительно текущей раскладки.
   const int target_layout = (current_layout_ == 0) ? 1 : 0;
+
+  // Оригинальный текст (для Ctrl+Z).
+  std::optional<std::string> original_text_opt =
+      key_entries_to_visible_text_checked(word, restore_layout_for_undo);
 
   // Строим видимый текст так, как если бы мы перепечатали те же скан-коды в
   // target_layout.
@@ -1093,8 +1223,14 @@ void EventLoop::action_invert_layout_word() {
   for (ScanCode c : buffer_.trailing()) {
     if (c == KEY_SPACE) {
       replacement.push_back(' ');
+      if (original_text_opt.has_value()) {
+        original_text_opt->push_back(' ');
+      }
     } else if (c == KEY_TAB) {
       replacement.push_back('\t');
+      if (original_text_opt.has_value()) {
+        original_text_opt->push_back('\t');
+      }
     }
   }
 
@@ -1106,9 +1242,14 @@ void EventLoop::action_invert_layout_word() {
   } drain_guard{this};
 
   const std::size_t total_len = word.size() + buffer_.trailing_length();
-  (void)replace_text_oneshot(total_len, replacement,
-                             /*final_layout=*/target_layout,
-                             /*play_sound=*/true);
+  const bool ok = replace_text_oneshot(total_len, replacement,
+                                      /*final_layout=*/target_layout,
+                                      /*play_sound=*/true);
+  if (ok && original_text_opt.has_value()) {
+    set_last_undo_record(std::move(*original_text_opt), replacement,
+                         /*restore_layout=*/restore_layout_for_undo,
+                         /*is_auto_correction=*/false);
+  }
 }
 
 void EventLoop::action_auto_invert_word(std::span<const KeyEntry> word,
@@ -1160,8 +1301,9 @@ void EventLoop::action_auto_invert_word(std::span<const KeyEntry> word,
 
 void EventLoop::action_invert_case_word() {
   auto word = buffer_.get_active_word();
-  if (word.empty())
+  if (word.empty()) {
     return;
+  }
 
   auto visible_opt = key_entries_to_visible_text_checked(word, current_layout_);
   if (!visible_opt.has_value()) {
@@ -1170,15 +1312,16 @@ void EventLoop::action_invert_case_word() {
     return;
   }
 
-  const std::string &visible = *visible_opt;
-
-  std::string replacement = invert_case(visible);
+  std::string original_text = *visible_opt;
+  std::string replacement = invert_case(*visible_opt);
 
   // Добавляем trailing whitespace (пробелы/табы) в конец.
   for (ScanCode c : buffer_.trailing()) {
     if (c == KEY_SPACE) {
+      original_text.push_back(' ');
       replacement.push_back(' ');
     } else if (c == KEY_TAB) {
+      original_text.push_back('\t');
       replacement.push_back('\t');
     }
   }
@@ -1190,13 +1333,19 @@ void EventLoop::action_invert_case_word() {
   } drain_guard{this};
 
   const std::size_t total_len = word.size() + buffer_.trailing_length();
-  (void)replace_text_oneshot(total_len, replacement,
-                             /*final_layout=*/std::nullopt,
-                             /*play_sound=*/false);
+  const bool ok = replace_text_oneshot(total_len, replacement,
+                                      /*final_layout=*/std::nullopt,
+                                      /*play_sound=*/false);
+  if (ok) {
+    set_last_undo_record(std::move(original_text), replacement,
+                         /*restore_layout=*/std::nullopt,
+                         /*is_auto_correction=*/false);
+  }
 }
 
 bool EventLoop::process_selection(
-    std::function<std::string(std::string_view)> transform) {
+    std::function<std::string(std::string_view)> transform,
+    std::optional<int> restore_layout_for_undo) {
 
   if (!clipboard_) {
     std::cerr << "[punto] Clipboard: недоступен\n";
@@ -1210,10 +1359,6 @@ bool EventLoop::process_selection(
 
   const bool is_terminal = clipboard_->is_active_window_terminal();
 
-  // Важно: не пытаемся удалять выделение руками.
-  // В GUI-приложениях paste обычно заменяет выделение автоматически.
-  // В терминале выделение не является "selection для редактирования".
-
   injector->release_all_modifiers();
   wait_and_buffer(std::chrono::microseconds{30000});
   flush_pending_release_frames();
@@ -1221,10 +1366,20 @@ bool EventLoop::process_selection(
   std::optional<std::string> text;
 
   if (is_terminal) {
-    // В терминале: читаем PRIMARY selection (автоматически заполняется при выделении)
+    // В терминале: читаем PRIMARY selection (автоматически заполняется при выделении).
     text = clipboard_->get_text(Selection::Primary);
   } else {
     // В обычных приложениях: Ctrl+C для копирования выделения.
+    //
+    // Важно: если выделения нет, то Ctrl+C обычно не меняет CLIPBOARD.
+    // Чтобы не трансформировать "старый" clipboard, читаем значение до и после.
+    const std::optional<std::string> before_clip =
+        clipboard_->get_text(Selection::Clipboard);
+    if (!before_clip.has_value()) {
+      std::cerr << "[punto] Clipboard: cannot read CLIPBOARD before copy\n";
+      return false;
+    }
+
     injector->send_key(KEY_LEFTCTRL, KeyState::Press);
     wait_and_buffer(std::chrono::microseconds{20000});
     injector->send_key(KEY_C, KeyState::Press);
@@ -1237,6 +1392,15 @@ bool EventLoop::process_selection(
     wait_and_buffer(std::chrono::microseconds{200000});
 
     text = clipboard_->get_text(Selection::Clipboard);
+
+    if (!text.has_value() || text->empty()) {
+      return false;
+    }
+
+    if (*text == *before_clip) {
+      // Скорее всего, выделения не было.
+      return false;
+    }
   }
 
   if (!text || text->empty()) {
@@ -1261,12 +1425,21 @@ bool EventLoop::process_selection(
     return false;
   }
 
-  // Даём X11/xsel шанс обновить selections.
+  // Даём X11 шанс обновить selections.
   wait_and_buffer(std::chrono::microseconds{150000});
 
   // Для Ctrl+Shift+V в некоторых терминалах нужен EN layout.
   const std::optional<int> restore_layout =
       maybe_switch_layout_to_en_for_terminal_paste(is_terminal);
+
+  if (!is_terminal) {
+    // Критично: некоторые приложения НЕ заменяют выделение при paste hotkey.
+    // Удаляем выделение вручную (Backspace удаляет весь selection).
+    injector->tap_key(KEY_BACKSPACE, /*with_shift=*/false, /*turbo=*/false);
+
+    wait_and_buffer(std::chrono::microseconds{30000});
+    flush_pending_release_frames();
+  }
 
   injector->send_paste(is_terminal);
 
@@ -1277,35 +1450,54 @@ bool EventLoop::process_selection(
     (void)set_layout(*restore_layout, /*play_sound=*/false);
   }
 
+  // Undo: в терминале мы вставляем "как есть" в позицию курсора, т.е.
+  // откат = удалить вставку (в исходном состоянии текста не было).
+  std::string undo_original = is_terminal ? std::string{} : *text;
+  set_last_undo_record(std::move(undo_original), transformed,
+                       restore_layout_for_undo,
+                       /*is_auto_correction=*/false);
+
   return true;
 }
 
 void EventLoop::wait_and_buffer(std::chrono::microseconds us) {
-  if (us.count() <= 0)
+  if (us.count() <= 0) {
     return;
+  }
 
-  auto start = std::chrono::steady_clock::now();
-  auto end = start + us;
+  const auto start = std::chrono::steady_clock::now();
+  const auto end = start + us;
 
   while (true) {
-    auto now = std::chrono::steady_clock::now();
-    if (now >= end)
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= end) {
       break;
+    }
 
-    auto remaining_us =
+    // Обслуживаем X11 selection ownership, даже когда stdin молчит.
+    if (clipboard_) {
+      clipboard_->pump_events();
+    }
+
+    const auto remaining_us =
         std::chrono::duration_cast<std::chrono::microseconds>(end - now);
+
     int timeout_ms = static_cast<int>(remaining_us.count() / 1000);
 
-    // Ensure timeout is at least 1ms if there's time remaining,
-    // or 0 if time is up/very little left.
+    // Ensure timeout is at least 1ms if there's time remaining.
     if (timeout_ms < 1 && remaining_us.count() > 0) {
       timeout_ms = 1;
-    } else if (remaining_us.count() <= 0) {
-      break; // Time is up
+    }
+
+    // Мы должны регулярно обслуживать X11 события, иначе paste может не
+    // получить содержимое selection. Поэтому дробим длинные ожидания.
+    constexpr int kMaxPollSliceMs = 5;
+    if (timeout_ms > kMaxPollSliceMs) {
+      timeout_ms = kMaxPollSliceMs;
     }
 
     pollfd pfd = {STDIN_FILENO, POLLIN, 0};
-    int ret = poll(&pfd, 1, timeout_ms);
+    const int ret = poll(&pfd, 1, timeout_ms);
 
     if (ret > 0 && (pfd.revents & POLLIN)) {
       input_event ev;
@@ -1329,15 +1521,17 @@ void EventLoop::wait_and_buffer(std::chrono::microseconds us) {
           break;
         }
       }
-    } else if (ret < 0) {
-      if (errno == EINTR)
-        continue; // Interrupted by signal, retry poll
-      break;      // Other error
-    } else {
-      // timeout - we waited 'timeout_ms' ms, so 'now' should be >= 'end'
-      // or no events arrived within the timeout.
-      break;
+      continue;
     }
+
+    if (ret < 0) {
+      if (errno == EINTR) {
+        continue; // Interrupted by signal, retry poll
+      }
+      break; // Other error
+    }
+
+    // ret == 0 (timeout) или без POLLIN: продолжаем ждать до end.
   }
 }
 
@@ -1716,6 +1910,19 @@ void EventLoop::apply_correction(const PendingWordMeta &meta,
   replacement += *word_text_opt;
   replacement += *tail_text_opt;
 
+  // Оригинальный текст (для Ctrl+Z).
+  std::optional<std::string> original_text_opt;
+  {
+    auto orig_word_text_opt = key_entries_to_visible_text_checked(
+        std::span<const KeyEntry>{meta.word.data(), meta.word.size()},
+        original_layout);
+    if (orig_word_text_opt.has_value()) {
+      std::string tmp = std::move(*orig_word_text_opt);
+      tmp += *tail_text_opt;
+      original_text_opt = std::move(tmp);
+    }
+  }
+
   std::cerr << "[punto] Async-CORRECT(oneshot): task_id=" << meta.task_id
             << " word_len=" << meta.word.size()
             << " tail_len=" << tail_scratch_.size() << " erase=" << erase
@@ -1736,6 +1943,12 @@ void EventLoop::apply_correction(const PendingWordMeta &meta,
     std::cerr << "[punto] Async: oneshot replace failed for task_id=" << meta.task_id
               << " (skip)\n";
     return;
+  }
+
+  if (original_text_opt.has_value()) {
+    set_last_undo_record(std::move(*original_text_opt), replacement,
+                         /*restore_layout=*/original_layout,
+                         /*is_auto_correction=*/true);
   }
 
   const auto macro_end = std::chrono::steady_clock::now();
@@ -1822,6 +2035,18 @@ void EventLoop::apply_case_correction(
   replacement += *word_text_opt;
   replacement += *tail_text_opt;
 
+  // Оригинальный текст (для Ctrl+Z).
+  std::optional<std::string> original_text_opt;
+  {
+    auto orig_word_text_opt = key_entries_to_visible_text_checked(
+        std::span<const KeyEntry>{meta.word.data(), meta.word.size()}, layout);
+    if (orig_word_text_opt.has_value()) {
+      std::string tmp = std::move(*orig_word_text_opt);
+      tmp += *tail_text_opt;
+      original_text_opt = std::move(tmp);
+    }
+  }
+
   is_processing_macro_ = true;
   struct DrainGuard {
     EventLoop *self;
@@ -1837,6 +2062,12 @@ void EventLoop::apply_case_correction(
     std::cerr << "[punto] Async: oneshot replace failed for task_id=" << meta.task_id
               << " (skip)\n";
     return;
+  }
+
+  if (original_text_opt.has_value()) {
+    set_last_undo_record(std::move(*original_text_opt), replacement,
+                         /*restore_layout=*/std::nullopt,
+                         /*is_auto_correction=*/true);
   }
 
   const auto macro_end = std::chrono::steady_clock::now();
@@ -1920,6 +2151,20 @@ void EventLoop::apply_combined_correction(
   replacement += *word_text_opt;
   replacement += *tail_text_opt;
 
+  // Оригинальный текст (для Ctrl+Z).
+  std::optional<std::string> original_text_opt;
+  {
+    auto orig_word_text_opt = key_entries_to_visible_text_checked(
+        std::span<const KeyEntry>{meta.word.data(), meta.word.size()},
+        original_layout);
+    if (orig_word_text_opt.has_value()) {
+      // Tail в original_layout уже посчитан в tail_text_opt.
+      std::string tmp = std::move(*orig_word_text_opt);
+      tmp += *tail_text_opt;
+      original_text_opt = std::move(tmp);
+    }
+  }
+
   is_processing_macro_ = true;
   struct DrainGuard {
     EventLoop *self;
@@ -1935,6 +2180,12 @@ void EventLoop::apply_combined_correction(
     std::cerr << "[punto] Async: oneshot replace failed for task_id=" << meta.task_id
               << " (skip)\n";
     return;
+  }
+
+  if (original_text_opt.has_value()) {
+    set_last_undo_record(std::move(*original_text_opt), replacement,
+                         /*restore_layout=*/original_layout,
+                         /*is_auto_correction=*/true);
   }
 
   const auto macro_end = std::chrono::steady_clock::now();
@@ -1954,24 +2205,32 @@ void EventLoop::apply_combined_correction(
 
 void EventLoop::action_invert_layout_selection() {
   is_processing_macro_ = true;
+
+  const int restore_layout_for_undo = current_layout_;
+
   if (process_selection(
-          [](std::string_view text) { return invert_layout(text); })) {
+          [](std::string_view text) { return invert_layout(text); },
+          /*restore_layout_for_undo=*/restore_layout_for_undo)) {
     // Переключаем раскладку после успешной инверсии
     wait_and_buffer(std::chrono::microseconds{100000});
     switch_layout(true);
   }
+
   drain_pending_events();
 }
 
 void EventLoop::action_invert_case_selection() {
   is_processing_macro_ = true;
-  process_selection([](std::string_view text) { return invert_case(text); });
+  (void)process_selection([](std::string_view text) { return invert_case(text); },
+                          /*restore_layout_for_undo=*/std::nullopt);
   drain_pending_events();
 }
 
 void EventLoop::action_transliterate_selection() {
   is_processing_macro_ = true;
-  process_selection([](std::string_view text) { return transliterate(text); });
+  (void)process_selection(
+      [](std::string_view text) { return transliterate(text); },
+      /*restore_layout_for_undo=*/std::nullopt);
   drain_pending_events();
 }
 

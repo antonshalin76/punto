@@ -14,6 +14,7 @@
 #include <cstring>
 #include <iostream>
 #include <thread>
+#include <vector>
 
 namespace punto {
 
@@ -47,6 +48,11 @@ bool ClipboardManager::open() {
   atom_primary_ = XInternAtom(display_, "PRIMARY", False);
   atom_utf8_string_ = XInternAtom(display_, "UTF8_STRING", False);
 
+  // Часто используемые targets (для SelectionRequest).
+  atom_targets_ = XInternAtom(display_, "TARGETS", False);
+  atom_text_plain_ = XInternAtom(display_, "text/plain", False);
+  atom_text_plain_utf8_ = XInternAtom(display_, "text/plain;charset=utf-8", False);
+
   return true;
 }
 
@@ -67,13 +73,135 @@ Atom ClipboardManager::get_selection_atom(Selection sel) const {
   return sel == Selection::Primary ? atom_primary_ : atom_clipboard_;
 }
 
-bool ClipboardManager::wait_for_selection_notify(Atom selection) {
+void ClipboardManager::pump_events() {
+  if (!display_) {
+    return;
+  }
+
+  // Важно: обрабатываем только selection-события. Остальные события нам не нужны.
+  XEvent ev;
+
+  while (XCheckTypedEvent(display_, SelectionRequest, &ev) != 0) {
+    handle_selection_request(ev.xselectionrequest);
+  }
+
+  while (XCheckTypedEvent(display_, SelectionClear, &ev) != 0) {
+    handle_selection_clear(ev.xselectionclear);
+  }
+}
+
+void ClipboardManager::handle_selection_clear(const XSelectionClearEvent &ev) {
+  if (ev.selection == atom_clipboard_) {
+    owns_clipboard_ = false;
+    clipboard_text_.clear();
+    return;
+  }
+
+  if (ev.selection == atom_primary_) {
+    owns_primary_ = false;
+    primary_text_.clear();
+    return;
+  }
+}
+
+void ClipboardManager::handle_selection_request(const XSelectionRequestEvent &req) {
+  if (!display_) {
+    return;
+  }
+
+  const std::string *payload = nullptr;
+
+  if (req.selection == atom_clipboard_ && owns_clipboard_) {
+    payload = &clipboard_text_;
+  } else if (req.selection == atom_primary_ && owns_primary_) {
+    payload = &primary_text_;
+  }
+
+  // По ICCCM request.property может быть None.
+  Atom property = req.property;
+  if (property == None) {
+    property = req.target;
+  }
+
+  XEvent reply{};
+  reply.xselection.type = SelectionNotify;
+  reply.xselection.display = req.display;
+  reply.xselection.requestor = req.requestor;
+  reply.xselection.selection = req.selection;
+  reply.xselection.target = req.target;
+  reply.xselection.time = req.time;
+  reply.xselection.property = None;
+
+  if (payload == nullptr) {
+    // Мы не владеем этим selection или у нас нет данных.
+    (void)XSendEvent(display_, req.requestor, False, 0, &reply);
+    XFlush(display_);
+    return;
+  }
+
+  if (req.target == atom_targets_) {
+    std::vector<Atom> targets;
+    targets.reserve(6);
+    targets.push_back(atom_targets_);
+    targets.push_back(atom_utf8_string_);
+    targets.push_back(atom_text_plain_utf8_);
+    targets.push_back(atom_text_plain_);
+    targets.push_back(XA_STRING);
+
+    const int n = static_cast<int>(targets.size());
+
+    XChangeProperty(display_, req.requestor, property,
+                    /*type=*/XA_ATOM,
+                    /*format=*/32,
+                    PropModeReplace,
+                    reinterpret_cast<const unsigned char *>(targets.data()), n);
+
+    reply.xselection.property = property;
+
+    (void)XSendEvent(display_, req.requestor, False, 0, &reply);
+    XFlush(display_);
+    return;
+  }
+
+  const bool is_text_target =
+      (req.target == atom_utf8_string_ || req.target == atom_text_plain_utf8_ ||
+       req.target == atom_text_plain_ || req.target == XA_STRING);
+
+  if (!is_text_target) {
+    // Unsupported target
+    (void)XSendEvent(display_, req.requestor, False, 0, &reply);
+    XFlush(display_);
+    return;
+  }
+
+  // Передаём байты "как есть" (UTF-8). В современных приложениях target чаще всего
+  // UTF8_STRING или text/plain;charset=utf-8.
+  const int nbytes = static_cast<int>(payload->size());
+  XChangeProperty(display_, req.requestor, property,
+                  /*type=*/req.target,
+                  /*format=*/8,
+                  PropModeReplace,
+                  reinterpret_cast<const unsigned char *>(payload->data()), nbytes);
+
+  reply.xselection.property = property;
+
+  (void)XSendEvent(display_, req.requestor, False, 0, &reply);
+  XFlush(display_);
+}
+
+bool ClipboardManager::wait_for_selection_notify(Atom property) {
   auto start = std::chrono::steady_clock::now();
   XEvent event;
 
   while (std::chrono::steady_clock::now() - start < timeout_) {
-    if (XCheckTypedWindowEvent(display_, window_, SelectionNotify, &event)) {
-      return event.xselection.property != None;
+    // Если мы владеем selection, то при XConvertSelection() сервер присылает нам
+    // SelectionRequest, и без обработки этого события SelectionNotify не придёт.
+    pump_events();
+
+    if (XCheckTypedWindowEvent(display_, window_, SelectionNotify, &event) != 0) {
+      if (event.xselection.property == property) {
+        return event.xselection.property != None;
+      }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
@@ -95,7 +223,7 @@ std::optional<std::string> ClipboardManager::get_text(Selection sel) {
                     CurrentTime);
   XFlush(display_);
 
-  if (!wait_for_selection_notify(selection)) {
+  if (!wait_for_selection_notify(property)) {
     return std::nullopt;
   }
 
@@ -123,32 +251,38 @@ std::optional<std::string> ClipboardManager::get_text(Selection sel) {
 ClipboardResult ClipboardManager::set_text(Selection sel,
                                            std::string_view text) {
   if (!display_) {
-    if (!open())
+    if (!open()) {
       return ClipboardResult::NoConnection;
+    }
   }
 
-  // Для установки selection нам нужно стать его владельцем
-  // и обрабатывать SelectionRequest события.
-  // Это сложнее, чем просто установить — нужен event loop.
-  //
-  // Для простоты, используем xsel через exec (временное решение).
-  // В Phase 3 можно реализовать полноценный ownership.
+  const Atom selection = get_selection_atom(sel);
 
-  // Временная реализация через pipe к xsel
-  std::string cmd = "xsel --clipboard --input";
-  if (sel == Selection::Primary) {
-    cmd = "xsel --primary --input";
+  // Сохраняем данные в памяти процесса: в X11 selection "данные" находятся у owner.
+  if (sel == Selection::Clipboard) {
+    clipboard_text_.assign(text.data(), text.size());
+    owns_clipboard_ = true;
+  } else {
+    primary_text_.assign(text.data(), text.size());
+    owns_primary_ = true;
   }
 
-  FILE *pipe = popen(cmd.c_str(), "w");
-  if (!pipe) {
+  XSetSelectionOwner(display_, selection, window_, CurrentTime);
+  XFlush(display_);
+
+  const Window owner = XGetSelectionOwner(display_, selection);
+  if (owner != window_) {
+    if (sel == Selection::Clipboard) {
+      owns_clipboard_ = false;
+      clipboard_text_.clear();
+    } else {
+      owns_primary_ = false;
+      primary_text_.clear();
+    }
     return ClipboardResult::ConversionFailed;
   }
 
-  fwrite(text.data(), 1, text.size(), pipe);
-  int ret = pclose(pipe);
-
-  return ret == 0 ? ClipboardResult::Ok : ClipboardResult::ConversionFailed;
+  return ClipboardResult::Ok;
 }
 
 bool ClipboardManager::is_active_window_terminal() {

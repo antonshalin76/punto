@@ -6,7 +6,7 @@ mkdir -p /etc/punto
 mkdir -p /etc/interception
 
 # Определяем версию пакета
-PKG_VERSION="2.7.5"
+PKG_VERSION="2.8.0"
 CONFIG_FILE="/etc/punto/config.yaml"
 NEW_CONFIG="/usr/share/punto-switcher/config.yaml"
 

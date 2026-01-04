@@ -143,6 +143,22 @@ private:
   bool
   process_selection(std::function<std::string(std::string_view)> transform);
 
+  /// Вставляет текст одной операцией через Clipboard + Paste.
+  ///
+  /// Best-effort: пытается сохранить/восстановить содержимое CLIPBOARD, чтобы
+  /// не ломать пользовательский буфер обмена.
+  [[nodiscard]] bool paste_text_oneshot(std::string_view text,
+                                       bool restore_clipboard = true);
+
+  /// Удаляет `backspace_count` символов и вставляет `text` через oneshot paste.
+  ///
+  /// @param final_layout если задано (0/1) — стараемся установить раскладку
+  /// после вставки.
+  [[nodiscard]] bool replace_text_oneshot(std::size_t backspace_count,
+                                         std::string_view text,
+                                         std::optional<int> final_layout,
+                                         bool play_sound);
+
   /// Ожидает указанное время, буферизуя входящие события
   void wait_and_buffer(std::chrono::microseconds us);
 

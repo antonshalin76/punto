@@ -31,31 +31,6 @@ struct HotkeyConfig {
   std::uint16_t key = KEY_GRAVE;
 };
 
-/// Настройки задержек (в микросекундах для совместимости с usleep)
-struct DelayConfig {
-  std::chrono::microseconds key_press{20000};      // 20ms
-  std::chrono::microseconds layout_switch{100000}; // 100ms
-  std::chrono::microseconds retype{3000};          // 3ms между символами
-
-  // Турбо-задержки для автокоррекции.
-  // ВАЖНО: слишком малые значения приводят к гонке символов в медленных
-  // приложениях (Electron, Java). Минимальные безопасные значения: 15ms/35ms.
-  std::chrono::microseconds turbo_key_press{
-      15000}; // 15ms для автостирания/печати
-  std::chrono::microseconds turbo_retype{
-      35000}; // 35ms пауза между символами в turbo
-
-  // Детальные настройки для tap_key (эмуляция нажатия клавиши)
-  // Эти параметры влияют на надёжность ввода в разных приложениях
-  std::chrono::microseconds key_hold{
-      20000}; // 20ms удержание клавиши между press и release
-  std::chrono::microseconds modifier_hold{
-      15000}; // 15ms удержание модификатора (Shift) перед клавишей
-  std::chrono::microseconds modifier_release{
-      8000}; // 8ms задержка после отпускания модификатора
-  std::chrono::microseconds backspace_hold{18000}; // 18ms удержание Backspace
-};
-
 /// Настройки автоматического переключения раскладки
 struct AutoSwitchConfig {
   /// Включено ли автопереключение
@@ -104,7 +79,6 @@ struct SoundConfig {
 /// Полная конфигурация приложения
 struct Config {
   HotkeyConfig hotkey;
-  DelayConfig delays;
   AutoSwitchConfig auto_switch;
   SoundConfig sound;
   std::filesystem::path config_path{"/etc/punto/config.yaml"};
@@ -143,15 +117,6 @@ struct ConfigLoadOutcome {
  * Best-effort поведение: при ошибках чтения/валидации возвращает дефолты.
  */
 [[nodiscard]] Config load_config(std::string_view path = kConfigPath);
-
-/**
- * @brief Парсит значение задержки из строки
- *
- * @param value Строка с числом (миллисекунды)
- * @return Значение в микросекундах или std::nullopt
- */
-[[nodiscard]] std::optional<std::chrono::microseconds>
-parse_delay_ms(std::string_view value);
 
 /**
  * @brief Валидирует конфигурацию

@@ -3,7 +3,7 @@
 # Высокопроизводительный плагин для interception-tools
 # =============================================================================
 cmake_minimum_required(VERSION 3.16)
-project(punto VERSION 2.7.5 LANGUAGES CXX)
+project(punto VERSION 2.8.0 LANGUAGES CXX)
 
 # Для clangd/IDE: генерируем compile_commands.json
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -200,3 +200,21 @@ message(STATUS "C++ Standard:   ${CMAKE_CXX_STANDARD}")
 message(STATUS "X11 Found:      ${X11_FOUND}")
 message(STATUS "XCB Found:      ${XCB_FOUND}")
 message(STATUS "")
+
+# -----------------------------------------------------------------------------
+# Tests (CTest)
+# -----------------------------------------------------------------------------
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(punto-tests
+        tests/test_main.cpp
+        src/text_processor.cpp
+    )
+
+    target_include_directories(punto-tests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    add_test(NAME punto-tests COMMAND punto-tests)
+endif()

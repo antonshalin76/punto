@@ -10,7 +10,6 @@
 #include <functional>
 #include <span>
 
-#include "punto/config.hpp"
 #include "punto/types.hpp"
 
 namespace punto {
@@ -22,17 +21,8 @@ namespace punto {
  */
 class KeyInjector {
 public:
-  /**
-   * @brief Конструктор
-   * @param delays Конфигурация задержек
-   */
-  explicit KeyInjector(DelayConfig delays) noexcept;
-
-  /**
-   * @brief Обновляет конфигурацию задержек (для hot reload)
-   * @param delays Новая конфигурация
-   */
-  void update_delays(const DelayConfig &delays) noexcept;
+  /// Конструктор (задержки внутри зашиты; config.delays удалён)
+  KeyInjector() noexcept;
 
   // =========================================================================
   // Низкоуровневые операции
@@ -110,6 +100,12 @@ public:
   void send_layout_hotkey(ScanCode modifier, ScanCode key) const;
 
   /**
+   * @brief Вставка из clipboard (Ctrl+V / Ctrl+Shift+V)
+   * @param is_terminal true если активное окно — терминал
+   */
+  void send_paste(bool is_terminal) const;
+
+  /**
    * @brief Отпускает все модификаторы
    */
   void release_all_modifiers() const;
@@ -120,7 +116,18 @@ public:
 private:
   static void write_all_or_die(int fd, const void *data, std::size_t bytes);
 
-  DelayConfig delays_;
+  // Встроенные задержки (в микросекундах).
+  // Значения соответствуют прежним рекомендуемым параметрам из config.yaml.
+  static constexpr std::chrono::microseconds kKeyPress{12000};
+  static constexpr std::chrono::microseconds kLayoutSwitch{150000};
+  static constexpr std::chrono::microseconds kRetype{15000};
+  static constexpr std::chrono::microseconds kTurboKeyPress{15000};
+  static constexpr std::chrono::microseconds kTurboRetype{35000};
+  static constexpr std::chrono::microseconds kKeyHold{20000};
+  static constexpr std::chrono::microseconds kModifierHold{15000};
+  static constexpr std::chrono::microseconds kModifierRelease{8000};
+  static constexpr std::chrono::microseconds kBackspaceHold{18000};
+
   WaitFunc wait_func_;
 };
 

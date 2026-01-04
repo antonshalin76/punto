@@ -67,29 +67,7 @@ std::optional<bool> parse_bool(std::string_view sv) {
 
 } // namespace
 
-std::optional<std::chrono::microseconds>
-parse_delay_ms(std::string_view value) {
-  auto ms = parse_int(value);
-  if (ms && *ms > 0) {
-    return std::chrono::microseconds{*ms * 1000};
-  }
-  return std::nullopt;
-}
-
 bool validate_config(const Config &config) {
-  // Проверка задержек
-  if (config.delays.key_press.count() <= 0 ||
-      config.delays.layout_switch.count() <= 0 ||
-      config.delays.retype.count() <= 0 ||
-      config.delays.turbo_key_press.count() <= 0 ||
-      config.delays.turbo_retype.count() <= 0 ||
-      config.delays.key_hold.count() <= 0 ||
-      config.delays.modifier_hold.count() <= 0 ||
-      config.delays.modifier_release.count() <= 0 ||
-      config.delays.backspace_hold.count() <= 0) {
-    return false;
-  }
-
   // Проверка кодов клавиш
   if (config.hotkey.modifier == 0 || config.hotkey.key == 0) {
     return false;
@@ -134,10 +112,6 @@ Config parse_config_stream(std::istream &file) {
       current_section = "hotkey";
       continue;
     }
-    if (sv == "delays:" || sv.starts_with("delays:")) {
-      current_section = "delays";
-      continue;
-    }
     if (sv == "auto_switch:" || sv.starts_with("auto_switch:")) {
       current_section = "auto_switch";
       continue;
@@ -164,28 +138,6 @@ Config parse_config_stream(std::istream &file) {
       } else if (key == "key") {
         if (auto code = key_name_to_code(value)) {
           config.hotkey.key = *code;
-        }
-      }
-    } else if (current_section == "delays") {
-      if (auto delay = parse_delay_ms(value)) {
-        if (key == "key_press") {
-          config.delays.key_press = *delay;
-        } else if (key == "layout_switch") {
-          config.delays.layout_switch = *delay;
-        } else if (key == "retype") {
-          config.delays.retype = *delay;
-        } else if (key == "turbo_key_press") {
-          config.delays.turbo_key_press = *delay;
-        } else if (key == "turbo_retype") {
-          config.delays.turbo_retype = *delay;
-        } else if (key == "key_hold") {
-          config.delays.key_hold = *delay;
-        } else if (key == "modifier_hold") {
-          config.delays.modifier_hold = *delay;
-        } else if (key == "modifier_release") {
-          config.delays.modifier_release = *delay;
-        } else if (key == "backspace_hold") {
-          config.delays.backspace_hold = *delay;
         }
       }
     } else if (current_section == "auto_switch") {

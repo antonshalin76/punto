@@ -3,7 +3,7 @@
 Высокопроизводительная реализация Punto Switcher на C++20 для Linux.
 Позволяет исправлять текст, набранный в неправильной раскладке клавиатуры.
 
-![Version](https://img.shields.io/badge/version-2.7.5-blue)
+![Version](https://img.shields.io/badge/version-2.8.0-blue)
 ![C++](https://img.shields.io/badge/C%2B%2B-20-orange)
 ![License](https://img.shields.io/badge/license-Personal%20Use%20Only-red)
 
@@ -15,7 +15,7 @@
 - **Визуальный статус** — видно, включено ли автопереключение
 - **Автопереключение (toggle)** — быстро вкл/выкл без перезапуска `udevmon`
 - **Звук (toggle)** — вкл/выкл звуковой индикации (пишется в `~/.config/punto/config.yaml`, применяется через RELOAD)
-- **Настройки...** — диалог (GTK3): автопереключение, звук, задержки, хоткей раскладки (`~/.config/punto/config.yaml`)
+- **Настройки...** — диалог (GTK3): автопереключение, звук, хоткей раскладки (`~/.config/punto/config.yaml`)
   - **max_rollback_words** — максимальная глубина отката (сколько последних слов можно безопасно перепечатать при позднем срабатывании анализа)
   - **Синхронизация хоткея с системой**: GNOME (через gsettings) и Generic X11 (через setxkbmap / XKB grp:*_toggle)
   - Вкладка «Горячие клавиши» показывает, какие комбинации применимы для GNOME и для X11
@@ -182,7 +182,7 @@ sudo apt install pulseaudio-utils alsa-utils
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh
-sudo dpkg -i punto-switcher_2.7.5_amd64.deb
+sudo dpkg -i punto-switcher_2.8.0_amd64.deb
 ```
 
 #### Ручная сборка без пакета
@@ -237,14 +237,8 @@ hotkey:
   modifier: leftctrl   # leftctrl, rightctrl, leftalt, rightalt, leftshift, rightshift, leftmeta, rightmeta
   key: grave           # grave (` ~), space, tab, backslash, capslock, а также left/right: shift/ctrl/alt/meta
 
-# Задержки (в миллисекундах)
-delays:
-  key_press: 12        # Задержка между нажатием и отпусканием
-  layout_switch: 150   # Задержка после переключения раскладки
-  retype: 15           # Задержка между символами при перепечатывании
-  turbo_key_press: 12  # Турбо-задержки для автокоррекции
-  turbo_retype: 20
-
+# Примечание: в v2.8.0 раздел delays удалён. Задержки эмуляции ввода теперь
+# фиксированы (зашиты в код) и не настраиваются через YAML.
 # Автоматическое переключение раскладки при нажатии пробела
 auto_switch:
   enabled: true        # Включить автопереключение
@@ -402,6 +396,11 @@ sudo rm -rf /etc/punto
 | wamerican-huge             | любая (опционально)       |
 
 ## История изменений
+
+### v2.8.0 — Oneshot замена через Clipboard+Paste + удаление delays
+
+- **Oneshot замена текста**: все режимы замен (авто/ручные, слово/selection, async corrections) выполняются через Clipboard+Paste вместо посимвольного retype.
+- **Удалён раздел `delays`** из конфига и UI: настройки задержек больше не редактируются в YAML/`punto-tray`.
 
 ### v2.7.5 — Исправление ложного переключения при вводе чисел
 

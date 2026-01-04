@@ -15,12 +15,7 @@
 
 namespace punto {
 
-KeyInjector::KeyInjector(DelayConfig delays) noexcept
-    : delays_{std::move(delays)} {}
-
-void KeyInjector::update_delays(const DelayConfig &delays) noexcept {
-  delays_ = delays;
-}
+KeyInjector::KeyInjector() noexcept = default;
 
 void KeyInjector::write_all_or_die(int fd, const void *data,
                                    std::size_t bytes) {
@@ -75,32 +70,32 @@ void KeyInjector::send_key(ScanCode code, KeyState state) const {
 }
 
 void KeyInjector::tap_key(ScanCode code, bool with_shift, bool turbo) const {
-  auto retype_delay = turbo ? delays_.turbo_retype : delays_.retype;
+  auto retype_delay = turbo ? kTurboRetype : kRetype;
 
   if (with_shift) {
     send_key(KEY_LEFTSHIFT, KeyState::Press);
-    delay(delays_.modifier_hold); // Конфигурируемая задержка для модификатора
+    delay(kModifierHold);
   }
 
   send_key(code, KeyState::Press);
-  delay(delays_.key_hold); // Конфигурируемое удержание клавиши
+  delay(kKeyHold);
   send_key(code, KeyState::Release);
 
   if (with_shift) {
-    delay(delays_.modifier_release);
+    delay(kModifierRelease);
     send_key(KEY_LEFTSHIFT, KeyState::Release);
-    delay(delays_.modifier_release);
+    delay(kModifierRelease);
   }
 
   delay(retype_delay);
 }
 
 void KeyInjector::send_backspace(std::size_t count, bool turbo) const {
-  auto retype_delay = turbo ? delays_.turbo_retype : delays_.retype;
+  auto retype_delay = turbo ? kTurboRetype : kRetype;
 
   for (std::size_t i = 0; i < count; ++i) {
     send_key(KEY_BACKSPACE, KeyState::Press);
-    delay(delays_.backspace_hold); // Конфигурируемое удержание Backspace
+    delay(kBackspaceHold);
     send_key(KEY_BACKSPACE, KeyState::Release);
 
     if (i < count - 1) {
@@ -126,19 +121,44 @@ void KeyInjector::retype_trailing(std::span<const ScanCode> codes,
 }
 
 void KeyInjector::send_layout_hotkey(ScanCode modifier, ScanCode key) const {
-  delay(delays_.key_press);
+  delay(kKeyPress);
 
   send_key(modifier, KeyState::Press);
-  delay(delays_.key_press);
+  delay(kKeyPress);
 
   send_key(key, KeyState::Press);
-  delay(delays_.key_press + std::chrono::microseconds{50000}); // Extended hold
+  delay(kKeyPress + std::chrono::microseconds{50000}); // Extended hold
 
   send_key(key, KeyState::Release);
-  delay(delays_.key_press);
+  delay(kKeyPress);
 
   send_key(modifier, KeyState::Release);
-  delay(delays_.layout_switch);
+  delay(kLayoutSwitch);
+}
+
+void KeyInjector::send_paste(bool is_terminal) const {
+  // Важно: предполагаем, что вызывающий код уже отпустил "чужие" модификаторы.
+  delay(kKeyPress);
+
+  send_key(KEY_LEFTCTRL, KeyState::Press);
+  if (is_terminal) {
+    send_key(KEY_LEFTSHIFT, KeyState::Press);
+  }
+
+  delay(kKeyPress);
+
+  send_key(KEY_V, KeyState::Press);
+  delay(kKeyHold);
+  send_key(KEY_V, KeyState::Release);
+
+  delay(kKeyPress);
+
+  if (is_terminal) {
+    send_key(KEY_LEFTSHIFT, KeyState::Release);
+  }
+  send_key(KEY_LEFTCTRL, KeyState::Release);
+
+  delay(kKeyPress);
 }
 
 void KeyInjector::release_all_modifiers() const {
@@ -151,7 +171,7 @@ void KeyInjector::release_all_modifiers() const {
   send_key(KEY_RIGHTALT, KeyState::Release);
   send_key(KEY_LEFTMETA, KeyState::Release);
   send_key(KEY_RIGHTMETA, KeyState::Release);
-  delay(delays_.key_press);
+  delay(kKeyPress);
 }
 
 void KeyInjector::delay(std::chrono::microseconds us) const noexcept {

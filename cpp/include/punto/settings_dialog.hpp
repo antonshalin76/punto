@@ -29,13 +29,6 @@ struct SettingsData {
   // Sound
   bool sound_enabled = true;
 
-  // Delays
-  int key_press = 12;
-  int layout_switch = 150;
-  int retype = 15;
-  int turbo_key_press = 12;
-  int turbo_retype = 20;
-
   // Hotkey
   std::string modifier = "leftctrl";
   std::string key = "grave";

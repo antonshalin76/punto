@@ -4,6 +4,7 @@
  */
 
 #include "punto/event_loop.hpp"
+#include "punto/key_entry_text.hpp"
 #include "punto/scancode_map.hpp"
 #include "punto/sound_manager.hpp"
 #include "punto/text_processor.hpp"
@@ -34,8 +35,7 @@ bool EventLoop::initialize() {
   // Создаём минимальный KeyInjector из текущего снапшота конфига.
   // Важно: reload_config() может заменить его на новый.
   {
-    auto cfg = std::atomic_load(&config_);
-    auto injector = std::make_shared<KeyInjector>(cfg->delays);
+    auto injector = std::make_shared<KeyInjector>();
     injector->set_wait_func(
         [this](std::chrono::microseconds us) { this->wait_and_buffer(us); });
 
@@ -808,43 +808,161 @@ bool EventLoop::set_layout(int target_layout, bool play_sound) {
   return false;
 }
 
+bool EventLoop::paste_text_oneshot(std::string_view text,
+                                  bool restore_clipboard) {
+  if (!clipboard_) {
+    std::cerr << "[punto] Clipboard: недоступен (oneshot paste skipped)\n";
+    return false;
+  }
+
+  auto injector = std::atomic_load(&injector_);
+  if (!injector) {
+    return false;
+  }
+
+  // Определяем, какой hotkey paste использовать.
+  const bool is_terminal = clipboard_->is_active_window_terminal();
+
+  std::optional<std::string> prev_clip;
+  if (restore_clipboard) {
+    prev_clip = clipboard_->get_text(Selection::Clipboard);
+    if (!prev_clip.has_value()) {
+      std::cerr << "[punto] Clipboard: cannot read CLIPBOARD for restore "
+                   "(oneshot paste skipped)\n";
+      return false;
+    }
+  }
+
+  const ClipboardResult set_res =
+      clipboard_->set_text(Selection::Clipboard, text);
+  if (set_res != ClipboardResult::Ok) {
+    std::cerr << "[punto] Clipboard: failed to set CLIPBOARD (res="
+              << static_cast<int>(set_res) << ")\n";
+    return false;
+  }
+
+  // Даём X11/xsel шанс обновить CLIPBOARD, иначе приложение может прочитать
+  // старое значение.
+  wait_and_buffer(std::chrono::microseconds{100000});
+
+  injector->release_all_modifiers();
+  injector->send_paste(is_terminal);
+
+  // Даем приложению время запросить содержимое clipboard.
+  wait_and_buffer(std::chrono::microseconds{100000});
+
+  if (restore_clipboard && prev_clip.has_value()) {
+    (void)clipboard_->set_text(Selection::Clipboard, *prev_clip);
+  }
+
+  return true;
+}
+
+bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
+                                    std::string_view text,
+                                    std::optional<int> final_layout,
+                                    bool play_sound) {
+  if (!clipboard_) {
+    std::cerr << "[punto] Clipboard: недоступен (oneshot replace skipped)\n";
+    return false;
+  }
+
+  auto injector = std::atomic_load(&injector_);
+  if (!injector) {
+    return false;
+  }
+
+  // Определяем, какой hotkey paste использовать.
+  const bool is_terminal = clipboard_->is_active_window_terminal();
+
+  // Важно: стараемся НЕ удалять текст, пока не убедились, что можем выставить
+  // CLIPBOARD для вставки.
+  std::optional<std::string> prev_clip = clipboard_->get_text(Selection::Clipboard);
+  if (!prev_clip.has_value()) {
+    std::cerr << "[punto] Clipboard: cannot read CLIPBOARD for restore "
+                 "(oneshot replace skipped)\n";
+    return false;
+  }
+
+  const ClipboardResult set_res =
+      clipboard_->set_text(Selection::Clipboard, text);
+  if (set_res != ClipboardResult::Ok) {
+    std::cerr << "[punto] Clipboard: failed to set CLIPBOARD (res="
+              << static_cast<int>(set_res) << ")\n";
+    return false;
+  }
+
+  // Даём X11/xsel шанс обновить CLIPBOARD.
+  wait_and_buffer(std::chrono::microseconds{100000});
+
+  // Важно: replace вызывается только из main thread в режиме macro.
+  injector->release_all_modifiers();
+
+  // Даем физическим key-release шанс прийти в stdin.
+  wait_and_buffer(std::chrono::microseconds{30000});
+  flush_pending_release_frames();
+
+  // Удаляем то, что заменяем.
+  if (backspace_count > 0) {
+    injector->send_backspace(backspace_count, true);
+    flush_pending_release_frames();
+  }
+
+  injector->send_paste(is_terminal);
+
+  // Даем приложению время запросить содержимое clipboard.
+  wait_and_buffer(std::chrono::microseconds{100000});
+
+  if (prev_clip.has_value()) {
+    (void)clipboard_->set_text(Selection::Clipboard, *prev_clip);
+  }
+
+  if (final_layout.has_value()) {
+    // Best-effort: если не получилось — текст всё равно уже вставлен.
+    (void)set_layout(*final_layout, play_sound);
+  }
+
+  return true;
+}
+
 void EventLoop::action_invert_layout_word() {
   auto word = buffer_.get_active_word();
   if (word.empty())
     return;
 
-  auto cfg = std::atomic_load(&config_);
-  auto injector = std::atomic_load(&injector_);
-  if (!injector) {
+  // Важно: слово инвертируем относительно текущей раскладки.
+  const int target_layout = (current_layout_ == 0) ? 1 : 0;
+
+  // Строим видимый текст так, как если бы мы перепечатали те же скан-коды в
+  // target_layout.
+  auto replacement_opt = key_entries_to_visible_text_checked(word, target_layout);
+  if (!replacement_opt.has_value()) {
+    std::cerr << "[punto] Invert-layout: cannot build visible text (layout="
+              << target_layout << ")\n";
     return;
   }
+  std::string replacement = std::move(*replacement_opt);
 
+  // Добавляем trailing whitespace (пробелы/табы) в конец.
+  for (ScanCode c : buffer_.trailing()) {
+    if (c == KEY_SPACE) {
+      replacement.push_back(' ');
+    } else if (c == KEY_TAB) {
+      replacement.push_back('\t');
+    }
+  }
+
+  // Удаляем слово + trailing и вставляем replacement одной операцией.
   is_processing_macro_ = true;
-  injector->release_all_modifiers();
-  wait_and_buffer(cfg->delays.turbo_key_press);
+  struct DrainGuard {
+    EventLoop *self;
+    ~DrainGuard() { self->drain_pending_events(); }
+  } drain_guard{this};
 
-  // Удаляем слово + trailing whitespace (используем turbo)
-  std::size_t total_len = word.size() + buffer_.trailing_length();
-  injector->send_backspace(total_len, true);
-
-  // Переключаем раскладку
-  switch_layout(true);
-  wait_and_buffer(std::chrono::microseconds{60000}); // Wait for DE/OS
-
-  // Перепечатываем с сохранением регистра (turbo)
-  injector->retype_buffer(word, true);
-
-  // Восстанавливаем trailing whitespace
-  if (buffer_.trailing_length() > 0) {
-    injector->retype_trailing(buffer_.trailing(), true);
-  }
-
-  // 5. Коммитим состояние
-  if (buffer_.current_length() > 0) {
-    buffer_.commit_word();
-  }
-
-  drain_pending_events();
+  const std::size_t total_len = word.size() + buffer_.trailing_length();
+  (void)replace_text_oneshot(total_len, replacement,
+                             /*final_layout=*/target_layout,
+                             /*play_sound=*/true);
 }
 
 void EventLoop::action_auto_invert_word(std::span<const KeyEntry> word,
@@ -899,80 +1017,78 @@ void EventLoop::action_invert_case_word() {
   if (word.empty())
     return;
 
-  auto cfg = std::atomic_load(&config_);
-  auto injector = std::atomic_load(&injector_);
-  if (!injector) {
+  auto visible_opt = key_entries_to_visible_text_checked(word, current_layout_);
+  if (!visible_opt.has_value()) {
+    std::cerr << "[punto] Invert-case: cannot build visible text (layout="
+              << current_layout_ << ")\n";
     return;
   }
 
+  const std::string &visible = *visible_opt;
+
+  std::string replacement = invert_case(visible);
+
+  // Добавляем trailing whitespace (пробелы/табы) в конец.
+  for (ScanCode c : buffer_.trailing()) {
+    if (c == KEY_SPACE) {
+      replacement.push_back(' ');
+    } else if (c == KEY_TAB) {
+      replacement.push_back('\t');
+    }
+  }
+
   is_processing_macro_ = true;
-  injector->release_all_modifiers();
-  wait_and_buffer(cfg->delays.turbo_key_press);
+  struct DrainGuard {
+    EventLoop *self;
+    ~DrainGuard() { self->drain_pending_events(); }
+  } drain_guard{this};
 
-  // Удаляем слово + trailing
-  std::size_t total_len = word.size() + buffer_.trailing_length();
-  injector->send_backspace(total_len, true);
-
-  // Перепечатываем с инвертированным регистром
-  for (const auto &entry : word) {
-    injector->tap_key(entry.code, !entry.shifted, true);
-  }
-
-  // Восстанавливаем trailing
-  if (buffer_.trailing_length() > 0) {
-    injector->retype_trailing(buffer_.trailing(), true);
-  }
-
-  if (buffer_.current_length() > 0) {
-    buffer_.commit_word();
-  }
-
-  drain_pending_events();
+  const std::size_t total_len = word.size() + buffer_.trailing_length();
+  (void)replace_text_oneshot(total_len, replacement,
+                             /*final_layout=*/std::nullopt,
+                             /*play_sound=*/false);
 }
 
 bool EventLoop::process_selection(
     std::function<std::string(std::string_view)> transform) {
 
   if (!clipboard_) {
-    std::cerr << "[punto] Буфер обмена недоступен\n";
+    std::cerr << "[punto] Clipboard: недоступен\n";
     return false;
   }
 
-  auto cfg = std::atomic_load(&config_);
   auto injector = std::atomic_load(&injector_);
   if (!injector) {
     return false;
   }
 
-  injector->release_all_modifiers();
-  usleep(static_cast<useconds_t>(cfg->delays.key_press.count()));
+  const bool is_terminal = clipboard_->is_active_window_terminal();
 
-  bool is_terminal = clipboard_->is_active_window_terminal();
+  // Важно: не пытаемся удалять выделение руками.
+  // В GUI-приложениях paste обычно заменяет выделение автоматически.
+  // В терминале выделение не является "selection для редактирования".
+
+  injector->release_all_modifiers();
+  wait_and_buffer(std::chrono::microseconds{30000});
+  flush_pending_release_frames();
 
   std::optional<std::string> text;
 
   if (is_terminal) {
-    // В терминале: читаем PRIMARY selection (автоматически заполняется)
+    // В терминале: читаем PRIMARY selection (автоматически заполняется при выделении)
     text = clipboard_->get_text(Selection::Primary);
-
-    if (text && !text->empty()) {
-      // Удаляем выделенный текст через Backspace
-      std::size_t len = text->size();
-      for (std::size_t i = 0; i < len; ++i) {
-        injector->tap_key(KEY_BACKSPACE, false);
-      }
-      usleep(100000); // 100ms
-    }
   } else {
-    // В обычных приложениях: Ctrl+C для копирования
+    // В обычных приложениях: Ctrl+C для копирования выделения.
     injector->send_key(KEY_LEFTCTRL, KeyState::Press);
-    usleep(20000); // 20ms
+    wait_and_buffer(std::chrono::microseconds{20000});
     injector->send_key(KEY_C, KeyState::Press);
-    usleep(20000);
+    wait_and_buffer(std::chrono::microseconds{20000});
     injector->send_key(KEY_C, KeyState::Release);
-    usleep(20000);
+    wait_and_buffer(std::chrono::microseconds{20000});
     injector->send_key(KEY_LEFTCTRL, KeyState::Release);
-    usleep(200000); // 200ms для clipboard
+
+    // Даём приложению время выставить CLIPBOARD.
+    wait_and_buffer(std::chrono::microseconds{200000});
 
     text = clipboard_->get_text(Selection::Clipboard);
   }
@@ -981,35 +1097,20 @@ bool EventLoop::process_selection(
     return false;
   }
 
-  // Трансформируем текст
-  std::string transformed = transform(*text);
+  const std::string transformed = transform(*text);
 
-  // Записываем в clipboard
-  clipboard_->set_text(Selection::Clipboard, transformed);
-  usleep(100000);
-
-  // Вставляем
-  if (is_terminal) {
-    // Ctrl+Shift+V для терминала
-    injector->send_key(KEY_LEFTCTRL, KeyState::Press);
-    injector->send_key(KEY_LEFTSHIFT, KeyState::Press);
-    usleep(20000);
-    injector->send_key(KEY_V, KeyState::Press);
-    usleep(20000);
-    injector->send_key(KEY_V, KeyState::Release);
-    usleep(20000);
-    injector->send_key(KEY_LEFTSHIFT, KeyState::Release);
-    injector->send_key(KEY_LEFTCTRL, KeyState::Release);
-  } else {
-    // Ctrl+V для обычных приложений
-    injector->send_key(KEY_LEFTCTRL, KeyState::Press);
-    usleep(20000);
-    injector->send_key(KEY_V, KeyState::Press);
-    usleep(20000);
-    injector->send_key(KEY_V, KeyState::Release);
-    usleep(20000);
-    injector->send_key(KEY_LEFTCTRL, KeyState::Release);
+  const ClipboardResult set_res =
+      clipboard_->set_text(Selection::Clipboard, transformed);
+  if (set_res != ClipboardResult::Ok) {
+    std::cerr << "[punto] Clipboard: failed to set CLIPBOARD (res="
+              << static_cast<int>(set_res) << ")\n";
+    return false;
   }
+
+  // Даём X11/xsel шанс обновить CLIPBOARD.
+  wait_and_buffer(std::chrono::microseconds{100000});
+
+  injector->send_paste(is_terminal);
 
   return true;
 }
@@ -1390,13 +1491,14 @@ void EventLoop::apply_correction(const PendingWordMeta &meta,
     return;
   }
 
-  auto cfg = std::atomic_load(&config_);
-  auto injector = std::atomic_load(&injector_);
-  if (!injector) {
+  const int original_layout = meta.layout_at_boundary;
+  if ((original_layout != 0 && original_layout != 1) ||
+      (target_layout != 0 && target_layout != 1)) {
+    std::cerr << "[punto] Async: invalid layout values for task_id="
+              << meta.task_id << " original=" << original_layout
+              << " target=" << target_layout << "\n";
     return;
   }
-
-  // Ограничение по глубине: если мета уже была выкинута, сюда не попадём.
 
   const std::uint64_t cursor = history_.cursor_pos();
   const std::uint64_t base = history_.base_pos();
@@ -1411,8 +1513,8 @@ void EventLoop::apply_correction(const PendingWordMeta &meta,
 
   // Tail = всё после слова (включая разделитель) до текущей позиции.
   if (!history_.get_range(meta.end_pos, cursor, tail_scratch_)) {
-    std::cerr << "[punto] Async: failed to get tail for task_id="
-              << meta.task_id << "\n";
+    std::cerr << "[punto] Async: failed to get tail for task_id=" << meta.task_id
+              << "\n";
     return;
   }
 
@@ -1421,38 +1523,38 @@ void EventLoop::apply_correction(const PendingWordMeta &meta,
 
   const std::size_t expected_retype = meta.word.size() + tail_scratch_.size();
   if (expected_retype != erase) {
-    // Инвариант: число удалённых символов должно совпасть с числом вставленных.
     std::cerr << "[punto] Async: length invariant violated for task_id="
               << meta.task_id << " erase=" << erase
               << " retype=" << expected_retype << " (skip)\n";
     return;
   }
 
-  const bool has_delim =
-      !tail_scratch_.empty() && (tail_scratch_.front().code == KEY_SPACE ||
-                                 tail_scratch_.front().code == KEY_TAB);
-  const ScanCode delim_code = has_delim ? tail_scratch_.front().code : 0;
-
-  const std::span<const KeyEntry> tail_after_delim =
-      has_delim ? std::span<const KeyEntry>{tail_scratch_.data() + 1,
-                                            tail_scratch_.size() - 1}
-                : std::span<const KeyEntry>{tail_scratch_.data(),
-                                            tail_scratch_.size()};
-
-  bool tail_layout_invariant = true;
-  for (const KeyEntry &e : tail_after_delim) {
-    if (e.code != KEY_SPACE && e.code != KEY_TAB) {
-      tail_layout_invariant = false;
-      break;
-    }
+  auto word_text_opt = key_entries_to_visible_text_checked(
+      std::span<const KeyEntry>{meta.word.data(), meta.word.size()}, target_layout);
+  if (!word_text_opt.has_value()) {
+    std::cerr << "[punto] Async: cannot build corrected word text for task_id="
+              << meta.task_id << " (layout=" << target_layout << ")\n";
+    return;
   }
 
-  std::cerr << "[punto] Async-CORRECT: task_id=" << meta.task_id
+  auto tail_text_opt = key_entries_to_visible_text_checked(
+      std::span<const KeyEntry>{tail_scratch_.data(), tail_scratch_.size()},
+      original_layout);
+  if (!tail_text_opt.has_value()) {
+    std::cerr << "[punto] Async: cannot build tail text for task_id=" << meta.task_id
+              << " (layout=" << original_layout << ")\n";
+    return;
+  }
+
+  std::string replacement;
+  replacement.reserve(word_text_opt->size() + tail_text_opt->size());
+  replacement += *word_text_opt;
+  replacement += *tail_text_opt;
+
+  std::cerr << "[punto] Async-CORRECT(oneshot): task_id=" << meta.task_id
             << " word_len=" << meta.word.size()
-            << " tail_len=" << tail_scratch_.size() << " delim="
-            << (has_delim ? (delim_code == KEY_SPACE ? "SPACE" : "TAB")
-                          : "<none>")
-            << " tail_invariant=" << (tail_layout_invariant ? 1 : 0) << "\n";
+            << " tail_len=" << tail_scratch_.size() << " erase=" << erase
+            << "\n";
 
   is_processing_macro_ = true;
   struct DrainGuard {
@@ -1462,138 +1564,13 @@ void EventLoop::apply_correction(const PendingWordMeta &meta,
 
   const auto macro_start = std::chrono::steady_clock::now();
 
-  injector->release_all_modifiers();
-
-  // Даем физическим key-release шанс прийти в stdin.
-  // Иначе мы можем инжектировать нажатия, пока клавиша ещё "зажата" для
-  // приложения (особенно последняя буква и SPACE), и тогда press будет
-  // проигнорирован.
-  wait_and_buffer(cfg->delays.key_press + std::chrono::microseconds{30000});
-  flush_pending_release_frames();
-
-  wait_and_buffer(cfg->delays.turbo_key_press);
-  flush_pending_release_frames();
-
-  const int original_layout = meta.layout_at_boundary;
-
-  auto verify_layout = [&](int expected, const char *phase) -> bool {
-    if (x11_session_ && x11_session_->is_valid()) {
-      x11_session_->apply_environment();
-      const int os_layout = x11_session_->get_current_keyboard_layout();
-      if (os_layout == 0 || os_layout == 1) {
-        if (os_layout != expected) {
-          std::cerr << "[punto] Async: layout mismatch (" << phase
-                    << ") expected=" << expected << " os_layout=" << os_layout
-                    << " task_id=" << meta.task_id << "\n";
-          return false;
-        }
-      }
-    }
-    return true;
-  };
-
-  // Важно: если мы не можем реально переключить раскладку, лучше не удалять
-  // текст. Иначе получим «звук есть, а коррекция не произошла» или испортим
-  // хвост.
-  if (tail_layout_invariant) {
-    if (!set_layout(target_layout, false)) {
-      std::cerr << "[punto] Async: failed to set target layout="
-                << target_layout << " for task_id=" << meta.task_id
-                << " (skip)\n";
-      return;
-    }
-    wait_and_buffer(cfg->delays.layout_switch);
-    if (!verify_layout(target_layout, "preflight-target")) {
-      return;
-    }
-  } else {
-    // Preflight: проверяем оба направления переключения до удаления.
-    if (!set_layout(target_layout, false)) {
-      std::cerr << "[punto] Async: failed to set target layout="
-                << target_layout << " for task_id=" << meta.task_id
-                << " (skip)\n";
-      return;
-    }
-    wait_and_buffer(cfg->delays.layout_switch);
-    if (!verify_layout(target_layout, "preflight-target")) {
-      return;
-    }
-
-    if (!set_layout(original_layout, false)) {
-      std::cerr << "[punto] Async: failed to set original layout="
-                << original_layout << " for task_id=" << meta.task_id
-                << " (skip)\n";
-      return;
-    }
-    wait_and_buffer(cfg->delays.layout_switch);
-    if (!verify_layout(original_layout, "preflight-original")) {
-      return;
-    }
-
-    if (!set_layout(target_layout, false)) {
-      std::cerr << "[punto] Async: failed to re-set target layout="
-                << target_layout << " for task_id=" << meta.task_id
-                << " (skip)\n";
-      return;
-    }
-    wait_and_buffer(cfg->delays.layout_switch);
-    if (!verify_layout(target_layout, "preflight-target-2")) {
-      return;
-    }
-  }
-
-  // 1) Удаляем слово + хвост.
-  injector->send_backspace(erase, true);
-
-  // Если релизы пришли позже — выпускаем их до перепечатки.
-  flush_pending_release_frames();
-
-  // 2) Печатаем слово в целевой раскладке.
-  injector->retype_buffer(
-      std::span<const KeyEntry>{meta.word.data(), meta.word.size()}, true);
-
-  // Разделитель (SPACE/TAB) печатаем явно и без turbo — это критично,
-  // иначе в некоторых приложениях может "пропадать" пробел.
-  if (has_delim && delim_code != 0) {
-    // На случай, если release пробела пришёл позже, чем мы начали макрос.
-    flush_pending_release_frames();
-    wait_and_buffer(cfg->delays.key_press);
-    injector->tap_key(delim_code, false, false);
-  }
-
-  // 3) Печатаем хвост ПОСЛЕ разделителя.
-  // Если хвост содержит только пробелы/таб — он инвариантен к раскладке,
-  // и мы избегаем лишних переключений.
-  if (!tail_after_delim.empty()) {
-    if (!tail_layout_invariant) {
-      if (!set_layout(original_layout, false)) {
-        std::cerr << "[punto] Async: failed to set original layout="
-                  << original_layout << " for task_id=" << meta.task_id
-                  << " (tail lost)\n";
-        return;
-      }
-      wait_and_buffer(cfg->delays.layout_switch);
-      if (!verify_layout(original_layout, "tail-original")) {
-        return;
-      }
-    }
-
-    injector->retype_buffer(tail_after_delim, true);
-  }
-
-  // 4) Финально оставляем целевую раскладку пользователю.
-  if (!set_layout(target_layout, false)) {
-    std::cerr << "[punto] Async: failed to finalize target layout="
-              << target_layout << " for task_id=" << meta.task_id << "\n";
+  const bool ok = replace_text_oneshot(erase, replacement,
+                                      /*final_layout=*/target_layout,
+                                      /*play_sound=*/true);
+  if (!ok) {
+    std::cerr << "[punto] Async: oneshot replace failed for task_id=" << meta.task_id
+              << " (skip)\n";
     return;
-  }
-  wait_and_buffer(cfg->delays.layout_switch);
-  if (!verify_layout(target_layout, "final-target")) {
-    return;
-  }
-
-  if (sound_manager_) {
-    sound_manager_->play_for_layout(target_layout);
   }
 
   const auto macro_end = std::chrono::steady_clock::now();
@@ -1623,9 +1600,10 @@ void EventLoop::apply_case_correction(
     return;
   }
 
-  auto cfg = std::atomic_load(&config_);
-  auto injector = std::atomic_load(&injector_);
-  if (!injector) {
+  const int layout = meta.layout_at_boundary;
+  if (layout != 0 && layout != 1) {
+    std::cerr << "[punto] Async: invalid layout for case correction task_id="
+              << meta.task_id << " layout=" << layout << "\n";
     return;
   }
 
@@ -1650,13 +1628,34 @@ void EventLoop::apply_case_correction(
   const std::uint64_t erase64 = cursor - meta.start_pos;
   const std::size_t erase = static_cast<std::size_t>(erase64);
 
-  // Для case correction длина может совпадать с исходной
-  // (ПРивет -> Привет имеют одинаковую длину)
-
-  std::cerr << "[punto] Async-CASE-FIX: task_id=" << meta.task_id
+  std::cerr << "[punto] Async-CASE-FIX(oneshot): task_id=" << meta.task_id
             << " word_len=" << meta.word.size()
             << " corrected_len=" << corrected_word.size()
-            << " tail_len=" << tail_scratch_.size() << "\n";
+            << " tail_len=" << tail_scratch_.size() << " erase=" << erase
+            << "\n";
+
+  auto word_text_opt = key_entries_to_visible_text_checked(
+      std::span<const KeyEntry>{corrected_word.data(), corrected_word.size()},
+      layout);
+  if (!word_text_opt.has_value()) {
+    std::cerr << "[punto] Async: cannot build corrected word text for task_id="
+              << meta.task_id << " (layout=" << layout << ")\n";
+    return;
+  }
+
+  auto tail_text_opt = key_entries_to_visible_text_checked(
+      std::span<const KeyEntry>{tail_scratch_.data(), tail_scratch_.size()},
+      layout);
+  if (!tail_text_opt.has_value()) {
+    std::cerr << "[punto] Async: cannot build tail text for task_id=" << meta.task_id
+              << " (layout=" << layout << ")\n";
+    return;
+  }
+
+  std::string replacement;
+  replacement.reserve(word_text_opt->size() + tail_text_opt->size());
+  replacement += *word_text_opt;
+  replacement += *tail_text_opt;
 
   is_processing_macro_ = true;
   struct DrainGuard {
@@ -1666,43 +1665,13 @@ void EventLoop::apply_case_correction(
 
   const auto macro_start = std::chrono::steady_clock::now();
 
-  injector->release_all_modifiers();
-  wait_and_buffer(cfg->delays.key_press + std::chrono::microseconds{30000});
-  flush_pending_release_frames();
-  wait_and_buffer(cfg->delays.turbo_key_press);
-  flush_pending_release_frames();
-
-  // 1) Удаляем слово + хвост
-  injector->send_backspace(erase, true);
-  flush_pending_release_frames();
-
-  // 2) Печатаем исправленное слово (с правильным регистром)
-  injector->retype_buffer(
-      std::span<const KeyEntry>{corrected_word.data(), corrected_word.size()},
-      true);
-
-  // 3) Печатаем хвост
-  if (!tail_scratch_.empty()) {
-    // Разделитель
-    const bool has_delim = (tail_scratch_.front().code == KEY_SPACE ||
-                            tail_scratch_.front().code == KEY_TAB);
-    const ScanCode delim_code = has_delim ? tail_scratch_.front().code : 0;
-
-    if (has_delim && delim_code != 0) {
-      flush_pending_release_frames();
-      wait_and_buffer(cfg->delays.key_press);
-      injector->tap_key(delim_code, false, false);
-    }
-
-    const std::span<const KeyEntry> tail_after_delim =
-        has_delim ? std::span<const KeyEntry>{tail_scratch_.data() + 1,
-                                              tail_scratch_.size() - 1}
-                  : std::span<const KeyEntry>{tail_scratch_.data(),
-                                              tail_scratch_.size()};
-
-    if (!tail_after_delim.empty()) {
-      injector->retype_buffer(tail_after_delim, true);
-    }
+  const bool ok = replace_text_oneshot(erase, replacement,
+                                      /*final_layout=*/std::nullopt,
+                                      /*play_sound=*/false);
+  if (!ok) {
+    std::cerr << "[punto] Async: oneshot replace failed for task_id=" << meta.task_id
+              << " (skip)\n";
+    return;
   }
 
   const auto macro_end = std::chrono::steady_clock::now();
@@ -1728,9 +1697,12 @@ void EventLoop::apply_combined_correction(
     return;
   }
 
-  auto cfg = std::atomic_load(&config_);
-  auto injector = std::atomic_load(&injector_);
-  if (!injector) {
+  const int original_layout = meta.layout_at_boundary;
+  if ((original_layout != 0 && original_layout != 1) ||
+      (target_layout != 0 && target_layout != 1)) {
+    std::cerr << "[punto] Async: invalid layout values for combined fix task_id="
+              << meta.task_id << " original=" << original_layout
+              << " target=" << target_layout << "\n";
     return;
   }
 
@@ -1754,11 +1726,34 @@ void EventLoop::apply_combined_correction(
   const std::uint64_t erase64 = cursor - meta.start_pos;
   const std::size_t erase = static_cast<std::size_t>(erase64);
 
-  std::cerr << "[punto] Async-COMBINED-FIX: task_id=" << meta.task_id
+  std::cerr << "[punto] Async-COMBINED-FIX(oneshot): task_id=" << meta.task_id
             << " word_len=" << meta.word.size()
             << " corrected_len=" << corrected_word.size()
-            << " tail_len=" << tail_scratch_.size()
+            << " tail_len=" << tail_scratch_.size() << " erase=" << erase
             << " target_layout=" << target_layout << "\n";
+
+  auto word_text_opt = key_entries_to_visible_text_checked(
+      std::span<const KeyEntry>{corrected_word.data(), corrected_word.size()},
+      target_layout);
+  if (!word_text_opt.has_value()) {
+    std::cerr << "[punto] Async: cannot build corrected word text for task_id="
+              << meta.task_id << " (layout=" << target_layout << ")\n";
+    return;
+  }
+
+  auto tail_text_opt = key_entries_to_visible_text_checked(
+      std::span<const KeyEntry>{tail_scratch_.data(), tail_scratch_.size()},
+      original_layout);
+  if (!tail_text_opt.has_value()) {
+    std::cerr << "[punto] Async: cannot build tail text for task_id=" << meta.task_id
+              << " (layout=" << original_layout << ")\n";
+    return;
+  }
+
+  std::string replacement;
+  replacement.reserve(word_text_opt->size() + tail_text_opt->size());
+  replacement += *word_text_opt;
+  replacement += *tail_text_opt;
 
   is_processing_macro_ = true;
   struct DrainGuard {
@@ -1768,78 +1763,13 @@ void EventLoop::apply_combined_correction(
 
   const auto macro_start = std::chrono::steady_clock::now();
 
-  injector->release_all_modifiers();
-  wait_and_buffer(cfg->delays.key_press + std::chrono::microseconds{30000});
-  flush_pending_release_frames();
-  wait_and_buffer(cfg->delays.turbo_key_press);
-  flush_pending_release_frames();
-
-  // Переключаем раскладку ПЕРЕД удалением
-  if (!set_layout(target_layout, false)) {
-    std::cerr << "[punto] Async: failed to set target layout=" << target_layout
-              << " for combined correction task_id=" << meta.task_id
+  const bool ok = replace_text_oneshot(erase, replacement,
+                                      /*final_layout=*/target_layout,
+                                      /*play_sound=*/true);
+  if (!ok) {
+    std::cerr << "[punto] Async: oneshot replace failed for task_id=" << meta.task_id
               << " (skip)\n";
     return;
-  }
-  wait_and_buffer(cfg->delays.layout_switch);
-
-  // 1) Удаляем слово + хвост
-  injector->send_backspace(erase, true);
-  flush_pending_release_frames();
-
-  // 2) Печатаем исправленное слово в целевой раскладке
-  injector->retype_buffer(
-      std::span<const KeyEntry>{corrected_word.data(), corrected_word.size()},
-      true);
-
-  // 3) Печатаем хвост
-  if (!tail_scratch_.empty()) {
-    const bool has_delim = (tail_scratch_.front().code == KEY_SPACE ||
-                            tail_scratch_.front().code == KEY_TAB);
-    const ScanCode delim_code = has_delim ? tail_scratch_.front().code : 0;
-
-    if (has_delim && delim_code != 0) {
-      flush_pending_release_frames();
-      wait_and_buffer(cfg->delays.key_press);
-      injector->tap_key(delim_code, false, false);
-    }
-
-    const std::span<const KeyEntry> tail_after_delim =
-        has_delim ? std::span<const KeyEntry>{tail_scratch_.data() + 1,
-                                              tail_scratch_.size() - 1}
-                  : std::span<const KeyEntry>{tail_scratch_.data(),
-                                              tail_scratch_.size()};
-
-    if (!tail_after_delim.empty()) {
-      // Хвост может быть в другой раскладке - нужно вернуться назад
-      const int original_layout = meta.layout_at_boundary;
-
-      // Проверяем, есть ли буквы в хвосте
-      bool tail_has_letters = false;
-      for (const auto &e : tail_after_delim) {
-        if (e.code != KEY_SPACE && e.code != KEY_TAB) {
-          tail_has_letters = true;
-          break;
-        }
-      }
-
-      if (tail_has_letters) {
-        (void)set_layout(original_layout, false);
-        wait_and_buffer(cfg->delays.layout_switch);
-      }
-
-      injector->retype_buffer(tail_after_delim, true);
-
-      // Возвращаем целевую раскладку
-      if (tail_has_letters) {
-        (void)set_layout(target_layout, false);
-        wait_and_buffer(cfg->delays.layout_switch);
-      }
-    }
-  }
-
-  if (sound_manager_) {
-    sound_manager_->play_for_layout(target_layout);
   }
 
   const auto macro_end = std::chrono::steady_clock::now();
@@ -1862,8 +1792,7 @@ void EventLoop::action_invert_layout_selection() {
   if (process_selection(
           [](std::string_view text) { return invert_layout(text); })) {
     // Переключаем раскладку после успешной инверсии
-    auto cfg = std::atomic_load(&config_);
-    wait_and_buffer(cfg->delays.layout_switch);
+    wait_and_buffer(std::chrono::microseconds{100000});
     switch_layout(true);
   }
   drain_pending_events();
@@ -1937,7 +1866,7 @@ IpcResult EventLoop::reload_config(const std::string &config_path) {
 
   auto new_analyzer = std::make_shared<LayoutAnalyzer>(new_cfg->auto_switch);
 
-  auto new_injector = std::make_shared<KeyInjector>(new_cfg->delays);
+  auto new_injector = std::make_shared<KeyInjector>();
   new_injector->set_wait_func(
       [this](std::chrono::microseconds us) { this->wait_and_buffer(us); });
 

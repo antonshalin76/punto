@@ -51,13 +51,6 @@ struct SettingsDialogUiContext {
   GtkSpinButton *max_typo_diff_spin = nullptr;
   GtkToggleButton *sticky_shift_check = nullptr;
 
-  // Delays
-  GtkSpinButton *key_press_spin = nullptr;
-  GtkSpinButton *layout_spin = nullptr;
-  GtkSpinButton *retype_spin = nullptr;
-  GtkSpinButton *turbo_key_spin = nullptr;
-  GtkSpinButton *turbo_retype_spin = nullptr;
-
   // Hotkey
   GtkComboBox *modifier_combo = nullptr;
   GtkComboBox *key_combo = nullptr;
@@ -125,17 +118,6 @@ hotkey_supported_combos_text(std::string_view active_backend) {
   if (a.sticky_shift_correction_enabled != b.sticky_shift_correction_enabled)
     return true;
 
-  if (a.key_press != b.key_press)
-    return true;
-  if (a.layout_switch != b.layout_switch)
-    return true;
-  if (a.retype != b.retype)
-    return true;
-  if (a.turbo_key_press != b.turbo_key_press)
-    return true;
-  if (a.turbo_retype != b.turbo_retype)
-    return true;
-
   return false;
 }
 
@@ -169,22 +151,6 @@ read_non_hotkey_from_ui(const SettingsDialogUiContext &ctx) {
   if (ctx.sticky_shift_check) {
     out.sticky_shift_correction_enabled =
         gtk_toggle_button_get_active(ctx.sticky_shift_check);
-  }
-
-  if (ctx.key_press_spin) {
-    out.key_press = gtk_spin_button_get_value_as_int(ctx.key_press_spin);
-  }
-  if (ctx.layout_spin) {
-    out.layout_switch = gtk_spin_button_get_value_as_int(ctx.layout_spin);
-  }
-  if (ctx.retype_spin) {
-    out.retype = gtk_spin_button_get_value_as_int(ctx.retype_spin);
-  }
-  if (ctx.turbo_key_spin) {
-    out.turbo_key_press = gtk_spin_button_get_value_as_int(ctx.turbo_key_spin);
-  }
-  if (ctx.turbo_retype_spin) {
-    out.turbo_retype = gtk_spin_button_get_value_as_int(ctx.turbo_retype_spin);
   }
 
   return out;
@@ -370,10 +336,6 @@ SettingsData SettingsDialog::load_settings() {
       section = "hotkey";
       continue;
     }
-    if (trimmed == "delays:") {
-      section = "delays";
-      continue;
-    }
     if (trimmed == "auto_switch:") {
       section = "auto_switch";
       continue;
@@ -396,18 +358,6 @@ SettingsData SettingsDialog::load_settings() {
         settings.modifier = value;
       } else if (key == "key") {
         settings.key = value;
-      }
-    } else if (section == "delays") {
-      if (key == "key_press") {
-        settings.key_press = std::stoi(value);
-      } else if (key == "layout_switch") {
-        settings.layout_switch = std::stoi(value);
-      } else if (key == "retype") {
-        settings.retype = std::stoi(value);
-      } else if (key == "turbo_key_press") {
-        settings.turbo_key_press = std::stoi(value);
-      } else if (key == "turbo_retype") {
-        settings.turbo_retype = std::stoi(value);
       }
     } else if (section == "auto_switch") {
       if (key == "enabled") {
@@ -473,13 +423,6 @@ bool SettingsDialog::save_settings(const SettingsData &settings) {
     file << "hotkey:\n";
     file << "  modifier: " << settings.modifier << "\n";
     file << "  key: " << settings.key << "\n\n";
-
-    file << "delays:\n";
-    file << "  key_press: " << settings.key_press << "\n";
-    file << "  layout_switch: " << settings.layout_switch << "\n";
-    file << "  retype: " << settings.retype << "\n";
-    file << "  turbo_key_press: " << settings.turbo_key_press << "\n";
-    file << "  turbo_retype: " << settings.turbo_retype << "\n\n";
 
     file << "auto_switch:\n";
     file << "  enabled: " << (settings.auto_enabled ? "true" : "false") << "\n";
@@ -686,109 +629,6 @@ bool SettingsDialog::show(GtkWidget *parent) {
   gtk_notebook_append_page(GTK_NOTEBOOK(notebook), auto_box,
                            gtk_label_new("Автопереключение"));
 
-  // ===== Вкладка "Задержки" =====
-  GtkWidget *delays_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
-  gtk_container_set_border_width(GTK_CONTAINER(delays_box), 12);
-
-  GtkWidget *delays_note = make_dim_label(
-      "Задержки влияют на совместимость: слишком маленькие значения могут "
-      "приводить к пропускам в отдельных приложениях.");
-  gtk_box_pack_start(GTK_BOX(delays_box), delays_note, FALSE, FALSE, 0);
-
-  GtkWidget *delays_grid = gtk_grid_new();
-  gtk_grid_set_row_spacing(GTK_GRID(delays_grid), 4);
-  gtk_grid_set_column_spacing(GTK_GRID(delays_grid), 12);
-  gtk_box_pack_start(GTK_BOX(delays_box), delays_grid, FALSE, FALSE, 0);
-
-  // Key press
-  GtkWidget *key_press_lbl = make_left_label("Нажатие клавиши (мс):");
-  gtk_grid_attach(GTK_GRID(delays_grid), key_press_lbl, 0, 0, 1, 1);
-  GtkWidget *key_press_spin = gtk_spin_button_new_with_range(1, 100, 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(key_press_spin),
-                            initial_settings.key_press);
-  gtk_grid_attach(GTK_GRID(delays_grid), key_press_spin, 1, 0, 1, 1);
-  GtkWidget *key_press_desc =
-      make_dim_label("Диапазон: 1–100. Задержка между нажатием и отпусканием "
-                     "клавиши при эмуляции.");
-  gtk_grid_attach(GTK_GRID(delays_grid), key_press_desc, 0, 1, 2, 1);
-
-  // Layout switch
-  GtkWidget *layout_lbl = make_left_label("Переключение раскладки (мс):");
-  gtk_grid_attach(GTK_GRID(delays_grid), layout_lbl, 0, 2, 1, 1);
-  GtkWidget *layout_spin = gtk_spin_button_new_with_range(10, 500, 10);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(layout_spin),
-                            initial_settings.layout_switch);
-  gtk_grid_attach(GTK_GRID(delays_grid), layout_spin, 1, 2, 1, 1);
-  GtkWidget *layout_desc = make_dim_label(
-      "Диапазон: 10–500. Пауза после отправки хоткея смены раскладки.");
-  gtk_grid_attach(GTK_GRID(delays_grid), layout_desc, 0, 3, 2, 1);
-
-  // Retype
-  GtkWidget *retype_lbl = make_left_label("Перепечатывание (мс):");
-  gtk_grid_attach(GTK_GRID(delays_grid), retype_lbl, 0, 4, 1, 1);
-  GtkWidget *retype_spin = gtk_spin_button_new_with_range(1, 100, 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(retype_spin),
-                            initial_settings.retype);
-  gtk_grid_attach(GTK_GRID(delays_grid), retype_spin, 1, 4, 1, 1);
-  GtkWidget *retype_desc = make_dim_label(
-      "Диапазон: 1–100. Пауза между символами при перепечатывании.");
-  gtk_grid_attach(GTK_GRID(delays_grid), retype_desc, 0, 5, 2, 1);
-
-  // Separator
-  gtk_box_pack_start(GTK_BOX(delays_box),
-                     gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE,
-                     FALSE, 6);
-  gtk_box_pack_start(GTK_BOX(delays_box), make_left_label("Турбо-режим:"),
-                     FALSE, FALSE, 0);
-
-  GtkWidget *turbo_grid = gtk_grid_new();
-  gtk_grid_set_row_spacing(GTK_GRID(turbo_grid), 4);
-  gtk_grid_set_column_spacing(GTK_GRID(turbo_grid), 12);
-  gtk_box_pack_start(GTK_BOX(delays_box), turbo_grid, FALSE, FALSE, 4);
-
-  // Turbo key press
-  GtkWidget *turbo_key_lbl = make_left_label("Турбо нажатие (мс):");
-  gtk_grid_attach(GTK_GRID(turbo_grid), turbo_key_lbl, 0, 0, 1, 1);
-  GtkWidget *turbo_key_spin = gtk_spin_button_new_with_range(1, 100, 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(turbo_key_spin),
-                            initial_settings.turbo_key_press);
-  gtk_grid_attach(GTK_GRID(turbo_grid), turbo_key_spin, 1, 0, 1, 1);
-  GtkWidget *turbo_key_desc =
-      make_dim_label("Диапазон: 1–100. Задержка нажатия в turbo-режиме "
-                     "(быстрее, но менее надёжно).");
-  gtk_grid_attach(GTK_GRID(turbo_grid), turbo_key_desc, 0, 1, 2, 1);
-
-  // Turbo retype
-  GtkWidget *turbo_retype_lbl = make_left_label("Турбо перепечатка (мс):");
-  gtk_grid_attach(GTK_GRID(turbo_grid), turbo_retype_lbl, 0, 2, 1, 1);
-  GtkWidget *turbo_retype_spin = gtk_spin_button_new_with_range(1, 100, 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(turbo_retype_spin),
-                            initial_settings.turbo_retype);
-  gtk_grid_attach(GTK_GRID(turbo_grid), turbo_retype_spin, 1, 2, 1, 1);
-  GtkWidget *turbo_retype_desc =
-      make_dim_label("Диапазон: 1–100. Пауза между символами в turbo-режиме.");
-  gtk_grid_attach(GTK_GRID(turbo_grid), turbo_retype_desc, 0, 3, 2, 1);
-
-  ui_ctx.key_press_spin = GTK_SPIN_BUTTON(key_press_spin);
-  ui_ctx.layout_spin = GTK_SPIN_BUTTON(layout_spin);
-  ui_ctx.retype_spin = GTK_SPIN_BUTTON(retype_spin);
-  ui_ctx.turbo_key_spin = GTK_SPIN_BUTTON(turbo_key_spin);
-  ui_ctx.turbo_retype_spin = GTK_SPIN_BUTTON(turbo_retype_spin);
-
-  g_signal_connect(key_press_spin, "value-changed",
-                   G_CALLBACK(on_any_setting_changed), &ui_ctx);
-  g_signal_connect(layout_spin, "value-changed",
-                   G_CALLBACK(on_any_setting_changed), &ui_ctx);
-  g_signal_connect(retype_spin, "value-changed",
-                   G_CALLBACK(on_any_setting_changed), &ui_ctx);
-  g_signal_connect(turbo_key_spin, "value-changed",
-                   G_CALLBACK(on_any_setting_changed), &ui_ctx);
-  g_signal_connect(turbo_retype_spin, "value-changed",
-                   G_CALLBACK(on_any_setting_changed), &ui_ctx);
-
-  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), delays_box,
-                           gtk_label_new("Задержки"));
-
   // ===== Вкладка "Горячие клавиши" =====
   GtkWidget *hotkey_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
   gtk_container_set_border_width(GTK_CONTAINER(hotkey_box), 12);
@@ -949,17 +789,6 @@ bool SettingsDialog::show(GtkWidget *parent) {
         gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(typo_check));
     new_settings.max_typo_diff =
         gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(typo_diff_spin));
-
-    new_settings.key_press =
-        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(key_press_spin));
-    new_settings.layout_switch =
-        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(layout_spin));
-    new_settings.retype =
-        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(retype_spin));
-    new_settings.turbo_key_press =
-        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(turbo_key_spin));
-    new_settings.turbo_retype =
-        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(turbo_retype_spin));
 
     const gchar *mod_id =
         gtk_combo_box_get_active_id(GTK_COMBO_BOX(modifier_combo));

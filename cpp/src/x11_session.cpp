@@ -25,7 +25,8 @@ namespace punto {
 namespace {
 
 [[nodiscard]] bool is_ascii_space(char c) {
-  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' ||
+         c == '\v';
 }
 
 [[nodiscard]] std::string trim_copy(std::string s) {
@@ -52,8 +53,9 @@ namespace {
 }
 
 [[nodiscard]] bool is_digits(const std::string &s) {
-  return !s.empty() &&
-         std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
+  return !s.empty() && std::all_of(s.begin(), s.end(), [](unsigned char c) {
+    return std::isdigit(c) != 0;
+  });
 }
 
 [[nodiscard]] bool is_greeter_username(std::string_view u) {
@@ -86,7 +88,8 @@ std::string exec_command(const std::string &cmd) {
   if (!pipe)
     return "";
 
-  while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
+  while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) !=
+         nullptr) {
     result += buffer.data();
   }
   pclose(pipe);
@@ -115,7 +118,8 @@ parse_key_value_lines(const std::string &s) {
 }
 
 /// Читает переменные окружения из /proc/<pid>/environ
-std::unordered_map<std::string, std::string> read_proc_environ(const std::string &pid) {
+std::unordered_map<std::string, std::string>
+read_proc_environ(const std::string &pid) {
   std::unordered_map<std::string, std::string> env;
 
   std::ifstream file("/proc/" + pid + "/environ", std::ios::binary);
@@ -171,7 +175,8 @@ bool X11Session::initialize() {
   } else {
     auto u = find_active_user_fallback();
     if (!u) {
-      std::cerr << "[punto] Ошибка: не удалось найти активного GUI пользователя\n";
+      std::cerr
+          << "[punto] Ошибка: не удалось найти активного GUI пользователя\n";
       return false;
     }
     username = *u;
@@ -229,7 +234,8 @@ bool X11Session::initialize() {
 }
 
 X11Session::RefreshResult X11Session::refresh() {
-  // Сохраняем текущий effective UID/GID (нужно для корректного switch_to_root()).
+  // Сохраняем текущий effective UID/GID (нужно для корректного
+  // switch_to_root()).
   original_uid_ = geteuid();
   original_gid_ = getegid();
 
@@ -248,7 +254,8 @@ X11Session::RefreshResult X11Session::refresh() {
       return RefreshResult::Unchanged;
     }
 
-    // Если имя совпадает с текущим — просто пытаемся обновить env через user-scan.
+    // Если имя совпадает с текущим — просто пытаемся обновить env через
+    // user-scan.
     const X11SessionInfo cur = info();
     if (was_valid && cur.username == *fallback_user) {
       X11SessionInfo next = cur;
@@ -300,12 +307,12 @@ X11Session::RefreshResult X11Session::refresh() {
     cur = info_;
   }
 
-  const bool same_session = (!cur.session_id.empty() &&
-                             cur.session_id == active->session_id &&
-                             cur.username == active->username);
+  const bool same_session =
+      (!cur.session_id.empty() && cur.session_id == active->session_id &&
+       cur.username == active->username);
 
-  // Всегда перечитываем env: DISPLAY/XAUTHORITY/XDG_RUNTIME_DIR могут измениться
-  // в рамках одной логин-сессии (ранняя стадия после логина).
+  // Всегда перечитываем env: DISPLAY/XAUTHORITY/XDG_RUNTIME_DIR могут
+  // измениться в рамках одной логин-сессии (ранняя стадия после логина).
   X11SessionInfo next = cur;
   next.session_id = active->session_id;
   next.username = active->username;
@@ -343,13 +350,14 @@ X11Session::RefreshResult X11Session::refresh() {
     return RefreshResult::Unchanged;
   }
 
-  const bool env_changed = (cur.display != next.display ||
-                            cur.xauthority_path != next.xauthority_path ||
-                            cur.xdg_runtime_dir != next.xdg_runtime_dir ||
-                            cur.username != next.username ||
-                            cur.session_id != next.session_id);
+  const bool env_changed =
+      (cur.display != next.display ||
+       cur.xauthority_path != next.xauthority_path ||
+       cur.xdg_runtime_dir != next.xdg_runtime_dir ||
+       cur.username != next.username || cur.session_id != next.session_id);
 
-  if (!env_changed && same_session && initialized_.load(std::memory_order_acquire)) {
+  if (!env_changed && same_session &&
+      initialized_.load(std::memory_order_acquire)) {
     return RefreshResult::Unchanged;
   }
 
@@ -484,7 +492,8 @@ bool X11Session::switch_to_root() const {
   return true;
 }
 
-std::optional<X11Session::ActiveSession> X11Session::find_active_session_loginctl() {
+std::optional<X11Session::ActiveSession>
+X11Session::find_active_session_loginctl() {
   const std::string out =
       exec_command("loginctl list-sessions --no-legend --no-pager 2>/dev/null");
   if (out.empty()) {
@@ -553,8 +562,8 @@ std::optional<X11Session::ActiveSession> X11Session::find_active_session_loginct
 
 std::optional<std::string> X11Session::find_active_user_fallback() {
   // Метод 1: who
-  std::string user =
-      exec_command("who 2>/dev/null | grep '(:0)' | awk '{print $1}' | head -n 1");
+  std::string user = exec_command(
+      "who 2>/dev/null | grep '(:0)' | awk '{print $1}' | head -n 1");
   if (!user.empty() && !is_greeter_username(user) && user != "root") {
     return user;
   }
@@ -568,7 +577,8 @@ std::optional<std::string> X11Session::find_active_user_fallback() {
   return std::nullopt;
 }
 
-bool X11Session::find_session_env_by_pid(const std::string &pid, X11SessionInfo &out) {
+bool X11Session::find_session_env_by_pid(const std::string &pid,
+                                         X11SessionInfo &out) {
   if (!is_digits(pid)) {
     return false;
   }
@@ -594,7 +604,7 @@ bool X11Session::find_session_env_by_pid(const std::string &pid, X11SessionInfo 
 }
 
 bool X11Session::find_session_env_by_user(const std::string &username,
-                                         X11SessionInfo &out) {
+                                          X11SessionInfo &out) {
   if (username.empty() || is_greeter_username(username)) {
     return false;
   }
@@ -703,8 +713,28 @@ bool X11Session::set_keyboard_layout(int index) const {
   if (display) {
     XkbLockGroup(display, XkbUseCoreKbd, static_cast<unsigned int>(index));
     XSync(display, False);
+
+    // Проверяем результат в том же соединении с несколькими попытками.
+    // XkbLockGroup может применяться с небольшой задержкой.
+    constexpr int kMaxRetries = 5;
+    constexpr int kRetryDelayUs = 1000; // 1 мс
+
+    for (int retry = 0; retry < kMaxRetries; ++retry) {
+      XkbStateRec state;
+      if (XkbGetState(display, XkbUseCoreKbd, &state) == Success) {
+        if (static_cast<int>(state.group) == index) {
+          success = true;
+          break;
+        }
+      }
+
+      if (retry < kMaxRetries - 1) {
+        usleep(kRetryDelayUs);
+        XSync(display, False);
+      }
+    }
+
     XCloseDisplay(display);
-    success = true;
   }
 
   switch_to_root();

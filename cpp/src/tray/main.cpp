@@ -14,7 +14,7 @@
 namespace {
 
 void print_version() {
-  std::cout << "Punto Tray 2.8.2\n"
+  std::cout << "Punto Tray 2.8.3\n"
             << "Приложение для управления Punto Switcher\n";
 }
 

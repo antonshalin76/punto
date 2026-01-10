@@ -26,8 +26,8 @@ struct OneshotPasteWaits {
   std::chrono::microseconds after_backspace;
 };
 
-[[nodiscard]] constexpr OneshotPasteWaits oneshot_paste_waits(
-    bool is_terminal) noexcept {
+[[nodiscard]] constexpr OneshotPasteWaits
+oneshot_paste_waits(bool is_terminal) noexcept {
   if (is_terminal) {
     return {
         /*pre_paste=*/std::chrono::microseconds{150000},
@@ -39,8 +39,8 @@ struct OneshotPasteWaits {
   return {
       /*pre_paste=*/std::chrono::microseconds{100000},
       // В некоторых приложениях (особенно IDE) обработка paste может быть
-      // асинхронной. Даем больше времени, чтобы не восстановить CLIPBOARD слишком
-      // рано.
+      // асинхронной. Даем больше времени, чтобы не восстановить CLIPBOARD
+      // слишком рано.
       /*post_paste=*/std::chrono::microseconds{250000},
       /*after_backspace=*/std::chrono::microseconds{0},
   };
@@ -112,11 +112,11 @@ bool EventLoop::initialize() {
   }
 
   if (!x11_ok) {
-    std::cerr
-        << "[punto] Предупреждение: X11 сессия не инициализирована (нет активной "
-           "user-сессии или недоступен DISPLAY/XAUTHORITY).\n"
-        << "[punto] Ожидается на экране логина: сервис автоматически "
-           "перепривяжется после входа пользователя.\n";
+    std::cerr << "[punto] Предупреждение: X11 сессия не инициализирована (нет "
+                 "активной "
+                 "user-сессии или недоступен DISPLAY/XAUTHORITY).\n"
+              << "[punto] Ожидается на экране логина: сервис автоматически "
+                 "перепривяжется после входа пользователя.\n";
     // Не фатальная ошибка — базовая функциональность работает
   } else {
     // Создаём ClipboardManager
@@ -175,7 +175,8 @@ int EventLoop::run() {
   pollfd pfd{STDIN_FILENO, POLLIN, 0};
 
   // Время последней проверки/обновления X11-сессии.
-  // Нужен для фикса "прилипание к GDM" на буте и корректной работы после logout/login.
+  // Нужен для фикса "прилипание к GDM" на буте и корректной работы после
+  // logout/login.
   auto last_x11_check_time = std::chrono::steady_clock::now();
   constexpr auto kX11CheckInterval = std::chrono::seconds{3};
 
@@ -194,6 +195,7 @@ int EventLoop::run() {
 
     // На новой сессии пробуем снова включить прямой XKB set.
     xkb_set_available_ = true;
+    xkb_disabled_at_ = {};
 
     {
       const X11SessionInfo info = x11_session_->info();
@@ -202,7 +204,8 @@ int EventLoop::run() {
                 << "\n";
     }
 
-    // Пересоздаём Clipboard/Sound (они завязаны на DISPLAY/XDG_RUNTIME_DIR/uid).
+    // Пересоздаём Clipboard/Sound (они завязаны на
+    // DISPLAY/XDG_RUNTIME_DIR/uid).
     clipboard_ = std::make_unique<ClipboardManager>(*x11_session_);
 
     auto cfg = std::atomic_load(&config_);
@@ -245,7 +248,8 @@ int EventLoop::run() {
           rebuild_x11_deps();
         } else if (rr == X11Session::RefreshResult::Invalidated) {
           teardown_x11_deps();
-          std::cerr << "[punto] X11 session invalidated (no active user session)\n";
+          std::cerr
+              << "[punto] X11 session invalidated (no active user session)\n";
         }
       }
     }
@@ -256,8 +260,9 @@ int EventLoop::run() {
     if (!x11_session_->is_valid()) {
       if (!x11_wait_log_emitted) {
         x11_wait_log_emitted = true;
-        std::cerr << "[punto] X11: активная пользовательская сессия не обнаружена "
-                     "(возможно экран логина). Ожидаю входа пользователя...\n";
+        std::cerr
+            << "[punto] X11: активная пользовательская сессия не обнаружена "
+               "(возможно экран логина). Ожидаю входа пользователя...\n";
       }
     } else {
       x11_wait_log_emitted = false;
@@ -355,7 +360,8 @@ void EventLoop::handle_event(const input_event &ev) {
   const bool is_press = ev.value == 1; // Только первое нажатие, не repeat
 
   // Если мы перехватили Ctrl+Z и не отдали press наружу, то все последующие
-  // repeat/release для Z нужно проглотить (иначе приложение увидит release без press).
+  // repeat/release для Z нужно проглотить (иначе приложение увидит release без
+  // press).
   if (code == KEY_Z && swallow_z_until_release_) {
     if (!pressed) {
       swallow_z_until_release_ = false;
@@ -815,16 +821,35 @@ bool EventLoop::set_layout(int target_layout, bool play_sound) {
     return true;
   }
 
-  // Быстрый путь: XKB LockGroup (но только если реально работает).
+  // Периодическая ре-проверка XKB: если был отключён, но прошло достаточно
+  // времени — пробуем снова. Это нужно для восстановления после гонок при
+  // старте нескольких экземпляров punto-daemon.
+  constexpr auto kXkbRetryInterval = std::chrono::seconds{10};
+  if (!xkb_set_available_ && x11_session_ && x11_session_->is_valid()) {
+    const auto now = std::chrono::steady_clock::now();
+    if (xkb_disabled_at_.time_since_epoch().count() == 0 ||
+        now - xkb_disabled_at_ >= kXkbRetryInterval) {
+      std::cerr << "[punto] XKB set: re-enabling after "
+                << std::chrono::duration_cast<std::chrono::seconds>(
+                       now - xkb_disabled_at_)
+                       .count()
+                << "s\n";
+      xkb_set_available_ = true;
+    }
+  }
+
+  // Примечание: XKB LockGroup отключён, т.к. при нескольких экземплярах
+  // punto-daemon возникает гонка — один устанавливает раскладку, другой
+  // перезаписывает. Используем только hotkey fallback (эмуляция нажатия).
+  //
+  // Если нужно включить XKB set, раскомментируйте блок ниже.
+  /*
   if (xkb_set_available_ && x11_session_ && x11_session_->is_valid()) {
     x11_session_->apply_environment();
 
     bool ok = x11_session_->set_keyboard_layout(target_layout);
 
-    // Важно: set_keyboard_layout() в некоторых окружениях может возвращать
-    // успех, но фактически раскладка не меняется. Проверяем состоянием XKB.
-    int os_layout = x11_session_->get_current_keyboard_layout();
-    if (ok && os_layout == target_layout) {
+    if (ok) {
       current_layout_ = target_layout;
       last_sync_time_ = std::chrono::steady_clock::now();
 
@@ -835,34 +860,35 @@ bool EventLoop::set_layout(int target_layout, bool play_sound) {
       return true;
     }
 
-    std::cerr << "[punto] Layout SET via XKB did not apply (ok=" << ok
-              << " os_layout=" << os_layout << "); disable XKB set\n";
-    xkb_set_available_ = false;
+    std::cerr
+        << "[punto] Layout SET via XKB did not apply, trying hotkey fallback\n";
   }
+  */
 
   // Fallback: hotkey toggle (работает только если 2 раскладки).
-  if ((current_layout_ == 0 || current_layout_ == 1) &&
-      target_layout == ((current_layout_ == 0) ? 1 : 0)) {
-
-    switch_layout(play_sound);
-
-    // Best-effort: сверяемся с ОС после хоткея.
-    // Важно: сразу после переключения XKB state может обновиться с задержкой,
-    // поэтому не «откатываем» внутреннее состояние назад, если ОС ещё не
-    // успела.
+  // Используется если XKB не доступен ИЛИ если XKB set не сработал.
+  if (target_layout == 0 || target_layout == 1) {
+    // Синхронизируем current_layout_ с ОС перед hotkey
     if (x11_session_ && x11_session_->is_valid()) {
       x11_session_->apply_environment();
       int os_layout = x11_session_->get_current_keyboard_layout();
       if (os_layout == 0 || os_layout == 1) {
-        if (os_layout == target_layout) {
-          current_layout_ = os_layout;
-          last_sync_time_ = std::chrono::steady_clock::now();
-        } else {
-          std::cerr << "[punto] Layout SYNC(hotkey): os_layout=" << os_layout
-                    << " expected=" << target_layout << " (may be delayed)\n";
-        }
+        current_layout_ = os_layout;
       }
     }
+
+    // Если уже в нужной раскладке — ничего не делаем
+    if (current_layout_ == target_layout) {
+      return true;
+    }
+
+    // Hotkey переключает раскладку (toggle)
+    switch_layout(play_sound);
+
+    // Важно: доверяем внутреннему состоянию, switch_layout() уже обновил
+    // current_layout_. Не пытаемся синхронизироваться с ОС сразу — она может
+    // обновиться с задержкой.
+    last_sync_time_ = std::chrono::steady_clock::now();
 
     return current_layout_ == target_layout;
   }
@@ -870,8 +896,8 @@ bool EventLoop::set_layout(int target_layout, bool play_sound) {
   return false;
 }
 
-std::optional<int> EventLoop::maybe_switch_layout_to_en_for_terminal_paste(
-    bool is_terminal) {
+std::optional<int>
+EventLoop::maybe_switch_layout_to_en_for_terminal_paste(bool is_terminal) {
   if (!is_terminal) {
     return std::nullopt;
   }
@@ -904,7 +930,7 @@ std::optional<int> EventLoop::maybe_switch_layout_to_en_for_terminal_paste(
 }
 
 bool EventLoop::paste_text_oneshot(std::string_view text,
-                                  bool restore_clipboard) {
+                                   bool restore_clipboard) {
   if (!clipboard_) {
     std::cerr << "[punto] Clipboard: недоступен (oneshot paste skipped)\n";
     return false;
@@ -917,8 +943,8 @@ bool EventLoop::paste_text_oneshot(std::string_view text,
 
   const bool is_terminal = clipboard_->is_active_window_terminal();
 
-  // Пытаемся сохранить CLIPBOARD (best-effort), чтобы не ломать пользовательский
-  // буфер обмена.
+  // Пытаемся сохранить CLIPBOARD (best-effort), чтобы не ломать
+  // пользовательский буфер обмена.
   std::optional<std::string> prev_clip;
   if (restore_clipboard) {
     prev_clip = clipboard_->get_text(Selection::Clipboard);
@@ -929,7 +955,8 @@ bool EventLoop::paste_text_oneshot(std::string_view text,
     }
   }
 
-  // Для Shift+Insert нам нужен PRIMARY, но для Ctrl+Shift+V достаточно CLIPBOARD.
+  // Для Shift+Insert нам нужен PRIMARY, но для Ctrl+Shift+V достаточно
+  // CLIPBOARD.
   std::optional<std::string> prev_primary;
   if (!is_terminal) {
     prev_primary = clipboard_->get_text(Selection::Primary);
@@ -996,9 +1023,9 @@ bool EventLoop::paste_text_oneshot(std::string_view text,
 }
 
 bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
-                                    std::string_view text,
-                                    std::optional<int> final_layout,
-                                    bool play_sound) {
+                                     std::string_view text,
+                                     std::optional<int> final_layout,
+                                     bool play_sound) {
   if (!clipboard_) {
     std::cerr << "[punto] Clipboard: недоступен (oneshot replace skipped)\n";
     return false;
@@ -1013,7 +1040,8 @@ bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
 
   // Важно: стараемся НЕ удалять текст, пока не убедились, что можем выставить
   // буфер для вставки.
-  std::optional<std::string> prev_clip = clipboard_->get_text(Selection::Clipboard);
+  std::optional<std::string> prev_clip =
+      clipboard_->get_text(Selection::Clipboard);
   if (!prev_clip.has_value()) {
     std::cerr << "[punto] Clipboard: cannot read CLIPBOARD for restore "
                  "(oneshot replace skipped)\n";
@@ -1064,8 +1092,9 @@ bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
     injector->send_backspace(backspace_count, true);
     flush_pending_release_frames();
 
-    // КРИТИЧЕСКАЯ ПАУЗА: терминалы/TTY UI иногда применяют Backspace не мгновенно.
-    // Без паузы Paste может прийти до фактического удаления символов.
+    // КРИТИЧЕСКАЯ ПАУЗА: терминалы/TTY UI иногда применяют Backspace не
+    // мгновенно. Без паузы Paste может прийти до фактического удаления
+    // символов.
     if (waits.after_backspace.count() > 0) {
       wait_and_buffer(waits.after_backspace);
     }
@@ -1104,9 +1133,9 @@ bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
 }
 
 void EventLoop::set_last_undo_record(std::string original_text,
-                                   std::string_view inserted_text,
-                                   std::optional<int> restore_layout,
-                                   bool is_auto_correction) {
+                                     std::string_view inserted_text,
+                                     std::optional<int> restore_layout,
+                                     bool is_auto_correction) {
   UndoRecord rec;
   rec.original_text = std::move(original_text);
   rec.inserted_len = utf8_codepoint_count(inserted_text);
@@ -1172,21 +1201,22 @@ bool EventLoop::action_undo_last_correction() {
 
   std::cerr << "[punto] Undo: start (erase=" << rec.inserted_len
             << " restore_layout="
-            << (rec.restore_layout.has_value() ? std::to_string(*rec.restore_layout)
-                                               : std::string{"-"})
+            << (rec.restore_layout.has_value()
+                    ? std::to_string(*rec.restore_layout)
+                    : std::string{"-"})
             << ")\n";
 
-  const bool ok = replace_text_oneshot(
-      rec.inserted_len, rec.original_text,
-      /*final_layout=*/rec.restore_layout,
-      /*play_sound=*/false);
+  const bool ok = replace_text_oneshot(rec.inserted_len, rec.original_text,
+                                       /*final_layout=*/rec.restore_layout,
+                                       /*play_sound=*/false);
   if (!ok) {
     std::cerr << "[punto] Undo: oneshot replace failed (skip)\n";
     return false;
   }
 
   if (rec.is_auto_correction) {
-    // Ctrl+Z как явный сигнал "отменяю автокоррекцию" → пишем слово в exclusions.
+    // Ctrl+Z как явный сигнал "отменяю автокоррекцию" → пишем слово в
+    // exclusions.
     undo_detector_.on_undo();
   }
 
@@ -1211,7 +1241,8 @@ void EventLoop::action_invert_layout_word() {
 
   // Строим видимый текст так, как если бы мы перепечатали те же скан-коды в
   // target_layout.
-  auto replacement_opt = key_entries_to_visible_text_checked(word, target_layout);
+  auto replacement_opt =
+      key_entries_to_visible_text_checked(word, target_layout);
   if (!replacement_opt.has_value()) {
     std::cerr << "[punto] Invert-layout: cannot build visible text (layout="
               << target_layout << ")\n";
@@ -1243,8 +1274,8 @@ void EventLoop::action_invert_layout_word() {
 
   const std::size_t total_len = word.size() + buffer_.trailing_length();
   const bool ok = replace_text_oneshot(total_len, replacement,
-                                      /*final_layout=*/target_layout,
-                                      /*play_sound=*/true);
+                                       /*final_layout=*/target_layout,
+                                       /*play_sound=*/true);
   if (ok && original_text_opt.has_value()) {
     set_last_undo_record(std::move(*original_text_opt), replacement,
                          /*restore_layout=*/restore_layout_for_undo,
@@ -1334,8 +1365,8 @@ void EventLoop::action_invert_case_word() {
 
   const std::size_t total_len = word.size() + buffer_.trailing_length();
   const bool ok = replace_text_oneshot(total_len, replacement,
-                                      /*final_layout=*/std::nullopt,
-                                      /*play_sound=*/false);
+                                       /*final_layout=*/std::nullopt,
+                                       /*play_sound=*/false);
   if (ok) {
     set_last_undo_record(std::move(original_text), replacement,
                          /*restore_layout=*/std::nullopt,
@@ -1366,7 +1397,8 @@ bool EventLoop::process_selection(
   std::optional<std::string> text;
 
   if (is_terminal) {
-    // В терминале: читаем PRIMARY selection (автоматически заполняется при выделении).
+    // В терминале: читаем PRIMARY selection (автоматически заполняется при
+    // выделении).
     text = clipboard_->get_text(Selection::Primary);
   } else {
     // В обычных приложениях: Ctrl+C для копирования выделения.
@@ -1872,8 +1904,8 @@ void EventLoop::apply_correction(const PendingWordMeta &meta,
 
   // Tail = всё после слова (включая разделитель) до текущей позиции.
   if (!history_.get_range(meta.end_pos, cursor, tail_scratch_)) {
-    std::cerr << "[punto] Async: failed to get tail for task_id=" << meta.task_id
-              << "\n";
+    std::cerr << "[punto] Async: failed to get tail for task_id="
+              << meta.task_id << "\n";
     return;
   }
 
@@ -1889,7 +1921,8 @@ void EventLoop::apply_correction(const PendingWordMeta &meta,
   }
 
   auto word_text_opt = key_entries_to_visible_text_checked(
-      std::span<const KeyEntry>{meta.word.data(), meta.word.size()}, target_layout);
+      std::span<const KeyEntry>{meta.word.data(), meta.word.size()},
+      target_layout);
   if (!word_text_opt.has_value()) {
     std::cerr << "[punto] Async: cannot build corrected word text for task_id="
               << meta.task_id << " (layout=" << target_layout << ")\n";
@@ -1900,8 +1933,8 @@ void EventLoop::apply_correction(const PendingWordMeta &meta,
       std::span<const KeyEntry>{tail_scratch_.data(), tail_scratch_.size()},
       original_layout);
   if (!tail_text_opt.has_value()) {
-    std::cerr << "[punto] Async: cannot build tail text for task_id=" << meta.task_id
-              << " (layout=" << original_layout << ")\n";
+    std::cerr << "[punto] Async: cannot build tail text for task_id="
+              << meta.task_id << " (layout=" << original_layout << ")\n";
     return;
   }
 
@@ -1937,11 +1970,11 @@ void EventLoop::apply_correction(const PendingWordMeta &meta,
   const auto macro_start = std::chrono::steady_clock::now();
 
   const bool ok = replace_text_oneshot(erase, replacement,
-                                      /*final_layout=*/target_layout,
-                                      /*play_sound=*/true);
+                                       /*final_layout=*/target_layout,
+                                       /*play_sound=*/true);
   if (!ok) {
-    std::cerr << "[punto] Async: oneshot replace failed for task_id=" << meta.task_id
-              << " (skip)\n";
+    std::cerr << "[punto] Async: oneshot replace failed for task_id="
+              << meta.task_id << " (skip)\n";
     return;
   }
 
@@ -2025,8 +2058,8 @@ void EventLoop::apply_case_correction(
       std::span<const KeyEntry>{tail_scratch_.data(), tail_scratch_.size()},
       layout);
   if (!tail_text_opt.has_value()) {
-    std::cerr << "[punto] Async: cannot build tail text for task_id=" << meta.task_id
-              << " (layout=" << layout << ")\n";
+    std::cerr << "[punto] Async: cannot build tail text for task_id="
+              << meta.task_id << " (layout=" << layout << ")\n";
     return;
   }
 
@@ -2056,11 +2089,11 @@ void EventLoop::apply_case_correction(
   const auto macro_start = std::chrono::steady_clock::now();
 
   const bool ok = replace_text_oneshot(erase, replacement,
-                                      /*final_layout=*/std::nullopt,
-                                      /*play_sound=*/false);
+                                       /*final_layout=*/std::nullopt,
+                                       /*play_sound=*/false);
   if (!ok) {
-    std::cerr << "[punto] Async: oneshot replace failed for task_id=" << meta.task_id
-              << " (skip)\n";
+    std::cerr << "[punto] Async: oneshot replace failed for task_id="
+              << meta.task_id << " (skip)\n";
     return;
   }
 
@@ -2096,9 +2129,10 @@ void EventLoop::apply_combined_correction(
   const int original_layout = meta.layout_at_boundary;
   if ((original_layout != 0 && original_layout != 1) ||
       (target_layout != 0 && target_layout != 1)) {
-    std::cerr << "[punto] Async: invalid layout values for combined fix task_id="
-              << meta.task_id << " original=" << original_layout
-              << " target=" << target_layout << "\n";
+    std::cerr
+        << "[punto] Async: invalid layout values for combined fix task_id="
+        << meta.task_id << " original=" << original_layout
+        << " target=" << target_layout << "\n";
     return;
   }
 
@@ -2141,8 +2175,8 @@ void EventLoop::apply_combined_correction(
       std::span<const KeyEntry>{tail_scratch_.data(), tail_scratch_.size()},
       original_layout);
   if (!tail_text_opt.has_value()) {
-    std::cerr << "[punto] Async: cannot build tail text for task_id=" << meta.task_id
-              << " (layout=" << original_layout << ")\n";
+    std::cerr << "[punto] Async: cannot build tail text for task_id="
+              << meta.task_id << " (layout=" << original_layout << ")\n";
     return;
   }
 
@@ -2174,11 +2208,11 @@ void EventLoop::apply_combined_correction(
   const auto macro_start = std::chrono::steady_clock::now();
 
   const bool ok = replace_text_oneshot(erase, replacement,
-                                      /*final_layout=*/target_layout,
-                                      /*play_sound=*/true);
+                                       /*final_layout=*/target_layout,
+                                       /*play_sound=*/true);
   if (!ok) {
-    std::cerr << "[punto] Async: oneshot replace failed for task_id=" << meta.task_id
-              << " (skip)\n";
+    std::cerr << "[punto] Async: oneshot replace failed for task_id="
+              << meta.task_id << " (skip)\n";
     return;
   }
 
@@ -2221,8 +2255,9 @@ void EventLoop::action_invert_layout_selection() {
 
 void EventLoop::action_invert_case_selection() {
   is_processing_macro_ = true;
-  (void)process_selection([](std::string_view text) { return invert_case(text); },
-                          /*restore_layout_for_undo=*/std::nullopt);
+  (void)process_selection(
+      [](std::string_view text) { return invert_case(text); },
+      /*restore_layout_for_undo=*/std::nullopt);
   drain_pending_events();
 }
 

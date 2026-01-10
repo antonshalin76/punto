@@ -145,16 +145,15 @@ private:
                             std::span<const ScanCode> trailing);
 
   /// Обрабатывает selection (копирование, трансформация, вставка)
-  bool process_selection(
-      std::function<std::string(std::string_view)> transform,
-      std::optional<int> restore_layout_for_undo);
+  bool process_selection(std::function<std::string(std::string_view)> transform,
+                         std::optional<int> restore_layout_for_undo);
 
   /// Вставляет текст одной операцией через Clipboard + Paste.
   ///
   /// Best-effort: пытается сохранить/восстановить содержимое CLIPBOARD, чтобы
   /// не ломать пользовательский буфер обмена.
   [[nodiscard]] bool paste_text_oneshot(std::string_view text,
-                                       bool restore_clipboard = true);
+                                        bool restore_clipboard = true);
 
   /// Если paste делается через Ctrl+Shift+V, то в ряде терминалов хоткей
   /// распознаётся по keysym и зависит от раскладки.
@@ -169,9 +168,9 @@ private:
   /// @param final_layout если задано (0/1) — стараемся установить раскладку
   /// после вставки.
   [[nodiscard]] bool replace_text_oneshot(std::size_t backspace_count,
-                                         std::string_view text,
-                                         std::optional<int> final_layout,
-                                         bool play_sound);
+                                          std::string_view text,
+                                          std::optional<int> final_layout,
+                                          bool play_sound);
 
   /// Запоминает последнюю коррекцию для Ctrl+Z undo.
   void set_last_undo_record(std::string original_text,
@@ -277,6 +276,9 @@ private:
   // отключаем его и используем только hotkey-метод.
   bool xkb_set_available_ = true;
 
+  /// Время, когда XKB set был отключён (для периодической ре-проверки)
+  std::chrono::steady_clock::time_point xkb_disabled_at_{};
+
   std::unique_ptr<X11Session> x11_session_;
   std::unique_ptr<ClipboardManager> clipboard_;
   std::unique_ptr<SoundManager> sound_manager_;
@@ -305,7 +307,8 @@ private:
 
   struct UndoRecord {
     std::string original_text;
-    std::size_t inserted_len = 0; // сколько Backspace нужно для удаления вставки
+    std::size_t inserted_len =
+        0; // сколько Backspace нужно для удаления вставки
     std::optional<int> restore_layout; // 0/1, если нужно вернуть раскладку
 
     bool is_auto_correction = false; // если true — можно писать в UndoDetector

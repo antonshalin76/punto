@@ -639,7 +639,8 @@ bool SettingsDialog::show(GtkWidget *parent) {
                       "  Shift+Pause — инвертировать раскладку выделения\n"
                       "  Ctrl+Pause — инвертировать регистр слова\n"
                       "  Alt+Pause — инвертировать регистр выделения\n"
-                      "  LCtrl+LAlt+Pause — транслитерировать выделение");
+                      "  LCtrl+LAlt+Pause — транслитерировать выделение\n"
+                      "  LCtrl+Z — отменить последнее исправление");                      
   gtk_label_set_line_wrap(GTK_LABEL(builtin_label), TRUE);
   gtk_box_pack_start(GTK_BOX(hotkey_box), builtin_label, FALSE, FALSE, 0);
 

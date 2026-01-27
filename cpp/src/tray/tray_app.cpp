@@ -337,7 +337,7 @@ void TrayApp::on_about_clicked(GtkMenuItem *item, gpointer user_data) {
 
   const char *markup =
       "<b>Punto Switcher for Linux</b>\n"
-      "Version 2.8.3\n"
+      "Version 2.8.4\n"
       "Лицензия: Personal Use Only\n"
       "Автор: Anton Shalin\n"
       "email: <a "

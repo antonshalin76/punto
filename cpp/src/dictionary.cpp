@@ -566,9 +566,11 @@ bool Dictionary::check_hunspell(const std::string &word,
                                 bool is_english) const {
 #ifdef HAVE_HUNSPELL
   if (is_english && hunspell_en_) {
+    std::lock_guard<std::mutex> lock(hunspell_mutex_);
     return hunspell_en_->spell(word) != 0;
   }
   if (!is_english && hunspell_ru_) {
+    std::lock_guard<std::mutex> lock(hunspell_mutex_);
     return hunspell_ru_->spell(word) != 0;
   }
 #else
@@ -597,7 +599,11 @@ Dictionary::suggest(const std::string &word, bool is_english,
   }
 
   // Hunspell::suggest возвращает список предложений
-  std::vector<std::string> suggestions = hs->suggest(word);
+  std::vector<std::string> suggestions;
+  {
+    std::lock_guard<std::mutex> lock(hunspell_mutex_);
+    suggestions = hs->suggest(word);
+  }
 
   // Ограничиваем количество результатов
   std::size_t count = std::min(suggestions.size(), max_suggestions);

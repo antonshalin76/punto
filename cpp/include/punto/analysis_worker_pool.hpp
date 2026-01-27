@@ -322,6 +322,7 @@ private:
             std::vector<std::string> suggestions =
                 dict_->suggest(word_str, is_en_layout, 5);
 
+            bool typo_fix_found = false;
             for (const auto &suggestion : suggestions) {
               // Проверяем что suggestion - это исправление оригинала
               if (suggestion == word_str) {
@@ -342,13 +343,14 @@ private:
                 res.correction_type = CorrectionType::TypoFix;
                 res.correction =
                     utf8_to_keys(suggestion, is_en_layout, true, analysis_span);
-                finish_and_push(res, t0);
-                continue; // Это continue для внешнего while, но мы в for...
+                typo_fix_found = true;
+                break;
               }
             }
 
-            // Если нашли typo fix, уже сделали continue выше
-            if (res.correction_type == CorrectionType::TypoFix) {
+            // Если нашли typo fix — отправляем результат и переходим к следующей задаче
+            if (typo_fix_found) {
+              finish_and_push(res, t0);
               continue;
             }
           }

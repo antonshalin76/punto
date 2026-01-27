@@ -3,7 +3,7 @@
 Высокопроизводительная реализация Punto Switcher на C++20 для Linux.
 Позволяет исправлять текст, набранный в неправильной раскладке клавиатуры.
 
-![Version](https://img.shields.io/badge/version-2.8.3-blue)
+![Version](https://img.shields.io/badge/version-2.8.4-blue)
 ![C++](https://img.shields.io/badge/C%2B%2B-20-orange)
 ![License](https://img.shields.io/badge/license-Personal%20Use%20Only-red)
 
@@ -183,7 +183,7 @@ sudo apt install pulseaudio-utils alsa-utils
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh
-sudo dpkg -i punto-switcher_2.8.3_amd64.deb
+sudo dpkg -i punto-switcher_2.8.4_amd64.deb
 ```
 
 #### Ручная сборка без пакета
@@ -393,6 +393,11 @@ sudo rm -rf /etc/punto
 | wamerican-huge             | любая (опционально)       |
 
 ## История изменений
+
+### v2.8.4 — Стабильность async-обработки и Hunspell
+
+- **Исправлен use-after-move в async typo fix**: результат отправляется строго один раз, без дубликатов и мусорных данных.
+- **Hunspell теперь потокобезопасен**: доступ к `spell()`/`suggest()` защищён мьютексом, чтобы избежать гонок.
 
 ### v2.8.3 — Исправление маппинга знаков препинания + XKB sync
 

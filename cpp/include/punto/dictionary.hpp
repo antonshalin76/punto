@@ -9,6 +9,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -183,6 +184,9 @@ private:
   std::unique_ptr<Hunspell> hunspell_en_;
   std::unique_ptr<Hunspell> hunspell_ru_;
 #endif
+
+  // Hunspell не потокобезопасен — защищаем вызовы spell/suggest.
+  mutable std::mutex hunspell_mutex_;
 
   bool initialized_ = false;
   bool hunspell_available_ = false;

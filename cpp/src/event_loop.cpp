@@ -236,6 +236,7 @@ int EventLoop::run() {
     if (clipboard_) {
       clipboard_->pump_events();
     }
+    flush_pending_clipboard_restore(false);
 
     // Периодически проверяем, не сменилась ли активная user-сессия.
     {
@@ -356,8 +357,9 @@ void EventLoop::handle_event(const input_event &ev) {
   }
 
   const ScanCode code = ev.code;
-  const bool pressed = ev.value != 0;
-  const bool is_press = ev.value == 1; // Только первое нажатие, не repeat
+  const bool is_release = (ev.value == 0);
+  const bool is_press = (ev.value == 1);
+  const bool pressed = !is_release;
 
   // Если мы перехватили Ctrl+Z и не отдали press наружу, то все последующие
   // repeat/release для Z нужно проглотить (иначе приложение увидит release без
@@ -390,10 +392,9 @@ void EventLoop::handle_event(const input_event &ev) {
   }
 
   // =========================================================================
-  // Обрабатываем только нажатия (не отпускания и не repeat)
+  // Обрабатываем только нажатия/повторы (release пропускаем)
   // =========================================================================
-
-  if (!is_press) {
+  if (is_release) {
     emit_passthrough_event(ev);
     return;
   }
@@ -404,7 +405,7 @@ void EventLoop::handle_event(const input_event &ev) {
   //  - прошло мало времени.
   // Иначе Ctrl+Z пропускается в приложение как обычный системный хоткей.
   if (code == KEY_Z && modifiers_.any_ctrl() && !modifiers_.any_alt() &&
-      !modifiers_.any_meta()) {
+      !modifiers_.any_meta() && is_press) {
     if (action_undo_last_correction()) {
       swallow_z_until_release_ = true;
       return;
@@ -438,6 +439,10 @@ void EventLoop::handle_event(const input_event &ev) {
   // =========================================================================
 
   if (code == KEY_PAUSE) {
+    if (!is_press) {
+      emit_passthrough_event(ev);
+      return;
+    }
     // Любой макрос по хоткею делает "переписывание" текста.
     // Чтобы избежать гонок/рассинхронизации, сбрасываем async-состояние.
     pending_words_.clear();
@@ -935,6 +940,7 @@ bool EventLoop::paste_text_oneshot(std::string_view text,
     std::cerr << "[punto] Clipboard: недоступен (oneshot paste skipped)\n";
     return false;
   }
+  flush_pending_clipboard_restore(true);
 
   auto injector = std::atomic_load(&injector_);
   if (!injector) {
@@ -986,6 +992,10 @@ bool EventLoop::paste_text_oneshot(std::string_view text,
   // В терминалах (и в целом в «медленных» UI-циклах) запрос буфера обмена может
   // приходить с задержкой.
   const OneshotPasteWaits waits = oneshot_paste_waits(is_terminal);
+  const std::uint64_t clip_seq =
+      clipboard_->selection_request_seq(Selection::Clipboard);
+  const std::uint64_t primary_seq =
+      is_terminal ? 0 : clipboard_->selection_request_seq(Selection::Primary);
 
   wait_and_buffer(waits.pre_paste);
 
@@ -997,27 +1007,47 @@ bool EventLoop::paste_text_oneshot(std::string_view text,
 
   injector->send_paste(is_terminal);
 
-  // Даем приложению время запросить содержимое clipboard.
-  wait_and_buffer(waits.post_paste);
+  const bool watch_clip = restore_clipboard && prev_clip.has_value();
+  const bool watch_primary = !is_terminal;
+
+  auto has_request = [this, clip_seq, primary_seq, watch_clip,
+                      watch_primary]() {
+    if (!clipboard_) {
+      return false;
+    }
+    if (watch_clip &&
+        clipboard_->selection_request_seq(Selection::Clipboard) != clip_seq) {
+      return true;
+    }
+    if (watch_primary &&
+        clipboard_->selection_request_seq(Selection::Primary) != primary_seq) {
+      return true;
+    }
+    return false;
+  };
+
+  if (watch_clip || watch_primary) {
+    wait_and_buffer_until(waits.post_paste, has_request);
+  } else {
+    wait_and_buffer(waits.post_paste);
+  }
 
   if (restore_layout.has_value()) {
     (void)set_layout(*restore_layout, /*play_sound=*/false);
   }
 
-  // Восстанавливаем PRIMARY только если трогали его.
-  if (!is_terminal) {
-    if (prev_primary.has_value()) {
-      (void)clipboard_->set_text(Selection::Primary, *prev_primary);
-    } else {
-      // Если PRIMARY не удаётся прочитать (нет selection owner / таймаут),
-      // лучше не оставлять в PRIMARY подстановочный текст.
-      (void)clipboard_->set_text(Selection::Primary, "");
-    }
-  }
+  const bool request_seen = (watch_clip || watch_primary) ? has_request() : true;
 
-  if (restore_clipboard && prev_clip.has_value()) {
-    (void)clipboard_->set_text(Selection::Clipboard, *prev_clip);
-  }
+  PendingClipboardRestore plan;
+  plan.restore_clipboard = watch_clip;
+  plan.restore_primary = watch_primary;
+  plan.clipboard = std::move(prev_clip);
+  plan.primary = std::move(prev_primary);
+  plan.clip_req_seq = clip_seq;
+  plan.primary_req_seq = primary_seq;
+  plan.deadline = std::chrono::steady_clock::now() + waits.post_paste * 4;
+
+  finalize_clipboard_restore(std::move(plan), request_seen);
 
   return true;
 }
@@ -1030,6 +1060,7 @@ bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
     std::cerr << "[punto] Clipboard: недоступен (oneshot replace skipped)\n";
     return false;
   }
+  flush_pending_clipboard_restore(true);
 
   auto injector = std::atomic_load(&injector_);
   if (!injector) {
@@ -1077,6 +1108,10 @@ bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
   // В терминалах часто есть дополнительная задержка между hotkey paste и
   // фактическим запросом clipboard.
   const OneshotPasteWaits waits = oneshot_paste_waits(is_terminal);
+  const std::uint64_t clip_seq =
+      clipboard_->selection_request_seq(Selection::Clipboard);
+  const std::uint64_t primary_seq =
+      is_terminal ? 0 : clipboard_->selection_request_seq(Selection::Primary);
 
   wait_and_buffer(waits.pre_paste);
 
@@ -1105,21 +1140,29 @@ bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
       maybe_switch_layout_to_en_for_terminal_paste(is_terminal);
 
   injector->send_paste(is_terminal);
+  const bool watch_clip = prev_clip.has_value();
+  const bool watch_primary = !is_terminal;
 
-  // Даем приложению время запросить содержимое clipboard.
-  wait_and_buffer(waits.post_paste);
-
-  if (prev_clip.has_value()) {
-    (void)clipboard_->set_text(Selection::Clipboard, *prev_clip);
-  }
-
-  // Восстанавливаем PRIMARY только если трогали его.
-  if (!is_terminal) {
-    if (prev_primary.has_value()) {
-      (void)clipboard_->set_text(Selection::Primary, *prev_primary);
-    } else {
-      (void)clipboard_->set_text(Selection::Primary, "");
+  auto has_request = [this, clip_seq, primary_seq, watch_clip,
+                      watch_primary]() {
+    if (!clipboard_) {
+      return false;
     }
+    if (watch_clip &&
+        clipboard_->selection_request_seq(Selection::Clipboard) != clip_seq) {
+      return true;
+    }
+    if (watch_primary &&
+        clipboard_->selection_request_seq(Selection::Primary) != primary_seq) {
+      return true;
+    }
+    return false;
+  };
+
+  if (watch_clip || watch_primary) {
+    wait_and_buffer_until(waits.post_paste, has_request);
+  } else {
+    wait_and_buffer(waits.post_paste);
   }
 
   if (final_layout.has_value()) {
@@ -1128,6 +1171,19 @@ bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
   } else if (restore_layout.has_value()) {
     (void)set_layout(*restore_layout, /*play_sound=*/false);
   }
+
+  const bool request_seen = (watch_clip || watch_primary) ? has_request() : true;
+
+  PendingClipboardRestore plan;
+  plan.restore_clipboard = watch_clip;
+  plan.restore_primary = watch_primary;
+  plan.clipboard = std::move(prev_clip);
+  plan.primary = std::move(prev_primary);
+  plan.clip_req_seq = clip_seq;
+  plan.primary_req_seq = primary_seq;
+  plan.deadline = std::chrono::steady_clock::now() + waits.post_paste * 4;
+
+  finalize_clipboard_restore(std::move(plan), request_seen);
 
   return true;
 }
@@ -1493,6 +1549,12 @@ bool EventLoop::process_selection(
 }
 
 void EventLoop::wait_and_buffer(std::chrono::microseconds us) {
+  wait_and_buffer_until(us, {});
+}
+
+void EventLoop::wait_and_buffer_until(
+    std::chrono::microseconds us,
+    const std::function<bool()> &stop_pred) {
   if (us.count() <= 0) {
     return;
   }
@@ -1501,6 +1563,9 @@ void EventLoop::wait_and_buffer(std::chrono::microseconds us) {
   const auto end = start + us;
 
   while (true) {
+    if (stop_pred && stop_pred()) {
+      break;
+    }
     const auto now = std::chrono::steady_clock::now();
     if (now >= end) {
       break;
@@ -1553,6 +1618,9 @@ void EventLoop::wait_and_buffer(std::chrono::microseconds us) {
           break;
         }
       }
+      if (stop_pred && stop_pred()) {
+        break;
+      }
       continue;
     }
 
@@ -1565,6 +1633,78 @@ void EventLoop::wait_and_buffer(std::chrono::microseconds us) {
 
     // ret == 0 (timeout) или без POLLIN: продолжаем ждать до end.
   }
+}
+
+void EventLoop::flush_pending_clipboard_restore(bool force) {
+  if (!pending_clip_restore_.has_value()) {
+    return;
+  }
+  if (!clipboard_) {
+    pending_clip_restore_.reset();
+    return;
+  }
+
+  auto &p = *pending_clip_restore_;
+
+  const bool clip_req =
+      p.restore_clipboard && p.clipboard.has_value() &&
+      (clipboard_->selection_request_seq(Selection::Clipboard) != p.clip_req_seq);
+  const bool prim_req =
+      p.restore_primary &&
+      (clipboard_->selection_request_seq(Selection::Primary) !=
+       p.primary_req_seq);
+
+  const bool request_seen = clip_req || prim_req;
+  const bool deadline_reached =
+      (p.deadline.time_since_epoch().count() != 0) &&
+      (std::chrono::steady_clock::now() >= p.deadline);
+
+  if (!force && !request_seen && !deadline_reached) {
+    return;
+  }
+
+  if (p.restore_primary) {
+    if (p.primary.has_value()) {
+      (void)clipboard_->set_text(Selection::Primary, *p.primary);
+    } else {
+      (void)clipboard_->set_text(Selection::Primary, "");
+    }
+  }
+
+  if (p.restore_clipboard && p.clipboard.has_value()) {
+    (void)clipboard_->set_text(Selection::Clipboard, *p.clipboard);
+  }
+
+  pending_clip_restore_.reset();
+}
+
+void EventLoop::finalize_clipboard_restore(PendingClipboardRestore plan,
+                                           bool request_seen) {
+  if (!plan.restore_clipboard && !plan.restore_primary) {
+    return;
+  }
+
+  if (request_seen) {
+    if (!clipboard_) {
+      return;
+    }
+
+    if (plan.restore_primary) {
+      if (plan.primary.has_value()) {
+        (void)clipboard_->set_text(Selection::Primary, *plan.primary);
+      } else {
+        (void)clipboard_->set_text(Selection::Primary, "");
+      }
+    }
+
+    if (plan.restore_clipboard && plan.clipboard.has_value()) {
+      (void)clipboard_->set_text(Selection::Clipboard, *plan.clipboard);
+    }
+
+    return;
+  }
+
+  pending_clip_restore_ = std::move(plan);
 }
 
 void EventLoop::flush_pending_release_frames() {

@@ -56,6 +56,10 @@ bool ClipboardManager::open() {
   return true;
 }
 
+std::uint64_t ClipboardManager::selection_request_seq(Selection sel) const noexcept {
+  return (sel == Selection::Primary) ? primary_req_seq_ : clipboard_req_seq_;
+}
+
 void ClipboardManager::close() {
   if (display_) {
     if (window_ != None) {
@@ -137,6 +141,12 @@ void ClipboardManager::handle_selection_request(const XSelectionRequestEvent &re
     (void)XSendEvent(display_, req.requestor, False, 0, &reply);
     XFlush(display_);
     return;
+  }
+
+  if (req.selection == atom_clipboard_) {
+    ++clipboard_req_seq_;
+  } else if (req.selection == atom_primary_) {
+    ++primary_req_seq_;
   }
 
   if (req.target == atom_targets_) {

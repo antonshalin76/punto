@@ -181,8 +181,31 @@ private:
   /// Ожидает указанное время, буферизуя входящие события
   void wait_and_buffer(std::chrono::microseconds us);
 
+  /// Ожидает указанное время или до выполнения условия, буферизуя ввод
+  void wait_and_buffer_until(std::chrono::microseconds us,
+                             const std::function<bool()> &stop_pred);
+
   /// Обрабатывает все накопленные события
   void drain_pending_events();
+
+  /// Восстанавливает буфер обмена, если есть отложенная операция
+  void flush_pending_clipboard_restore(bool force);
+
+  struct PendingClipboardRestore {
+    bool restore_clipboard = false;
+    bool restore_primary = false;
+
+    std::optional<std::string> clipboard;
+    std::optional<std::string> primary;
+
+    std::uint64_t clip_req_seq = 0;
+    std::uint64_t primary_req_seq = 0;
+
+    std::chrono::steady_clock::time_point deadline{};
+  };
+
+  void finalize_clipboard_restore(PendingClipboardRestore plan,
+                                  bool request_seen);
 
   /// Во время макроса мы буферизуем ввод. Если макрос стартует очень быстро,
   /// key-release (в т.ч. для SPACE/последней буквы) может оказаться в
@@ -282,6 +305,8 @@ private:
   std::unique_ptr<X11Session> x11_session_;
   std::unique_ptr<ClipboardManager> clipboard_;
   std::unique_ptr<SoundManager> sound_manager_;
+
+  std::optional<PendingClipboardRestore> pending_clip_restore_;
 
   bool initialized_ = false;
 

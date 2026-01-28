@@ -11,6 +11,7 @@
 #include <X11/Xlib.h>
 
 #include <chrono>
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -100,6 +101,9 @@ public:
    */
   [[nodiscard]] bool is_active_window_terminal();
 
+  /// Монотонный счётчик SelectionRequest по типу selection.
+  [[nodiscard]] std::uint64_t selection_request_seq(Selection sel) const noexcept;
+
 private:
   /**
    * @brief Атом selection по типу
@@ -114,6 +118,7 @@ private:
 
   /// Ожидание SelectionNotify события (для get_text).
   bool wait_for_selection_notify(Atom property);
+
 
   X11Session &session_;
   std::chrono::milliseconds timeout_;
@@ -135,6 +140,10 @@ private:
   std::string primary_text_;
   bool owns_clipboard_ = false;
   bool owns_primary_ = false;
+
+  // Счётчики запросов selection (индикатор того, что приложение запросило буфер).
+  std::uint64_t clipboard_req_seq_ = 0;
+  std::uint64_t primary_req_seq_ = 0;
 };
 
 } // namespace punto

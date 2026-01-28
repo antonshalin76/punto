@@ -247,10 +247,6 @@ X11Session::RefreshResult X11Session::refresh() {
 
     auto fallback_user = find_active_user_fallback();
     if (!fallback_user) {
-      if (was_valid) {
-        reset();
-        return RefreshResult::Invalidated;
-      }
       return RefreshResult::Unchanged;
     }
 

@@ -93,6 +93,9 @@ private:
   /// Обновляет состояние модификаторов
   void update_modifier_state(ScanCode code, bool pressed);
 
+  /// Сбрасывает состояние всех модификаторов (после release_all_modifiers)
+  void reset_modifiers_state();
+
   /// Определяет действие по горячей клавише
   [[nodiscard]] HotkeyAction determine_hotkey_action(ScanCode code) const;
 
@@ -303,6 +306,7 @@ private:
   std::chrono::steady_clock::time_point xkb_disabled_at_{};
 
   std::unique_ptr<X11Session> x11_session_;
+  bool x11_refresh_pending_{false}; // Флаг фонового refresh
   std::unique_ptr<ClipboardManager> clipboard_;
   std::unique_ptr<SoundManager> sound_manager_;
 
@@ -322,8 +326,13 @@ private:
   // даже если они пришли в одном SYN-фрейме вместе с press других клавиш.
   std::array<std::uint8_t, KEY_CNT> key_down_{};
 
-  /// Флаг выполнения макроса (автокоррекции)
-  bool is_processing_macro_ = false;
+  /// Флаг выполнения макроса (автокоррекции).
+  /// Атомарный для безопасности при взаимодействии с IPC callbacks.
+  std::atomic<bool> is_processing_macro_{false};
+
+  /// Флаг аварийного прерывания макроса при переполнении очереди событий.
+  /// Сбрасывается в drain_pending_events().
+  bool event_overflow_abort_requested_{false};
 
   /// Если перехватили Ctrl+Z и НЕ пропустили press наружу, то все события Z
   /// (repeat/release) до первого release нужно проглотить, иначе приложение

@@ -8,9 +8,11 @@
 #include "punto/text_processor.hpp"
 #include "punto/scancode_map.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace punto {
 
@@ -338,12 +340,21 @@ std::string lat_to_cyr(std::string_view text) {
 
   const auto &multi_map = get_lat_to_cyr_multi();
 
+  // Сортируем замены по длине from в убывающем порядке
+  // чтобы "shch" обрабатывался раньше "sh"
+  std::vector<std::pair<std::string_view, std::string_view>> sorted_multi(
+      multi_map.begin(), multi_map.end());
+  std::sort(sorted_multi.begin(), sorted_multi.end(),
+            [](const auto &a, const auto &b) {
+              return a.first.size() > b.first.size();
+            });
+
   // Сначала заменяем многосимвольные последовательности
   std::string temp{text};
-  for (const auto &[from, to] : multi_map) {
+  for (const auto &[from, to] : sorted_multi) {
     std::size_t pos = 0;
     while ((pos = temp.find(from, pos)) != std::string::npos) {
-      temp.replace(pos, from.size(), to);
+      temp.replace(pos, from.size(), std::string{to});
       pos += to.size();
     }
   }

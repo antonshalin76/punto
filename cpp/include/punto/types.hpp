@@ -75,6 +75,18 @@ struct ModifierState {
     return left_meta || right_meta;
   }
 
+  /// Сбрасывает все модификаторы в false
+  constexpr void reset_all() noexcept {
+    left_shift = false;
+    right_shift = false;
+    left_ctrl = false;
+    right_ctrl = false;
+    left_alt = false;
+    right_alt = false;
+    left_meta = false;
+    right_meta = false;
+  }
+
   /// Сброс всех модификаторов
   constexpr void reset() noexcept {
     left_shift = right_shift = false;

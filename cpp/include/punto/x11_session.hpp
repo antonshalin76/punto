@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -60,8 +61,24 @@ public:
    *
    * Используется, чтобы не «прилипать» к greeter (gdm/lightdm) на этапе boot
    * и корректно переживать logout/login.
+   *
+   * ВНИМАНИЕ: Блокирующий вызов! Может занять 2-3 секунды.
+   * Для неблокирующего варианта используйте start_background_refresh() + poll_refresh_result().
    */
   [[nodiscard]] RefreshResult refresh();
+
+  /**
+   * @brief Запускает refresh в фоновом потоке (неблокирующий)
+   *
+   * Если refresh уже запущен, ничего не делает.
+   */
+  void start_background_refresh();
+
+  /**
+   * @brief Проверяет результат фонового refresh (неблокирующий)
+   * @return Результат если refresh завершен, nullopt если еще выполняется
+   */
+  [[nodiscard]] std::optional<RefreshResult> poll_refresh_result();
 
   /**
    * @brief Сбрасывает состояние (сессия считается невалидной)
@@ -147,6 +164,10 @@ private:
   std::atomic<bool> initialized_{false};
   uid_t original_uid_ = 0;
   gid_t original_gid_ = 0;
+
+  // Фоновый refresh
+  mutable std::mutex refresh_mutex_;
+  std::future<RefreshResult> pending_refresh_;
 };
 
 } // namespace punto

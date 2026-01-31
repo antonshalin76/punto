@@ -115,6 +115,17 @@ public:
   /// Задержка (использует wait_func_ если установлена, иначе usleep)
   void delay(std::chrono::microseconds us) const noexcept;
 
+  // =========================================================================
+  // Публичные константы таймингов (для использования в EventLoop и др.)
+  // =========================================================================
+
+  // Централизованные задержки для операций замены текста
+  static constexpr std::chrono::microseconds kPostLayoutSwitchWait{110000};  // После переключения раскладки
+  static constexpr std::chrono::microseconds kAfterBackspaceWaitTerminal{60000};  // После Backspace (терминал)
+  static constexpr std::chrono::microseconds kAfterBackspaceWaitGUI{25000};  // После Backspace (GUI)
+  static constexpr std::chrono::microseconds kPrePasteWaitTerminal{150000};  // До Paste (терминал)
+  static constexpr std::chrono::microseconds kPrePasteWaitGUI{100000};  // До Paste (GUI)
+
 private:
   static void write_all_or_die(int fd, const void *data, std::size_t bytes);
 

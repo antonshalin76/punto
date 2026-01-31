@@ -16,6 +16,7 @@
 #include <iostream>
 #include <pwd.h>
 #include <sstream>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
@@ -79,12 +80,17 @@ namespace {
   return true;
 }
 
-/// Выполняет команду и возвращает stdout (в конце без \n/\r)
-std::string exec_command(const std::string &cmd) {
+/// Выполняет команду с таймаутом и возвращает stdout (в конце без \n/\r).
+/// При таймауте возвращает пустую строку.
+std::string exec_command(const std::string &cmd, int timeout_seconds = 2) {
   std::array<char, 256> buffer{};
   std::string result;
 
-  FILE *pipe = popen(cmd.c_str(), "r");
+  // Используем coreutils timeout для ограничения времени выполнения
+  std::string timed_cmd =
+      "timeout " + std::to_string(timeout_seconds) + "s " + cmd;
+
+  FILE *pipe = popen(timed_cmd.c_str(), "r");
   if (!pipe)
     return "";
 
@@ -92,7 +98,13 @@ std::string exec_command(const std::string &cmd) {
          nullptr) {
     result += buffer.data();
   }
-  pclose(pipe);
+
+  int status = pclose(pipe);
+  // Код 124 = timeout завершил процесс по таймауту
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 124) {
+    std::cerr << "[punto] exec_command timeout: " << cmd << "\n";
+    return "";
+  }
 
   while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
     result.pop_back();
@@ -735,6 +747,40 @@ bool X11Session::set_keyboard_layout(int index) const {
 
   switch_to_root();
   return success;
+}
+
+void X11Session::start_background_refresh() {
+  std::lock_guard<std::mutex> lock(refresh_mutex_);
+
+  // Если уже есть активный refresh, ничего не делаем
+  if (pending_refresh_.valid()) {
+    // Проверяем, не завершился ли он
+    if (pending_refresh_.wait_for(std::chrono::milliseconds{0}) !=
+        std::future_status::ready) {
+      return; // Еще выполняется
+    }
+    // Завершился, но результат не забрали - игнорируем старый результат
+    pending_refresh_ = {};
+  }
+
+  pending_refresh_ = std::async(std::launch::async, [this]() {
+    return this->refresh();
+  });
+}
+
+std::optional<X11Session::RefreshResult> X11Session::poll_refresh_result() {
+  std::lock_guard<std::mutex> lock(refresh_mutex_);
+
+  if (!pending_refresh_.valid()) {
+    return std::nullopt;
+  }
+
+  if (pending_refresh_.wait_for(std::chrono::milliseconds{0}) ==
+      std::future_status::ready) {
+    return pending_refresh_.get();
+  }
+
+  return std::nullopt;
 }
 
 } // namespace punto

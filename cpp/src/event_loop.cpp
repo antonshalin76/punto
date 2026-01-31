@@ -42,7 +42,9 @@ oneshot_paste_waits(bool is_terminal) noexcept {
       // асинхронной. Даем больше времени, чтобы не восстановить CLIPBOARD
       // слишком рано.
       /*post_paste=*/std::chrono::microseconds{250000},
-      /*after_backspace=*/std::chrono::microseconds{0},
+      // FIX: Для GUI-приложений тоже нужна пауза после Backspace, иначе Paste
+      // может прийти до фактического удаления символов (гонка).
+      /*after_backspace=*/std::chrono::microseconds{25000},
   };
 }
 
@@ -239,18 +241,30 @@ int EventLoop::run() {
     flush_pending_clipboard_restore(false);
 
     // Периодически проверяем, не сменилась ли активная user-сессия.
+    // Используем фоновый refresh чтобы не блокировать обработку клавиатуры.
     {
       const auto now = std::chrono::steady_clock::now();
-      if (now - last_x11_check_time >= kX11CheckInterval) {
-        last_x11_check_time = now;
 
-        const X11Session::RefreshResult rr = x11_session_->refresh();
-        if (rr == X11Session::RefreshResult::Updated) {
-          rebuild_x11_deps();
-        } else if (rr == X11Session::RefreshResult::Invalidated) {
-          teardown_x11_deps();
-          std::cerr
-              << "[punto] X11 session invalidated (no active user session)\n";
+      // Запускаем фоновый refresh если пришло время и нет активного
+      if (!x11_refresh_pending_ && now - last_x11_check_time >= kX11CheckInterval) {
+        x11_session_->start_background_refresh();
+        x11_refresh_pending_ = true;
+      }
+
+      // Проверяем результат фонового refresh (неблокирующий poll)
+      if (x11_refresh_pending_) {
+        auto result = x11_session_->poll_refresh_result();
+        if (result.has_value()) {
+          x11_refresh_pending_ = false;
+          last_x11_check_time = now;
+
+          if (*result == X11Session::RefreshResult::Updated) {
+            rebuild_x11_deps();
+          } else if (*result == X11Session::RefreshResult::Invalidated) {
+            teardown_x11_deps();
+            std::cerr
+                << "[punto] X11 session invalidated (no active user session)\n";
+          }
         }
       }
     }
@@ -334,8 +348,19 @@ void EventLoop::emit_passthrough_event(const input_event &ev) {
 
 void EventLoop::handle_event(const input_event &ev) {
   // If we are processing a macro, buffer ALL events (including EV_SYN, EV_MSC)
-  if (is_processing_macro_) {
+  if (is_processing_macro_.load(std::memory_order_acquire)) {
     constexpr std::size_t kPendingEventsCap = 5000;
+    constexpr std::size_t kOverflowAbortThreshold = 4000; // 80% - прерываем макрос
+
+    // Проверяем порог аварийного прерывания
+    if (pending_events_.size() >= kOverflowAbortThreshold &&
+        !event_overflow_abort_requested_) {
+      event_overflow_abort_requested_ = true;
+      std::cerr << "[punto] ABORT: event queue near overflow ("
+                << pending_events_.size() << "/" << kPendingEventsCap
+                << "), aborting macro execution\n";
+    }
+
     if (pending_events_.size() < kPendingEventsCap) {
       pending_events_.push_back(ev);
     } else {
@@ -529,7 +554,7 @@ void EventLoop::handle_event(const input_event &ev) {
     auto full_word = buffer_.current_word();
 
     // 1. Синхронизируем раскладку (на каждом разделителе!)
-    if (!is_processing_macro_) {
+    if (!is_processing_macro_.load(std::memory_order_acquire)) {
       x11_session_->apply_environment();
       int os_layout = x11_session_->get_current_keyboard_layout();
       if (os_layout != -1 && os_layout != current_layout_) {
@@ -641,7 +666,7 @@ void EventLoop::handle_event(const input_event &ev) {
       code == KEY_APOSTROPHE || code == KEY_SLASH || code == KEY_MINUS) {
 
     // Синхронизируем раскладку (только синхронизация, без анализа)
-    if (!is_processing_macro_) {
+    if (!is_processing_macro_.load(std::memory_order_acquire)) {
       int os_layout = x11_session_->get_current_keyboard_layout();
       if (os_layout != -1 && os_layout != current_layout_) {
         std::cerr << "[punto] Layout SYNC: " << current_layout_ << " -> "
@@ -753,6 +778,29 @@ void EventLoop::update_modifier_state(ScanCode code, bool pressed) {
   default:
     break;
   }
+}
+
+void EventLoop::reset_modifiers_state() {
+  // Сбрасываем флаги модификаторов
+  modifiers_.reset_all();
+
+  // Сбрасываем key_down_ для модификаторов
+  if (KEY_LEFTSHIFT < key_down_.size())
+    key_down_[KEY_LEFTSHIFT] = 0;
+  if (KEY_RIGHTSHIFT < key_down_.size())
+    key_down_[KEY_RIGHTSHIFT] = 0;
+  if (KEY_LEFTCTRL < key_down_.size())
+    key_down_[KEY_LEFTCTRL] = 0;
+  if (KEY_RIGHTCTRL < key_down_.size())
+    key_down_[KEY_RIGHTCTRL] = 0;
+  if (KEY_LEFTALT < key_down_.size())
+    key_down_[KEY_LEFTALT] = 0;
+  if (KEY_RIGHTALT < key_down_.size())
+    key_down_[KEY_RIGHTALT] = 0;
+  if (KEY_LEFTMETA < key_down_.size())
+    key_down_[KEY_LEFTMETA] = 0;
+  if (KEY_RIGHTMETA < key_down_.size())
+    key_down_[KEY_RIGHTMETA] = 0;
 }
 
 HotkeyAction EventLoop::determine_hotkey_action(ScanCode code) const {
@@ -1000,6 +1048,7 @@ bool EventLoop::paste_text_oneshot(std::string_view text,
   wait_and_buffer(waits.pre_paste);
 
   injector->release_all_modifiers();
+  reset_modifiers_state();
 
   // Для Ctrl+Shift+V в некоторых терминалах нужен EN layout.
   const std::optional<int> restore_layout =
@@ -1117,6 +1166,7 @@ bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
 
   // Важно: replace вызывается только из main thread в режиме macro.
   injector->release_all_modifiers();
+  reset_modifiers_state();
 
   // Даем физическим key-release шанс прийти в stdin.
   wait_and_buffer(std::chrono::microseconds{30000});
@@ -1127,12 +1177,12 @@ bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
     injector->send_backspace(backspace_count, true);
     flush_pending_release_frames();
 
-    // КРИТИЧЕСКАЯ ПАУЗА: терминалы/TTY UI иногда применяют Backspace не
-    // мгновенно. Без паузы Paste может прийти до фактического удаления
-    // символов.
-    if (waits.after_backspace.count() > 0) {
-      wait_and_buffer(waits.after_backspace);
-    }
+    // КРИТИЧЕСКАЯ ПАУЗА: приложения обрабатывают Backspace асинхронно.
+    // Без паузы Paste может прийти до фактического удаления символов.
+    // Гарантируем минимум 25ms даже если config указывает меньше.
+    constexpr auto kMinBackspaceWait = std::chrono::microseconds{25000};
+    const auto actual_wait = std::max(waits.after_backspace, kMinBackspaceWait);
+    wait_and_buffer(actual_wait);
   }
 
   // Для Ctrl+Shift+V в некоторых терминалах нужен EN layout.
@@ -1200,6 +1250,10 @@ void EventLoop::set_last_undo_record(std::string original_text,
   rec.applied_at = std::chrono::steady_clock::now();
   rec.user_seq_at_apply = user_seq_;
 
+  std::cerr << "[punto] Undo record saved: original=\"" << rec.original_text
+            << "\" inserted_len=" << rec.inserted_len
+            << " inserted=\"" << inserted_text << "\"\n";
+
   last_undo_ = std::move(rec);
 }
 
@@ -1249,13 +1303,14 @@ bool EventLoop::action_undo_last_correction() {
   history_.reset();
   buffer_.reset_all();
 
-  is_processing_macro_ = true;
+  is_processing_macro_.store(true, std::memory_order_release);
   struct DrainGuard {
     EventLoop *self;
     ~DrainGuard() { self->drain_pending_events(); }
   } drain_guard{this};
 
   std::cerr << "[punto] Undo: start (erase=" << rec.inserted_len
+            << " original=\"" << rec.original_text << "\""
             << " restore_layout="
             << (rec.restore_layout.has_value()
                     ? std::to_string(*rec.restore_layout)
@@ -1322,7 +1377,7 @@ void EventLoop::action_invert_layout_word() {
   }
 
   // Удаляем слово + trailing и вставляем replacement одной операцией.
-  is_processing_macro_ = true;
+  is_processing_macro_.store(true, std::memory_order_release);
   struct DrainGuard {
     EventLoop *self;
     ~DrainGuard() { self->drain_pending_events(); }
@@ -1345,7 +1400,7 @@ void EventLoop::action_auto_invert_word(std::span<const KeyEntry> word,
     return;
 
   std::cerr << "[punto] AUTO-INVERT: start (len=" << word.size() << ")\n";
-  is_processing_macro_ = true;
+  is_processing_macro_.store(true, std::memory_order_release);
 
   auto injector = std::atomic_load(&injector_);
   if (!injector) {
@@ -1354,6 +1409,7 @@ void EventLoop::action_auto_invert_word(std::span<const KeyEntry> word,
 
   // 1. Отпускаем всё
   injector->release_all_modifiers();
+  reset_modifiers_state();
   wait_and_buffer(std::chrono::microseconds{5000});
 
   // 2. Удаляем слово (turbo)
@@ -1363,13 +1419,13 @@ void EventLoop::action_auto_invert_word(std::span<const KeyEntry> word,
   // и обновить позицию курсора перед началом ввода новых символов.
   // Без этой паузы в медленных приложениях (Electron, Java Swing)
   // возникает гонка: новые символы вводятся до того, как удалены старые.
-  wait_and_buffer(std::chrono::microseconds{60000}); // 60ms
+  wait_and_buffer(KeyInjector::kAfterBackspaceWaitTerminal);
 
   // 3. Переключаем раскладку
   switch_layout(true);
 
   // ДАЕМ ОС ВРЕМЯ НА ПЕРЕКЛЮЧЕНИЕ
-  wait_and_buffer(std::chrono::microseconds{110000});
+  wait_and_buffer(KeyInjector::kPostLayoutSwitchWait);
 
   // 4. Перепечатываем слово (turbo)
   injector->retype_buffer(word, true);
@@ -1413,7 +1469,7 @@ void EventLoop::action_invert_case_word() {
     }
   }
 
-  is_processing_macro_ = true;
+  is_processing_macro_.store(true, std::memory_order_release);
   struct DrainGuard {
     EventLoop *self;
     ~DrainGuard() { self->drain_pending_events(); }
@@ -1447,7 +1503,9 @@ bool EventLoop::process_selection(
   const bool is_terminal = clipboard_->is_active_window_terminal();
 
   injector->release_all_modifiers();
-  wait_and_buffer(std::chrono::microseconds{30000});
+  reset_modifiers_state();
+  // Увеличенная пауза для VS Code и других приложений где Alt активирует меню
+  wait_and_buffer(std::chrono::microseconds{150000});
   flush_pending_release_frames();
 
   std::optional<std::string> text;
@@ -1514,7 +1572,7 @@ bool EventLoop::process_selection(
   }
 
   // Даём X11 шанс обновить selections.
-  wait_and_buffer(std::chrono::microseconds{150000});
+  wait_and_buffer(KeyInjector::kPrePasteWaitTerminal);
 
   // Для Ctrl+Shift+V в некоторых терминалах нужен EN layout.
   const std::optional<int> restore_layout =
@@ -1563,6 +1621,10 @@ void EventLoop::wait_and_buffer_until(
   const auto end = start + us;
 
   while (true) {
+    // Аварийный выход при переполнении очереди событий
+    if (event_overflow_abort_requested_) {
+      break;
+    }
     if (stop_pred && stop_pred()) {
       break;
     }
@@ -1601,6 +1663,17 @@ void EventLoop::wait_and_buffer_until(
       while (true) {
         if (std::fread(&ev, sizeof(ev), 1, stdin) == 1) {
           constexpr std::size_t kPendingEventsCap = 5000;
+          constexpr std::size_t kOverflowAbortThreshold = 4000;
+
+          // Проверяем порог аварийного прерывания
+          if (pending_events_.size() >= kOverflowAbortThreshold &&
+              !event_overflow_abort_requested_) {
+            event_overflow_abort_requested_ = true;
+            std::cerr << "[punto] ABORT(wait): event queue near overflow ("
+                      << pending_events_.size() << "/" << kPendingEventsCap
+                      << "), aborting macro\n";
+          }
+
           if (pending_events_.size() < kPendingEventsCap) {
             pending_events_.push_back(ev);
           } else {
@@ -1617,6 +1690,10 @@ void EventLoop::wait_and_buffer_until(
         if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN)) {
           break;
         }
+      }
+      // Проверяем флаг abort после чтения событий
+      if (event_overflow_abort_requested_) {
+        break;
       }
       if (stop_pred && stop_pred()) {
         break;
@@ -1810,24 +1887,28 @@ void EventLoop::flush_pending_release_frames() {
 }
 
 void EventLoop::drain_pending_events() {
-  if (pending_events_.empty()) {
-    is_processing_macro_ = false;
-    return;
+  // FIX: Сначала изымаем все события атомарно (swap), затем сбрасываем флаг.
+  // Это предотвращает рассинхронизацию, если handle_event() вызовет новый макрос.
+  std::deque<input_event> events_to_process;
+  events_to_process.swap(pending_events_);
+
+  if (!events_to_process.empty()) {
+    std::cerr << "[punto] Input Guard: draining " << events_to_process.size()
+              << " events\n";
   }
 
-  std::cerr << "[punto] Input Guard: draining " << pending_events_.size()
-            << " events\n";
-  is_processing_macro_ = false;
+  // Сбрасываем флаги ПОСЛЕ изъятия очереди, но ДО обработки.
+  // Новые макросы будут буферизовать в свежую pending_events_.
+  is_processing_macro_.store(false, std::memory_order_release);
+  event_overflow_abort_requested_ = false;
 
-  while (!pending_events_.empty()) {
-    input_event ev = pending_events_.front();
-    pending_events_.pop_front();
+  for (const auto &ev : events_to_process) {
     handle_event(ev);
   }
 }
 
 void EventLoop::process_ready_results() {
-  if (is_processing_macro_) {
+  if (is_processing_macro_.load(std::memory_order_acquire)) {
     return;
   }
 
@@ -2101,7 +2182,7 @@ void EventLoop::apply_correction(const PendingWordMeta &meta,
             << " tail_len=" << tail_scratch_.size() << " erase=" << erase
             << "\n";
 
-  is_processing_macro_ = true;
+  is_processing_macro_.store(true, std::memory_order_release);
   struct DrainGuard {
     EventLoop *self;
     ~DrainGuard() { self->drain_pending_events(); }
@@ -2220,7 +2301,7 @@ void EventLoop::apply_case_correction(
     }
   }
 
-  is_processing_macro_ = true;
+  is_processing_macro_.store(true, std::memory_order_release);
   struct DrainGuard {
     EventLoop *self;
     ~DrainGuard() { self->drain_pending_events(); }
@@ -2339,7 +2420,7 @@ void EventLoop::apply_combined_correction(
     }
   }
 
-  is_processing_macro_ = true;
+  is_processing_macro_.store(true, std::memory_order_release);
   struct DrainGuard {
     EventLoop *self;
     ~DrainGuard() { self->drain_pending_events(); }
@@ -2378,7 +2459,7 @@ void EventLoop::apply_combined_correction(
 }
 
 void EventLoop::action_invert_layout_selection() {
-  is_processing_macro_ = true;
+  is_processing_macro_.store(true, std::memory_order_release);
 
   const int restore_layout_for_undo = current_layout_;
 
@@ -2394,7 +2475,7 @@ void EventLoop::action_invert_layout_selection() {
 }
 
 void EventLoop::action_invert_case_selection() {
-  is_processing_macro_ = true;
+  is_processing_macro_.store(true, std::memory_order_release);
   (void)process_selection(
       [](std::string_view text) { return invert_case(text); },
       /*restore_layout_for_undo=*/std::nullopt);
@@ -2402,7 +2483,7 @@ void EventLoop::action_invert_case_selection() {
 }
 
 void EventLoop::action_transliterate_selection() {
-  is_processing_macro_ = true;
+  is_processing_macro_.store(true, std::memory_order_release);
   (void)process_selection(
       [](std::string_view text) { return transliterate(text); },
       /*restore_layout_for_undo=*/std::nullopt);

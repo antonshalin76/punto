@@ -384,6 +384,7 @@ void EventLoop::handle_event(const input_event &ev) {
   const ScanCode code = ev.code;
   const bool is_release = (ev.value == 0);
   const bool is_press = (ev.value == 1);
+  const bool is_repeat = (ev.value == 2);
   const bool pressed = !is_release;
 
   // Если мы перехватили Ctrl+Z и не отдали press наружу, то все последующие
@@ -420,6 +421,14 @@ void EventLoop::handle_event(const input_event &ev) {
   // Обрабатываем только нажатия/повторы (release пропускаем)
   // =========================================================================
   if (is_release) {
+    emit_passthrough_event(ev);
+    return;
+  }
+
+  // Повторы разделителей (SPACE/TAB) должны проходить в приложение,
+  // но не должны повторно запускать автоанализ/автозамену.
+  // Иначе возможны дубли пробела и рассинхронизация контекста слова.
+  if (is_repeat && (code == KEY_SPACE || code == KEY_TAB)) {
     emit_passthrough_event(ev);
     return;
   }
@@ -464,6 +473,9 @@ void EventLoop::handle_event(const input_event &ev) {
   // =========================================================================
 
   if (code == KEY_PAUSE) {
+    // По хоткею нужна реакция только на физическое нажатие.
+    // Повтор клавиши (EV_KEY value=2) может запускать макрос многократно,
+    // что временно ломает обработку ввода.
     if (!is_press) {
       emit_passthrough_event(ev);
       return;
@@ -530,7 +542,7 @@ void EventLoop::handle_event(const input_event &ev) {
     else if (mod_key == KEY_RIGHTSHIFT)
       mod_pressed = modifiers_.right_shift;
 
-    if (mod_pressed && code == layout_key) {
+    if (is_press && mod_pressed && code == layout_key) {
       // Пользователь переключает раскладку вручную!
       current_layout_ = (current_layout_ == 0) ? 1 : 0;
       std::cerr << "[punto] USER layout switch -> "

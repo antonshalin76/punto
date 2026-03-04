@@ -104,6 +104,10 @@ public:
   /// Монотонный счётчик SelectionRequest по типу selection.
   [[nodiscard]] std::uint64_t selection_request_seq(Selection sel) const noexcept;
 
+  /// Проверяет, владеем ли мы CLIPBOARD и PRIMARY (после set_text).
+  /// Возвращает false если ownership был перехвачен другим процессом.
+  [[nodiscard]] bool verify_ownership() const;
+
 private:
   /**
    * @brief Атом selection по типу

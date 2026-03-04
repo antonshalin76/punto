@@ -295,6 +295,31 @@ ClipboardResult ClipboardManager::set_text(Selection sel,
   return ClipboardResult::Ok;
 }
 
+bool ClipboardManager::verify_ownership() const {
+  if (!display_ || window_ == None) {
+    return false;
+  }
+
+  // Проверяем, что мы всё ещё владеем selections, которые мы устанавливали.
+  // Если другой экземпляр punto-daemon перезаписал selection, ownership
+  // будет указывать на чужое окно.
+  if (owns_clipboard_) {
+    const Window owner = XGetSelectionOwner(display_, atom_clipboard_);
+    if (owner != window_) {
+      return false;
+    }
+  }
+
+  if (owns_primary_) {
+    const Window owner = XGetSelectionOwner(display_, atom_primary_);
+    if (owner != window_) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 bool ClipboardManager::is_active_window_terminal() {
   if (!display_) {
     if (!open())

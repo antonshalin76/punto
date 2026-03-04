@@ -30,6 +30,7 @@
 #include "punto/ipc_server.hpp"
 #include "punto/key_injector.hpp"
 #include "punto/layout_analyzer.hpp"
+#include "punto/macro_lock.hpp"
 #include "punto/types.hpp"
 #include "punto/undo_detector.hpp"
 #include "punto/x11_session.hpp"
@@ -131,6 +132,14 @@ private:
   // =========================================================================
   // Вспомогательные методы
   // =========================================================================
+
+  /// Синхронизирует current_layout_ с ОС (best-effort, для использования
+  /// перед макросами). Возвращает текущую раскладку ОС или -1 при ошибке.
+  int sync_layout_from_os();
+
+  /// Проверяет, что punto по-прежнему владеет clipboard/primary после set_text.
+  /// Возвращает false если ownership был украден (другой экземпляр punto).
+  [[nodiscard]] bool verify_clipboard_ownership() const;
 
   /// Переключает раскладку через системный hotkey (toggle).
   /// Используется как fallback, если XKB недоступен.
@@ -374,6 +383,10 @@ private:
 
   /// IPC сервер для управления из tray-приложения
   std::unique_ptr<IpcServer> ipc_server_;
+
+  /// Межпроцессная блокировка для сериализации макросов между экземплярами
+  /// punto-daemon (один на каждую клавиатуру в udevmon pipeline).
+  MacroLock macro_lock_;
 
   /// Перезагружает конфигурацию (вызывается из IPC потока)
   /// Если config_path не пуст, пытается загрузить именно этот файл.

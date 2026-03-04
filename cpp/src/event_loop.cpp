@@ -5,6 +5,7 @@
 
 #include "punto/event_loop.hpp"
 #include "punto/key_entry_text.hpp"
+#include "punto/macro_lock.hpp"
 #include "punto/scancode_map.hpp"
 #include "punto/sound_manager.hpp"
 #include "punto/text_processor.hpp"
@@ -844,6 +845,29 @@ HotkeyAction EventLoop::determine_hotkey_action(ScanCode code) const {
   return HotkeyAction::InvertLayoutWord;
 }
 
+int EventLoop::sync_layout_from_os() {
+  if (!x11_session_ || !x11_session_->is_valid()) {
+    return -1;
+  }
+
+  x11_session_->apply_environment();
+  const int os_layout = x11_session_->get_current_keyboard_layout();
+  if (os_layout >= 0 && os_layout != current_layout_) {
+    std::cerr << "[punto] Layout PRE-SYNC: " << current_layout_ << " -> "
+              << os_layout << "\n";
+    current_layout_ = os_layout;
+    last_sync_time_ = std::chrono::steady_clock::now();
+  }
+  return os_layout;
+}
+
+bool EventLoop::verify_clipboard_ownership() const {
+  if (!clipboard_) {
+    return false;
+  }
+  return clipboard_->verify_ownership();
+}
+
 void EventLoop::switch_layout(bool play_sound) {
   // Инвертируем внутреннее состояние
   current_layout_ = (current_layout_ == 0) ? 1 : 0;
@@ -1046,6 +1070,13 @@ bool EventLoop::paste_text_oneshot(std::string_view text,
     }
   }
 
+  // Проверяем, что другой экземпляр punto-daemon не перехватил selection.
+  if (!clipboard_->verify_ownership()) {
+    std::cerr << "[punto] Clipboard: ownership stolen after set_text "
+                 "(another instance?), aborting paste\n";
+    return false;
+  }
+
   // Даём X11 шанс обновить CLIPBOARD, иначе приложение может прочитать
   // старое значение.
   //
@@ -1162,6 +1193,14 @@ bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
                 << static_cast<int>(set_primary) << ")\n";
       return false;
     }
+  }
+
+  // Проверяем, что другой экземпляр punto-daemon не перехватил selection
+  // между нашим set_text и этой проверкой.
+  if (!clipboard_->verify_ownership()) {
+    std::cerr << "[punto] Clipboard: ownership stolen after set_text "
+                 "(another instance?), aborting replace\n";
+    return false;
   }
 
   // Даём X11 шанс обновить CLIPBOARD.
@@ -1315,6 +1354,13 @@ bool EventLoop::action_undo_last_correction() {
   history_.reset();
   buffer_.reset_all();
 
+  MacroLockGuard lock_guard(macro_lock_);
+  if (!lock_guard.owns_lock()) {
+    std::cerr << "[punto] Undo: не удалось захватить macro lock (skip)\n";
+    return false;
+  }
+  sync_layout_from_os();
+
   is_processing_macro_.store(true, std::memory_order_release);
   struct DrainGuard {
     EventLoop *self;
@@ -1389,6 +1435,13 @@ void EventLoop::action_invert_layout_word() {
   }
 
   // Удаляем слово + trailing и вставляем replacement одной операцией.
+  MacroLockGuard lock_guard(macro_lock_);
+  if (!lock_guard.owns_lock()) {
+    std::cerr << "[punto] Invert-layout-word: не удалось захватить macro lock (skip)\n";
+    return;
+  }
+  sync_layout_from_os();
+
   is_processing_macro_.store(true, std::memory_order_release);
   struct DrainGuard {
     EventLoop *self;
@@ -1412,6 +1465,13 @@ void EventLoop::action_auto_invert_word(std::span<const KeyEntry> word,
     return;
 
   std::cerr << "[punto] AUTO-INVERT: start (len=" << word.size() << ")\n";
+  MacroLockGuard lock_guard(macro_lock_);
+  if (!lock_guard.owns_lock()) {
+    std::cerr << "[punto] AUTO-INVERT: не удалось захватить macro lock (skip)\n";
+    return;
+  }
+  sync_layout_from_os();
+
   is_processing_macro_.store(true, std::memory_order_release);
 
   auto injector = std::atomic_load(&injector_);
@@ -1480,6 +1540,13 @@ void EventLoop::action_invert_case_word() {
       replacement.push_back('\t');
     }
   }
+
+  MacroLockGuard lock_guard(macro_lock_);
+  if (!lock_guard.owns_lock()) {
+    std::cerr << "[punto] Invert-case-word: не удалось захватить macro lock (skip)\n";
+    return;
+  }
+  sync_layout_from_os();
 
   is_processing_macro_.store(true, std::memory_order_release);
   struct DrainGuard {
@@ -2194,6 +2261,14 @@ void EventLoop::apply_correction(const PendingWordMeta &meta,
             << " tail_len=" << tail_scratch_.size() << " erase=" << erase
             << "\n";
 
+  MacroLockGuard lock_guard(macro_lock_);
+  if (!lock_guard.owns_lock()) {
+    std::cerr << "[punto] Async: не удалось захватить macro lock for task_id="
+              << meta.task_id << " (skip)\n";
+    return;
+  }
+  sync_layout_from_os();
+
   is_processing_macro_.store(true, std::memory_order_release);
   struct DrainGuard {
     EventLoop *self;
@@ -2209,6 +2284,17 @@ void EventLoop::apply_correction(const PendingWordMeta &meta,
     std::cerr << "[punto] Async: oneshot replace failed for task_id="
               << meta.task_id << " (skip)\n";
     return;
+  }
+
+  // Пост-коррекционная верификация раскладки: другой экземпляр мог переключить.
+  {
+    const int post_layout = sync_layout_from_os();
+    if (post_layout >= 0 && post_layout != target_layout) {
+      std::cerr << "[punto] Async: post-correction layout mismatch "
+                << post_layout << " != " << target_layout
+                << ", retrying set_layout\n";
+      (void)set_layout(target_layout, /*play_sound=*/false);
+    }
   }
 
   if (original_text_opt.has_value()) {
@@ -2312,6 +2398,14 @@ void EventLoop::apply_case_correction(
       original_text_opt = std::move(tmp);
     }
   }
+
+  MacroLockGuard lock_guard(macro_lock_);
+  if (!lock_guard.owns_lock()) {
+    std::cerr << "[punto] Async: не удалось захватить macro lock for case task_id="
+              << meta.task_id << " (skip)\n";
+    return;
+  }
+  sync_layout_from_os();
 
   is_processing_macro_.store(true, std::memory_order_release);
   struct DrainGuard {
@@ -2432,6 +2526,14 @@ void EventLoop::apply_combined_correction(
     }
   }
 
+  MacroLockGuard lock_guard(macro_lock_);
+  if (!lock_guard.owns_lock()) {
+    std::cerr << "[punto] Async: не удалось захватить macro lock for combined task_id="
+              << meta.task_id << " (skip)\n";
+    return;
+  }
+  sync_layout_from_os();
+
   is_processing_macro_.store(true, std::memory_order_release);
   struct DrainGuard {
     EventLoop *self;
@@ -2447,6 +2549,17 @@ void EventLoop::apply_combined_correction(
     std::cerr << "[punto] Async: oneshot replace failed for task_id="
               << meta.task_id << " (skip)\n";
     return;
+  }
+
+  // Пост-коррекционная верификация раскладки.
+  {
+    const int post_layout = sync_layout_from_os();
+    if (post_layout >= 0 && post_layout != target_layout) {
+      std::cerr << "[punto] Async: post-combined layout mismatch "
+                << post_layout << " != " << target_layout
+                << ", retrying set_layout\n";
+      (void)set_layout(target_layout, /*play_sound=*/false);
+    }
   }
 
   if (original_text_opt.has_value()) {
@@ -2471,6 +2584,12 @@ void EventLoop::apply_combined_correction(
 }
 
 void EventLoop::action_invert_layout_selection() {
+  MacroLockGuard lock_guard(macro_lock_);
+  if (!lock_guard.owns_lock()) {
+    std::cerr << "[punto] Invert-layout-selection: не удалось захватить macro lock (skip)\n";
+    return;
+  }
+  sync_layout_from_os();
   is_processing_macro_.store(true, std::memory_order_release);
 
   const int restore_layout_for_undo = current_layout_;
@@ -2487,6 +2606,12 @@ void EventLoop::action_invert_layout_selection() {
 }
 
 void EventLoop::action_invert_case_selection() {
+  MacroLockGuard lock_guard(macro_lock_);
+  if (!lock_guard.owns_lock()) {
+    std::cerr << "[punto] Invert-case-selection: не удалось захватить macro lock (skip)\n";
+    return;
+  }
+  sync_layout_from_os();
   is_processing_macro_.store(true, std::memory_order_release);
   (void)process_selection(
       [](std::string_view text) { return invert_case(text); },
@@ -2495,6 +2620,12 @@ void EventLoop::action_invert_case_selection() {
 }
 
 void EventLoop::action_transliterate_selection() {
+  MacroLockGuard lock_guard(macro_lock_);
+  if (!lock_guard.owns_lock()) {
+    std::cerr << "[punto] Transliterate-selection: не удалось захватить macro lock (skip)\n";
+    return;
+  }
+  sync_layout_from_os();
   is_processing_macro_.store(true, std::memory_order_release);
   (void)process_selection(
       [](std::string_view text) { return transliterate(text); },

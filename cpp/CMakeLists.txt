@@ -71,6 +71,7 @@ set(PUNTO_SOURCES
     src/ipc_server.cpp
     src/typo_corrector.cpp
     src/smart_bypass.cpp
+    src/macro_lock.cpp
 )
 
 set(PUNTO_HEADERS
@@ -96,6 +97,7 @@ set(PUNTO_HEADERS
     include/punto/typo_corrector.hpp
     include/punto/smart_bypass.hpp
     include/punto/undo_detector.hpp
+    include/punto/macro_lock.hpp
 )
 
 # -----------------------------------------------------------------------------

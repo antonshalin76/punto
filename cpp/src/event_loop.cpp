@@ -1473,6 +1473,10 @@ void EventLoop::action_auto_invert_word(std::span<const KeyEntry> word,
   sync_layout_from_os();
 
   is_processing_macro_.store(true, std::memory_order_release);
+  struct DrainGuard {
+    EventLoop *self;
+    ~DrainGuard() { self->drain_pending_events(); }
+  } drain_guard{this};
 
   auto injector = std::atomic_load(&injector_);
   if (!injector) {
@@ -1511,7 +1515,6 @@ void EventLoop::action_auto_invert_word(std::span<const KeyEntry> word,
   }
 
   std::cerr << "[punto] AUTO-INVERT: done\n";
-  drain_pending_events();
 }
 
 void EventLoop::action_invert_case_word() {
@@ -1819,6 +1822,15 @@ void EventLoop::flush_pending_clipboard_restore(bool force) {
     return;
   }
 
+  // Если ownership уже потерян, значит другой процесс/приложение успел
+  // перехватить selection и восстановление старых данных может испортить
+  // актуальный буфер обмена. В этом случае отменяем restore.
+  if (!clipboard_->verify_ownership()) {
+    std::cerr << "[punto] Clipboard: skip deferred restore (ownership lost)\n";
+    pending_clip_restore_.reset();
+    return;
+  }
+
   if (p.restore_primary) {
     if (p.primary.has_value()) {
       (void)clipboard_->set_text(Selection::Primary, *p.primary);
@@ -1842,6 +1854,11 @@ void EventLoop::finalize_clipboard_restore(PendingClipboardRestore plan,
 
   if (request_seen) {
     if (!clipboard_) {
+      return;
+    }
+
+    if (!clipboard_->verify_ownership()) {
+      std::cerr << "[punto] Clipboard: skip immediate restore (ownership lost)\n";
       return;
     }
 

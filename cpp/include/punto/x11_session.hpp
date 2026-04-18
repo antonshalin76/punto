@@ -34,6 +34,8 @@ struct X11SessionInfo {
   std::string xauthority_path; // e.g., "/run/user/1000/gdm/Xauthority"
   std::string home_dir;
   std::string xdg_runtime_dir; // e.g., "/run/user/1000"
+  std::string xdg_config_home;
+  std::string wayland_display;
 };
 
 /**
@@ -94,6 +96,8 @@ public:
    * @brief Возвращает снапшот информации о сессии (thread-safe)
    */
   [[nodiscard]] X11SessionInfo info() const;
+
+  [[nodiscard]] bool is_wayland_session() const;
 
   /**
    * @brief Устанавливает переменные окружения для X11 операций

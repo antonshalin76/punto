@@ -27,3 +27,7 @@ auto_switch:
 # Звуковая индикация переключения раскладки
 sound:
   enabled: true
+
+# Логирование демона (syslog/journald)
+logging:
+  level: info   # error, warning, info, debug

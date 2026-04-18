@@ -13,11 +13,13 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -68,9 +70,12 @@ public:
   /**
    * @brief Запрашивает остановку цикла обработки событий
    *
-   * Thread-safe. Может вызываться из signal handler.
+   * Thread-safe. Для signal handler используется self-pipe в main.cpp.
    */
   void request_stop() noexcept;
+
+  /// Передаёт read-end self-pipe для корректной обработки SIGINT/SIGTERM.
+  void set_stop_signal_fd(int fd) noexcept;
 
   /**
    * @brief Запускает главный цикл
@@ -234,6 +239,17 @@ private:
   /// коррекции
   void process_ready_results();
 
+  /// Сбрасывает async state и выставляет новый barrier для task_id.
+  void reset_async_state(bool bump_task_barrier = true);
+
+  void sync_current_layout_from_os(std::string_view reason);
+  void mark_layout_desynced(std::string_view reason);
+  void maybe_handle_injector_failure(std::string_view context);
+
+  [[nodiscard]] IpcResult stats_report() const;
+  [[nodiscard]] std::optional<std::filesystem::path>
+  validate_reload_path(const std::string &config_path) const;
+
   struct PendingWordMeta {
     std::uint64_t task_id = 0;
     std::vector<KeyEntry> word;
@@ -307,15 +323,29 @@ private:
     std::uint64_t tail_len_max = 0;
   } telemetry_;
 
+  struct LifetimeTelemetry {
+    std::atomic<std::uint64_t> analyzed_words{0};
+    std::atomic<std::uint64_t> need_switch_words{0};
+    std::atomic<std::uint64_t> analysis_us_sum{0};
+    std::atomic<std::uint64_t> queue_us_sum{0};
+    std::atomic<std::uint64_t> corrections{0};
+    std::atomic<std::uint64_t> correction_us_sum{0};
+    std::atomic<std::uint64_t> tail_len_sum{0};
+    std::atomic<std::size_t> pending_words{0};
+    std::atomic<std::size_t> ready_results{0};
+  } lifetime_telemetry_;
+
   // Если прямое XKB-переключение не работает в текущем окружении,
   // отключаем его и используем только hotkey-метод.
   bool xkb_set_available_ = true;
 
   /// Время, когда XKB set был отключён (для периодической ре-проверки)
   std::chrono::steady_clock::time_point xkb_disabled_at_{};
+  bool layout_desynced_ = false;
 
   std::unique_ptr<X11Session> x11_session_;
   bool x11_refresh_pending_{false}; // Флаг фонового refresh
+  bool wayland_warning_emitted_{false};
   std::unique_ptr<ClipboardManager> clipboard_;
   std::unique_ptr<SoundManager> sound_manager_;
 
@@ -326,6 +356,8 @@ private:
   /// Текущая раскладка: 0 = EN (первая), 1 = RU (вторая)
   /// Обновляется при переключении раскладки
   int current_layout_ = 0;
+  int stop_signal_fd_ = -1;
+  int exit_code_ = 0;
 
   /// Очередь событий, накопленных во время выполнения макроса коррекции
   std::deque<input_event> pending_events_;

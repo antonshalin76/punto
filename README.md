@@ -137,31 +137,50 @@ Privet  →  [LCtrl+LAlt+Pause]  →  Привет
 - **Управление через трей** — `punto-tray` (GTK3 + AppIndicator/Ayatana), toggle-пункты, "О программе"
 - **Синхронизация хоткея раскладки с системой** — GNOME (gsettings) и Generic X11 (setxkbmap / XKB grp:*_toggle)
 - **Настройки + hot reload** — редактирование `~/.config/punto/config.yaml` и мгновенное применение через IPC (без перезапуска `udevmon`)
-- **IPC через Unix Socket** — `/var/run/punto.sock` (GET_STATUS, SET_STATUS, RELOAD)
+- **IPC через Unix Socket** — `/var/run/punto.sock` (GET_STATUS, SET_STATUS, RELOAD, STATS)
 - **Автопереключение раскладки** — словарь-first; N-граммы используются только для ambiguous слов (есть в обоих словарях)
 - **Звуковая индикация** — `paplay`/`aplay` (если доступны)
 - **Нативный X11** — чтение и запись selection напрямую (без xsel/xclip)
+
+## Production Checklist
+
+- IPC socket `/var/run/punto.sock` и macro lock рассчитаны на режим `root:punto` с правами `0660`.
+- Пользователи tray и локальных IPC-клиентов должны состоять в группе `punto`.
+- `RELOAD <path>` разрешён только для `/etc/punto/`, `$XDG_CONFIG_HOME/punto/` и `~/.config/punto/`.
+- `echo "STATS" | nc -U /var/run/punto.sock` возвращает агрегированные runtime-счётчики.
+- Диагностические сообщения демона уходят в syslog/journald; уровень задаётся через `logging.level`.
+- При отсутствии словарей daemon завершает старт с фатальной ошибкой вместо degraded-режима.
+- Для CI и безголовой упаковки используйте `./build-deb.sh --non-interactive --skip-runtime-installs`.
+
+## Known Limitations / Threat Model
+
+- Полной поддержки Wayland пока нет. Если обнаружен Wayland без X11, daemon продолжает анализ, но отключает переключение раскладки.
+- Compose/dead keys/AltGr пока не поддерживаются полноценно и считаются отдельной инициативой.
+- Демон работает в root-контексте и читает `/proc/<pid>/environ` только для процессов активного GUI-пользователя.
+- Логи должны содержать только типы IPC-команд и агрегированные счётчики, а не содержимое набранных слов.
 
 ## Установка
 
 ### Способ 1: Сборка и установка deb-пакета (рекомендуется)
 
 `build-deb.sh`:
-- проверит/предложит установить зависимости;
+- проверит зависимости;
 - соберёт `punto` и `punto-tray` (если доступны GTK3/AppIndicator dev-пакеты);
-- соберёт deb-пакет и установит его.
+- соберёт deb-пакет;
+- установит зависимости только при явном `--allow-apt-installs`.
 
 ```bash
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh --install
+./build-deb.sh --non-interactive --skip-runtime-installs
 ```
 
 ### Способ 2: Сборка из исходников
 
 #### Зависимости
 
-> Примечание: `build-deb.sh` рассчитан на Debian/Ubuntu и сам предложит установить зависимости.
+> Примечание: `build-deb.sh` рассчитан на Debian/Ubuntu. В CI и автоматизации используйте `--non-interactive`; для host-mutating установки пакетов нужен явный `--allow-apt-installs`.
 
 ```bash
 # Ubuntu/Debian (минимум для сборки punto)
@@ -251,6 +270,9 @@ auto_switch:
 # Звуковая индикация переключения раскладки
 sound:
   enabled: true
+
+logging:
+  level: info
 ```
 
 ### Синхронизация хоткея с системой

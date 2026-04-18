@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -79,6 +80,7 @@ public:
     base_pos_ = 0;
     cursor_pos_ = 0;
     words_.clear();
+    debug_validate();
   }
 
   void push_token(KeyEntry entry) {
@@ -103,6 +105,8 @@ public:
         words_.pop_front();
       }
     }
+
+    debug_validate();
   }
 
   bool pop_token() {
@@ -132,6 +136,7 @@ public:
       break;
     }
 
+    debug_validate();
     return true;
   }
 
@@ -174,6 +179,7 @@ public:
 
     words_.push_back(w);
     trim_words_to_capacity();
+    debug_validate();
 
     return w;
   }
@@ -263,6 +269,25 @@ private:
     while (words_.size() > max_words_) {
       words_.pop_front();
     }
+  }
+
+  void debug_validate() const {
+#ifndef NDEBUG
+    std::uint64_t prev_start = 0;
+    bool first = true;
+    for (const auto &word : words_) {
+      assert(word.start_pos >= base_pos_);
+      assert(word.end_pos <= cursor_pos_);
+      assert(word.delim_pos == word.end_pos);
+      assert(word.delim_pos < cursor_pos_);
+      assert(word.start_pos <= word.end_pos);
+      if (!first) {
+        assert(word.start_pos >= prev_start);
+      }
+      prev_start = word.start_pos;
+      first = false;
+    }
+#endif
   }
 
   std::size_t max_words_ = 5;

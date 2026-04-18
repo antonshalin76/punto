@@ -19,11 +19,33 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 INSTALL_AFTER_BUILD=false
+NONINTERACTIVE=false
+ALLOW_APT_INSTALLS=false
+SKIP_RUNTIME_INSTALLS=false
 for arg in "$@"; do
-    if [[ "$arg" == "--install" ]]; then
-        INSTALL_AFTER_BUILD=true
-    fi
+    case "$arg" in
+        --install)
+            INSTALL_AFTER_BUILD=true
+            ;;
+        --non-interactive|--ci)
+            NONINTERACTIVE=true
+            ;;
+        --allow-apt-installs)
+            ALLOW_APT_INSTALLS=true
+            ;;
+        --skip-runtime-installs)
+            SKIP_RUNTIME_INSTALLS=true
+            ;;
+    esac
 done
+
+if [[ -n "${CI:-}" ]]; then
+    NONINTERACTIVE=true
+fi
+
+if [[ -n "${PUNTO_ALLOW_APT_INSTALLS:-}" ]]; then
+    ALLOW_APT_INSTALLS=true
+fi
 
 restart_tray() {
     if [[ "$BUILD_TRAY" != "true" ]]; then
@@ -80,6 +102,11 @@ apt_install() {
     if [[ $# -eq 0 ]]; then
         return 0
     fi
+    if [[ "$ALLOW_APT_INSTALLS" != "true" ]]; then
+        echo -e "${RED}   Требуется установка пакетов: $*${NC}" >&2
+        echo "   Повторите с --allow-apt-installs или установите зависимости вручную." >&2
+        return 1
+    fi
     apt_update_once
     sudo apt-get install -y "$@"
 }
@@ -103,8 +130,9 @@ done
 # Устанавливаем обязательные зависимости
 if [[ ${#MISSING_BUILD_DEPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}   Отсутствуют пакеты для сборки: ${MISSING_BUILD_DEPS[*]}${NC}"
-    echo "   Установка..."
-    apt_install "${MISSING_BUILD_DEPS[@]}"
+    if ! apt_install "${MISSING_BUILD_DEPS[@]}"; then
+        exit 1
+    fi
     echo -e "${GREEN}   Зависимости для сборки установлены${NC}"
 else
     echo -e "${GREEN}   Все зависимости для сборки установлены${NC}"
@@ -121,12 +149,10 @@ done
 BUILD_TRAY=true
 if [[ ${#MISSING_TRAY_DEPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}   Отсутствуют пакеты для tray: ${MISSING_TRAY_DEPS[*]}${NC}"
-    echo "   Установка..."
-
     if apt_install "${MISSING_TRAY_DEPS[@]}"; then
         echo -e "${GREEN}   Зависимости для tray установлены${NC}"
     else
-        echo -e "${YELLOW}   Предупреждение: не удалось установить зависимости для tray. punto-tray не будет собран.${NC}" >&2
+        echo -e "${YELLOW}   Предупреждение: зависимости для tray не установлены. punto-tray не будет собран.${NC}" >&2
         BUILD_TRAY=false
     fi
 fi
@@ -134,13 +160,11 @@ fi
 # Устанавливаем опциональные зависимости (словари)
 if [[ ${#MISSING_OPTIONAL_DEPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}   Опциональные пакеты (словари): ${MISSING_OPTIONAL_DEPS[*]}${NC}"
-    echo "   Установка..."
-
     if apt_install "${MISSING_OPTIONAL_DEPS[@]}"; then
         echo -e "${GREEN}   Словари установлены${NC}"
         MISSING_OPTIONAL_DEPS=()
     else
-        echo -e "${YELLOW}   Предупреждение: не удалось установить словари. Автопереключение может быть менее точным.${NC}" >&2
+        echo -e "${YELLOW}   Предупреждение: словари не установлены автоматически. Автопереключение может быть менее точным.${NC}" >&2
     fi
 fi
 
@@ -248,9 +272,13 @@ done
 
 if [[ ${#MISSING_RUNTIME_DEPS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}   Отсутствуют runtime-пакеты: ${MISSING_RUNTIME_DEPS[*]}${NC}"
-    echo "   Эти пакеты нужны для работы punto-switcher. Установка..."
-    apt_install "${MISSING_RUNTIME_DEPS[@]}"
-    echo -e "${GREEN}   Runtime-зависимости установлены${NC}"
+    if [[ "$SKIP_RUNTIME_INSTALLS" == "true" || "$ALLOW_APT_INSTALLS" != "true" ]]; then
+        echo -e "${YELLOW}   Автоустановка runtime-зависимостей пропущена. Установите вручную перед деплоем.${NC}"
+    else
+        echo "   Эти пакеты нужны для работы punto-switcher. Установка..."
+        apt_install "${MISSING_RUNTIME_DEPS[@]}"
+        echo -e "${GREEN}   Runtime-зависимости установлены${NC}"
+    fi
 else
     echo -e "${GREEN}   Все runtime-зависимости установлены${NC}"
 fi
@@ -290,7 +318,7 @@ if [[ "$INSTALL_AFTER_BUILD" == "true" ]]; then
 
     echo "Перезапуск punto-tray..."
     restart_tray
-else
+elif [[ "$NONINTERACTIVE" != "true" ]]; then
     echo ""
     read -p "Установить пакет сейчас и перезапустить tray? [Y/n] " -n 1 -r
     echo
@@ -298,6 +326,9 @@ else
         sudo dpkg -i "$OUTPUT_DEB"
         restart_tray
     fi
+else
+    echo ""
+    echo "Интерактивная установка пропущена (--non-interactive/CI mode)."
 fi
 
 # Показываем статус словарей

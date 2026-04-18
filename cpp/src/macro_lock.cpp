@@ -5,15 +5,39 @@
 
 #include "punto/macro_lock.hpp"
 
+#include <grp.h>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 
 namespace punto {
+
+namespace {
+
+void apply_runtime_permissions(int fd) {
+  if (fd < 0) {
+    return;
+  }
+
+  if (::fchmod(fd, 0660) != 0) {
+    std::cerr << "[punto] MacroLock: failed to chmod lock file: "
+              << std::strerror(errno) << "\n";
+  }
+
+  if (group *grp = ::getgrnam("punto"); grp != nullptr) {
+    if (::fchown(fd, 0, grp->gr_gid) != 0) {
+      std::cerr << "[punto] MacroLock: failed to chown lock file: "
+                << std::strerror(errno) << "\n";
+    }
+  }
+}
+
+} // namespace
 
 MacroLock::MacroLock() = default;
 
@@ -34,7 +58,7 @@ bool MacroLock::ensure_fd() {
 
   // O_CREAT | O_RDWR: создаём файл если не существует.
   // Файл НЕ удаляется — stale lock файлы безопасны для flock().
-  fd_ = ::open(kLockPath, O_CREAT | O_RDWR, 0666);
+  fd_ = ::open(kLockPath, O_CREAT | O_RDWR, 0660);
   if (fd_ < 0) {
     const int err = errno;
     std::cerr << "[punto] MacroLock: failed to open " << kLockPath << ": "
@@ -42,6 +66,7 @@ bool MacroLock::ensure_fd() {
     return false;
   }
 
+  apply_runtime_permissions(fd_);
   return true;
 }
 

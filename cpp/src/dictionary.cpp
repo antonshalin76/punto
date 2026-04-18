@@ -339,8 +339,8 @@ bool Dictionary::initialize() {
     return true;
   }
 
-  std::size_t en_count = 0;
-  std::size_t ru_count = 0;
+  std::size_t fallback_en_count = 0;
+  std::size_t fallback_ru_count = 0;
 
 #ifdef HAVE_HUNSPELL
   // Инициализируем Hunspell для проверки словоформ (падежи, склонения, времена)
@@ -378,7 +378,7 @@ bool Dictionary::initialize() {
     if (loaded > 0) {
       std::cerr << "[punto] Loaded EN dict: " << path << " (+" << loaded
                 << " words)\n";
-      en_count += loaded;
+      fallback_en_count += loaded;
     }
   }
 
@@ -388,7 +388,7 @@ bool Dictionary::initialize() {
     if (loaded > 0) {
       std::cerr << "[punto] Loaded RU dict: " << path << " (+" << loaded
                 << " words)\n";
-      ru_count += loaded;
+      fallback_ru_count += loaded;
     }
   }
 
@@ -408,13 +408,13 @@ bool Dictionary::initialize() {
   if (it_count > 0) {
     std::cerr << "[punto] Loaded built-in IT terms: +" << it_count
               << " words\n";
-    en_count += it_count;
   }
 
   // Сортируем и удаляем дубликаты после загрузки всех словарей
   finalize_hashes();
 
-  initialized_ = (en_count > 0 || ru_count > 0 || hunspell_available_);
+  initialized_ =
+      (fallback_en_count > 0 || fallback_ru_count > 0 || hunspell_available_);
 
   std::cerr << "[punto] Dictionary: EN=" << en_hashes_.size()
             << " RU=" << ru_hashes_.size() << " unique words (hash-based)\n";

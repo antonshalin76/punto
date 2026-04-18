@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
+#include <iostream>
 #include <optional>
 #include <span>
 #include <stop_token>
@@ -102,6 +104,11 @@ public:
       t.request_stop();
     }
     tasks_.notify_all();
+    for (auto &t : threads_) {
+      if (t.joinable()) {
+        t.join();
+      }
+    }
     threads_.clear();
   }
 
@@ -111,44 +118,52 @@ public:
     return results_.try_pop(out);
   }
 
+  [[nodiscard]] std::size_t pending_task_count() const {
+    return tasks_.size();
+  }
+
+  [[nodiscard]] std::size_t worker_count() const { return threads_.size(); }
+
 private:
   void worker_main(std::stop_token st) {
-    while (!st.stop_requested()) {
-      auto opt = tasks_.pop_wait(st);
-      if (!opt.has_value()) {
-        break;
-      }
+    try {
+      while (!st.stop_requested()) {
+        auto opt = tasks_.pop_wait(st);
+        if (!opt.has_value()) {
+          break;
+        }
 
-      WordTask task = std::move(*opt);
+        WordTask task = std::move(*opt);
 
-      WordResult res;
-      res.task_id = task.task_id;
-      res.need_switch = false;
-      res.correction_type = CorrectionType::NoCorrection;
-      res.word_len = task.word.size();
-      res.analysis_len = task.analysis_len;
-      res.layout_at_boundary = task.layout_at_boundary;
+        WordResult res;
+        res.task_id = task.task_id;
+        res.need_switch = false;
+        res.correction_type = CorrectionType::NoCorrection;
+        res.word_len = task.word.size();
+        res.analysis_len = task.analysis_len;
+        res.layout_at_boundary = task.layout_at_boundary;
 
-      const auto t_pop = std::chrono::steady_clock::now();
-      if (task.submitted_at.time_since_epoch().count() != 0) {
-        res.queue_us = static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                t_pop - task.submitted_at)
-                .count());
-      }
+        const auto t_pop = std::chrono::steady_clock::now();
+        if (task.submitted_at.time_since_epoch().count() != 0) {
+          res.queue_us = static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  t_pop - task.submitted_at)
+                  .count());
+        }
 
-      const auto t0 = std::chrono::steady_clock::now();
+        const auto t0 = std::chrono::steady_clock::now();
 
-      // Проверяем что слово достаточно длинное
-      if (task.analysis_len < task.cfg.min_word_len) {
-        res.analysis_us = 0;
-        results_.push(std::move(res));
-        continue;
-      }
+        try {
+          // Проверяем что слово достаточно длинное
+          if (task.analysis_len < task.cfg.min_word_len) {
+            res.analysis_us = 0;
+            results_.push(std::move(res));
+            continue;
+          }
 
-      // Берём только анализируемую часть (без trailing пунктуации)
-      std::span<const KeyEntry> analysis_span(task.word.data(),
-                                              task.analysis_len);
+          // Берём только анализируемую часть (без trailing пунктуации)
+          std::span<const KeyEntry> analysis_span(task.word.data(),
+                                                  task.analysis_len);
 
       // =========================================================================
       // Этап 0: Smart Bypass — определяем, нужно ли пропускать РЕГИСТРОВЫЕ
@@ -357,7 +372,23 @@ private:
         }
       }
 
-      finish_and_push(res, t0);
+          finish_and_push(res, t0);
+        } catch (const std::exception &ex) {
+          std::cerr << "[punto] AnalysisWorkerPool: task " << res.task_id
+                    << " failed: " << ex.what() << "\n";
+          finish_and_push(res, t0);
+        } catch (...) {
+          std::cerr << "[punto] AnalysisWorkerPool: task " << res.task_id
+                    << " failed with unknown exception\n";
+          finish_and_push(res, t0);
+        }
+      }
+    } catch (const std::exception &ex) {
+      std::cerr << "[punto] AnalysisWorkerPool: worker terminated: "
+                << ex.what() << "\n";
+    } catch (...) {
+      std::cerr
+          << "[punto] AnalysisWorkerPool: worker terminated by unknown exception\n";
     }
   }
 

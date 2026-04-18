@@ -12,10 +12,11 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
+#include <fcntl.h>
 #include <iostream>
 #include <pwd.h>
 #include <sstream>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <unordered_map>
@@ -131,16 +132,35 @@ parse_key_value_lines(const std::string &s) {
 
 /// Читает переменные окружения из /proc/<pid>/environ
 std::unordered_map<std::string, std::string>
-read_proc_environ(const std::string &pid) {
+read_proc_environ(const std::string &pid, uid_t expected_uid) {
   std::unordered_map<std::string, std::string> env;
+  const std::string path = "/proc/" + pid + "/environ";
 
-  std::ifstream file("/proc/" + pid + "/environ", std::ios::binary);
-  if (!file) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
     return env;
   }
 
-  std::string content((std::istreambuf_iterator<char>(file)),
-                      std::istreambuf_iterator<char>());
+  struct stat st {};
+  if (::fstat(fd, &st) != 0 || st.st_uid != expected_uid) {
+    ::close(fd);
+    return env;
+  }
+
+  std::string content;
+  std::array<char, 4096> buffer{};
+  while (true) {
+    const ssize_t n = ::read(fd, buffer.data(), buffer.size());
+    if (n > 0) {
+      content.append(buffer.data(), static_cast<std::size_t>(n));
+      continue;
+    }
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    break;
+  }
+  ::close(fd);
 
   std::size_t start = 0;
   while (start < content.size()) {
@@ -215,6 +235,9 @@ bool X11Session::initialize() {
     next.home_dir = pw->pw_dir;
   }
   next.xdg_runtime_dir = "/run/user/" + std::to_string(next.uid);
+  if (!next.home_dir.empty()) {
+    next.xdg_config_home = next.home_dir + "/.config";
+  }
 
   bool env_ok = false;
   if (!leader_pid.empty()) {
@@ -225,6 +248,10 @@ bool X11Session::initialize() {
   }
 
   if (!env_ok || next.display.empty()) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      info_ = next;
+    }
     // Не поднимаем "валидную" сессию без DISPLAY — иначе сервис прилипнет
     // к нерабочему контексту и не будет пытаться реинициализироваться.
     return false;
@@ -340,6 +367,9 @@ X11Session::RefreshResult X11Session::refresh() {
   next.gid = pw->pw_gid;
   next.home_dir = (pw->pw_dir != nullptr) ? pw->pw_dir : std::string{};
   next.xdg_runtime_dir = "/run/user/" + std::to_string(next.uid);
+  if (!next.home_dir.empty()) {
+    next.xdg_config_home = next.home_dir + "/.config";
+  }
 
   bool env_ok = false;
   if (!active->leader_pid.empty()) {
@@ -351,8 +381,20 @@ X11Session::RefreshResult X11Session::refresh() {
 
   if (!env_ok || next.display.empty()) {
     const bool was_valid = initialized_.load(std::memory_order_acquire);
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      info_ = next;
+    }
+    initialized_.store(false, std::memory_order_release);
+    unsetenv("DISPLAY");
+    unsetenv("XAUTHORITY");
+    unsetenv("HOME");
+    unsetenv("USER");
+    unsetenv("LOGNAME");
+    unsetenv("XDG_RUNTIME_DIR");
+    unsetenv("XDG_CONFIG_HOME");
+    unsetenv("WAYLAND_DISPLAY");
     if (was_valid) {
-      reset();
       return RefreshResult::Invalidated;
     }
     return RefreshResult::Unchanged;
@@ -399,6 +441,8 @@ void X11Session::reset() noexcept {
   unsetenv("USER");
   unsetenv("LOGNAME");
   unsetenv("XDG_RUNTIME_DIR");
+  unsetenv("XDG_CONFIG_HOME");
+  unsetenv("WAYLAND_DISPLAY");
 }
 
 bool X11Session::is_valid() const noexcept {
@@ -408,6 +452,11 @@ bool X11Session::is_valid() const noexcept {
 X11SessionInfo X11Session::info() const {
   std::lock_guard<std::mutex> lock(mu_);
   return info_;
+}
+
+bool X11Session::is_wayland_session() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return !info_.wayland_display.empty();
 }
 
 void X11Session::apply_environment() const {
@@ -451,6 +500,18 @@ void X11Session::apply_environment() const {
     setenv("XDG_RUNTIME_DIR", snap.xdg_runtime_dir.c_str(), 1);
   } else {
     unsetenv("XDG_RUNTIME_DIR");
+  }
+
+  if (!snap.xdg_config_home.empty()) {
+    setenv("XDG_CONFIG_HOME", snap.xdg_config_home.c_str(), 1);
+  } else {
+    unsetenv("XDG_CONFIG_HOME");
+  }
+
+  if (!snap.wayland_display.empty()) {
+    setenv("WAYLAND_DISPLAY", snap.wayland_display.c_str(), 1);
+  } else {
+    unsetenv("WAYLAND_DISPLAY");
   }
 }
 
@@ -591,7 +652,7 @@ bool X11Session::find_session_env_by_pid(const std::string &pid,
     return false;
   }
 
-  auto env = read_proc_environ(pid);
+  auto env = read_proc_environ(pid, static_cast<uid_t>(out.uid));
   if (env.empty()) {
     return false;
   }
@@ -606,6 +667,14 @@ bool X11Session::find_session_env_by_pid(const std::string &pid,
 
   if (auto it = env.find("XDG_RUNTIME_DIR"); it != env.end()) {
     out.xdg_runtime_dir = it->second;
+  }
+
+  if (auto it = env.find("XDG_CONFIG_HOME"); it != env.end()) {
+    out.xdg_config_home = it->second;
+  }
+
+  if (auto it = env.find("WAYLAND_DISPLAY"); it != env.end()) {
+    out.wayland_display = it->second;
   }
 
   return !out.display.empty();

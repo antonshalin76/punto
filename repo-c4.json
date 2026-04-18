@@ -1,0 +1,838 @@
+{
+  "meta": {
+    "version": "1.0",
+    "generated": "2026-04-18",
+    "root_path": ".",
+    "languages": [
+      "c++",
+      "bash",
+      "yaml"
+    ],
+    "frameworks": [
+      "X11",
+      "GTK3",
+      "AppIndicator",
+      "Hunspell",
+      "interception-tools"
+    ],
+    "description_1l": "Linux keyboard layout switcher that auto-corrects EN/RU input, typos, and case mistakes.",
+    "description_short": "Punto is a Linux desktop utility built around a root-owned keyboard daemon and an optional tray app. The daemon reads interception-tools input streams, analyzes completed words with dictionary and n-gram heuristics, and retypes corrected text through X11 and uinput. The tray app edits user settings, toggles auto-switching over a Unix socket, and syncs the system layout hotkey for GNOME or generic X11.",
+    "file_count_approx": 65,
+    "token_estimate": 3600
+  },
+  "system": {
+    "name": "Punto Switcher for Linux",
+    "type": "desktop_app",
+    "c4_level": "SystemContext",
+    "description": "Local-only Linux utility that intercepts keyboard input, fixes wrong EN/RU layout input, case glitches, and typos, and exposes tray-based control plus install-time tooling.",
+    "users": [
+      {
+        "name": "Desktop User",
+        "description": "Types text, uses Pause-based corrections, and toggles behavior from the tray icon."
+      },
+      {
+        "name": "Local Administrator",
+        "description": "Builds or installs the package, manages udevmon/systemd integration, and maintains default config."
+      }
+    ],
+    "top_boundary": "Runs locally as a root-owned keyboard daemon, an optional GTK tray controller, and Debian-oriented packaging/runtime scripts on X11 Linux desktops."
+  },
+  "containers": [
+    {
+      "id": "keyboard-daemon",
+      "name": "Keyboard Daemon",
+      "c4_level": "Container",
+      "description": "Consumes intercepted keyboard events, analyzes completed words, and injects corrected output back into the desktop session.",
+      "technology": [
+        "C++20",
+        "Linux input_event/uinput",
+        "X11",
+        "Hunspell",
+        "Unix domain sockets"
+      ],
+      "responsibilities": [
+        "Read keyboard events from stdin in an interception-tools pipeline",
+        "Track word boundaries, modifier state, and rollback history",
+        "Run async language, typo, and sticky-shift analysis",
+        "Rewrite text through clipboard, paste, backspace, and layout macros",
+        "Expose local IPC for enable, disable, status, and reload operations"
+      ],
+      "entry_files": [
+        "cpp/src/main.cpp"
+      ],
+      "key_directories": [
+        "cpp/src",
+        "cpp/include/punto"
+      ]
+    },
+    {
+      "id": "tray-ui",
+      "name": "Tray UI",
+      "c4_level": "Container",
+      "description": "GTK/AppIndicator frontend that surfaces daemon status, user settings, and system hotkey synchronization.",
+      "technology": [
+        "C++20",
+        "GTK3",
+        "AppIndicator/Ayatana",
+        "GLib/GSettings",
+        "Unix domain sockets"
+      ],
+      "responsibilities": [
+        "Show service state in the system tray",
+        "Toggle auto-switching and sound without restarting udevmon",
+        "Edit per-user YAML settings",
+        "Validate and apply layout hotkeys to GNOME or generic X11 backends"
+      ],
+      "entry_files": [
+        "cpp/src/tray/main.cpp"
+      ],
+      "key_directories": [
+        "cpp/src/tray",
+        "cpp/include/punto"
+      ]
+    },
+    {
+      "id": "distribution-tooling",
+      "name": "Distribution Tooling",
+      "c4_level": "Container",
+      "description": "Shell scripts, package metadata, and static assets that build, install, and operate the daemon and tray binaries.",
+      "technology": [
+        "Bash",
+        "dpkg-deb",
+        "systemd",
+        "udevmon"
+      ],
+      "responsibilities": [
+        "Build native binaries and assemble a Debian package",
+        "Install default config, tray autostart, and udevmon assets",
+        "Start, stop, and restart backend and tray processes from a CLI wrapper",
+        "Refresh runtime dependencies during package creation"
+      ],
+      "entry_files": [
+        "build-deb.sh",
+        "punto-cli.sh"
+      ],
+      "key_directories": [
+        "DEBIAN"
+      ]
+    }
+  ],
+  "components": [
+    {
+      "id": "daemon-bootstrap",
+      "container_id": "keyboard-daemon",
+      "c4_level": "Component",
+      "name": "Daemon Bootstrap",
+      "description": "Loads config, installs signal handlers, and creates the main EventLoop instance.",
+      "responsibilities": [
+        "Prefer user config over the system config when loading defaults",
+        "Validate core hotkey and auto-switch ranges",
+        "Wire process lifecycle flags and startup logging",
+        "Pass the current Config snapshot into EventLoop"
+      ],
+      "files": [
+        "cpp/src/main.cpp",
+        "cpp/src/config.cpp",
+        "cpp/include/punto/config.hpp",
+        "cpp/include/punto/types.hpp"
+      ],
+      "file_groups": [],
+      "provides": [
+        "main",
+        "load_config",
+        "load_config_checked",
+        "validate_config",
+        "Config",
+        "ConfigLoadOutcome"
+      ],
+      "consumes_from": [
+        "event-orchestrator"
+      ],
+      "data_flows": [
+        {
+          "from": "/etc/punto/config.yaml or ~/.config/punto/config.yaml",
+          "to": "here",
+          "trigger": "daemon startup or explicit reload",
+          "payload": "Config values for hotkeys, auto-switching, typo correction, and sound"
+        }
+      ]
+    },
+    {
+      "id": "event-orchestrator",
+      "container_id": "keyboard-daemon",
+      "c4_level": "Component",
+      "name": "Event Orchestrator",
+      "description": "Central runtime loop that tracks typed state, coordinates corrections, and executes output macros safely across multiple daemon instances.",
+      "responsibilities": [
+        "Read and classify input_event frames from stdin",
+        "Maintain current word, trailing whitespace, and rollback history",
+        "Coordinate undo detection and cross-process macro locking",
+        "Apply manual and automatic correction actions in order"
+      ],
+      "files": [
+        "cpp/src/event_loop.cpp",
+        "cpp/src/input_buffer.cpp",
+        "cpp/src/key_injector.cpp",
+        "cpp/src/macro_lock.cpp",
+        "cpp/include/punto/event_loop.hpp",
+        "cpp/include/punto/input_buffer.hpp",
+        "cpp/include/punto/key_injector.hpp",
+        "cpp/include/punto/history_manager.hpp",
+        "cpp/include/punto/macro_lock.hpp",
+        "cpp/include/punto/undo_detector.hpp",
+        "cpp/include/punto/key_entry_text.hpp",
+        "cpp/include/punto/asm_utils.hpp"
+      ],
+      "file_groups": [],
+      "provides": [
+        "EventLoop",
+        "InputBuffer",
+        "KeyInjector",
+        "HistoryManager",
+        "MacroLock",
+        "UndoDetector"
+      ],
+      "consumes_from": [
+        "analysis-pipeline",
+        "text-transforms",
+        "desktop-integration",
+        "daemon-ipc"
+      ],
+      "data_flows": [
+        {
+          "from": "interception-tools pipeline",
+          "to": "here",
+          "trigger": "stdin keyboard event stream",
+          "payload": "linux input_event frames for one physical keyboard"
+        },
+        {
+          "from": "analysis-pipeline",
+          "to": "here",
+          "trigger": "completed async word analysis",
+          "payload": "WordResult with target layout and optional corrected KeyEntry sequence"
+        },
+        {
+          "from": "here",
+          "to": "desktop-integration",
+          "trigger": "manual or automatic correction",
+          "payload": "clipboard writes, paste macros, layout switch requests, and sound cues"
+        }
+      ]
+    },
+    {
+      "id": "analysis-pipeline",
+      "container_id": "keyboard-daemon",
+      "c4_level": "Component",
+      "name": "Analysis Pipeline",
+      "description": "Dictionary-first asynchronous word analysis that falls back to n-grams and typo heuristics when a decision is ambiguous.",
+      "responsibilities": [
+        "Load English and Russian dictionaries with Bloom-filter prechecks",
+        "Score ambiguous words with bigram and trigram tables",
+        "Detect sticky-shift patterns and typo candidates",
+        "Run word analysis on background worker threads"
+      ],
+      "files": [
+        "cpp/src/layout_analyzer.cpp",
+        "cpp/src/dictionary.cpp",
+        "cpp/src/typo_corrector.cpp",
+        "cpp/src/smart_bypass.cpp",
+        "cpp/include/punto/layout_analyzer.hpp",
+        "cpp/include/punto/dictionary.hpp",
+        "cpp/include/punto/analysis_worker_pool.hpp",
+        "cpp/include/punto/typo_corrector.hpp",
+        "cpp/include/punto/smart_bypass.hpp",
+        "cpp/include/punto/concurrent_queue.hpp",
+        "cpp/include/punto/bloom_filter.hpp",
+        "cpp/include/punto/hasher.hpp",
+        "cpp/include/punto/ngram_data.hpp",
+        "cpp/include/punto/scancode_map.hpp",
+        "cpp/include/punto/asm_utils.hpp"
+      ],
+      "file_groups": [],
+      "provides": [
+        "LayoutAnalyzer",
+        "Dictionary",
+        "AnalysisWorkerPool",
+        "WordTask",
+        "WordResult",
+        "CorrectionType",
+        "detect_sticky_shift",
+        "generate_typo_candidates"
+      ],
+      "consumes_from": [],
+      "data_flows": [
+        {
+          "from": "event-orchestrator",
+          "to": "here",
+          "trigger": "word committed at space or tab boundary",
+          "payload": "WordTask with KeyEntry buffer, current layout, and AutoSwitchConfig snapshot"
+        },
+        {
+          "from": "here",
+          "to": "event-orchestrator",
+          "trigger": "worker thread completes analysis",
+          "payload": "WordResult with correction type, optional replacement keys, and timing telemetry"
+        }
+      ]
+    },
+    {
+      "id": "text-transforms",
+      "container_id": "keyboard-daemon",
+      "c4_level": "Component",
+      "name": "Text Transforms",
+      "description": "Pure UTF-8 conversion helpers for layout inversion, transliteration, case inversion, and visible-text rendering.",
+      "responsibilities": [
+        "Map QWERTY scancodes between English and Russian layouts",
+        "Invert per-character case for Latin and Cyrillic text",
+        "Transliterate text between Cyrillic and Latin alphabets",
+        "Render KeyEntry sequences into visible text for oneshot paste paths"
+      ],
+      "files": [
+        "cpp/src/text_processor.cpp",
+        "cpp/include/punto/text_processor.hpp",
+        "cpp/include/punto/key_entry_text.hpp",
+        "cpp/include/punto/scancode_map.hpp"
+      ],
+      "file_groups": [],
+      "provides": [
+        "invert_layout",
+        "invert_case",
+        "transliterate",
+        "en_to_ru",
+        "ru_to_en",
+        "cyr_to_lat",
+        "lat_to_cyr",
+        "key_entries_to_visible_text_checked"
+      ],
+      "consumes_from": [],
+      "data_flows": []
+    },
+    {
+      "id": "desktop-integration",
+      "container_id": "keyboard-daemon",
+      "c4_level": "Component",
+      "name": "Desktop Integration",
+      "description": "Bridges the root-run daemon into the active desktop session for X11, clipboard ownership, terminal-safe paste, and sound playback.",
+      "responsibilities": [
+        "Discover the active GUI session and export DISPLAY/XAUTHORITY",
+        "Read and set the current keyboard layout",
+        "Own and restore X11 clipboard and primary selections",
+        "Detect terminal windows to choose a safe paste shortcut",
+        "Play layout-switch sounds in the active user session"
+      ],
+      "files": [
+        "cpp/src/x11_session.cpp",
+        "cpp/src/clipboard_manager.cpp",
+        "cpp/src/terminal_detection.cpp",
+        "cpp/src/sound_manager.cpp",
+        "cpp/include/punto/x11_session.hpp",
+        "cpp/include/punto/clipboard_manager.hpp",
+        "cpp/include/punto/terminal_detection.hpp",
+        "cpp/include/punto/sound_manager.hpp",
+        "cpp/src/sound/en_ru.wav",
+        "cpp/src/sound/ru_en.wav"
+      ],
+      "file_groups": [],
+      "provides": [
+        "X11Session",
+        "ClipboardManager",
+        "SoundManager",
+        "is_terminal_wm_class"
+      ],
+      "consumes_from": [],
+      "data_flows": [
+        {
+          "from": "X server and active desktop session",
+          "to": "here",
+          "trigger": "session initialization or refresh",
+          "payload": "DISPLAY, XAUTHORITY, active window metadata, and layout state"
+        }
+      ]
+    },
+    {
+      "id": "daemon-ipc",
+      "container_id": "keyboard-daemon",
+      "c4_level": "Component",
+      "name": "Daemon IPC",
+      "description": "Background Unix-socket server that publishes enablement state and accepts control commands from local clients.",
+      "responsibilities": [
+        "Bind the primary control socket or a per-process fallback socket",
+        "Accept GET_STATUS, SET_STATUS, RELOAD, and SHUTDOWN commands",
+        "Forward reload requests to a thread-safe callback",
+        "Expose daemon state to tray and local tooling"
+      ],
+      "files": [
+        "cpp/src/ipc_server.cpp",
+        "cpp/include/punto/ipc_server.hpp"
+      ],
+      "file_groups": [],
+      "provides": [
+        "IpcServer",
+        "IpcCommand",
+        "IpcResult"
+      ],
+      "consumes_from": [],
+      "data_flows": [
+        {
+          "from": "tray-ipc-client",
+          "to": "here",
+          "trigger": "local Unix socket command",
+          "payload": "service status queries, enable/disable toggles, and config reload requests"
+        }
+      ]
+    },
+    {
+      "id": "tray-shell",
+      "container_id": "tray-ui",
+      "c4_level": "Component",
+      "name": "Tray Shell",
+      "description": "GTK/AppIndicator application shell that renders menu state and dispatches user actions.",
+      "responsibilities": [
+        "Bootstrap GTK and AppIndicator",
+        "Poll daemon status on a timer and update tray icons",
+        "Offer auto-switch, sound, settings, about, and quit actions",
+        "Coordinate settings saves with daemon reloads"
+      ],
+      "files": [
+        "cpp/src/tray/main.cpp",
+        "cpp/src/tray/tray_app.cpp",
+        "cpp/include/punto/tray_app.hpp"
+      ],
+      "file_groups": [],
+      "provides": [
+        "main",
+        "TrayApp"
+      ],
+      "consumes_from": [
+        "tray-ipc-client",
+        "tray-settings"
+      ],
+      "data_flows": [
+        {
+          "from": "Desktop User",
+          "to": "here",
+          "trigger": "tray menu interaction",
+          "payload": "toggle requests, settings dialog opens, and quit actions"
+        }
+      ]
+    },
+    {
+      "id": "tray-ipc-client",
+      "container_id": "tray-ui",
+      "c4_level": "Component",
+      "name": "Tray IPC Client",
+      "description": "Local client that discovers daemon sockets, broadcasts commands, and aggregates multi-instance daemon state.",
+      "responsibilities": [
+        "Scan /var/run for primary and fallback daemon sockets",
+        "Send GET_STATUS, SET_STATUS, and RELOAD commands with timeouts",
+        "Merge responses from multiple daemon processes into one tray status"
+      ],
+      "files": [
+        "cpp/src/tray/ipc_client.cpp",
+        "cpp/include/punto/ipc_client.hpp"
+      ],
+      "file_groups": [],
+      "provides": [
+        "IpcClient",
+        "ServiceStatus"
+      ],
+      "consumes_from": [
+        "daemon-ipc"
+      ],
+      "data_flows": [
+        {
+          "from": "here",
+          "to": "daemon-ipc",
+          "trigger": "status poll or tray command",
+          "payload": "Unix socket request strings and aggregated daemon replies"
+        }
+      ]
+    },
+    {
+      "id": "tray-settings",
+      "container_id": "tray-ui",
+      "c4_level": "Component",
+      "name": "Tray Settings",
+      "description": "Loads and saves per-user settings and syncs the system layout hotkey through GNOME or X11 backends.",
+      "responsibilities": [
+        "Parse and write ~/.config/punto/config.yaml",
+        "Render settings dialog fields for auto-switch, typo fix, sound, and hotkeys",
+        "Validate requested system layout shortcuts before saving",
+        "Write layout-toggle settings through GSettings or setxkbmap"
+      ],
+      "files": [
+        "cpp/src/tray/settings_dialog.cpp",
+        "cpp/src/tray/system_input_settings.cpp",
+        "cpp/include/punto/settings_dialog.hpp",
+        "cpp/include/punto/system_input_settings.hpp"
+      ],
+      "file_groups": [],
+      "provides": [
+        "SettingsDialog",
+        "SettingsData",
+        "SystemInputSettings",
+        "LayoutToggle"
+      ],
+      "consumes_from": [],
+      "data_flows": [
+        {
+          "from": "~/.config/punto/config.yaml",
+          "to": "here",
+          "trigger": "tray startup or settings dialog open",
+          "payload": "user overrides for auto-switch, typo correction, sound, and hotkeys"
+        }
+      ]
+    },
+    {
+      "id": "packaging-and-runtime",
+      "container_id": "distribution-tooling",
+      "c4_level": "Component",
+      "name": "Packaging and Runtime Scripts",
+      "description": "Bash and Debian metadata that compile the project, assemble installation assets, and control deployed processes.",
+      "responsibilities": [
+        "Install build and runtime packages before packaging",
+        "Compile punto and punto-tray with CMake",
+        "Assemble Debian metadata, static assets, and default config",
+        "Install or refresh udevmon and tray autostart files",
+        "Expose start, stop, restart, and status commands for deployed binaries"
+      ],
+      "files": [
+        "build-deb.sh",
+        "punto-cli.sh",
+        "cpp/CMakeLists.txt",
+        "DEBIAN/control",
+        "DEBIAN/postinst",
+        "DEBIAN/prerm",
+        "config.yaml",
+        "udevmon.yaml",
+        "punto-tray.desktop"
+      ],
+      "file_groups": [],
+      "provides": [
+        "restart_tray",
+        "print_status",
+        "start_service",
+        "stop_service",
+        "restart_service"
+      ],
+      "consumes_from": [
+        "daemon-bootstrap",
+        "tray-shell"
+      ],
+      "data_flows": [
+        {
+          "from": "Local Administrator",
+          "to": "here",
+          "trigger": "build, install, or service-management command",
+          "payload": "package build flags, systemd control requests, and asset installation"
+        }
+      ]
+    }
+  ],
+  "dependencies": {
+    "internal": [
+      {
+        "from": "daemon-bootstrap",
+        "to": "event-orchestrator",
+        "type": "calls"
+      },
+      {
+        "from": "event-orchestrator",
+        "to": "analysis-pipeline",
+        "type": "calls"
+      },
+      {
+        "from": "event-orchestrator",
+        "to": "text-transforms",
+        "type": "calls"
+      },
+      {
+        "from": "event-orchestrator",
+        "to": "desktop-integration",
+        "type": "calls"
+      },
+      {
+        "from": "event-orchestrator",
+        "to": "daemon-ipc",
+        "type": "calls"
+      },
+      {
+        "from": "tray-shell",
+        "to": "tray-ipc-client",
+        "type": "calls"
+      },
+      {
+        "from": "tray-shell",
+        "to": "tray-settings",
+        "type": "calls"
+      },
+      {
+        "from": "tray-ipc-client",
+        "to": "daemon-ipc",
+        "type": "calls"
+      },
+      {
+        "from": "packaging-and-runtime",
+        "to": "keyboard-daemon",
+        "type": "config"
+      },
+      {
+        "from": "packaging-and-runtime",
+        "to": "tray-ui",
+        "type": "config"
+      }
+    ],
+    "external": [
+      {
+        "name": "cmake",
+        "version": "3.16",
+        "purpose": "native build configuration"
+      },
+      {
+        "name": "interception-tools",
+        "purpose": "capture physical keyboard events and replay corrected events through uinput"
+      },
+      {
+        "name": "X11",
+        "purpose": "active session discovery, clipboard ownership, and keyboard layout control"
+      },
+      {
+        "name": "XCB",
+        "purpose": "optional X11 integration enabled when available"
+      },
+      {
+        "name": "Hunspell",
+        "purpose": "dictionary-backed word validation and suggestion generation"
+      },
+      {
+        "name": "GTK3",
+        "purpose": "tray menus, dialogs, and desktop UI widgets"
+      },
+      {
+        "name": "AppIndicator / Ayatana AppIndicator",
+        "purpose": "system tray icon integration"
+      },
+      {
+        "name": "GLib / GSettings",
+        "purpose": "GNOME hotkey inspection and update logic"
+      },
+      {
+        "name": "systemd",
+        "purpose": "udevmon lifecycle control and loginctl session inspection"
+      },
+      {
+        "name": "dpkg-deb",
+        "purpose": "Debian package assembly"
+      },
+      {
+        "name": "pulseaudio-utils / alsa-utils",
+        "purpose": "optional sound playback for layout-switch cues"
+      }
+    ]
+  },
+  "data_structures": [
+    {
+      "name": "AutoSwitchConfig",
+      "file": "cpp/include/punto/config.hpp:35",
+      "description": "Runtime thresholds and feature flags that govern automatic word analysis and correction behavior.",
+      "fields": {
+        "enabled": "bool - master switch for auto layout correction",
+        "threshold": "double - minimum score ratio before switching layouts",
+        "min_word_len": "size_t - shortest word allowed into analysis",
+        "min_score": "double - floor for confident n-gram decisions",
+        "max_rollback_words": "size_t - maximum number of recent words that replay logic may rewrite",
+        "typo_correction_enabled": "bool - enables typo suggestions and replacements",
+        "max_typo_diff": "size_t - edit-distance ceiling for typo fixes",
+        "sticky_shift_correction_enabled": "bool - enables title-case repair for sticky-shift patterns"
+      }
+    },
+    {
+      "name": "Config",
+      "file": "cpp/include/punto/config.hpp:80",
+      "description": "Top-level daemon configuration loaded from the system or user YAML file.",
+      "fields": {
+        "hotkey": "HotkeyConfig - modifier plus key used as a layout-toggle fallback",
+        "auto_switch": "AutoSwitchConfig - automatic analysis and correction rules",
+        "sound": "SoundConfig - sound playback toggle",
+        "config_path": "filesystem::path - resolved file path used for this config snapshot"
+      }
+    },
+    {
+      "name": "KeyEntry",
+      "file": "cpp/include/punto/types.hpp:104",
+      "description": "Normalized keyboard token that preserves scan code and whether Shift was held when the key was typed.",
+      "fields": {
+        "code": "ScanCode - linux input key code",
+        "shifted": "bool - whether the visible character was shifted"
+      }
+    },
+    {
+      "name": "AnalysisResult",
+      "file": "cpp/include/punto/layout_analyzer.hpp:23",
+      "description": "Scoring outcome from dictionary and n-gram language analysis for a completed word.",
+      "fields": {
+        "en_score": "double - English language confidence score",
+        "ru_score": "double - Russian language confidence score",
+        "en_invalid_count": "size_t - invalid English bigram count",
+        "ru_invalid_count": "size_t - invalid Russian bigram count",
+        "likely_lang": "Language - best-scoring language classification",
+        "should_switch": "bool - whether the daemon should switch layouts"
+      }
+    },
+    {
+      "name": "WordTask",
+      "file": "cpp/include/punto/analysis_worker_pool.hpp:29",
+      "description": "Queued work item representing one completed word handed from the EventLoop to the async analysis pool.",
+      "fields": {
+        "task_id": "uint64_t - monotonic task ordering key",
+        "word": "vector<KeyEntry> - full typed token buffer including punctuation",
+        "analysis_len": "size_t - prefix length that should be analyzed",
+        "layout_at_boundary": "int - keyboard layout seen at the word boundary",
+        "cfg": "AutoSwitchConfig - analysis rules snapshot for this task",
+        "submitted_at": "time_point - enqueue timestamp for telemetry"
+      }
+    },
+    {
+      "name": "WordResult",
+      "file": "cpp/include/punto/analysis_worker_pool.hpp:57",
+      "description": "Async analysis result returned to the EventLoop with optional replacement keys and telemetry.",
+      "fields": {
+        "task_id": "uint64_t - original task ordering key",
+        "need_switch": "bool - whether the resulting correction needs a layout change",
+        "correction_type": "CorrectionType - no-op, layout switch, typo fix, sticky-shift fix, or combined fix",
+        "correction": "optional<vector<KeyEntry>> - replacement word when the output differs from the original",
+        "word_len": "size_t - total queued word length",
+        "analysis_len": "size_t - analyzed prefix length",
+        "layout_at_boundary": "int - layout snapshot from the task",
+        "queue_us": "uint64_t - microseconds spent waiting in the queue",
+        "analysis_us": "uint64_t - microseconds spent performing analysis"
+      }
+    },
+    {
+      "name": "HistoryWord",
+      "file": "cpp/include/punto/history_manager.hpp:27",
+      "description": "Metadata for one committed word inside the rollback/replay history ring buffer.",
+      "fields": {
+        "task_id": "uint64_t - analysis task linked to the committed word",
+        "start_pos": "uint64_t - inclusive token-stream start position",
+        "end_pos": "uint64_t - exclusive token-stream end position before the delimiter",
+        "delim_pos": "uint64_t - token position of the committed delimiter",
+        "delimiter": "ScanCode - recorded space or tab token",
+        "detected_language": "uint8_t - contextual language tag for recent-word heuristics"
+      }
+    },
+    {
+      "name": "X11SessionInfo",
+      "file": "cpp/include/punto/x11_session.hpp:25",
+      "description": "Snapshot of the active desktop session that the root-run daemon must impersonate for X11 work.",
+      "fields": {
+        "session_id": "string - systemd login session identifier when available",
+        "username": "string - active desktop user",
+        "uid": "uint32_t - target effective UID for X11 calls",
+        "gid": "uint32_t - target effective GID for X11 calls",
+        "display": "string - X11 display name such as :0",
+        "xauthority_path": "string - Xauthority file used to reach the X server",
+        "home_dir": "string - active user's home directory",
+        "xdg_runtime_dir": "string - runtime directory for the active session"
+      }
+    },
+    {
+      "name": "SettingsData",
+      "file": "cpp/include/punto/settings_dialog.hpp:16",
+      "description": "User-facing settings model stored by the tray dialog before it is written back to YAML or applied to the system hotkey backend.",
+      "fields": {
+        "auto_enabled": "bool - tray-side toggle for automatic layout switching",
+        "threshold": "double - analysis threshold mirrored from config.yaml",
+        "min_word_len": "int - minimum analyzed word length",
+        "min_score": "double - minimum score for a confident correction",
+        "max_rollback_words": "int - rollback depth for replay-based correction",
+        "typo_correction_enabled": "bool - typo-correction toggle",
+        "max_typo_diff": "int - maximum edit distance for typo repair",
+        "sticky_shift_correction_enabled": "bool - sticky-shift fix toggle",
+        "sound_enabled": "bool - sound cue toggle",
+        "modifier": "string - configured layout-hotkey modifier id",
+        "key": "string - configured layout-hotkey key id"
+      }
+    }
+  ],
+  "external_services": [
+    {
+      "name": "udevmon",
+      "purpose": "Hosts the interception pipeline and launches one daemon process per keyboard device.",
+      "auth": "Local root or systemd service permissions",
+      "trigger": "Package install, CLI start, or system boot"
+    },
+    {
+      "name": "X Server",
+      "purpose": "Clipboard access, active-window inspection, and XKB layout control.",
+      "auth": "DISPLAY and XAUTHORITY from the active desktop session",
+      "trigger": "Clipboard-based paste, layout switching, terminal detection, and tray UI startup"
+    },
+    {
+      "name": "systemd / loginctl",
+      "purpose": "Discover the active desktop session and manage the udevmon service lifecycle.",
+      "auth": "Local process and service-control privileges",
+      "trigger": "Daemon session refresh and CLI/package lifecycle actions"
+    },
+    {
+      "name": "GNOME GSettings",
+      "purpose": "Read and write the system layout-switch hotkey on GNOME desktops.",
+      "auth": "Desktop-session GSettings access",
+      "trigger": "Saving tray settings when the active backend is GNOME"
+    },
+    {
+      "name": "setxkbmap",
+      "purpose": "Fallback writer for X11 layout-toggle configuration outside GNOME.",
+      "auth": "Desktop-session X11 access",
+      "trigger": "Saving tray settings when the active backend is generic X11"
+    },
+    {
+      "name": "paplay or aplay",
+      "purpose": "Play optional sound cues after a successful layout change.",
+      "auth": "Active user audio-session access",
+      "trigger": "Layout switch when sound is enabled"
+    }
+  ],
+  "glossary": [
+    {
+      "term": "Auto-switch",
+      "definition": "Automatic correction that runs after a word boundary such as Space or Tab."
+    },
+    {
+      "term": "KeyEntry",
+      "definition": "One typed token stored as a scan code plus its Shift state."
+    },
+    {
+      "term": "Rollback/Replay",
+      "definition": "Correction strategy that deletes already typed tokens and retypes the corrected sequence."
+    },
+    {
+      "term": "Sticky Shift",
+      "definition": "Wrong-case pattern like ПРивет or кОЛБАСА that should become Title Case."
+    },
+    {
+      "term": "Typo Fix",
+      "definition": "Hunspell-assisted correction for insertions, deletions, substitutions, and adjacent transpositions."
+    },
+    {
+      "term": "QWERTY Cyrillic",
+      "definition": "Russian words represented as the English keyboard sequence that produced them, used for lookup and conversion."
+    },
+    {
+      "term": "IPC Socket",
+      "definition": "Local Unix domain socket under /var/run that carries status and reload commands between tray and daemon."
+    },
+    {
+      "term": "Macro Lock",
+      "definition": "Cross-process flock-based guard that prevents multiple daemon instances from replaying corrections at the same time."
+    },
+    {
+      "term": "Oneshot Paste",
+      "definition": "Clipboard-plus-paste replacement path used instead of retyping characters one by one."
+    },
+    {
+      "term": "Smart Bypass",
+      "definition": "Heuristic that skips case-only fixes for words that should not receive sticky-shift corrections."
+    }
+  ]
+}

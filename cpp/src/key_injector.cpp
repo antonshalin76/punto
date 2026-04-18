@@ -7,7 +7,6 @@
 
 #include <cerrno>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <unistd.h>
 
@@ -17,8 +16,7 @@ namespace punto {
 
 KeyInjector::KeyInjector() noexcept = default;
 
-void KeyInjector::write_all_or_die(int fd, const void *data,
-                                   std::size_t bytes) {
+void KeyInjector::write_all(int fd, const void *data, std::size_t bytes) const {
   const std::uint8_t *p = static_cast<const std::uint8_t *>(data);
   std::size_t remaining = bytes;
 
@@ -38,20 +36,25 @@ void KeyInjector::write_all_or_die(int fd, const void *data,
     std::cerr << "[punto] KeyInjector: write failed (fd=" << fd
               << " bytes=" << bytes << " remaining=" << remaining
               << ") errno=" << e << " (" << std::strerror(e) << ")\n";
-    std::exit(1);
+    fatal_io_errno_.store(e, std::memory_order_relaxed);
+    fatal_io_error_.store(true, std::memory_order_release);
+    return;
   }
 }
 
-void KeyInjector::emit_events(std::span<const input_event> events) {
+void KeyInjector::emit_events(std::span<const input_event> events) const {
   if (events.empty()) {
     return;
   }
 
-  write_all_or_die(STDOUT_FILENO, events.data(),
-                   events.size() * sizeof(input_event));
+  if (fatal_io_error_.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  write_all(STDOUT_FILENO, events.data(), events.size() * sizeof(input_event));
 }
 
-void KeyInjector::emit_event(const input_event &ev) {
+void KeyInjector::emit_event(const input_event &ev) const {
   emit_events(std::span<const input_event>{&ev, 1});
 }
 
@@ -195,6 +198,19 @@ void KeyInjector::delay(std::chrono::microseconds us) const noexcept {
   } else {
     usleep(static_cast<useconds_t>(us.count()));
   }
+}
+
+bool KeyInjector::has_fatal_io_error() const noexcept {
+  return fatal_io_error_.load(std::memory_order_acquire);
+}
+
+int KeyInjector::fatal_io_errno() const noexcept {
+  return fatal_io_errno_.load(std::memory_order_relaxed);
+}
+
+void KeyInjector::clear_fatal_io_error() const noexcept {
+  fatal_io_errno_.store(0, std::memory_order_relaxed);
+  fatal_io_error_.store(false, std::memory_order_release);
 }
 
 } // namespace punto

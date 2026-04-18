@@ -79,10 +79,15 @@ function stop_service() {
         sleep 1
     fi
     
-    # Убиваем оставшиеся процессы punto-daemon если есть
+    # Best-effort: просим оставшиеся процессы завершиться без SIGKILL.
     if pgrep -f "punto-daemon" > /dev/null; then
-        echo "  → Killing remaining daemon processes..."
-        sudo pkill -9 -f "punto-daemon" || true
+        echo "  → Sending TERM to remaining daemon processes..."
+        sudo pkill -TERM -f "punto-daemon" || true
+        sleep 2
+    fi
+
+    if pgrep -f "punto-daemon" > /dev/null; then
+        echo -e "${YELLOW}  → Внимание: часть punto-daemon всё ещё работает. Проверьте journalctl и состояние udevmon вручную.${NC}"
     fi
     
     echo -e "${GREEN}✓ Punto Switcher stopped${NC}"

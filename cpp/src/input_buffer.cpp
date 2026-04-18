@@ -12,7 +12,14 @@
 namespace punto {
 
 bool InputBuffer::push_char(ScanCode code, bool shifted) noexcept {
+  if (current_overflowed_) {
+    return false;
+  }
+
   if (current_len_ >= kMaxWordLen - 1) {
+    current_len_ = 0;
+    trailing_len_ = 0;
+    current_overflowed_ = true;
     return false;
   }
 
@@ -35,6 +42,13 @@ bool InputBuffer::pop_char() noexcept {
 }
 
 void InputBuffer::commit_word() noexcept {
+  if (current_overflowed_) {
+    current_len_ = 0;
+    trailing_len_ = 0;
+    current_overflowed_ = false;
+    return;
+  }
+
   if (current_len_ > 0) {
     // Копируем текущее слово в last_word
     std::copy_n(current_buf_.begin(), current_len_, last_buf_.begin());
@@ -48,6 +62,7 @@ void InputBuffer::reset_all() noexcept {
   current_len_ = 0;
   last_len_ = 0;
   trailing_len_ = 0;
+  current_overflowed_ = false;
 
   // Ассемблерная оптимизация для очистки памяти
   asm_utils::fast_zero_buffer(current_buf_.data(),
@@ -58,7 +73,10 @@ void InputBuffer::reset_all() noexcept {
                               trailing_buf_.size() * sizeof(ScanCode) / 8);
 }
 
-void InputBuffer::reset_current() noexcept { current_len_ = 0; }
+void InputBuffer::reset_current() noexcept {
+  current_len_ = 0;
+  current_overflowed_ = false;
+}
 
 bool InputBuffer::push_trailing(ScanCode code) noexcept {
   if (trailing_len_ >= kMaxWordLen - 1) {
@@ -98,6 +116,10 @@ std::size_t InputBuffer::last_length() const noexcept { return last_len_; }
 
 std::size_t InputBuffer::trailing_length() const noexcept {
   return trailing_len_;
+}
+
+bool InputBuffer::current_overflowed() const noexcept {
+  return current_overflowed_;
 }
 
 } // namespace punto

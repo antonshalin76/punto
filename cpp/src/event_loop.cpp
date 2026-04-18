@@ -5,13 +5,17 @@
 
 #include "punto/event_loop.hpp"
 #include "punto/key_entry_text.hpp"
+#include "punto/logger.hpp"
 #include "punto/macro_lock.hpp"
 #include "punto/scancode_map.hpp"
 #include "punto/sound_manager.hpp"
 #include "punto/text_processor.hpp"
 
+#include <algorithm>
 #include <cerrno>
+#include <cstring>
 #include <cstdio>
+#include <filesystem>
 #include <iostream>
 #include <poll.h>
 #include <thread>
@@ -49,6 +53,72 @@ oneshot_paste_waits(bool is_terminal) noexcept {
   };
 }
 
+constexpr std::uint64_t kTaskIdFenceStride = 1024;
+
+enum class ReadEventStatus {
+  Ok,
+  Eof,
+  Again,
+  Error,
+};
+
+ReadEventStatus read_input_event(int fd, input_event &ev) {
+  auto *dst = reinterpret_cast<std::uint8_t *>(&ev);
+  std::size_t total = 0;
+
+  while (total < sizeof(ev)) {
+    const ssize_t n = ::read(fd, dst + total, sizeof(ev) - total);
+    if (n > 0) {
+      total += static_cast<std::size_t>(n);
+      continue;
+    }
+    if (n == 0) {
+      return total == 0 ? ReadEventStatus::Eof : ReadEventStatus::Error;
+    }
+    if (errno == EINTR) {
+      continue;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return total == 0 ? ReadEventStatus::Again : ReadEventStatus::Error;
+    }
+    return ReadEventStatus::Error;
+  }
+
+  return ReadEventStatus::Ok;
+}
+
+void drain_fd(int fd) {
+  if (fd < 0) {
+    return;
+  }
+
+  std::array<char, 32> buffer{};
+  while (true) {
+    const ssize_t n = ::read(fd, buffer.data(), buffer.size());
+    if (n > 0) {
+      continue;
+    }
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    break;
+  }
+}
+
+bool path_within(const std::filesystem::path &child,
+                 const std::filesystem::path &parent) {
+  auto child_it = child.begin();
+  auto parent_it = parent.begin();
+
+  for (; parent_it != parent.end(); ++parent_it, ++child_it) {
+    if (child_it == child.end() || *child_it != *parent_it) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 } // namespace
 
 EventLoop::EventLoop(Config config)
@@ -59,6 +129,8 @@ EventLoop::EventLoop(Config config)
 }
 
 EventLoop::~EventLoop() = default;
+
+void EventLoop::set_stop_signal_fd(int fd) noexcept { stop_signal_fd_ = fd; }
 
 bool EventLoop::initialize() {
   if (initialized_) {
@@ -77,7 +149,11 @@ bool EventLoop::initialize() {
   }
 
   // Инициализируем словарь для гибридного анализа
-  dict_.initialize();
+  if (!dict_.initialize()) {
+    std::cerr << "[punto] FATAL: no dictionaries available\n";
+    exit_code_ = 2;
+    return false;
+  }
 
   // Инициализируем X11 сессию
   x11_session_ = std::make_unique<X11Session>();
@@ -120,6 +196,12 @@ bool EventLoop::initialize() {
                  "user-сессии или недоступен DISPLAY/XAUTHORITY).\n"
               << "[punto] Ожидается на экране логина: сервис автоматически "
                  "перепривяжется после входа пользователя.\n";
+    const X11SessionInfo info = x11_session_->info();
+    if (!wayland_warning_emitted_ && !info.wayland_display.empty()) {
+      wayland_warning_emitted_ = true;
+      std::cerr << "[punto] WARN: Wayland session detected, layout switching "
+                   "disabled until X11 becomes available.\n";
+    }
     // Не фатальная ошибка — базовая функциональность работает
   } else {
     // Создаём ClipboardManager
@@ -138,7 +220,8 @@ bool EventLoop::initialize() {
   // Создаём IPC сервер для управления из tray-приложения
   ipc_server_ = std::make_unique<IpcServer>(
       ipc_enabled_,
-      [this](const std::string &path) { return reload_config(path); });
+      [this](const std::string &path) { return reload_config(path); },
+      [this]() { return stats_report(); });
   if (!ipc_server_->start()) {
     std::cerr << "[punto] Warning: IPC server failed to start. "
                  "Tray control will be unavailable.\n";
@@ -156,21 +239,14 @@ void EventLoop::request_stop() noexcept {
 int EventLoop::run() {
   if (!initialize()) {
     std::cerr << "[punto] Failed to initialize event loop\n";
-    return 1;
+    return exit_code_ != 0 ? exit_code_ : 1;
   }
 
   // Пытаемся синхронизировать раскладку на старте
-  x11_session_->apply_environment();
-  current_layout_ = x11_session_->get_current_keyboard_layout();
-  if (current_layout_ < 0) {
-    current_layout_ = 0;
-  }
+  sync_current_layout_from_os("startup");
   std::cerr << "[punto] Startup layout group: " << current_layout_ << "\n";
   last_sync_time_ = std::chrono::steady_clock::now();
 
-  // Полностью отключаем буферизацию stdin для корректной работы poll() +
-  // fread()
-  std::setvbuf(stdin, nullptr, _IONBF, 0);
   std::setbuf(stdout, nullptr);
 
   input_event ev{};
@@ -215,15 +291,13 @@ int EventLoop::run() {
     sound_manager_ = std::make_unique<SoundManager>(*x11_session_, cfg->sound);
 
     // Синхронизируем раскладку.
-    x11_session_->apply_environment();
-    current_layout_ = x11_session_->get_current_keyboard_layout();
-    if (current_layout_ < 0) {
-      current_layout_ = 0;
-    }
+    sync_current_layout_from_os("x11 refresh");
     std::cerr << "[punto] X11 session refreshed, layout: "
               << (current_layout_ == 0 ? "EN" : "RU") << "\n";
 
     last_sync_time_ = std::chrono::steady_clock::now();
+    layout_desynced_ = false;
+    wayland_warning_emitted_ = false;
   };
 
   auto teardown_x11_deps = [&]() {
@@ -240,6 +314,10 @@ int EventLoop::run() {
       clipboard_->pump_events();
     }
     flush_pending_clipboard_restore(false);
+    maybe_handle_injector_failure("main loop");
+    if (stop_requested_.load(std::memory_order_relaxed)) {
+      break;
+    }
 
     // Периодически проверяем, не сменилась ли активная user-сессия.
     // Используем фоновый refresh чтобы не блокировать обработку клавиатуры.
@@ -280,19 +358,46 @@ int EventLoop::run() {
             << "[punto] X11: активная пользовательская сессия не обнаружена "
                "(возможно экран логина). Ожидаю входа пользователя...\n";
       }
+      const X11SessionInfo info = x11_session_->info();
+      if (!wayland_warning_emitted_ && !info.wayland_display.empty()) {
+        wayland_warning_emitted_ = true;
+        std::cerr << "[punto] WARN: Wayland session detected, layout "
+                     "switching disabled, analysis continues in read-only "
+                     "mode.\n";
+      }
     } else {
       x11_wait_log_emitted = false;
+      wayland_warning_emitted_ = false;
     }
 
     // Важно: даже если пользователь перестал печатать, мы должны
     // применять готовые результаты анализа (иначе автоинверсия может не
     // сработать).
     process_ready_results();
+    maybe_handle_injector_failure("post-result processing");
+    if (stop_requested_.load(std::memory_order_relaxed)) {
+      break;
+    }
 
-    pfd.revents = 0;
-    int ret = poll(&pfd, 1, 1); // 1ms тик
+    std::array<pollfd, 2> pfds{};
+    nfds_t nfds = 1;
+    pfds[0] = pfd;
+    if (stop_signal_fd_ >= 0) {
+      pfds[1] = pollfd{stop_signal_fd_, POLLIN, 0};
+      nfds = 2;
+    }
+
+    int ret = poll(pfds.data(), nfds, 1); // 1ms тик
 
     if (ret > 0) {
+      if (stop_signal_fd_ >= 0 && (pfds[1].revents & POLLIN)) {
+        drain_fd(stop_signal_fd_);
+        request_stop();
+        continue;
+      }
+
+      pfd = pfds[0];
+
       // Проверяем флаги закрытия канала или ошибки.
       // POLLHUP возникает когда udevmon закрывает пайп (остановка сервиса).
       // Если установлен POLLIN вместе с POLLHUP, сначала читаем оставшиеся
@@ -309,13 +414,26 @@ int EventLoop::run() {
       }
 
       if (pfd.revents & POLLIN) {
-        if (std::fread(&ev, sizeof(ev), 1, stdin) != 1) {
-          break; // EOF или ошибка
+        switch (read_input_event(STDIN_FILENO, ev)) {
+        case ReadEventStatus::Ok:
+          handle_event(ev);
+          process_ready_results();
+          maybe_handle_injector_failure("stdin event processing");
+          continue;
+        case ReadEventStatus::Again:
+          continue;
+        case ReadEventStatus::Eof:
+          std::cerr << "[punto] stdin closed, exiting gracefully\n";
+          stop_requested_.store(true, std::memory_order_relaxed);
+          continue;
+        case ReadEventStatus::Error:
+        default:
+          exit_code_ = (exit_code_ == 0) ? 1 : exit_code_;
+          std::cerr << "[punto] stdin read failed: " << std::strerror(errno)
+                    << "\n";
+          stop_requested_.store(true, std::memory_order_relaxed);
+          continue;
         }
-        handle_event(ev);
-        // После обработки события ещё раз проверим результаты.
-        process_ready_results();
-        continue;
       }
     }
 
@@ -328,12 +446,14 @@ int EventLoop::run() {
         // Сигнал прервал poll — проверяем флаг остановки на следующей итерации
         continue;
       }
+      exit_code_ = (exit_code_ == 0) ? 1 : exit_code_;
+      std::cerr << "[punto] poll failed: " << std::strerror(errno) << "\n";
       break;
     }
   }
 
   std::cerr << "[punto] Event loop terminated gracefully\n";
-  return 0;
+  return exit_code_;
 }
 
 void EventLoop::emit_passthrough_event(const input_event &ev) {
@@ -344,7 +464,12 @@ void EventLoop::emit_passthrough_event(const input_event &ev) {
     }
   }
 
-  KeyInjector::emit_event(ev);
+  auto injector = std::atomic_load(&injector_);
+  if (!injector) {
+    return;
+  }
+  injector->emit_event(ev);
+  maybe_handle_injector_failure("passthrough");
 }
 
 void EventLoop::handle_event(const input_event &ev) {
@@ -403,9 +528,7 @@ void EventLoop::handle_event(const input_event &ev) {
   // Применяем изменения max_rollback_words безопасно (только в main thread).
   if (history_.max_words() != cfg->auto_switch.max_rollback_words) {
     history_.set_max_words(cfg->auto_switch.max_rollback_words);
-    pending_words_.clear();
-    ready_results_.clear();
-    next_apply_task_id_ = next_task_id_;
+    reset_async_state();
   }
 
   // =========================================================================
@@ -483,9 +606,7 @@ void EventLoop::handle_event(const input_event &ev) {
     }
     // Любой макрос по хоткею делает "переписывание" текста.
     // Чтобы избежать гонок/рассинхронизации, сбрасываем async-состояние.
-    pending_words_.clear();
-    ready_results_.clear();
-    next_apply_task_id_ = next_task_id_;
+    reset_async_state();
     history_.reset();
 
     auto action = determine_hotkey_action(code);
@@ -519,9 +640,7 @@ void EventLoop::handle_event(const input_event &ev) {
   if (modifiers_.any_ctrl() || modifiers_.any_alt() || modifiers_.any_meta()) {
     // Системные хоткеи/комбинации потенциально меняют курсор/контекст.
     // Для надёжности сбрасываем async-состояние.
-    pending_words_.clear();
-    ready_results_.clear();
-    next_apply_task_id_ = next_task_id_;
+    reset_async_state();
     history_.reset();
 
     // Детектируем пользовательское переключение раскладки (Ctrl+`)
@@ -544,14 +663,7 @@ void EventLoop::handle_event(const input_event &ev) {
       mod_pressed = modifiers_.right_shift;
 
     if (is_press && mod_pressed && code == layout_key) {
-      // Пользователь переключает раскладку вручную!
-      current_layout_ = (current_layout_ == 0) ? 1 : 0;
-      std::cerr << "[punto] USER layout switch -> "
-                << (current_layout_ == 0 ? "EN" : "RU") << "\n";
-
-      if (sound_manager_) {
-        sound_manager_->play_for_layout(current_layout_);
-      }
+      mark_layout_desynced("user layout hotkey");
     }
 
     buffer_.reset_current();
@@ -568,15 +680,8 @@ void EventLoop::handle_event(const input_event &ev) {
 
     // 1. Синхронизируем раскладку (на каждом разделителе!)
     if (!is_processing_macro_.load(std::memory_order_acquire)) {
-      x11_session_->apply_environment();
-      int os_layout = x11_session_->get_current_keyboard_layout();
-      if (os_layout != -1 && os_layout != current_layout_) {
-        std::cerr << "[punto] Layout SYNC: " << current_layout_ << " -> "
-                  << os_layout << " (from "
-                  << (code == KEY_SPACE ? "space" : "tab") << ")\n";
-        current_layout_ = os_layout;
-        last_sync_time_ = std::chrono::steady_clock::now();
-      }
+      sync_current_layout_from_os(code == KEY_SPACE ? "space boundary"
+                                                    : "tab boundary");
     }
 
     // 2. Очищаем слово от пунктуации для анализа
@@ -616,6 +721,8 @@ void EventLoop::handle_event(const input_event &ev) {
       res.analysis_len = analysis_word.size();
       res.layout_at_boundary = current_layout_;
       ready_results_[task_id] = res;
+      lifetime_telemetry_.ready_results.store(ready_results_.size(),
+                                              std::memory_order_relaxed);
       return;
     }
 
@@ -640,6 +747,8 @@ void EventLoop::handle_event(const input_event &ev) {
       res.analysis_len = meta.analysis_len;
       res.layout_at_boundary = meta.layout_at_boundary;
       ready_results_[task_id] = res;
+      lifetime_telemetry_.ready_results.store(ready_results_.size(),
+                                              std::memory_order_relaxed);
       return;
     }
 
@@ -647,6 +756,8 @@ void EventLoop::handle_event(const input_event &ev) {
         meta.end_pos - static_cast<std::uint64_t>(meta.word.size());
 
     pending_words_[task_id] = meta;
+    lifetime_telemetry_.pending_words.store(pending_words_.size(),
+                                            std::memory_order_relaxed);
 
     WordTask task;
     task.task_id = task_id;
@@ -670,6 +781,8 @@ void EventLoop::handle_event(const input_event &ev) {
           ++it;
         }
       }
+      lifetime_telemetry_.pending_words.store(pending_words_.size(),
+                                              std::memory_order_relaxed);
     }
 
     return;
@@ -680,15 +793,13 @@ void EventLoop::handle_event(const input_event &ev) {
 
     // Синхронизируем раскладку (только синхронизация, без анализа)
     if (!is_processing_macro_.load(std::memory_order_acquire)) {
-      int os_layout = x11_session_->get_current_keyboard_layout();
-      if (os_layout != -1 && os_layout != current_layout_) {
-        std::cerr << "[punto] Layout SYNC: " << current_layout_ << " -> "
-                  << os_layout << " (from punct)\n";
-        current_layout_ = os_layout;
-      }
+      sync_current_layout_from_os("punctuation");
     }
 
-    buffer_.push_char(code, modifiers_.any_shift());
+    const bool was_overflowed = buffer_.current_overflowed();
+    if (!buffer_.push_char(code, modifiers_.any_shift()) && !was_overflowed) {
+      std::cerr << "[punto] word too long, skipped\n";
+    }
     history_.push_token(KeyEntry{code, modifiers_.any_shift()});
     emit_passthrough_event(ev);
     return;
@@ -701,9 +812,7 @@ void EventLoop::handle_event(const input_event &ev) {
   if (code == KEY_ENTER || code == KEY_KPENTER) {
     buffer_.reset_all();
     history_.reset();
-    pending_words_.clear();
-    ready_results_.clear();
-    next_apply_task_id_ = next_task_id_;
+    reset_async_state();
 
     emit_passthrough_event(ev);
     return;
@@ -714,7 +823,10 @@ void EventLoop::handle_event(const input_event &ev) {
   // =========================================================================
 
   if (is_letter_key(code)) {
-    buffer_.push_char(code, modifiers_.any_shift());
+    const bool was_overflowed = buffer_.current_overflowed();
+    if (!buffer_.push_char(code, modifiers_.any_shift()) && !was_overflowed) {
+      std::cerr << "[punto] word too long, skipped\n";
+    }
     history_.push_token(KeyEntry{code, modifiers_.any_shift()});
 
     // Сбрасываем счётчик backspace при наборе буквы
@@ -731,9 +843,7 @@ void EventLoop::handle_event(const input_event &ev) {
   if (is_navigation_key(code)) {
     buffer_.reset_all();
     history_.reset();
-    pending_words_.clear();
-    ready_results_.clear();
-    next_apply_task_id_ = next_task_id_;
+    reset_async_state();
 
     emit_passthrough_event(ev);
     return;
@@ -755,9 +865,7 @@ void EventLoop::handle_event(const input_event &ev) {
   buffer_.reset_current();
   // Неизвестная клавиша = потенциальный разрыв контекста.
   history_.reset();
-  pending_words_.clear();
-  ready_results_.clear();
-  next_apply_task_id_ = next_task_id_;
+  reset_async_state();
 
   emit_passthrough_event(ev);
 }
@@ -845,6 +953,30 @@ HotkeyAction EventLoop::determine_hotkey_action(ScanCode code) const {
   return HotkeyAction::InvertLayoutWord;
 }
 
+void EventLoop::reset_async_state(bool bump_task_barrier) {
+  pending_words_.clear();
+  ready_results_.clear();
+
+  if (bump_task_barrier) {
+    const std::uint64_t fence =
+        std::max(next_task_id_, next_apply_task_id_) + kTaskIdFenceStride;
+    next_task_id_ = fence;
+    next_apply_task_id_ = fence;
+  } else {
+    next_apply_task_id_ = next_task_id_;
+  }
+
+  lifetime_telemetry_.pending_words.store(0, std::memory_order_relaxed);
+  lifetime_telemetry_.ready_results.store(0, std::memory_order_relaxed);
+}
+
+void EventLoop::mark_layout_desynced(std::string_view reason) {
+  if (!layout_desynced_) {
+    std::cerr << "[punto] Layout marked desynced: " << reason << "\n";
+  }
+  layout_desynced_ = true;
+}
+
 int EventLoop::sync_layout_from_os() {
   if (!x11_session_ || !x11_session_->is_valid()) {
     return -1;
@@ -852,13 +984,45 @@ int EventLoop::sync_layout_from_os() {
 
   x11_session_->apply_environment();
   const int os_layout = x11_session_->get_current_keyboard_layout();
-  if (os_layout >= 0 && os_layout != current_layout_) {
+  if ((os_layout == 0 || os_layout == 1) && os_layout != current_layout_) {
     std::cerr << "[punto] Layout PRE-SYNC: " << current_layout_ << " -> "
               << os_layout << "\n";
     current_layout_ = os_layout;
     last_sync_time_ = std::chrono::steady_clock::now();
   }
+  if (os_layout == 0 || os_layout == 1) {
+    layout_desynced_ = false;
+  }
   return os_layout;
+}
+
+void EventLoop::sync_current_layout_from_os(std::string_view reason) {
+  const int os_layout = sync_layout_from_os();
+  if (os_layout == 0 || os_layout == 1) {
+    if (layout_desynced_) {
+      std::cerr << "[punto] Layout resynced via " << reason << ": "
+                << os_layout << "\n";
+    }
+    layout_desynced_ = false;
+    return;
+  }
+  if (!reason.empty()) {
+    mark_layout_desynced(reason);
+  }
+}
+
+void EventLoop::maybe_handle_injector_failure(std::string_view context) {
+  auto injector = std::atomic_load(&injector_);
+  if (!injector || !injector->has_fatal_io_error()) {
+    return;
+  }
+
+  const int err = injector->fatal_io_errno();
+  injector->clear_fatal_io_error();
+  exit_code_ = (exit_code_ == 0) ? 1 : exit_code_;
+  std::cerr << "[punto] Fatal output I/O error in " << context
+            << ": errno=" << err << " (" << std::strerror(err) << ")\n";
+  request_stop();
 }
 
 bool EventLoop::verify_clipboard_ownership() const {
@@ -869,22 +1033,31 @@ bool EventLoop::verify_clipboard_ownership() const {
 }
 
 void EventLoop::switch_layout(bool play_sound) {
-  // Инвертируем внутреннее состояние
-  current_layout_ = (current_layout_ == 0) ? 1 : 0;
-  last_sync_time_ = std::chrono::steady_clock::now();
-
-  if (play_sound && sound_manager_) {
-    sound_manager_->play_for_layout(current_layout_);
-  }
-
   auto cfg = std::atomic_load(&config_);
   auto injector = std::atomic_load(&injector_);
   if (!injector) {
+    mark_layout_desynced("missing injector");
     return;
   }
 
   // Эмулируем нажатие горячей клавиши (fallback).
   injector->send_layout_hotkey(cfg->hotkey.modifier, cfg->hotkey.key);
+  maybe_handle_injector_failure("layout hotkey");
+  if (stop_requested_.load(std::memory_order_relaxed)) {
+    return;
+  }
+
+  const int previous_layout = current_layout_;
+  sync_current_layout_from_os("hotkey toggle");
+  if (layout_desynced_) {
+    current_layout_ = previous_layout;
+    return;
+  }
+
+  last_sync_time_ = std::chrono::steady_clock::now();
+  if (play_sound && sound_manager_) {
+    sound_manager_->play_for_layout(current_layout_);
+  }
 }
 
 bool EventLoop::set_layout(int target_layout, bool play_sound) {
@@ -892,21 +1065,9 @@ bool EventLoop::set_layout(int target_layout, bool play_sound) {
     return false;
   }
 
-  // Всегда стараемся синхронизировать внутреннее состояние с ОС перед решением.
-  if (x11_session_ && x11_session_->is_valid()) {
-    x11_session_->apply_environment();
-    int os_layout = x11_session_->get_current_keyboard_layout();
-    if (os_layout == 0 || os_layout == 1) {
-      if (os_layout != current_layout_) {
-        std::cerr << "[punto] Layout SYNC(set): " << current_layout_ << " -> "
-                  << os_layout << "\n";
-        current_layout_ = os_layout;
-        last_sync_time_ = std::chrono::steady_clock::now();
-      }
-    }
-  }
+  sync_current_layout_from_os("set_layout pre-check");
 
-  if (current_layout_ == target_layout) {
+  if (!layout_desynced_ && current_layout_ == target_layout) {
     return true;
   }
 
@@ -957,28 +1118,16 @@ bool EventLoop::set_layout(int target_layout, bool play_sound) {
   // Fallback: hotkey toggle (работает только если 2 раскладки).
   // Используется если XKB не доступен ИЛИ если XKB set не сработал.
   if (target_layout == 0 || target_layout == 1) {
-    // Синхронизируем current_layout_ с ОС перед hotkey
-    if (x11_session_ && x11_session_->is_valid()) {
-      x11_session_->apply_environment();
-      int os_layout = x11_session_->get_current_keyboard_layout();
-      if (os_layout == 0 || os_layout == 1) {
-        current_layout_ = os_layout;
-      }
-    }
-
     // Если уже в нужной раскладке — ничего не делаем
-    if (current_layout_ == target_layout) {
+    if (!layout_desynced_ && current_layout_ == target_layout) {
       return true;
     }
 
     // Hotkey переключает раскладку (toggle)
     switch_layout(play_sound);
-
-    // Важно: доверяем внутреннему состоянию, switch_layout() уже обновил
-    // current_layout_. Не пытаемся синхронизироваться с ОС сразу — она может
-    // обновиться с задержкой.
-    last_sync_time_ = std::chrono::steady_clock::now();
-
+    if (layout_desynced_) {
+      return false;
+    }
     return current_layout_ == target_layout;
   }
 
@@ -1301,9 +1450,12 @@ void EventLoop::set_last_undo_record(std::string original_text,
   rec.applied_at = std::chrono::steady_clock::now();
   rec.user_seq_at_apply = user_seq_;
 
-  std::cerr << "[punto] Undo record saved: original=\"" << rec.original_text
-            << "\" inserted_len=" << rec.inserted_len
-            << " inserted=\"" << inserted_text << "\"\n";
+  std::cerr << "[punto] Undo record saved: inserted_len=" << rec.inserted_len
+            << " restore_layout="
+            << (rec.restore_layout.has_value()
+                    ? std::to_string(*rec.restore_layout)
+                    : std::string{"-"})
+            << "\n";
 
   last_undo_ = std::move(rec);
 }
@@ -1348,9 +1500,7 @@ bool EventLoop::action_undo_last_correction() {
   }
 
   // Undo — это макрос переписывания текста; сбрасываем async-состояние.
-  pending_words_.clear();
-  ready_results_.clear();
-  next_apply_task_id_ = next_task_id_;
+  reset_async_state();
   history_.reset();
   buffer_.reset_all();
 
@@ -1368,7 +1518,6 @@ bool EventLoop::action_undo_last_correction() {
   } drain_guard{this};
 
   std::cerr << "[punto] Undo: start (erase=" << rec.inserted_len
-            << " original=\"" << rec.original_text << "\""
             << " restore_layout="
             << (rec.restore_layout.has_value()
                     ? std::to_string(*rec.restore_layout)
@@ -1707,6 +1856,9 @@ void EventLoop::wait_and_buffer_until(
     if (event_overflow_abort_requested_) {
       break;
     }
+    if (stop_requested_.load(std::memory_order_relaxed)) {
+      break;
+    }
     if (stop_pred && stop_pred()) {
       break;
     }
@@ -1737,13 +1889,27 @@ void EventLoop::wait_and_buffer_until(
       timeout_ms = kMaxPollSliceMs;
     }
 
-    pollfd pfd = {STDIN_FILENO, POLLIN, 0};
-    const int ret = poll(&pfd, 1, timeout_ms);
+    std::array<pollfd, 2> pfds{};
+    nfds_t nfds = 1;
+    pfds[0] = pollfd{STDIN_FILENO, POLLIN, 0};
+    if (stop_signal_fd_ >= 0) {
+      pfds[1] = pollfd{stop_signal_fd_, POLLIN, 0};
+      nfds = 2;
+    }
 
-    if (ret > 0 && (pfd.revents & POLLIN)) {
+    const int ret = poll(pfds.data(), nfds, timeout_ms);
+
+    if (ret > 0 && stop_signal_fd_ >= 0 && (pfds[1].revents & POLLIN)) {
+      drain_fd(stop_signal_fd_);
+      request_stop();
+      break;
+    }
+
+    if (ret > 0 && (pfds[0].revents & POLLIN)) {
       input_event ev;
       while (true) {
-        if (std::fread(&ev, sizeof(ev), 1, stdin) == 1) {
+        const ReadEventStatus status = read_input_event(STDIN_FILENO, ev);
+        if (status == ReadEventStatus::Ok) {
           constexpr std::size_t kPendingEventsCap = 5000;
           constexpr std::size_t kOverflowAbortThreshold = 4000;
 
@@ -1768,8 +1934,20 @@ void EventLoop::wait_and_buffer_until(
             }
           }
         }
-        pfd.revents = 0;
-        if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN)) {
+        if (status == ReadEventStatus::Eof) {
+          request_stop();
+          break;
+        }
+        if (status == ReadEventStatus::Error) {
+          exit_code_ = (exit_code_ == 0) ? 1 : exit_code_;
+          std::cerr << "[punto] stdin read failed while buffering: "
+                    << std::strerror(errno) << "\n";
+          request_stop();
+          break;
+        }
+
+        pfds[0].revents = 0;
+        if (poll(&pfds[0], 1, 0) <= 0 || !(pfds[0].revents & POLLIN)) {
           break;
         }
       }
@@ -2024,6 +2202,11 @@ void EventLoop::process_ready_results() {
     telemetry_.analyzed_words++;
     telemetry_.analysis_us_sum += r.analysis_us;
     telemetry_.queue_us_sum += r.queue_us;
+    lifetime_telemetry_.analyzed_words.fetch_add(1, std::memory_order_relaxed);
+    lifetime_telemetry_.analysis_us_sum.fetch_add(r.analysis_us,
+                                                  std::memory_order_relaxed);
+    lifetime_telemetry_.queue_us_sum.fetch_add(r.queue_us,
+                                               std::memory_order_relaxed);
 
     if (r.analysis_us > telemetry_.analysis_us_max) {
       telemetry_.analysis_us_max = r.analysis_us;
@@ -2034,10 +2217,14 @@ void EventLoop::process_ready_results() {
 
     if (r.need_switch) {
       telemetry_.need_switch_words++;
+      lifetime_telemetry_.need_switch_words.fetch_add(
+          1, std::memory_order_relaxed);
     }
 
     ready_results_[r.task_id] = r;
   }
+  lifetime_telemetry_.ready_results.store(ready_results_.size(),
+                                          std::memory_order_relaxed);
 
   // Применяем строго по порядку.
   while (true) {
@@ -2079,9 +2266,10 @@ void EventLoop::process_ready_results() {
         }
 
         if (undo_detector_.is_excluded(word_ascii)) {
-          std::cerr << "[punto] Skipping correction for excluded word: "
-                    << word_ascii << "\n";
+          std::cerr << "[punto] Skipping correction for excluded word entry\n";
           pending_words_.erase(res.task_id);
+          lifetime_telemetry_.pending_words.store(
+              pending_words_.size(), std::memory_order_relaxed);
           ++next_apply_task_id_;
           continue;
         }
@@ -2147,6 +2335,10 @@ void EventLoop::process_ready_results() {
     pending_words_.erase(res.task_id);
     ++next_apply_task_id_;
   }
+  lifetime_telemetry_.pending_words.store(pending_words_.size(),
+                                          std::memory_order_relaxed);
+  lifetime_telemetry_.ready_results.store(ready_results_.size(),
+                                          std::memory_order_relaxed);
 
   // Периодическая телеметрия (агрегировано, чтобы не спамить).
   const auto dt = now - telemetry_.last_report_at;
@@ -2335,6 +2527,12 @@ void EventLoop::apply_correction(const PendingWordMeta &meta,
   if (tail_scratch_.size() > telemetry_.tail_len_max) {
     telemetry_.tail_len_max = tail_scratch_.size();
   }
+  lifetime_telemetry_.corrections.fetch_add(1, std::memory_order_relaxed);
+  lifetime_telemetry_.correction_us_sum.fetch_add(
+      static_cast<std::uint64_t>(macro_us), std::memory_order_relaxed);
+  lifetime_telemetry_.tail_len_sum.fetch_add(
+      static_cast<std::uint64_t>(tail_scratch_.size()),
+      std::memory_order_relaxed);
 
   std::cerr << "[punto] Async-MACRO: task_id=" << meta.task_id
             << " macro_us=" << macro_us << "\n";
@@ -2457,6 +2655,9 @@ void EventLoop::apply_case_correction(
   if (static_cast<std::uint64_t>(macro_us) > telemetry_.correction_us_max) {
     telemetry_.correction_us_max = static_cast<std::uint64_t>(macro_us);
   }
+  lifetime_telemetry_.corrections.fetch_add(1, std::memory_order_relaxed);
+  lifetime_telemetry_.correction_us_sum.fetch_add(
+      static_cast<std::uint64_t>(macro_us), std::memory_order_relaxed);
 
   std::cerr << "[punto] Async-CASE-MACRO: task_id=" << meta.task_id
             << " macro_us=" << macro_us << "\n";
@@ -2595,6 +2796,9 @@ void EventLoop::apply_combined_correction(
   if (static_cast<std::uint64_t>(macro_us) > telemetry_.correction_us_max) {
     telemetry_.correction_us_max = static_cast<std::uint64_t>(macro_us);
   }
+  lifetime_telemetry_.corrections.fetch_add(1, std::memory_order_relaxed);
+  lifetime_telemetry_.correction_us_sum.fetch_add(
+      static_cast<std::uint64_t>(macro_us), std::memory_order_relaxed);
 
   std::cerr << "[punto] Async-COMBINED-MACRO: task_id=" << meta.task_id
             << " macro_us=" << macro_us << "\n";
@@ -2650,6 +2854,93 @@ void EventLoop::action_transliterate_selection() {
   drain_pending_events();
 }
 
+IpcResult EventLoop::stats_report() const {
+  const std::uint64_t analyzed =
+      lifetime_telemetry_.analyzed_words.load(std::memory_order_relaxed);
+  const std::uint64_t corrections =
+      lifetime_telemetry_.corrections.load(std::memory_order_relaxed);
+  const std::uint64_t queue_sum =
+      lifetime_telemetry_.queue_us_sum.load(std::memory_order_relaxed);
+  const std::uint64_t analysis_sum =
+      lifetime_telemetry_.analysis_us_sum.load(std::memory_order_relaxed);
+  const std::uint64_t correction_sum =
+      lifetime_telemetry_.correction_us_sum.load(std::memory_order_relaxed);
+  const std::uint64_t tail_sum =
+      lifetime_telemetry_.tail_len_sum.load(std::memory_order_relaxed);
+
+  std::string stats;
+  stats.reserve(256);
+  stats += "enabled=";
+  stats += ipc_enabled_.load(std::memory_order_relaxed) ? "1" : "0";
+  stats += " analyzed=" + std::to_string(analyzed);
+  stats += " need_switch=" +
+           std::to_string(lifetime_telemetry_.need_switch_words.load(
+               std::memory_order_relaxed));
+  stats += " corrections=" + std::to_string(corrections);
+  stats += " pending_words=" +
+           std::to_string(lifetime_telemetry_.pending_words.load(
+               std::memory_order_relaxed));
+  stats += " ready_results=" +
+           std::to_string(lifetime_telemetry_.ready_results.load(
+               std::memory_order_relaxed));
+  stats += " worker_threads=" + std::to_string(analysis_pool_.worker_count());
+  stats += " queued_tasks=" + std::to_string(analysis_pool_.pending_task_count());
+  stats += " avg_queue_us=" +
+           std::to_string(analyzed > 0 ? queue_sum / analyzed : 0);
+  stats += " avg_analysis_us=" +
+           std::to_string(analyzed > 0 ? analysis_sum / analyzed : 0);
+  stats += " avg_macro_us=" +
+           std::to_string(corrections > 0 ? correction_sum / corrections : 0);
+  stats += " avg_tail_len=" +
+           std::to_string(corrections > 0 ? tail_sum / corrections : 0);
+
+  return {true, std::move(stats)};
+}
+
+std::optional<std::filesystem::path>
+EventLoop::validate_reload_path(const std::string &config_path) const {
+  std::filesystem::path candidate{config_path};
+  std::error_code ec;
+  if (!std::filesystem::exists(candidate, ec) || ec) {
+    return std::nullopt;
+  }
+
+  const std::filesystem::path canonical_candidate =
+      std::filesystem::weakly_canonical(candidate, ec);
+  if (ec) {
+    return std::nullopt;
+  }
+
+  std::vector<std::filesystem::path> allowed_roots{
+      std::filesystem::path{"/etc/punto"}};
+
+  if (x11_session_) {
+    const X11SessionInfo info = x11_session_->info();
+    if (!info.xdg_config_home.empty()) {
+      allowed_roots.emplace_back(std::filesystem::path{info.xdg_config_home} /
+                                 "punto");
+    }
+    if (!info.home_dir.empty()) {
+      allowed_roots.emplace_back(std::filesystem::path{info.home_dir} /
+                                 ".config/punto");
+    }
+  }
+
+  for (const auto &root : allowed_roots) {
+    const std::filesystem::path canonical_root =
+        std::filesystem::weakly_canonical(root, ec);
+    if (ec) {
+      ec.clear();
+      continue;
+    }
+    if (path_within(canonical_candidate, canonical_root)) {
+      return canonical_candidate;
+    }
+  }
+
+  return std::nullopt;
+}
+
 IpcResult EventLoop::reload_config(const std::string &config_path) {
   std::filesystem::path system_path{std::string{kConfigPath}};
   std::filesystem::path load_path = system_path;
@@ -2659,24 +2950,26 @@ IpcResult EventLoop::reload_config(const std::string &config_path) {
   const bool explicit_path = !config_path.empty();
 
   if (explicit_path) {
-    load_path = std::filesystem::path{config_path};
-    tried_user = true;
-    std::error_code ec;
-    if (!std::filesystem::exists(load_path, ec) || ec) {
-      std::string msg = "Config file not found: " + config_path;
-      std::cerr << "[punto] " << msg << "\\n";
-      return {false, std::move(msg)};
+    auto validated = validate_reload_path(config_path);
+    if (!validated.has_value()) {
+      std::cerr << "[punto] Invalid RELOAD path: " << config_path << "\n";
+      return {false, "Invalid path"};
     }
+    load_path = std::move(*validated);
+    tried_user = true;
     user_exists = true; // путь указан явно и существует
   } else {
     std::optional<std::filesystem::path> user_path;
-    if (x11_session_ && x11_session_->is_valid()) {
+    if (x11_session_) {
       // Важно: reload_config() может выполняться из IPC-потока.
       // Не трогаем процессное окружение (setenv) здесь, берём снапшот данных.
       const X11SessionInfo info = x11_session_->info();
-      if (!info.home_dir.empty()) {
+      if (!info.xdg_config_home.empty()) {
+        user_path = std::filesystem::path{info.xdg_config_home} / "punto" /
+                    "config.yaml";
+      } else if (!info.home_dir.empty()) {
         user_path = std::filesystem::path{info.home_dir} /
-                    std::filesystem::path{std::string{kUserConfigRelPath}};
+                    ".config/punto/config.yaml";
       }
     }
 
@@ -2722,6 +3015,7 @@ IpcResult EventLoop::reload_config(const std::string &config_path) {
   if (sound_manager_) {
     sound_manager_->set_enabled(new_cfg->sound.enabled);
   }
+  update_log_level(new_cfg->logging.level);
 
   std::cerr << "[punto] Configuration reloaded: " << loaded.used_path << "\n";
   std::cerr << "[punto] auto_switch: enabled=" << new_cfg->auto_switch.enabled

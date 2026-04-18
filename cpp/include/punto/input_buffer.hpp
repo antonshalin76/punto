@@ -106,6 +106,9 @@ public:
   /// Длина trailing whitespace
   [[nodiscard]] std::size_t trailing_length() const noexcept;
 
+  /// Флаг переполнения текущего слова — слово было отброшено до разделителя
+  [[nodiscard]] bool current_overflowed() const noexcept;
+
 private:
   WordBuffer current_buf_{};
   WordBuffer last_buf_{};
@@ -114,6 +117,7 @@ private:
   std::size_t current_len_ = 0;
   std::size_t last_len_ = 0;
   std::size_t trailing_len_ = 0;
+  bool current_overflowed_ = false;
 };
 
 } // namespace punto

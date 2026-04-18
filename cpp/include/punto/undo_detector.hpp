@@ -168,7 +168,7 @@ public:
       if (file.is_open()) {
         file << word << "\n";
       }
-      std::cerr << "[punto] Added undo exclusion: " << word << "\n";
+      std::cerr << "[punto] Added undo exclusion entry\n";
     }
   }
 

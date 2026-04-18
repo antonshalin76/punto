@@ -5,6 +5,7 @@
 
 #include "punto/ipc_server.hpp"
 
+#include <grp.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -15,6 +16,7 @@
 #include <cctype>
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -47,6 +49,9 @@ IpcCommand parse_command(std::string_view cmd) {
   if (cmd.starts_with("RELOAD")) {
     return IpcCommand::Reload;
   }
+  if (cmd.starts_with("STATS")) {
+    return IpcCommand::Stats;
+  }
   if (cmd.starts_with("SHUTDOWN")) {
     return IpcCommand::Shutdown;
   }
@@ -54,11 +59,48 @@ IpcCommand parse_command(std::string_view cmd) {
   return IpcCommand::Unknown;
 }
 
+std::string_view command_name(IpcCommand cmd) {
+  switch (cmd) {
+  case IpcCommand::GetStatus:
+    return "GET_STATUS";
+  case IpcCommand::SetStatus:
+    return "SET_STATUS";
+  case IpcCommand::Reload:
+    return "RELOAD";
+  case IpcCommand::Stats:
+    return "STATS";
+  case IpcCommand::Shutdown:
+    return "SHUTDOWN";
+  case IpcCommand::Unknown:
+  default:
+    return "UNKNOWN";
+  }
+}
+
+void apply_socket_permissions(const std::string &socket_path) {
+  if (chmod(socket_path.c_str(), 0660) < 0) {
+    std::cerr << "[punto-ipc] Warning: failed to chmod socket (" << socket_path
+              << "): " << strerror(errno) << "\n";
+  }
+
+  if (group *grp = ::getgrnam("punto"); grp != nullptr) {
+    if (::chown(socket_path.c_str(), 0, grp->gr_gid) < 0) {
+      std::cerr << "[punto-ipc] Warning: failed to chown socket (" << socket_path
+                << "): " << strerror(errno) << "\n";
+    }
+  }
+}
+
 } // namespace
 
-IpcServer::IpcServer(std::atomic<bool>& enabled_flag, ReloadCallback reload_callback)
-    : enabled_flag_(enabled_flag)
-    , reload_callback_(std::move(reload_callback)) {}
+IpcServer::IpcServer(std::atomic<bool>& enabled_flag,
+                     ReloadCallback reload_callback,
+                     StatsCallback stats_callback,
+                     std::string primary_socket_path)
+    : enabled_flag_(enabled_flag),
+      reload_callback_(std::move(reload_callback)),
+      stats_callback_(std::move(stats_callback)),
+      primary_socket_path_(std::move(primary_socket_path)) {}
 
 IpcServer::~IpcServer() {
   stop();
@@ -174,12 +216,7 @@ int IpcServer::create_socket() {
       return -1;
     }
 
-    // Устанавливаем права доступа: rw для всех (0666)
-    // Это безопасно для локального сокета — позволяет пользователю писать в сокет root'а
-    if (chmod(socket_path.c_str(), 0666) < 0) {
-      std::cerr << "[punto-ipc] Warning: failed to chmod socket (" << socket_path
-                << "): " << strerror(errno) << "\n";
-    }
+    apply_socket_permissions(socket_path);
 
     if (listen(fd, 5) < 0) {
       const int err = errno;
@@ -202,7 +239,8 @@ int IpcServer::create_socket() {
 
   // 1) Пытаемся поднять основной сокет.
   int bind_errno = 0;
-  int fd = create_bound_socket(kIpcSocketPath, /*unlink_first=*/false, &bind_errno);
+  int fd = create_bound_socket(primary_socket_path_, /*unlink_first=*/false,
+                               &bind_errno);
   if (fd >= 0) {
     return fd;
   }
@@ -211,23 +249,28 @@ int IpcServer::create_socket() {
   // а поднимаем отдельный сокет для текущего процесса.
   if (bind_errno == EADDRINUSE) {
     // Но если файл стейл (нет слушателя), можно безопасно заменить.
-    if (!is_socket_active(kIpcSocketPath)) {
+    if (!is_socket_active(primary_socket_path_.c_str())) {
       std::cerr << "[punto-ipc] Stale primary socket detected, replacing: "
-                << kIpcSocketPath << "\n";
-      (void)unlink(kIpcSocketPath);
+                << primary_socket_path_ << "\n";
+      (void)unlink(primary_socket_path_.c_str());
       bind_errno = 0;
-      fd = create_bound_socket(kIpcSocketPath, /*unlink_first=*/false, &bind_errno);
+      fd = create_bound_socket(primary_socket_path_, /*unlink_first=*/false,
+                               &bind_errno);
       if (fd >= 0) {
         return fd;
       }
     }
 
-    const std::string fallback =
-        std::string("/var/run/punto-") + std::to_string(::getpid()) + ".sock";
+    std::filesystem::path base_path{primary_socket_path_};
+    std::filesystem::path fallback =
+        base_path.parent_path() /
+        (base_path.stem().string() + "-" + std::to_string(::getpid()) +
+         base_path.extension().string());
     std::cerr << "[punto-ipc] Primary socket busy, using: " << fallback << "\n";
 
     bind_errno = 0;
-    fd = create_bound_socket(fallback, /*unlink_first=*/true, &bind_errno);
+    fd = create_bound_socket(fallback.string(), /*unlink_first=*/true,
+                             &bind_errno);
     if (fd >= 0) {
       return fd;
     }
@@ -286,8 +329,10 @@ void IpcServer::handle_client(int client_fd) {
 
   std::string_view cmd{buffer, static_cast<size_t>(bytes_read)};
   cmd = trim(cmd);
+  const IpcCommand command = parse_command(cmd);
 
-  std::cerr << "[punto-ipc] Received command: " << cmd << "\n";
+  std::cerr << "[punto-ipc] Received command: " << command_name(command)
+            << "\n";
 
   IpcResult result = execute_command(cmd);
 
@@ -298,8 +343,26 @@ void IpcServer::handle_client(int client_fd) {
   }
   response += "\n";
 
-  ssize_t written = write(client_fd, response.c_str(), response.size());
-  (void)written; // Игнорируем ошибки записи
+  std::size_t remaining = response.size();
+  const char *data = response.c_str();
+  while (remaining > 0) {
+    const ssize_t written = write(client_fd, data, remaining);
+    if (written > 0) {
+      data += written;
+      remaining -= static_cast<std::size_t>(written);
+      continue;
+    }
+    if (written < 0 && errno == EINTR) {
+      continue;
+    }
+    if (written < 0 && (errno == EPIPE || errno == ECONNRESET)) {
+      return;
+    }
+    if (written < 0) {
+      std::cerr << "[punto-ipc] Write error: " << strerror(errno) << "\n";
+    }
+    return;
+  }
 }
 
 IpcResult IpcServer::execute_command(std::string_view cmd) {
@@ -360,6 +423,13 @@ IpcResult IpcServer::execute_command(std::string_view cmd) {
     }
 
     return res;
+  }
+
+  case IpcCommand::Stats: {
+    if (!stats_callback_) {
+      return {false, "Stats not supported"};
+    }
+    return stats_callback_();
   }
 
   case IpcCommand::Shutdown: {

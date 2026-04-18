@@ -5,6 +5,11 @@ set -e
 mkdir -p /etc/punto
 mkdir -p /etc/interception
 
+# IPC и runtime-файлы демона доступны только root и группе punto.
+if ! getent group punto >/dev/null 2>&1; then
+    groupadd --system punto || true
+fi
+
 # Определяем версию пакета
 PKG_VERSION="2.8.4"
 CONFIG_FILE="/etc/punto/config.yaml"
@@ -54,6 +59,17 @@ systemctl daemon-reload
 systemctl enable udevmon || true
 systemctl restart udevmon || true
 
+if [ -e /var/run/punto.sock ]; then
+    chown root:punto /var/run/punto.sock 2>/dev/null || true
+    chmod 0660 /var/run/punto.sock 2>/dev/null || true
+fi
+
+if [ -e /var/run/punto-macro.lock ]; then
+    chown root:punto /var/run/punto-macro.lock 2>/dev/null || true
+    chmod 0660 /var/run/punto-macro.lock 2>/dev/null || true
+fi
+
 echo "Punto Switcher for Ubuntu установлен успешно!"
 echo "Author Anton Shalin <anton.shalin@gmail.com>"
 echo "Используйте Pause для инверсии слова, Shift+Pause для инверсии выделенного текста, Ctrl+Z для отмены последнего исправления."
+echo "Пользователи tray/IPC должны состоять в группе punto."

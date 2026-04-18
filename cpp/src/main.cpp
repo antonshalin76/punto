@@ -11,20 +11,28 @@
 
 #include "punto/config.hpp"
 #include "punto/event_loop.hpp"
+#include "punto/logger.hpp"
 
+#include <atomic>
+#include <cerrno>
+#include <cstring>
 #include <cstdlib>
+#include <fcntl.h>
 #include <iostream>
 #include <signal.h>
+#include <unistd.h>
 
 namespace {
 
-// Указатель на EventLoop для корректной остановки из signal handler
-punto::EventLoop *g_event_loop = nullptr;
+std::atomic<int> g_stop_pipe_write_fd{-1};
 
 void signal_handler(int sig) {
   if (sig == SIGINT || sig == SIGTERM) {
-    if (g_event_loop) {
-      g_event_loop->request_stop();
+    const int fd = g_stop_pipe_write_fd.load(std::memory_order_relaxed);
+    if (fd >= 0) {
+      constexpr char kStopByte = 'x';
+      const ssize_t ignored = ::write(fd, &kStopByte, sizeof(kStopByte));
+      (void)ignored;
     }
   }
 }
@@ -69,6 +77,17 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  punto::init_logging("punto", punto::LogLevel::Info);
+
+  int stop_pipe[2] = {-1, -1};
+  if (::pipe2(stop_pipe, O_CLOEXEC | O_NONBLOCK) != 0) {
+    std::cerr << "[punto] Failed to create stop pipe: " << std::strerror(errno)
+              << "\n";
+    return 1;
+  }
+
+  g_stop_pipe_write_fd.store(stop_pipe[1], std::memory_order_relaxed);
+
   // Установка обработчиков сигналов
   struct sigaction sa{};
   sa.sa_handler = signal_handler;
@@ -80,6 +99,7 @@ int main(int argc, char *argv[]) {
 
   // Загрузка конфигурации
   auto config = punto::load_config();
+  punto::update_log_level(config.logging.level);
 
   // Логирование настроек auto_switch для отладки
   std::cerr << "[punto] auto_switch: enabled=" << config.auto_switch.enabled
@@ -91,14 +111,18 @@ int main(int argc, char *argv[]) {
 
   // Запуск event loop
   punto::EventLoop loop{std::move(config)};
-
-  // Регистрируем EventLoop для signal handler
-  g_event_loop = &loop;
+  loop.set_stop_signal_fd(stop_pipe[0]);
 
   int result = loop.run();
 
-  // Сбрасываем указатель после завершения
-  g_event_loop = nullptr;
+  g_stop_pipe_write_fd.store(-1, std::memory_order_relaxed);
+  if (stop_pipe[0] >= 0) {
+    ::close(stop_pipe[0]);
+  }
+  if (stop_pipe[1] >= 0) {
+    ::close(stop_pipe[1]);
+  }
+  punto::shutdown_logging();
 
   return result;
 }

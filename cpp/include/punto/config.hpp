@@ -76,11 +76,23 @@ struct SoundConfig {
   bool enabled = true;
 };
 
+enum class LogLevel {
+  Error = 0,
+  Warning = 1,
+  Info = 2,
+  Debug = 3,
+};
+
+struct LoggingConfig {
+  LogLevel level = LogLevel::Info;
+};
+
 /// Полная конфигурация приложения
 struct Config {
   HotkeyConfig hotkey;
   AutoSwitchConfig auto_switch;
   SoundConfig sound;
+  LoggingConfig logging;
   std::filesystem::path config_path{"/etc/punto/config.yaml"};
 };
 

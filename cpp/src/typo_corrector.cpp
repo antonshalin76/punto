@@ -7,91 +7,80 @@
 #include "punto/scancode_map.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <iostream>
+#include <string_view>
 #include <vector>
 
 namespace punto {
 
 namespace {
 
-/// Проверяет, является ли буквенный скан-код гласной (EN или RU)
-[[nodiscard]] bool is_vowel_key(ScanCode code) noexcept {
-  // EN гласные: a, e, i, o, u
-  // RU гласные: а(f), е(t), ё(`), и(b), о(j), у(e), ы(s), э('), ю(.), я(z)
-  switch (code) {
-  // EN гласные
-  case KEY_A:
-  case KEY_E:
-  case KEY_I:
-  case KEY_O:
-  case KEY_U:
-  // RU гласные (QWERTY коды)
-  case KEY_F:          // а
-  case KEY_T:          // е
-  case KEY_B:          // и
-  case KEY_J:          // о
-  case KEY_S:          // ы
-  case KEY_APOSTROPHE: // э
-  case KEY_DOT:        // ю
-  case KEY_Z:          // я
-  case KEY_GRAVE:      // ё
-    return true;
-  default:
-    return false;
-  }
-}
+constexpr std::array<std::string_view, 22> kKnownAbbreviations{
+    "api",  "url",  "uuid", "json", "yaml", "http", "https", "ssh",
+    "dns",  "sql",  "cpu",  "gpu",  "ram",  "sdk",  "cli",   "gui",
+    "rest", "grpc", "jwt",  "oauth","tls",  "ssl"};
 
-/// Подсчитывает количество гласных в слове
-[[nodiscard]] std::size_t
-count_vowels(std::span<const KeyEntry> word) noexcept {
-  std::size_t count = 0;
+[[nodiscard]] std::string to_ascii_lower(std::span<const KeyEntry> word) {
+  std::string ascii;
+  ascii.reserve(word.size());
+
   for (const auto &entry : word) {
-    if (is_vowel_key(entry.code)) {
-      ++count;
+    if (!is_typeable_letter(entry.code) || entry.code >= kScancodeToChar.size()) {
+      return {};
     }
+
+    char c = kScancodeToChar[entry.code];
+    if (c >= 'A' && c <= 'Z') {
+      c = static_cast<char>(c + ('a' - 'A'));
+    }
+    if (c < 'a' || c > 'z') {
+      return {};
+    }
+    ascii.push_back(c);
   }
-  return count;
+
+  return ascii;
 }
 
-/// Проверяет, похоже ли слово на аббревиатуру
-/// Аббревиатуры обычно короткие (2-5 букв) и содержат мало гласных
 [[nodiscard]] bool
 is_likely_abbreviation(std::span<const KeyEntry> word) noexcept {
-  // Только короткие слова (2-5 символов)
-  if (word.size() < 2 || word.size() > 5) {
+  if (word.size() < 2 || word.size() > 8) {
     return false;
   }
 
-  // Подсчитываем гласные и заглавные
-  std::size_t vowel_count = count_vowels(word);
-  std::size_t upper_count = 0;
   std::size_t letter_count = 0;
+  std::size_t consecutive_upper = 0;
+  std::size_t max_consecutive_upper = 0;
 
   for (const auto &entry : word) {
     if (is_typeable_letter(entry.code)) {
       ++letter_count;
       if (entry.shifted) {
-        ++upper_count;
+        ++consecutive_upper;
+        max_consecutive_upper =
+            std::max(max_consecutive_upper, consecutive_upper);
+      } else {
+        consecutive_upper = 0;
       }
     }
   }
 
-  // Если слово короткое (2-4 буквы) и мало гласных (0-1) — вероятно
-  // аббревиатура Примеры: ДНК (0 гласных), СНГ (0), API (1), URL (1), СНиП (1)
-  if (letter_count >= 2 && letter_count <= 4 && vowel_count <= 1) {
-    // Дополнительная проверка: большинство букв заглавные
-    if (upper_count >= letter_count / 2) {
-      return true;
+  if (letter_count < 2) {
+    return false;
+  }
+
+  const std::string ascii = to_ascii_lower(word);
+  if (!ascii.empty()) {
+    for (std::string_view known : kKnownAbbreviations) {
+      if (ascii == known) {
+        return true;
+      }
     }
   }
 
-  // Также аббревиатуры: 2-3 буквы и все заглавные
-  if (letter_count >= 2 && letter_count <= 3 && upper_count == letter_count) {
-    return true;
-  }
-
-  return false;
+  return max_consecutive_upper >= 3;
 }
 
 } // namespace
@@ -285,10 +274,8 @@ StickyShiftResult detect_sticky_shift(std::span<const KeyEntry> word) {
 StickyShiftResult
 detect_sticky_shift_with_layout(std::span<const KeyEntry> word,
                                 int current_layout) {
-
-  // Сначала проверяем sticky shift в текущей раскладке
-  StickyShiftResult result = detect_sticky_shift(word);
-  if (result.detected) {
+  StickyShiftResult result;
+  if (current_layout != 0 && current_layout != 1) {
     return result;
   }
 

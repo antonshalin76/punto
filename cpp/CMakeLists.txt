@@ -15,8 +15,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Оптимизация под конкретную архитектуру
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -mtune=native -flto=auto -DNDEBUG")
+# Release-сборка должна быть переносимой между машинами, без CPU-specific флагов.
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -flto=auto -DNDEBUG")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -fsanitize=address,undefined -fno-omit-frame-pointer")
 
 # Предупреждения
@@ -61,6 +61,7 @@ set(PUNTO_SOURCES
     src/input_buffer.cpp
     src/key_injector.cpp
     src/config.cpp
+    src/logger.cpp
     src/text_processor.cpp
     src/clipboard_manager.cpp
     src/terminal_detection.cpp
@@ -80,6 +81,7 @@ set(PUNTO_HEADERS
     include/punto/input_buffer.hpp
     include/punto/key_injector.hpp
     include/punto/config.hpp
+    include/punto/logger.hpp
     include/punto/text_processor.hpp
     include/punto/clipboard_manager.hpp
     include/punto/terminal_detection.hpp
@@ -212,8 +214,12 @@ include(CTest)
 if(BUILD_TESTING)
     add_executable(punto-tests
         tests/test_main.cpp
+        src/input_buffer.cpp
+        src/ipc_server.cpp
+        src/config.cpp
         src/text_processor.cpp
         src/terminal_detection.cpp
+        src/typo_corrector.cpp
     )
 
     target_include_directories(punto-tests

@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <functional>
@@ -32,13 +33,13 @@ public:
    * @brief Записывает событие в stdout
    * @param ev Событие для записи
    */
-  static void emit_event(const input_event &ev);
+  void emit_event(const input_event &ev) const;
 
   /**
    * @brief Записывает пачку событий в stdout одним системным вызовом
    * @param events Пачка событий
    */
-  static void emit_events(std::span<const input_event> events);
+  void emit_events(std::span<const input_event> events) const;
 
   /**
    * @brief Отправляет событие нажатия/отпускания и SYN
@@ -115,6 +116,10 @@ public:
   /// Задержка (использует wait_func_ если установлена, иначе usleep)
   void delay(std::chrono::microseconds us) const noexcept;
 
+  [[nodiscard]] bool has_fatal_io_error() const noexcept;
+  [[nodiscard]] int fatal_io_errno() const noexcept;
+  void clear_fatal_io_error() const noexcept;
+
   // =========================================================================
   // Публичные константы таймингов (для использования в EventLoop и др.)
   // =========================================================================
@@ -127,7 +132,7 @@ public:
   static constexpr std::chrono::microseconds kPrePasteWaitGUI{100000};  // До Paste (GUI)
 
 private:
-  static void write_all_or_die(int fd, const void *data, std::size_t bytes);
+  void write_all(int fd, const void *data, std::size_t bytes) const;
 
   // Встроенные задержки (в микросекундах).
   // Значения соответствуют прежним рекомендуемым параметрам из config.yaml.
@@ -142,6 +147,8 @@ private:
   static constexpr std::chrono::microseconds kBackspaceHold{18000};
 
   WaitFunc wait_func_;
+  mutable std::atomic<bool> fatal_io_error_{false};
+  mutable std::atomic<int> fatal_io_errno_{0};
 };
 
 } // namespace punto

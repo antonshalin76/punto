@@ -26,6 +26,7 @@ enum class IpcCommand {
   GetStatus,   // GET_STATUS -> ENABLED|DISABLED
   SetStatus,   // SET_STATUS 0|1 -> OK
   Reload,      // RELOAD -> OK|ERROR
+  Stats,       // STATS -> counters
   Shutdown     // SHUTDOWN -> OK (graceful stop)
 };
 
@@ -48,13 +49,18 @@ public:
   /// в команде RELOAD; иначе пустая строка.
   /// Важно: callback выполняется в IPC-потоке, поэтому должен быть потокобезопасным.
   using ReloadCallback = std::function<IpcResult(const std::string&)>;
+  using StatsCallback = std::function<IpcResult()>;
 
   /**
    * @brief Конструктор
    * @param enabled_flag Атомарный флаг включения/выключения (shared с EventLoop)
    * @param reload_callback Callback для перезагрузки конфига
+   * @param stats_callback Callback для безопасной выдачи runtime-статистики
+   * @param primary_socket_path Основной путь сокета (для тестов может быть переопределён)
    */
-  IpcServer(std::atomic<bool>& enabled_flag, ReloadCallback reload_callback);
+  IpcServer(std::atomic<bool>& enabled_flag, ReloadCallback reload_callback,
+            StatsCallback stats_callback = {},
+            std::string primary_socket_path = std::string{kIpcSocketPath});
 
   ~IpcServer();
 
@@ -96,10 +102,12 @@ private:
   // Состояние сервера
   std::atomic<bool>& enabled_flag_;
   ReloadCallback reload_callback_;
+  StatsCallback stats_callback_;
 
   std::atomic<bool> running_{false};
   std::jthread server_thread_;
   int server_fd_ = -1;
+  std::string primary_socket_path_;
 
   // Фактический путь сокета, на котором запущен этот экземпляр.
   // Может отличаться от kIpcSocketPath, если основной сокет уже занят.

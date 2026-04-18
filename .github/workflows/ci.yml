@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            pkg-config \
+            libx11-dev \
+            libhunspell-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev
+      - name: Configure
+        run: cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build cpp/build -j"$(nproc)"
+      - name: Test
+        run: ctest --test-dir cpp/build --output-on-failure
+
+  sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            pkg-config \
+            libx11-dev \
+            libhunspell-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev
+      - name: Configure
+        run: cmake -S cpp -B cpp/build-debug -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build cpp/build-debug -j"$(nproc)"
+      - name: Test
+        run: ctest --test-dir cpp/build-debug --output-on-failure
+
+  clang-tidy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            pkg-config \
+            clang-tidy \
+            libx11-dev \
+            libhunspell-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev
+      - name: Configure
+        run: cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+      - name: Run clang-tidy
+        run: |
+          mapfile -t files < <(find cpp/src cpp/include -type f \( -name '*.cpp' -o -name '*.hpp' \))
+          clang-tidy -p cpp/build "${files[@]}"
+
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            pkg-config \
+            lintian \
+            libx11-dev \
+            libhunspell-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev
+      - name: Build package
+        run: ./build-deb.sh --non-interactive --skip-runtime-installs
+      - name: Lint package
+        run: lintian ./*.deb

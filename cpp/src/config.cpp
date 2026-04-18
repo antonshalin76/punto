@@ -65,6 +65,23 @@ std::optional<bool> parse_bool(std::string_view sv) {
   return std::nullopt;
 }
 
+std::optional<LogLevel> parse_log_level(std::string_view sv) {
+  sv = trim(sv);
+  if (sv == "error") {
+    return LogLevel::Error;
+  }
+  if (sv == "warning" || sv == "warn") {
+    return LogLevel::Warning;
+  }
+  if (sv == "info") {
+    return LogLevel::Info;
+  }
+  if (sv == "debug") {
+    return LogLevel::Debug;
+  }
+  return std::nullopt;
+}
+
 } // namespace
 
 bool validate_config(const Config &config) {
@@ -118,6 +135,10 @@ Config parse_config_stream(std::istream &file) {
     }
     if (sv == "sound:" || sv.starts_with("sound:")) {
       current_section = "sound";
+      continue;
+    }
+    if (sv == "logging:" || sv.starts_with("logging:")) {
+      current_section = "logging";
       continue;
     }
 
@@ -179,6 +200,12 @@ Config parse_config_stream(std::istream &file) {
       if (key == "enabled") {
         if (auto val = parse_bool(value)) {
           config.sound.enabled = *val;
+        }
+      }
+    } else if (current_section == "logging") {
+      if (key == "level") {
+        if (auto level = parse_log_level(value)) {
+          config.logging.level = *level;
         }
       }
     }

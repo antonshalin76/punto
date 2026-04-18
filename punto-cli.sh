@@ -13,44 +13,102 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+function daemon_count() {
+    pgrep -x -c "punto-daemon" 2>/dev/null || true
+}
+
+function tray_pid() {
+    pgrep -x "punto-tray" 2>/dev/null | head -1 || true
+}
+
+function backend_unit_active() {
+    systemctl is-active --quiet "${UDEVMON_SERVICE}"
+}
+
+function backend_is_healthy() {
+    local count
+    count="$(daemon_count)"
+    backend_unit_active && [[ "${count}" -gt 0 ]]
+}
+
+function wait_for_backend_healthy() {
+    local timeout_seconds="${1:-10}"
+    local attempt
+
+    for ((attempt = 0; attempt < timeout_seconds; ++attempt)); do
+        if backend_is_healthy; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    backend_is_healthy
+}
+
+function show_backend_diagnostics() {
+    echo -e "${YELLOW}  → systemd status:${NC}"
+    systemctl status "${UDEVMON_SERVICE}" --no-pager --lines=20 || true
+    echo -e "${YELLOW}  → recent journal:${NC}"
+    journalctl -u "${UDEVMON_SERVICE}" -n 30 --no-pager || true
+}
+
 function print_status() {
+    local count
+    local tray_process
+
+    count="$(daemon_count)"
+    tray_process="$(tray_pid)"
+
     echo -e "${GREEN}━━━ Punto Switcher Status ━━━${NC}"
-    
+
     # Backend (punto-daemon через udevmon)
-    if systemctl is-active --quiet "${UDEVMON_SERVICE}"; then
+    if backend_unit_active && [[ "${count}" -gt 0 ]]; then
         echo -e "Backend (udevmon):  ${GREEN}✓ running${NC}"
-        DAEMON_COUNT=$(ps aux | grep -c "[p]unto-daemon" || true)
-        echo -e "  Daemon processes: ${DAEMON_COUNT}"
+        echo -e "  Daemon processes: ${count}"
+    elif backend_unit_active; then
+        echo -e "Backend (udevmon):  ${YELLOW}! degraded${NC}"
+        echo -e "  Daemon processes: ${count}"
     else
         echo -e "Backend (udevmon):  ${RED}✗ stopped${NC}"
     fi
-    
+
     # Frontend (punto-tray)
-    if pgrep -f "punto-tray" > /dev/null; then
+    if [[ -n "${tray_process}" ]]; then
         echo -e "Frontend (tray):    ${GREEN}✓ running${NC}"
-        TRAY_PID=$(pgrep -f "punto-tray" | head -1)
-        echo -e "  PID: ${TRAY_PID}"
+        echo -e "  PID: ${tray_process}"
     else
         echo -e "Frontend (tray):    ${RED}✗ stopped${NC}"
     fi
-    
+
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
 function start_service() {
     echo "Starting Punto Switcher..."
-    
+
     # Запуск backend через systemd
-    if ! systemctl is-active --quiet "${UDEVMON_SERVICE}"; then
+    if backend_is_healthy; then
+        echo "  → Backend already running"
+    elif backend_unit_active; then
+        echo "  → Backend active but unhealthy, restarting udevmon..."
+        sudo systemctl restart "${UDEVMON_SERVICE}"
+    else
         echo "  → Starting backend (udevmon)..."
         sudo systemctl start "${UDEVMON_SERVICE}"
-        sleep 2
-    else
-        echo "  → Backend already running"
     fi
-    
+
+    if ! wait_for_backend_healthy 12; then
+        echo -e "${RED}✗ Backend failed to start cleanly${NC}"
+        show_backend_diagnostics
+        exit 1
+    fi
+
     # Запуск frontend
-    if ! pgrep -f "punto-tray" > /dev/null; then
+    if [[ ! -x "${TRAY}" ]]; then
+        echo -e "${YELLOW}  → Frontend binary not installed, skipping tray start${NC}"
+    elif [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+        echo -e "${YELLOW}  → GUI session not detected, skipping tray start${NC}"
+    elif [[ -z "$(tray_pid)" ]]; then
         echo "  → Starting frontend (tray)..."
         nohup "${TRAY}" > /dev/null 2>&1 &
         sleep 1
@@ -64,32 +122,32 @@ function start_service() {
 
 function stop_service() {
     echo "Stopping Punto Switcher..."
-    
+
     # Остановка frontend
-    if pgrep -f "punto-tray" > /dev/null; then
+    if [[ -n "$(tray_pid)" ]]; then
         echo "  → Stopping frontend (tray)..."
-        pkill -f "punto-tray" || true
+        pkill -x "punto-tray" || true
         sleep 1
     fi
-    
+
     # Остановка backend
-    if systemctl is-active --quiet "${UDEVMON_SERVICE}"; then
+    if backend_unit_active; then
         echo "  → Stopping backend (udevmon)..."
         sudo systemctl stop "${UDEVMON_SERVICE}"
         sleep 1
     fi
-    
+
     # Best-effort: просим оставшиеся процессы завершиться без SIGKILL.
-    if pgrep -f "punto-daemon" > /dev/null; then
+    if [[ "$(daemon_count)" -gt 0 ]]; then
         echo "  → Sending TERM to remaining daemon processes..."
-        sudo pkill -TERM -f "punto-daemon" || true
+        sudo pkill -TERM -x "punto-daemon" || true
         sleep 2
     fi
 
-    if pgrep -f "punto-daemon" > /dev/null; then
+    if [[ "$(daemon_count)" -gt 0 ]]; then
         echo -e "${YELLOW}  → Внимание: часть punto-daemon всё ещё работает. Проверьте journalctl и состояние udevmon вручную.${NC}"
     fi
-    
+
     echo -e "${GREEN}✓ Punto Switcher stopped${NC}"
 }
 

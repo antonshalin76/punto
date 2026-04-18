@@ -10,6 +10,18 @@ if ! getent group punto >/dev/null 2>&1; then
     groupadd --system punto || true
 fi
 
+ADDED_GROUP_USER=""
+if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+    if id -u "${SUDO_USER}" >/dev/null 2>&1; then
+        if ! id -nG "${SUDO_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx "punto"; then
+            usermod -aG punto "${SUDO_USER}" || true
+            if id -nG "${SUDO_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx "punto"; then
+                ADDED_GROUP_USER="${SUDO_USER}"
+            fi
+        fi
+    fi
+fi
+
 # Определяем версию пакета
 PKG_VERSION="2.8.4"
 CONFIG_FILE="/etc/punto/config.yaml"
@@ -73,3 +85,7 @@ echo "Punto Switcher for Ubuntu установлен успешно!"
 echo "Author Anton Shalin <anton.shalin@gmail.com>"
 echo "Используйте Pause для инверсии слова, Shift+Pause для инверсии выделенного текста, Ctrl+Z для отмены последнего исправления."
 echo "Пользователи tray/IPC должны состоять в группе punto."
+if [ -n "$ADDED_GROUP_USER" ]; then
+    echo "Пользователь ${ADDED_GROUP_USER} добавлен в группу punto."
+    echo "Новая группа будет применена после relogin; до этого punto start использует sg punto для tray."
+fi

@@ -21,6 +21,18 @@ function tray_pid() {
     pgrep -x "punto-tray" 2>/dev/null | head -1 || true
 }
 
+function current_login_user() {
+    id -un 2>/dev/null || echo "${USER:-unknown}"
+}
+
+function current_user_has_punto_group() {
+    id -nG 2>/dev/null | tr ' ' '\n' | grep -qx "punto"
+}
+
+function account_is_in_punto_group() {
+    id -nG "$(current_login_user)" 2>/dev/null | tr ' ' '\n' | grep -qx "punto"
+}
+
 function backend_unit_active() {
     systemctl is-active --quiet "${UDEVMON_SERVICE}"
 }
@@ -50,6 +62,55 @@ function show_backend_diagnostics() {
     systemctl status "${UDEVMON_SERVICE}" --no-pager --lines=20 || true
     echo -e "${YELLOW}  → recent journal:${NC}"
     journalctl -u "${UDEVMON_SERVICE}" -n 30 --no-pager || true
+}
+
+function wait_for_tray_started() {
+    local timeout_seconds="${1:-5}"
+    local attempt
+
+    for ((attempt = 0; attempt < timeout_seconds; ++attempt)); do
+        if [[ -n "$(tray_pid)" ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    [[ -n "$(tray_pid)" ]]
+}
+
+function start_tray() {
+    if [[ ! -x "${TRAY}" ]]; then
+        echo -e "${YELLOW}  → Frontend binary not installed, skipping tray start${NC}"
+        return 0
+    fi
+
+    if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+        echo -e "${YELLOW}  → GUI session not detected, skipping tray start${NC}"
+        return 0
+    fi
+
+    if [[ -n "$(tray_pid)" ]]; then
+        echo "  → Frontend already running"
+        return 0
+    fi
+
+    if current_user_has_punto_group; then
+        echo "  → Starting frontend (tray)..."
+        nohup "${TRAY}" > /dev/null 2>&1 &
+    elif account_is_in_punto_group; then
+        echo "  → Starting frontend (tray) via sg punto..."
+        sg punto -c "setsid ${TRAY} >/dev/null 2>&1 </dev/null &"
+    else
+        local login_user
+        login_user="$(current_login_user)"
+        echo -e "${YELLOW}  → User '${login_user}' is not in group punto; tray IPC will be unavailable.${NC}"
+        echo -e "${YELLOW}    Run: sudo usermod -aG punto ${login_user} && log out/in${NC}"
+        return 0
+    fi
+
+    if ! wait_for_tray_started 5; then
+        echo -e "${YELLOW}  → Tray process did not stay up. Check desktop session and appindicator support.${NC}"
+    fi
 }
 
 function print_status() {
@@ -104,17 +165,7 @@ function start_service() {
     fi
 
     # Запуск frontend
-    if [[ ! -x "${TRAY}" ]]; then
-        echo -e "${YELLOW}  → Frontend binary not installed, skipping tray start${NC}"
-    elif [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
-        echo -e "${YELLOW}  → GUI session not detected, skipping tray start${NC}"
-    elif [[ -z "$(tray_pid)" ]]; then
-        echo "  → Starting frontend (tray)..."
-        nohup "${TRAY}" > /dev/null 2>&1 &
-        sleep 1
-    else
-        echo "  → Frontend already running"
-    fi
+    start_tray
     
     echo -e "${GREEN}✓ Punto Switcher started${NC}"
     print_status

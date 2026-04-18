@@ -1,5 +1,6 @@
 #include "punto/input_buffer.hpp"
 #include "punto/ipc_server.hpp"
+#include "punto/layout_sync_sound.hpp"
 #include "punto/history_manager.hpp"
 #include "punto/text_processor.hpp"
 #include "punto/typo_corrector.hpp"
@@ -218,6 +219,27 @@ void test_config_logging_level() {
   expect(::rmdir(dir) == 0, "config tmp dir removed");
 }
 
+void test_external_layout_sound_state() {
+  ExternalLayoutSoundState state;
+  const auto now = std::chrono::steady_clock::now();
+
+  arm_external_layout_sound(state, now, std::chrono::milliseconds{500});
+  expect(state.pending, "external layout sound armed");
+  expect(should_play_external_layout_sound(state, now, 0, 1),
+         "external layout change within window plays sound");
+  expect(!should_play_external_layout_sound(state, now, 1, 1),
+         "same layout does not play sound");
+  expect(!should_play_external_layout_sound(state, now, 0, -1),
+         "invalid layout does not play sound");
+  expect(!external_layout_sound_expired(state, now),
+         "fresh external sound state not expired");
+  expect(external_layout_sound_expired(state, now + std::chrono::milliseconds{700}),
+         "external sound state expires after window");
+
+  clear_external_layout_sound(state);
+  expect(!state.pending, "external sound state cleared");
+}
+
 } // namespace
 
 int main() {
@@ -227,6 +249,7 @@ int main() {
   test_typo_corrector();
   test_history_manager();
   test_config_logging_level();
+  test_external_layout_sound_state();
 
   std::cout << "punto-tests: OK\n";
   return 0;

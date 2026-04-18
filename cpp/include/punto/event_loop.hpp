@@ -31,6 +31,7 @@
 #include "punto/input_buffer.hpp"
 #include "punto/ipc_server.hpp"
 #include "punto/key_injector.hpp"
+#include "punto/layout_sync_sound.hpp"
 #include "punto/layout_analyzer.hpp"
 #include "punto/macro_lock.hpp"
 #include "punto/types.hpp"
@@ -244,6 +245,11 @@ private:
 
   void sync_current_layout_from_os(std::string_view reason);
   void mark_layout_desynced(std::string_view reason);
+  [[nodiscard]] bool is_configured_layout_hotkey_press(ScanCode code,
+                                                       bool is_press) const;
+  [[nodiscard]] bool is_configured_layout_hotkey_release(ScanCode code,
+                                                         bool is_release) const;
+  void maybe_complete_external_layout_hotkey(ScanCode code, bool is_release);
   void maybe_handle_injector_failure(std::string_view context);
 
   [[nodiscard]] IpcResult stats_report() const;
@@ -342,6 +348,7 @@ private:
   /// Время, когда XKB set был отключён (для периодической ре-проверки)
   std::chrono::steady_clock::time_point xkb_disabled_at_{};
   bool layout_desynced_ = false;
+  ExternalLayoutSoundState external_layout_sound_{};
 
   std::unique_ptr<X11Session> x11_session_;
   bool x11_refresh_pending_{false}; // Флаг фонового refresh

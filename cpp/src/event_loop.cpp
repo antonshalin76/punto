@@ -536,8 +536,15 @@ void EventLoop::handle_event(const input_event &ev) {
   // =========================================================================
 
   if (is_modifier(code)) {
+    const bool hotkey_press = is_configured_layout_hotkey_press(code, is_press);
     update_modifier_state(code, pressed);
     emit_passthrough_event(ev);
+    if (hotkey_press) {
+      arm_external_layout_sound(external_layout_sound_,
+                                std::chrono::steady_clock::now());
+      mark_layout_desynced("user layout hotkey");
+    }
+    maybe_complete_external_layout_hotkey(code, is_release);
     return;
   }
 
@@ -546,6 +553,7 @@ void EventLoop::handle_event(const input_event &ev) {
   // =========================================================================
   if (is_release) {
     emit_passthrough_event(ev);
+    maybe_complete_external_layout_hotkey(code, true);
     return;
   }
 
@@ -634,6 +642,21 @@ void EventLoop::handle_event(const input_event &ev) {
   }
 
   // =========================================================================
+  // Пользовательский hotkey переключения раскладки
+  // =========================================================================
+
+  if (is_configured_layout_hotkey_press(code, is_press)) {
+    reset_async_state();
+    history_.reset();
+    arm_external_layout_sound(external_layout_sound_,
+                              std::chrono::steady_clock::now());
+    mark_layout_desynced("user layout hotkey");
+    buffer_.reset_current();
+    emit_passthrough_event(ev);
+    return;
+  }
+
+  // =========================================================================
   // Bypass для системных hotkeys (Ctrl+C, etc.)
   // =========================================================================
 
@@ -642,29 +665,6 @@ void EventLoop::handle_event(const input_event &ev) {
     // Для надёжности сбрасываем async-состояние.
     reset_async_state();
     history_.reset();
-
-    // Детектируем пользовательское переключение раскладки (Ctrl+`)
-    // Это важно для синхронизации current_layout_
-    ScanCode mod_key = cfg->hotkey.modifier;
-    ScanCode layout_key = cfg->hotkey.key;
-
-    bool mod_pressed = false;
-    if (mod_key == KEY_LEFTCTRL)
-      mod_pressed = modifiers_.left_ctrl;
-    else if (mod_key == KEY_RIGHTCTRL)
-      mod_pressed = modifiers_.right_ctrl;
-    else if (mod_key == KEY_LEFTALT)
-      mod_pressed = modifiers_.left_alt;
-    else if (mod_key == KEY_RIGHTALT)
-      mod_pressed = modifiers_.right_alt;
-    else if (mod_key == KEY_LEFTSHIFT)
-      mod_pressed = modifiers_.left_shift;
-    else if (mod_key == KEY_RIGHTSHIFT)
-      mod_pressed = modifiers_.right_shift;
-
-    if (is_press && mod_pressed && code == layout_key) {
-      mark_layout_desynced("user layout hotkey");
-    }
 
     buffer_.reset_current();
     emit_passthrough_event(ev);
@@ -956,6 +956,7 @@ HotkeyAction EventLoop::determine_hotkey_action(ScanCode code) const {
 void EventLoop::reset_async_state(bool bump_task_barrier) {
   pending_words_.clear();
   ready_results_.clear();
+  clear_external_layout_sound(external_layout_sound_);
 
   if (bump_task_barrier) {
     const std::uint64_t fence =
@@ -975,6 +976,54 @@ void EventLoop::mark_layout_desynced(std::string_view reason) {
     std::cerr << "[punto] Layout marked desynced: " << reason << "\n";
   }
   layout_desynced_ = true;
+}
+
+bool EventLoop::is_configured_layout_hotkey_press(ScanCode code,
+                                                  bool is_press) const {
+  if (!is_press) {
+    return false;
+  }
+
+  auto cfg = std::atomic_load(&config_);
+  if (code != cfg->hotkey.key) {
+    return false;
+  }
+
+  switch (cfg->hotkey.modifier) {
+  case KEY_LEFTCTRL:
+    return modifiers_.left_ctrl;
+  case KEY_RIGHTCTRL:
+    return modifiers_.right_ctrl;
+  case KEY_LEFTALT:
+    return modifiers_.left_alt;
+  case KEY_RIGHTALT:
+    return modifiers_.right_alt;
+  case KEY_LEFTSHIFT:
+    return modifiers_.left_shift;
+  case KEY_RIGHTSHIFT:
+    return modifiers_.right_shift;
+  default:
+    return false;
+  }
+}
+
+bool EventLoop::is_configured_layout_hotkey_release(ScanCode code,
+                                                    bool is_release) const {
+  if (!is_release || !external_layout_sound_.pending) {
+    return false;
+  }
+
+  auto cfg = std::atomic_load(&config_);
+  return code == cfg->hotkey.key || code == cfg->hotkey.modifier;
+}
+
+void EventLoop::maybe_complete_external_layout_hotkey(ScanCode code,
+                                                      bool is_release) {
+  if (!is_configured_layout_hotkey_release(code, is_release)) {
+    return;
+  }
+
+  sync_current_layout_from_os("user layout hotkey release");
 }
 
 int EventLoop::sync_layout_from_os() {
@@ -997,9 +1046,24 @@ int EventLoop::sync_layout_from_os() {
 }
 
 void EventLoop::sync_current_layout_from_os(std::string_view reason) {
+  const int previous_layout = current_layout_;
+  const bool was_desynced = layout_desynced_;
+  const auto now = std::chrono::steady_clock::now();
   const int os_layout = sync_layout_from_os();
+
+  if (external_layout_sound_expired(external_layout_sound_, now)) {
+    clear_external_layout_sound(external_layout_sound_);
+  }
+
   if (os_layout == 0 || os_layout == 1) {
-    if (layout_desynced_) {
+    if (should_play_external_layout_sound(external_layout_sound_, now,
+                                          previous_layout, os_layout) &&
+        sound_manager_) {
+      sound_manager_->play_for_layout(os_layout);
+      clear_external_layout_sound(external_layout_sound_);
+    }
+
+    if (was_desynced) {
       std::cerr << "[punto] Layout resynced via " << reason << ": "
                 << os_layout << "\n";
     }

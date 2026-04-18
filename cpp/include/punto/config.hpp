@@ -87,12 +87,21 @@ struct LoggingConfig {
   LogLevel level = LogLevel::Info;
 };
 
+struct RuntimeConfig {
+  // 0 = auto-budget на основе числа CPU и количества punto-daemon.
+  std::size_t analysis_threads = 0;
+
+  // Верхняя граница для auto-budget на один daemon.
+  std::size_t max_analysis_threads_per_daemon = 4;
+};
+
 /// Полная конфигурация приложения
 struct Config {
   HotkeyConfig hotkey;
   AutoSwitchConfig auto_switch;
   SoundConfig sound;
   LoggingConfig logging;
+  RuntimeConfig runtime;
   std::filesystem::path config_path{"/etc/punto/config.yaml"};
 };
 

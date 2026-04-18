@@ -131,6 +131,8 @@ Privet  →  [LCtrl+LAlt+Pause]  →  Привет
 - **Rollback/Replay** — исправление может перепечатать до `auto_switch.max_rollback_words` последних слов
 - **Защита от "пропавших" пробелов/букв** — Input Guard буферизует ввод во время макросов и умеет ранний форвард release-событий
 - **Телеметрия** — логирует `queue_us`, `analysis_us`, `macro_us`, длину хвоста (удобно смотреть в `journalctl -u udevmon -f`)
+- **Auto-budget worker pool** — при нескольких `punto-daemon` суммарный analysis pool автоматически делится между процессами и не раздувается линейно от числа клавиатур
+- **Primary control-plane** — только один `punto-daemon` держит `/var/run/punto.sock`; secondary daemons синхронизируют `RELOAD`/`SET_STATUS` через shared state в `/var/run/punto-control.state`
 - **KeyInjector оптимизирован** — меньше overhead на вывод событий (пакетная запись EV_KEY+SYN одним write)
 
 Также доступны возможности v2.4:
@@ -145,9 +147,11 @@ Privet  →  [LCtrl+LAlt+Pause]  →  Привет
 ## Production Checklist
 
 - IPC socket `/var/run/punto.sock` и macro lock рассчитаны на режим `root:punto` с правами `0660`.
+- Shared control-plane state `/var/run/punto-control.state` и lease `/var/run/punto-control.lock` также создаются с `root:punto` и служат для failover primary daemon.
 - Пользователи tray и локальных IPC-клиентов должны состоять в группе `punto`.
 - `RELOAD <path>` разрешён только для `/etc/punto/`, `$XDG_CONFIG_HOME/punto/` и `~/.config/punto/`.
 - `echo "STATS" | nc -U /var/run/punto.sock` возвращает агрегированные runtime-счётчики.
+- В `STATS` видны `daemon_peers` и `analysis_mode`, чтобы контролировать текущий thread budget.
 - Диагностические сообщения демона уходят в syslog/journald; уровень задаётся через `logging.level`.
 - При отсутствии словарей daemon завершает старт с фатальной ошибкой вместо degraded-режима.
 - Для CI и безголовой упаковки используйте `./build-deb.sh --non-interactive --skip-runtime-installs`.
@@ -273,6 +277,10 @@ sound:
 
 logging:
   level: info
+
+runtime:
+  analysis_threads: 0              # 0 = auto-budget, >0 = фиксированное число на daemon
+  max_analysis_threads_per_daemon: 4
 ```
 
 ### Синхронизация хоткея с системой

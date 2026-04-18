@@ -50,6 +50,7 @@ public:
   /// Важно: callback выполняется в IPC-потоке, поэтому должен быть потокобезопасным.
   using ReloadCallback = std::function<IpcResult(const std::string&)>;
   using StatsCallback = std::function<IpcResult()>;
+  using StatusCallback = std::function<void(bool)>;
 
   /**
    * @brief Конструктор
@@ -60,7 +61,9 @@ public:
    */
   IpcServer(std::atomic<bool>& enabled_flag, ReloadCallback reload_callback,
             StatsCallback stats_callback = {},
-            std::string primary_socket_path = std::string{kIpcSocketPath});
+            std::string primary_socket_path = std::string{kIpcSocketPath},
+            StatusCallback status_callback = {},
+            bool allow_fallback_sockets = true);
 
   ~IpcServer();
 
@@ -103,11 +106,13 @@ private:
   std::atomic<bool>& enabled_flag_;
   ReloadCallback reload_callback_;
   StatsCallback stats_callback_;
+  StatusCallback status_callback_;
 
   std::atomic<bool> running_{false};
   std::jthread server_thread_;
   int server_fd_ = -1;
   std::string primary_socket_path_;
+  bool allow_fallback_sockets_ = true;
 
   // Фактический путь сокета, на котором запущен этот экземпляр.
   // Может отличаться от kIpcSocketPath, если основной сокет уже занят.

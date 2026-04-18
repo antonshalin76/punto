@@ -96,6 +96,15 @@ bool validate_config(const Config &config) {
     return false;
   }
 
+  if (config.runtime.analysis_threads > 128) {
+    return false;
+  }
+
+  if (config.runtime.max_analysis_threads_per_daemon == 0 ||
+      config.runtime.max_analysis_threads_per_daemon > 128) {
+    return false;
+  }
+
   return true;
 }
 
@@ -139,6 +148,10 @@ Config parse_config_stream(std::istream &file) {
     }
     if (sv == "logging:" || sv.starts_with("logging:")) {
       current_section = "logging";
+      continue;
+    }
+    if (sv == "runtime:" || sv.starts_with("runtime:")) {
+      current_section = "runtime";
       continue;
     }
 
@@ -206,6 +219,17 @@ Config parse_config_stream(std::istream &file) {
       if (key == "level") {
         if (auto level = parse_log_level(value)) {
           config.logging.level = *level;
+        }
+      }
+    } else if (current_section == "runtime") {
+      if (key == "analysis_threads") {
+        if (auto val = parse_int(value); val && *val >= 0) {
+          config.runtime.analysis_threads = static_cast<std::size_t>(*val);
+        }
+      } else if (key == "max_analysis_threads_per_daemon") {
+        if (auto val = parse_int(value); val && *val > 0) {
+          config.runtime.max_analysis_threads_per_daemon =
+              static_cast<std::size_t>(*val);
         }
       }
     }

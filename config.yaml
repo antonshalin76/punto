@@ -31,3 +31,10 @@ sound:
 # Логирование демона (syslog/journald)
 logging:
   level: info   # error, warning, info, debug
+
+# Runtime budget для многоклавиатурной схемы udevmon.
+# Каждый punto-daemon получает только свою долю worker threads,
+# чтобы суммарный пул не рос линейно от числа клавиатур.
+runtime:
+  analysis_threads: 0              # 0 = auto-budget, >0 = жёсткий override на процесс
+  max_analysis_threads_per_daemon: 4

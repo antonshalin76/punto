@@ -26,6 +26,7 @@
 #include "punto/analysis_worker_pool.hpp"
 #include "punto/clipboard_manager.hpp"
 #include "punto/config.hpp"
+#include "punto/control_plane_state.hpp"
 #include "punto/dictionary.hpp"
 #include "punto/history_manager.hpp"
 #include "punto/input_buffer.hpp"
@@ -34,6 +35,7 @@
 #include "punto/layout_sync_sound.hpp"
 #include "punto/layout_analyzer.hpp"
 #include "punto/macro_lock.hpp"
+#include "punto/runtime_tuning.hpp"
 #include "punto/types.hpp"
 #include "punto/undo_detector.hpp"
 #include "punto/x11_session.hpp"
@@ -251,6 +253,11 @@ private:
                                                          bool is_release) const;
   void maybe_complete_external_layout_hotkey(ScanCode code, bool is_release);
   void maybe_handle_injector_failure(std::string_view context);
+  void maybe_promote_to_control_plane_primary();
+  void sync_control_plane_from_shared_state(bool force);
+  void publish_control_plane_state(bool bump_config_generation,
+                                   bool bump_status_generation);
+  [[nodiscard]] bool start_primary_ipc_server();
 
   [[nodiscard]] IpcResult stats_report() const;
   [[nodiscard]] std::optional<std::filesystem::path>
@@ -359,6 +366,7 @@ private:
   std::optional<PendingClipboardRestore> pending_clip_restore_;
 
   bool initialized_ = false;
+  AnalysisThreadBudget analysis_thread_budget_{};
 
   /// Текущая раскладка: 0 = EN (первая), 1 = RU (вторая)
   /// Обновляется при переключении раскладки
@@ -422,6 +430,12 @@ private:
 
   /// IPC сервер для управления из tray-приложения
   std::unique_ptr<IpcServer> ipc_server_;
+  ControlPlaneLease control_plane_lease_{};
+  SharedControlPlaneState shared_control_plane_state_{};
+  bool control_plane_primary_ = false;
+  std::uint64_t applied_config_generation_ = 0;
+  std::uint64_t applied_status_generation_ = 0;
+  std::chrono::steady_clock::time_point last_control_plane_poll_{};
 
   /// Межпроцессная блокировка для сериализации макросов между экземплярами
   /// punto-daemon (один на каждую клавиатуру в udevmon pipeline).

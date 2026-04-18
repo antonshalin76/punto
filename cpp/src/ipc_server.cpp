@@ -96,11 +96,15 @@ void apply_socket_permissions(const std::string &socket_path) {
 IpcServer::IpcServer(std::atomic<bool>& enabled_flag,
                      ReloadCallback reload_callback,
                      StatsCallback stats_callback,
-                     std::string primary_socket_path)
+                     std::string primary_socket_path,
+                     StatusCallback status_callback,
+                     bool allow_fallback_sockets)
     : enabled_flag_(enabled_flag),
       reload_callback_(std::move(reload_callback)),
       stats_callback_(std::move(stats_callback)),
-      primary_socket_path_(std::move(primary_socket_path)) {}
+      status_callback_(std::move(status_callback)),
+      primary_socket_path_(std::move(primary_socket_path)),
+      allow_fallback_sockets_(allow_fallback_sockets) {}
 
 IpcServer::~IpcServer() {
   stop();
@@ -261,6 +265,10 @@ int IpcServer::create_socket() {
       }
     }
 
+    if (!allow_fallback_sockets_) {
+      return -1;
+    }
+
     std::filesystem::path base_path{primary_socket_path_};
     std::filesystem::path fallback =
         base_path.parent_path() /
@@ -384,10 +392,16 @@ IpcResult IpcServer::execute_command(std::string_view cmd) {
     std::string_view arg = trim(cmd.substr(space_pos + 1));
     if (arg == "1" || arg == "true" || arg == "on") {
       enabled_flag_.store(true);
+      if (status_callback_) {
+        status_callback_(true);
+      }
       std::cerr << "[punto-ipc] Status set to ENABLED\n";
       return {true, "ENABLED"};
     } else if (arg == "0" || arg == "false" || arg == "off") {
       enabled_flag_.store(false);
+      if (status_callback_) {
+        status_callback_(false);
+      }
       std::cerr << "[punto-ipc] Status set to DISABLED\n";
       return {true, "DISABLED"};
     }

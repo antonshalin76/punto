@@ -13,6 +13,8 @@
 #include "punto/event_loop.hpp"
 #include "punto/logger.hpp"
 
+#include <X11/Xlib.h>
+
 #include <atomic>
 #include <cerrno>
 #include <cstring>
@@ -75,6 +77,11 @@ int main(int argc, char *argv[]) {
       print_version();
       return 0;
     }
+  }
+
+  if (XInitThreads() == 0) {
+    std::cerr << "[punto] Failed to initialize Xlib thread support\n";
+    return 1;
   }
 
   punto::init_logging("punto", punto::LogLevel::Info);

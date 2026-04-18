@@ -1,7 +1,9 @@
 #include "punto/input_buffer.hpp"
 #include "punto/ipc_server.hpp"
-#include "punto/layout_sync_sound.hpp"
 #include "punto/history_manager.hpp"
+#include "punto/layout_sync_sound.hpp"
+#include "punto/control_plane_state.hpp"
+#include "punto/runtime_tuning.hpp"
 #include "punto/text_processor.hpp"
 #include "punto/typo_corrector.hpp"
 #include "punto/config.hpp"
@@ -16,7 +18,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
 
 using namespace punto;
@@ -65,6 +69,13 @@ std::string send_ipc_command(const std::string &socket_path,
 
   ::close(fd);
   return response;
+}
+
+std::string read_text_file(const std::filesystem::path &path) {
+  std::ifstream input(path);
+  expect(input.good(), "source file open failed");
+  return {std::istreambuf_iterator<char>{input},
+          std::istreambuf_iterator<char>{}};
 }
 
 void test_text_processor() {
@@ -208,6 +219,9 @@ void test_config_logging_level() {
     std::fputs("auto_switch:\n  enabled: true\n  threshold: 2.0\n  min_word_len: 3\n  min_score: 5.0\n  max_rollback_words: 5\n", fp);
     std::fputs("sound:\n  enabled: true\n", fp);
     std::fputs("logging:\n  level: debug\n", fp);
+    std::fputs(
+        "runtime:\n  analysis_threads: 3\n  max_analysis_threads_per_daemon: 2\n",
+        fp);
     std::fclose(fp);
   }
 
@@ -215,6 +229,10 @@ void test_config_logging_level() {
   expect(loaded.result == ConfigResult::Ok, "config load ok");
   expect(loaded.config.logging.level == LogLevel::Debug,
          "config parsed logging level");
+  expect(loaded.config.runtime.analysis_threads == 3,
+         "config parsed runtime analysis_threads");
+  expect(loaded.config.runtime.max_analysis_threads_per_daemon == 2,
+         "config parsed runtime max threads per daemon");
   expect(std::filesystem::remove(config_path), "config removed");
   expect(::rmdir(dir) == 0, "config tmp dir removed");
 }
@@ -240,6 +258,76 @@ void test_external_layout_sound_state() {
   expect(!state.pending, "external sound state cleared");
 }
 
+void test_x11_threading_regression_guards() {
+  const std::filesystem::path source_root = PUNTO_SOURCE_DIR;
+  const std::string x11_session =
+      read_text_file(source_root / "src" / "x11_session.cpp");
+  expect(x11_session.find("seteuid(") == std::string::npos,
+         "x11 session must not switch euid in multithreaded daemon");
+  expect(x11_session.find("setegid(") == std::string::npos,
+         "x11 session must not switch egid in multithreaded daemon");
+
+  const std::string main_source =
+      read_text_file(source_root / "src" / "main.cpp");
+  expect(main_source.find("XInitThreads()") != std::string::npos,
+         "main must initialize Xlib threading support");
+}
+
+void test_runtime_thread_budget() {
+  AnalysisThreadBudget budget =
+      compute_analysis_thread_budget(/*hardware_threads=*/32,
+                                     /*daemon_count=*/4,
+                                     /*analysis_threads_override=*/0,
+                                     /*max_threads_per_daemon=*/4);
+  expect(budget.worker_threads == 4, "auto budget capped per daemon");
+  expect(budget.daemon_count == 4, "auto budget tracks daemon count");
+  expect(!budget.manual_override, "auto budget mode");
+
+  budget = compute_analysis_thread_budget(/*hardware_threads=*/8,
+                                          /*daemon_count=*/4,
+                                          /*analysis_threads_override=*/0,
+                                          /*max_threads_per_daemon=*/4);
+  expect(budget.worker_threads == 1, "auto budget shrinks on many daemons");
+
+  budget = compute_analysis_thread_budget(/*hardware_threads=*/32,
+                                          /*daemon_count=*/4,
+                                          /*analysis_threads_override=*/6,
+                                          /*max_threads_per_daemon=*/4);
+  expect(budget.worker_threads == 6, "manual override wins");
+  expect(budget.manual_override, "manual override mode");
+}
+
+void test_control_plane_state_round_trip() {
+  char dir_template[] = "/tmp/punto-control-XXXXXX";
+  char *dir = ::mkdtemp(dir_template);
+  expect(dir != nullptr, "control plane mkdtemp failed");
+
+  const std::filesystem::path state_path =
+      std::filesystem::path(dir) / "control.state";
+
+  SharedControlPlaneState input;
+  input.config_generation = 7;
+  input.status_generation = 9;
+  input.enabled = false;
+  input.config_path = "/tmp/punto/config.yaml";
+
+  expect(write_shared_control_plane_state(input, state_path.string()),
+         "control plane state write");
+
+  SharedControlPlaneState output;
+  expect(read_shared_control_plane_state(output, state_path.string()),
+         "control plane state read");
+  expect(output.config_generation == input.config_generation,
+         "control plane config generation");
+  expect(output.status_generation == input.status_generation,
+         "control plane status generation");
+  expect(output.enabled == input.enabled, "control plane enabled flag");
+  expect(output.config_path == input.config_path, "control plane config path");
+
+  expect(std::filesystem::remove(state_path), "control plane state removed");
+  expect(::rmdir(dir) == 0, "control plane dir removed");
+}
+
 } // namespace
 
 int main() {
@@ -250,6 +338,9 @@ int main() {
   test_history_manager();
   test_config_logging_level();
   test_external_layout_sound_state();
+  test_x11_threading_regression_guards();
+  test_runtime_thread_budget();
+  test_control_plane_state_round_trip();
 
   std::cout << "punto-tests: OK\n";
   return 0;

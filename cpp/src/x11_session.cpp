@@ -26,6 +26,42 @@ namespace punto {
 
 namespace {
 
+std::mutex &x11_open_mutex() {
+  static std::mutex mu;
+  return mu;
+}
+
+class ScopedEnvVar {
+public:
+  ScopedEnvVar(const char *name, const std::string &value) : name_{name} {
+    const char *current = std::getenv(name_);
+    if (current != nullptr) {
+      had_previous_ = true;
+      previous_ = current;
+    }
+
+    if (value.empty()) {
+      ::unsetenv(name_);
+      return;
+    }
+
+    ::setenv(name_, value.c_str(), 1);
+  }
+
+  ~ScopedEnvVar() {
+    if (had_previous_) {
+      ::setenv(name_, previous_.c_str(), 1);
+      return;
+    }
+    ::unsetenv(name_);
+  }
+
+private:
+  const char *name_;
+  bool had_previous_ = false;
+  std::string previous_;
+};
+
 [[nodiscard]] bool is_ascii_space(char c) {
   return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' ||
          c == '\v';
@@ -183,16 +219,22 @@ read_proc_environ(const std::string &pid, uid_t expected_uid) {
   return env;
 }
 
+Display *open_display_from_snapshot(const X11SessionInfo &snap) {
+  if (snap.display.empty()) {
+    return nullptr;
+  }
+
+  std::lock_guard<std::mutex> lock(x11_open_mutex());
+  ScopedEnvVar xauthority_override{"XAUTHORITY", snap.xauthority_path};
+  return XOpenDisplay(snap.display.c_str());
+}
+
 } // namespace
 
 bool X11Session::initialize() {
   if (initialized_.load(std::memory_order_acquire)) {
     return true;
   }
-
-  // Сохраняем оригинальные effective UID/GID (root-контекст).
-  original_uid_ = geteuid();
-  original_gid_ = getegid();
 
   std::optional<ActiveSession> active = find_active_session_loginctl();
 
@@ -273,11 +315,6 @@ bool X11Session::initialize() {
 }
 
 X11Session::RefreshResult X11Session::refresh() {
-  // Сохраняем текущий effective UID/GID (нужно для корректного
-  // switch_to_root()).
-  original_uid_ = geteuid();
-  original_gid_ = getegid();
-
   std::optional<ActiveSession> active = find_active_session_loginctl();
 
   if (!active) {
@@ -386,14 +423,6 @@ X11Session::RefreshResult X11Session::refresh() {
       info_ = next;
     }
     initialized_.store(false, std::memory_order_release);
-    unsetenv("DISPLAY");
-    unsetenv("XAUTHORITY");
-    unsetenv("HOME");
-    unsetenv("USER");
-    unsetenv("LOGNAME");
-    unsetenv("XDG_RUNTIME_DIR");
-    unsetenv("XDG_CONFIG_HOME");
-    unsetenv("WAYLAND_DISPLAY");
     if (was_valid) {
       return RefreshResult::Invalidated;
     }
@@ -433,16 +462,6 @@ void X11Session::reset() noexcept {
     std::lock_guard<std::mutex> lock(mu_);
     info_ = X11SessionInfo{};
   }
-
-  // Не оставляем стейл-окружение от предыдущей сессии.
-  unsetenv("DISPLAY");
-  unsetenv("XAUTHORITY");
-  unsetenv("HOME");
-  unsetenv("USER");
-  unsetenv("LOGNAME");
-  unsetenv("XDG_RUNTIME_DIR");
-  unsetenv("XDG_CONFIG_HOME");
-  unsetenv("WAYLAND_DISPLAY");
 }
 
 bool X11Session::is_valid() const noexcept {
@@ -459,9 +478,9 @@ bool X11Session::is_wayland_session() const {
   return !info_.wayland_display.empty();
 }
 
-void X11Session::apply_environment() const {
+Display *X11Session::open_display() const {
   if (!initialized_.load(std::memory_order_acquire)) {
-    return;
+    return nullptr;
   }
 
   X11SessionInfo snap;
@@ -470,95 +489,7 @@ void X11Session::apply_environment() const {
     snap = info_;
   }
 
-  if (!snap.display.empty()) {
-    setenv("DISPLAY", snap.display.c_str(), 1);
-  } else {
-    unsetenv("DISPLAY");
-  }
-
-  if (!snap.xauthority_path.empty()) {
-    setenv("XAUTHORITY", snap.xauthority_path.c_str(), 1);
-  } else {
-    unsetenv("XAUTHORITY");
-  }
-
-  if (!snap.home_dir.empty()) {
-    setenv("HOME", snap.home_dir.c_str(), 1);
-  } else {
-    unsetenv("HOME");
-  }
-
-  if (!snap.username.empty()) {
-    setenv("USER", snap.username.c_str(), 1);
-    setenv("LOGNAME", snap.username.c_str(), 1);
-  } else {
-    unsetenv("USER");
-    unsetenv("LOGNAME");
-  }
-
-  if (!snap.xdg_runtime_dir.empty()) {
-    setenv("XDG_RUNTIME_DIR", snap.xdg_runtime_dir.c_str(), 1);
-  } else {
-    unsetenv("XDG_RUNTIME_DIR");
-  }
-
-  if (!snap.xdg_config_home.empty()) {
-    setenv("XDG_CONFIG_HOME", snap.xdg_config_home.c_str(), 1);
-  } else {
-    unsetenv("XDG_CONFIG_HOME");
-  }
-
-  if (!snap.wayland_display.empty()) {
-    setenv("WAYLAND_DISPLAY", snap.wayland_display.c_str(), 1);
-  } else {
-    unsetenv("WAYLAND_DISPLAY");
-  }
-}
-
-bool X11Session::switch_to_user() const {
-  if (!initialized_.load(std::memory_order_acquire)) {
-    return false;
-  }
-
-  X11SessionInfo snap;
-  {
-    std::lock_guard<std::mutex> lock(mu_);
-    snap = info_;
-  }
-
-  if (geteuid() == static_cast<uid_t>(snap.uid)) {
-    return true;
-  }
-
-  // Сначала gid, потом uid
-  if (setegid(static_cast<gid_t>(snap.gid)) != 0) {
-    return false;
-  }
-  if (seteuid(static_cast<uid_t>(snap.uid)) != 0) {
-    // Откатываем gid (best effort, ignoring errors)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-result"
-    setegid(original_gid_);
-#pragma GCC diagnostic pop
-    return false;
-  }
-
-  return true;
-}
-
-bool X11Session::switch_to_root() const {
-  if (geteuid() == 0)
-    return true; // Уже root
-
-  // Сначала gid, потом uid
-  if (setegid(original_gid_) != 0) {
-    return false;
-  }
-  if (seteuid(original_uid_) != 0) {
-    return false;
-  }
-
-  return true;
+  return open_display_from_snapshot(snap);
 }
 
 std::optional<X11Session::ActiveSession>
@@ -712,19 +643,7 @@ bool X11Session::verify_x11_access() const {
     return false;
   }
 
-  // Переходим в контекст пользователя.
-  if (!switch_to_user()) {
-    return false;
-  }
-  apply_environment();
-
-  Display *display = XOpenDisplay(nullptr);
-  if (!display) {
-    const char *display_name = std::getenv("DISPLAY");
-    if (display_name) {
-      display = XOpenDisplay(display_name);
-    }
-  }
+  Display *display = open_display();
 
   bool ok = false;
   if (display) {
@@ -734,7 +653,6 @@ bool X11Session::verify_x11_access() const {
     XCloseDisplay(display);
   }
 
-  switch_to_root();
   return ok;
 }
 
@@ -743,18 +661,7 @@ int X11Session::get_current_keyboard_layout() const {
     return -1;
   }
 
-  // Переходим в контекст пользователя
-  if (!switch_to_user())
-    return -1;
-  apply_environment();
-
-  Display *display = XOpenDisplay(nullptr);
-  if (!display) {
-    const char *display_name = std::getenv("DISPLAY");
-    if (display_name) {
-      display = XOpenDisplay(display_name);
-    }
-  }
+  Display *display = open_display();
 
   int group = -1;
   if (display) {
@@ -765,7 +672,6 @@ int X11Session::get_current_keyboard_layout() const {
     XCloseDisplay(display);
   }
 
-  switch_to_root();
   return group;
 }
 
@@ -774,17 +680,7 @@ bool X11Session::set_keyboard_layout(int index) const {
     return false;
   }
 
-  if (!switch_to_user())
-    return false;
-  apply_environment();
-
-  Display *display = XOpenDisplay(nullptr);
-  if (!display) {
-    const char *display_name = std::getenv("DISPLAY");
-    if (display_name) {
-      display = XOpenDisplay(display_name);
-    }
-  }
+  Display *display = open_display();
 
   bool success = false;
   if (display) {
@@ -814,7 +710,6 @@ bool X11Session::set_keyboard_layout(int index) const {
     XCloseDisplay(display);
   }
 
-  switch_to_root();
   return success;
 }
 

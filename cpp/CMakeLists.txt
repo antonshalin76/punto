@@ -81,6 +81,7 @@ set(PUNTO_HEADERS
     include/punto/input_buffer.hpp
     include/punto/key_injector.hpp
     include/punto/config.hpp
+    include/punto/control_plane_state.hpp
     include/punto/logger.hpp
     include/punto/text_processor.hpp
     include/punto/clipboard_manager.hpp
@@ -100,6 +101,7 @@ set(PUNTO_HEADERS
     include/punto/smart_bypass.hpp
     include/punto/undo_detector.hpp
     include/punto/macro_lock.hpp
+    include/punto/runtime_tuning.hpp
 )
 
 # -----------------------------------------------------------------------------
@@ -225,6 +227,11 @@ if(BUILD_TESTING)
     target_include_directories(punto-tests
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    target_compile_definitions(punto-tests
+        PRIVATE
+            PUNTO_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     )
 
     add_test(NAME punto-tests COMMAND punto-tests)

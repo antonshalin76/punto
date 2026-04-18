@@ -28,10 +28,7 @@ bool ClipboardManager::open() {
   if (display_)
     return true;
 
-  // Применяем переменные окружения X11
-  session_.apply_environment();
-
-  display_ = XOpenDisplay(nullptr);
+  display_ = session_.open_display();
   if (!display_) {
     std::cerr << "[punto] Ошибка: не удалось открыть X display\n";
     return false;

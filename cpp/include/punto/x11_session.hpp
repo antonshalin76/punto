@@ -15,6 +15,7 @@
 #include <optional>
 #include <string>
 
+#include <X11/Xlib.h>
 #include <sys/types.h>
 
 namespace punto {
@@ -100,23 +101,13 @@ public:
   [[nodiscard]] bool is_wayland_session() const;
 
   /**
-   * @brief Устанавливает переменные окружения для X11 операций
+   * @brief Открывает X11 display для текущей сессии
    *
-   * Вызывается перед операциями с X11 API.
-   * Устанавливает DISPLAY и XAUTHORITY.
+   * Важно: не меняет process credentials. Root-daemon работает через cookies
+   * пользователя, а открытие display сериализуется, чтобы не устраивать гонки
+   * на process-wide XAUTHORITY при многопоточном доступе.
    */
-  void apply_environment() const;
-
-  /**
-   * @brief Переключает эффективный UID на пользователя сессии
-   * @return true если успешно (или если мы уже этот пользователь)
-   */
-  bool switch_to_user() const;
-
-  /**
-   * @brief Возвращает эффективный UID к root
-   */
-  bool switch_to_root() const;
+  [[nodiscard]] Display *open_display() const;
 
   /**
    * @brief Определяет текущую раскладку клавиатуры
@@ -166,8 +157,6 @@ private:
   mutable std::mutex mu_;
   X11SessionInfo info_;
   std::atomic<bool> initialized_{false};
-  uid_t original_uid_ = 0;
-  gid_t original_gid_ = 0;
 
   // Фоновый refresh
   mutable std::mutex refresh_mutex_;

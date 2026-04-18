@@ -12,10 +12,12 @@
 #include "punto/text_processor.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <poll.h>
 #include <thread>
@@ -54,6 +56,7 @@ oneshot_paste_waits(bool is_terminal) noexcept {
 }
 
 constexpr std::uint64_t kTaskIdFenceStride = 1024;
+constexpr auto kControlPlanePollInterval = std::chrono::seconds{2};
 
 enum class ReadEventStatus {
   Ok,
@@ -119,6 +122,65 @@ bool path_within(const std::filesystem::path &child,
   return true;
 }
 
+std::string trim_newline(std::string value) {
+  while (!value.empty() &&
+         (value.back() == '\n' || value.back() == '\r' ||
+          value.back() == '\0')) {
+    value.pop_back();
+  }
+  return value;
+}
+
+bool is_numeric_component(std::string_view value) {
+  return !value.empty() &&
+         std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+           return std::isdigit(ch) != 0;
+         });
+}
+
+std::string read_proc_comm(pid_t pid) {
+  std::ifstream input{"/proc/" + std::to_string(pid) + "/comm"};
+  if (!input.is_open()) {
+    return {};
+  }
+
+  std::string comm;
+  std::getline(input, comm);
+  return trim_newline(std::move(comm));
+}
+
+std::size_t count_running_punto_daemons() {
+  const std::string self_comm = read_proc_comm(::getpid());
+  std::size_t count = 0;
+
+  std::error_code ec;
+  for (const auto &entry : std::filesystem::directory_iterator("/proc", ec)) {
+    if (ec) {
+      break;
+    }
+
+    const std::string pid_name = entry.path().filename().string();
+    if (!is_numeric_component(pid_name)) {
+      continue;
+    }
+
+    std::ifstream input{entry.path() / "comm"};
+    if (!input.is_open()) {
+      continue;
+    }
+
+    std::string comm;
+    std::getline(input, comm);
+    comm = trim_newline(std::move(comm));
+
+    if (comm == "punto-daemon" || (!self_comm.empty() && comm == self_comm)) {
+      ++count;
+    }
+  }
+
+  return std::max<std::size_t>(count, 1);
+}
+
 } // namespace
 
 EventLoop::EventLoop(Config config)
@@ -169,19 +231,31 @@ bool EventLoop::initialize() {
     }
   }
 
+  control_plane_primary_ = control_plane_lease_.try_acquire();
+  if (control_plane_primary_) {
+    std::cerr << "[punto] Control plane role: primary\n";
+  } else {
+    std::cerr << "[punto] Control plane role: secondary\n";
+    sync_control_plane_from_shared_state(/*force=*/true);
+  }
+
   // Применяем настройки истории (max_rollback_words) и поднимаем пул анализа.
   {
     auto cfg = std::atomic_load(&config_);
     history_.set_max_words(cfg->auto_switch.max_rollback_words);
 
-    std::size_t hc = std::thread::hardware_concurrency();
-    std::size_t threads = 1;
-    if (hc > 1) {
-      threads = hc - 1;
-    }
+    analysis_thread_budget_ = compute_analysis_thread_budget(
+        std::thread::hardware_concurrency(), count_running_punto_daemons(),
+        cfg->runtime.analysis_threads,
+        cfg->runtime.max_analysis_threads_per_daemon);
 
-    analysis_pool_.start(threads);
-    std::cerr << "[punto] Analysis pool: " << threads << " threads\n";
+    analysis_pool_.start(analysis_thread_budget_.worker_threads);
+    std::cerr << "[punto] Analysis pool: "
+              << analysis_thread_budget_.worker_threads << " threads ("
+              << (analysis_thread_budget_.manual_override ? "fixed" : "auto")
+              << ", daemons=" << analysis_thread_budget_.daemon_count
+              << ", max_per_daemon="
+              << cfg->runtime.max_analysis_threads_per_daemon << ")\n";
   }
 
   // SoundManager зависит от X11Session (uid/gid/env активного пользователя)
@@ -208,7 +282,6 @@ bool EventLoop::initialize() {
     clipboard_ = std::make_unique<ClipboardManager>(*x11_session_);
 
     // Определяем текущую раскладку
-    x11_session_->apply_environment();
     current_layout_ = x11_session_->get_current_keyboard_layout();
     if (current_layout_ < 0) {
       current_layout_ = 0; // По умолчанию английская
@@ -217,15 +290,16 @@ bool EventLoop::initialize() {
               << (current_layout_ == 0 ? "EN" : "RU") << "\n";
   }
 
-  // Создаём IPC сервер для управления из tray-приложения
-  ipc_server_ = std::make_unique<IpcServer>(
-      ipc_enabled_,
-      [this](const std::string &path) { return reload_config(path); },
-      [this]() { return stats_report(); });
-  if (!ipc_server_->start()) {
-    std::cerr << "[punto] Warning: IPC server failed to start. "
-                 "Tray control will be unavailable.\n";
-    // Не фатальная ошибка — базовая функциональность работает
+  if (control_plane_primary_) {
+    if (!start_primary_ipc_server()) {
+      std::cerr << "[punto] Warning: primary IPC server failed to start. "
+                   "Tray control will be unavailable.\n";
+    } else {
+      publish_control_plane_state(/*bump_config_generation=*/true,
+                                  /*bump_status_generation=*/true);
+    }
+  } else {
+    std::cerr << "[punto] Secondary daemon: IPC served by primary process\n";
   }
 
   initialized_ = true;
@@ -323,6 +397,17 @@ int EventLoop::run() {
     // Используем фоновый refresh чтобы не блокировать обработку клавиатуры.
     {
       const auto now = std::chrono::steady_clock::now();
+
+      if (last_control_plane_poll_.time_since_epoch().count() == 0 ||
+          now - last_control_plane_poll_ >= kControlPlanePollInterval) {
+        last_control_plane_poll_ = now;
+        if (!control_plane_primary_) {
+          maybe_promote_to_control_plane_primary();
+          if (!control_plane_primary_) {
+            sync_control_plane_from_shared_state(/*force=*/false);
+          }
+        }
+      }
 
       // Запускаем фоновый refresh если пришло время и нет активного
       if (!x11_refresh_pending_ && now - last_x11_check_time >= kX11CheckInterval) {
@@ -1031,7 +1116,6 @@ int EventLoop::sync_layout_from_os() {
     return -1;
   }
 
-  x11_session_->apply_environment();
   const int os_layout = x11_session_->get_current_keyboard_layout();
   if ((os_layout == 0 || os_layout == 1) && os_layout != current_layout_) {
     std::cerr << "[punto] Layout PRE-SYNC: " << current_layout_ << " -> "
@@ -1087,6 +1171,97 @@ void EventLoop::maybe_handle_injector_failure(std::string_view context) {
   std::cerr << "[punto] Fatal output I/O error in " << context
             << ": errno=" << err << " (" << std::strerror(err) << ")\n";
   request_stop();
+}
+
+bool EventLoop::start_primary_ipc_server() {
+  if (ipc_server_ && ipc_server_->is_running()) {
+    return true;
+  }
+
+  ipc_server_ = std::make_unique<IpcServer>(
+      ipc_enabled_,
+      [this](const std::string &path) { return reload_config(path); },
+      [this]() { return stats_report(); },
+      std::string{kIpcSocketPath},
+      [this](bool /*enabled*/) {
+        publish_control_plane_state(/*bump_config_generation=*/false,
+                                    /*bump_status_generation=*/true);
+      },
+      /*allow_fallback_sockets=*/false);
+
+  return ipc_server_->start();
+}
+
+void EventLoop::publish_control_plane_state(bool bump_config_generation,
+                                            bool bump_status_generation) {
+  SharedControlPlaneState next = shared_control_plane_state_;
+
+  auto cfg = std::atomic_load(&config_);
+  next.enabled = ipc_enabled_.load(std::memory_order_relaxed);
+  next.config_path = cfg ? cfg->config_path.string() : std::string{};
+
+  if (bump_config_generation) {
+    next.config_generation += 1;
+  }
+  if (bump_status_generation) {
+    next.status_generation += 1;
+  }
+
+  if (!write_shared_control_plane_state(next)) {
+    std::cerr << "[punto] Warning: failed to publish control-plane state\n";
+    return;
+  }
+
+  shared_control_plane_state_ = next;
+  applied_config_generation_ = next.config_generation;
+  applied_status_generation_ = next.status_generation;
+}
+
+void EventLoop::sync_control_plane_from_shared_state(bool force) {
+  if (control_plane_primary_) {
+    return;
+  }
+
+  SharedControlPlaneState next;
+  if (!read_shared_control_plane_state(next)) {
+    return;
+  }
+
+  if (force || next.config_generation > applied_config_generation_) {
+    IpcResult res = reload_config(next.config_path);
+    if (!res.success) {
+      std::cerr << "[punto] Warning: shared control-plane config sync failed: "
+                << res.message << "\n";
+      return;
+    }
+    applied_config_generation_ = next.config_generation;
+  }
+
+  if (force || next.status_generation > applied_status_generation_) {
+    ipc_enabled_.store(next.enabled, std::memory_order_relaxed);
+    applied_status_generation_ = next.status_generation;
+  }
+
+  shared_control_plane_state_ = next;
+}
+
+void EventLoop::maybe_promote_to_control_plane_primary() {
+  if (control_plane_primary_) {
+    return;
+  }
+
+  if (!control_plane_lease_.try_acquire()) {
+    return;
+  }
+
+  control_plane_primary_ = true;
+  std::cerr << "[punto] Control plane failover: promoted to primary\n";
+  if (!start_primary_ipc_server()) {
+    std::cerr << "[punto] Warning: promoted primary failed to start IPC server\n";
+    return;
+  }
+  publish_control_plane_state(/*bump_config_generation=*/true,
+                              /*bump_status_generation=*/true);
 }
 
 bool EventLoop::verify_clipboard_ownership() const {
@@ -1159,8 +1334,6 @@ bool EventLoop::set_layout(int target_layout, bool play_sound) {
   // Если нужно включить XKB set, раскомментируйте блок ниже.
   /*
   if (xkb_set_available_ && x11_session_ && x11_session_->is_valid()) {
-    x11_session_->apply_environment();
-
     bool ok = x11_session_->set_keyboard_layout(target_layout);
 
     if (ok) {
@@ -1209,7 +1382,6 @@ EventLoop::maybe_switch_layout_to_en_for_terminal_paste(bool is_terminal) {
   int before = current_layout_;
 
   if (x11_session_ && x11_session_->is_valid()) {
-    x11_session_->apply_environment();
     const int os_layout = x11_session_->get_current_keyboard_layout();
     if (os_layout == 0 || os_layout == 1) {
       before = os_layout;
@@ -2948,6 +3120,12 @@ IpcResult EventLoop::stats_report() const {
            std::to_string(lifetime_telemetry_.ready_results.load(
                std::memory_order_relaxed));
   stats += " worker_threads=" + std::to_string(analysis_pool_.worker_count());
+  stats +=
+      " daemon_peers=" + std::to_string(analysis_thread_budget_.daemon_count);
+  stats += " analysis_mode=";
+  stats += analysis_thread_budget_.manual_override ? "fixed" : "auto";
+  stats += " control_plane=";
+  stats += control_plane_primary_ ? "primary" : "secondary";
   stats += " queued_tasks=" + std::to_string(analysis_pool_.pending_task_count());
   stats += " avg_queue_us=" +
            std::to_string(analyzed > 0 ? queue_sum / analyzed : 0);
@@ -3054,6 +3232,7 @@ IpcResult EventLoop::reload_config(const std::string &config_path) {
             loaded.error.empty() ? "Config reload failed" : loaded.error};
   }
 
+  auto old_cfg = std::atomic_load(&config_);
   auto new_cfg = std::make_shared<Config>(std::move(loaded.config));
 
   // Всегда синхронизируем runtime-статус автопереключения с конфигом при
@@ -3081,6 +3260,13 @@ IpcResult EventLoop::reload_config(const std::string &config_path) {
   }
   update_log_level(new_cfg->logging.level);
 
+  if (old_cfg &&
+      (old_cfg->runtime.analysis_threads != new_cfg->runtime.analysis_threads ||
+       old_cfg->runtime.max_analysis_threads_per_daemon !=
+           new_cfg->runtime.max_analysis_threads_per_daemon)) {
+    std::cerr << "[punto] runtime thread settings changed; restart punto/udevmon to apply\n";
+  }
+
   std::cerr << "[punto] Configuration reloaded: " << loaded.used_path << "\n";
   std::cerr << "[punto] auto_switch: enabled=" << new_cfg->auto_switch.enabled
             << ", threshold=" << new_cfg->auto_switch.threshold
@@ -3088,6 +3274,11 @@ IpcResult EventLoop::reload_config(const std::string &config_path) {
             << ", min_score=" << new_cfg->auto_switch.min_score
             << ", max_rollback_words="
             << new_cfg->auto_switch.max_rollback_words << '\n';
+
+  if (control_plane_primary_) {
+    publish_control_plane_state(/*bump_config_generation=*/true,
+                                /*bump_status_generation=*/true);
+  }
 
   std::string message = "Loaded " + loaded.used_path.string();
   if (!explicit_path && tried_user && !user_exists) {

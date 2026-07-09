@@ -231,8 +231,14 @@ bool EventLoop::initialize() {
     }
   }
 
-  control_plane_primary_ = control_plane_lease_.try_acquire();
-  if (control_plane_primary_) {
+  control_plane_primary_.store(control_plane_lease_.try_acquire(),
+                               std::memory_order_release);
+  if (control_plane_primary_.load(std::memory_order_acquire)) {
+    {
+      std::lock_guard<std::mutex> lock(control_plane_mutex_);
+      shared_control_plane_state_ =
+          seed_control_plane_generations(shared_control_plane_state_);
+    }
     std::cerr << "[punto] Control plane role: primary\n";
   } else {
     std::cerr << "[punto] Control plane role: secondary\n";
@@ -261,7 +267,8 @@ bool EventLoop::initialize() {
   // SoundManager зависит от X11Session (uid/gid/env активного пользователя)
   {
     auto cfg = std::atomic_load(&config_);
-    sound_manager_ = std::make_unique<SoundManager>(*x11_session_, cfg->sound);
+    std::atomic_store(&sound_manager_, std::make_shared<SoundManager>(
+                                           *x11_session_, cfg->sound));
   }
 
   if (!x11_ok) {
@@ -290,7 +297,7 @@ bool EventLoop::initialize() {
               << (current_layout_ == 0 ? "EN" : "RU") << "\n";
   }
 
-  if (control_plane_primary_) {
+  if (control_plane_primary_.load(std::memory_order_acquire)) {
     if (!start_primary_ipc_server()) {
       std::cerr << "[punto] Warning: primary IPC server failed to start. "
                    "Tray control will be unavailable.\n";
@@ -362,7 +369,8 @@ int EventLoop::run() {
     clipboard_ = std::make_unique<ClipboardManager>(*x11_session_);
 
     auto cfg = std::atomic_load(&config_);
-    sound_manager_ = std::make_unique<SoundManager>(*x11_session_, cfg->sound);
+    std::atomic_store(&sound_manager_, std::make_shared<SoundManager>(
+                                           *x11_session_, cfg->sound));
 
     // Синхронизируем раскладку.
     sync_current_layout_from_os("x11 refresh");
@@ -376,7 +384,7 @@ int EventLoop::run() {
 
   auto teardown_x11_deps = [&]() {
     clipboard_.reset();
-    sound_manager_.reset();
+    std::atomic_store(&sound_manager_, std::shared_ptr<SoundManager>{});
     // Не трогаем current_layout_: оно используется как внутренний стейт,
     // но без валидной X11-сессии операции set/get всё равно станут no-op.
   };
@@ -401,10 +409,18 @@ int EventLoop::run() {
       if (last_control_plane_poll_.time_since_epoch().count() == 0 ||
           now - last_control_plane_poll_ >= kControlPlanePollInterval) {
         last_control_plane_poll_ = now;
-        if (!control_plane_primary_) {
+        if (!control_plane_primary_.load(std::memory_order_acquire)) {
           maybe_promote_to_control_plane_primary();
-          if (!control_plane_primary_) {
+          if (!control_plane_primary_.load(std::memory_order_acquire)) {
             sync_control_plane_from_shared_state(/*force=*/false);
+          }
+        } else if (!ipc_server_ || !ipc_server_->is_running()) {
+          // Primary без IPC (например, при промоушене сокет ещё держал
+          // умирающий процесс) — иначе управление из трея потеряно навсегда.
+          if (start_primary_ipc_server()) {
+            std::cerr << "[punto] Primary IPC server recovered\n";
+            publish_control_plane_state(/*bump_config_generation=*/true,
+                                        /*bump_status_generation=*/true);
           }
         }
       }
@@ -1140,10 +1156,11 @@ void EventLoop::sync_current_layout_from_os(std::string_view reason) {
   }
 
   if (os_layout == 0 || os_layout == 1) {
+    auto sound_manager = std::atomic_load(&sound_manager_);
     if (should_play_external_layout_sound(external_layout_sound_, now,
                                           previous_layout, os_layout) &&
-        sound_manager_) {
-      sound_manager_->play_for_layout(os_layout);
+        sound_manager) {
+      sound_manager->play_for_layout(os_layout);
       clear_external_layout_sound(external_layout_sound_);
     }
 
@@ -1194,9 +1211,14 @@ bool EventLoop::start_primary_ipc_server() {
 
 void EventLoop::publish_control_plane_state(bool bump_config_generation,
                                             bool bump_status_generation) {
-  SharedControlPlaneState next = shared_control_plane_state_;
-
   auto cfg = std::atomic_load(&config_);
+
+  // Мьютекс обязателен: publish вызывается и из main-потока (initialize,
+  // failover, X11 refresh -> reload_config), и из IPC-потока
+  // (RELOAD/SET_STATUS callbacks).
+  std::lock_guard<std::mutex> lock(control_plane_mutex_);
+
+  SharedControlPlaneState next = shared_control_plane_state_;
   next.enabled = ipc_enabled_.load(std::memory_order_relaxed);
   next.config_path = cfg ? cfg->config_path.string() : std::string{};
 
@@ -1218,7 +1240,7 @@ void EventLoop::publish_control_plane_state(bool bump_config_generation,
 }
 
 void EventLoop::sync_control_plane_from_shared_state(bool force) {
-  if (control_plane_primary_) {
+  if (control_plane_primary_.load(std::memory_order_acquire)) {
     return;
   }
 
@@ -1227,26 +1249,45 @@ void EventLoop::sync_control_plane_from_shared_state(bool force) {
     return;
   }
 
-  if (force || next.config_generation > applied_config_generation_) {
+  std::uint64_t applied_config = 0;
+  std::uint64_t applied_status = 0;
+  {
+    std::lock_guard<std::mutex> lock(control_plane_mutex_);
+    applied_config = applied_config_generation_;
+    applied_status = applied_status_generation_;
+  }
+
+  // Сравнение через != (а не >): после рестарта primary нумерация может
+  // начаться заново, и «меньшее» поколение — это тоже изменение, которое
+  // нужно применить, иначе демоны разных клавиатур разойдутся по настройкам.
+  const bool config_changed = force || next.config_generation != applied_config;
+  const bool status_changed = force || next.status_generation != applied_status;
+
+  if (config_changed) {
     IpcResult res = reload_config(next.config_path);
     if (!res.success) {
       std::cerr << "[punto] Warning: shared control-plane config sync failed: "
                 << res.message << "\n";
       return;
     }
+  }
+
+  if (status_changed) {
+    ipc_enabled_.store(next.enabled, std::memory_order_relaxed);
+  }
+
+  std::lock_guard<std::mutex> lock(control_plane_mutex_);
+  if (config_changed) {
     applied_config_generation_ = next.config_generation;
   }
-
-  if (force || next.status_generation > applied_status_generation_) {
-    ipc_enabled_.store(next.enabled, std::memory_order_relaxed);
+  if (status_changed) {
     applied_status_generation_ = next.status_generation;
   }
-
   shared_control_plane_state_ = next;
 }
 
 void EventLoop::maybe_promote_to_control_plane_primary() {
-  if (control_plane_primary_) {
+  if (control_plane_primary_.load(std::memory_order_acquire)) {
     return;
   }
 
@@ -1254,9 +1295,10 @@ void EventLoop::maybe_promote_to_control_plane_primary() {
     return;
   }
 
-  control_plane_primary_ = true;
+  control_plane_primary_.store(true, std::memory_order_release);
   std::cerr << "[punto] Control plane failover: promoted to primary\n";
   if (!start_primary_ipc_server()) {
+    // Не фатально: main loop будет ретраить запуск IPC в control-plane poll.
     std::cerr << "[punto] Warning: promoted primary failed to start IPC server\n";
     return;
   }
@@ -1294,8 +1336,10 @@ void EventLoop::switch_layout(bool play_sound) {
   }
 
   last_sync_time_ = std::chrono::steady_clock::now();
-  if (play_sound && sound_manager_) {
-    sound_manager_->play_for_layout(current_layout_);
+  if (play_sound) {
+    if (auto sound_manager = std::atomic_load(&sound_manager_)) {
+      sound_manager->play_for_layout(current_layout_);
+    }
   }
 }
 
@@ -3125,7 +3169,9 @@ IpcResult EventLoop::stats_report() const {
   stats += " analysis_mode=";
   stats += analysis_thread_budget_.manual_override ? "fixed" : "auto";
   stats += " control_plane=";
-  stats += control_plane_primary_ ? "primary" : "secondary";
+  stats += control_plane_primary_.load(std::memory_order_acquire)
+               ? "primary"
+               : "secondary";
   stats += " queued_tasks=" + std::to_string(analysis_pool_.pending_task_count());
   stats += " avg_queue_us=" +
            std::to_string(analyzed > 0 ? queue_sum / analyzed : 0);
@@ -3227,7 +3273,7 @@ IpcResult EventLoop::reload_config(const std::string &config_path) {
 
   ConfigLoadOutcome loaded = load_config_checked(load_path);
   if (loaded.result != ConfigResult::Ok) {
-    std::cerr << "[punto] Config reload failed: " << loaded.error << "\\n";
+    std::cerr << "[punto] Config reload failed: " << loaded.error << "\n";
     return {false,
             loaded.error.empty() ? "Config reload failed" : loaded.error};
   }
@@ -3255,8 +3301,10 @@ IpcResult EventLoop::reload_config(const std::string &config_path) {
   std::atomic_store(&analyzer_, std::move(analyzer_const));
   std::atomic_store(&injector_, std::move(injector_const));
 
-  if (sound_manager_) {
-    sound_manager_->set_enabled(new_cfg->sound.enabled);
+  // reload_config() может выполняться в IPC-потоке, а main-поток пересоздаёт
+  // SoundManager при смене X11-сессии — работаем только через снапшот.
+  if (auto sound_manager = std::atomic_load(&sound_manager_)) {
+    sound_manager->set_enabled(new_cfg->sound.enabled);
   }
   update_log_level(new_cfg->logging.level);
 
@@ -3275,7 +3323,7 @@ IpcResult EventLoop::reload_config(const std::string &config_path) {
             << ", max_rollback_words="
             << new_cfg->auto_switch.max_rollback_words << '\n';
 
-  if (control_plane_primary_) {
+  if (control_plane_primary_.load(std::memory_order_acquire)) {
     publish_control_plane_state(/*bump_config_generation=*/true,
                                 /*bump_status_generation=*/true);
   }

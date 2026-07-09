@@ -6,6 +6,7 @@
 #include "punto/logger.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdlib>
 #include <iostream>
@@ -18,7 +19,9 @@ namespace punto {
 
 namespace {
 
-LogLevel g_min_log_level = LogLevel::Info;
+// Атомик: update_log_level() вызывается из IPC-потока (reload_config), а
+// чтение уровня происходит из всех потоков, пишущих в std::cerr.
+std::atomic<LogLevel> g_min_log_level{LogLevel::Info};
 std::streambuf *g_original_cerr = nullptr;
 std::string g_ident = "punto";
 
@@ -120,7 +123,8 @@ private:
     }
 
     const LogLevel level = infer_log_level(line);
-    if (static_cast<int>(level) > static_cast<int>(g_min_log_level)) {
+    if (static_cast<int>(level) >
+        static_cast<int>(g_min_log_level.load(std::memory_order_relaxed))) {
       return;
     }
 

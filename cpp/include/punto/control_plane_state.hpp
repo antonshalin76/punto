@@ -168,6 +168,23 @@ inline bool read_shared_control_plane_state(
   return true;
 }
 
+/// Продолжает нумерацию поколений от состояния на диске (если оно читается).
+///
+/// Нужно свежезапущенному primary: файл состояния в /var/run переживает
+/// рестарт сервиса, и secondary-демоны могли уже применить старшие поколения.
+/// Публикация "с нуля" (1, 2, ...) выглядела бы для них как отсутствие
+/// изменений, и настройки клавиатур разъехались бы.
+inline SharedControlPlaneState seed_control_plane_generations(
+    SharedControlPlaneState state,
+    const std::string &path = std::string{kControlPlaneStatePath}) {
+  SharedControlPlaneState previous;
+  if (read_shared_control_plane_state(previous, path)) {
+    state.config_generation = previous.config_generation;
+    state.status_generation = previous.status_generation;
+  }
+  return state;
+}
+
 inline bool write_shared_control_plane_state(
     const SharedControlPlaneState &state,
     const std::string &path = std::string{kControlPlaneStatePath}) {

@@ -23,7 +23,7 @@ if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
 fi
 
 # Определяем версию пакета
-PKG_VERSION="2.8.4"
+PKG_VERSION="2.8.5"
 CONFIG_FILE="/etc/punto/config.yaml"
 NEW_CONFIG="/usr/share/punto-switcher/config.yaml"
 

@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -361,7 +362,11 @@ private:
   bool x11_refresh_pending_{false}; // Флаг фонового refresh
   bool wayland_warning_emitted_{false};
   std::unique_ptr<ClipboardManager> clipboard_;
-  std::unique_ptr<SoundManager> sound_manager_;
+
+  // Доступ только через std::atomic_load/std::atomic_store:
+  // main thread пересоздаёт SoundManager при смене X11-сессии, а
+  // reload_config() из IPC-потока обновляет флаг enabled.
+  std::shared_ptr<SoundManager> sound_manager_;
 
   std::optional<PendingClipboardRestore> pending_clip_restore_;
 
@@ -431,8 +436,16 @@ private:
   /// IPC сервер для управления из tray-приложения
   std::unique_ptr<IpcServer> ipc_server_;
   ControlPlaneLease control_plane_lease_{};
+
+  /// Роль читается из IPC-потока (stats/reload), пишется main-потоком при
+  /// старте/промоушене — поэтому атомик.
+  std::atomic<bool> control_plane_primary_{false};
+
+  /// Защищает shared_control_plane_state_ и applied_*_generation_:
+  /// publish_control_plane_state() вызывается и из main-потока (initialize,
+  /// failover, X11 refresh -> reload), и из IPC-потока (RELOAD/SET_STATUS).
+  std::mutex control_plane_mutex_;
   SharedControlPlaneState shared_control_plane_state_{};
-  bool control_plane_primary_ = false;
   std::uint64_t applied_config_generation_ = 0;
   std::uint64_t applied_status_generation_ = 0;
   std::chrono::steady_clock::time_point last_control_plane_poll_{};

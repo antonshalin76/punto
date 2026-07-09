@@ -328,6 +328,44 @@ void test_control_plane_state_round_trip() {
   expect(::rmdir(dir) == 0, "control plane dir removed");
 }
 
+void test_control_plane_generation_seeding() {
+  char dir_template[] = "/tmp/punto-seed-XXXXXX";
+  char *dir = ::mkdtemp(dir_template);
+  expect(dir != nullptr, "seed mkdtemp failed");
+
+  const std::filesystem::path state_path =
+      std::filesystem::path(dir) / "control.state";
+
+  // Файл отсутствует: состояние не меняется.
+  SharedControlPlaneState fresh;
+  fresh.enabled = false;
+  fresh.config_path = "/etc/punto/config.yaml";
+  SharedControlPlaneState seeded =
+      seed_control_plane_generations(fresh, state_path.string());
+  expect(seeded.config_generation == 0, "seed keeps zero config gen");
+  expect(seeded.status_generation == 0, "seed keeps zero status gen");
+
+  // Файл от предыдущего запуска: поколения продолжаются, а локальные
+  // enabled/config_path не затираются стейл-значениями с диска.
+  SharedControlPlaneState previous;
+  previous.config_generation = 42;
+  previous.status_generation = 17;
+  previous.enabled = true;
+  previous.config_path = "/stale/path.yaml";
+  expect(write_shared_control_plane_state(previous, state_path.string()),
+         "seed state write");
+
+  seeded = seed_control_plane_generations(fresh, state_path.string());
+  expect(seeded.config_generation == 42, "seed continues config generation");
+  expect(seeded.status_generation == 17, "seed continues status generation");
+  expect(!seeded.enabled, "seed keeps local enabled flag");
+  expect(seeded.config_path == "/etc/punto/config.yaml",
+         "seed keeps local config path");
+
+  expect(std::filesystem::remove(state_path), "seed state removed");
+  expect(::rmdir(dir) == 0, "seed dir removed");
+}
+
 } // namespace
 
 int main() {
@@ -341,6 +379,7 @@ int main() {
   test_x11_threading_regression_guards();
   test_runtime_thread_budget();
   test_control_plane_state_round_trip();
+  test_control_plane_generation_seeding();
 
   std::cout << "punto-tests: OK\n";
   return 0;

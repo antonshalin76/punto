@@ -211,7 +211,7 @@ function restart_service() {
 
 function show_help() {
     cat << EOF
-Punto Switcher CLI v2.8.4
+Punto Switcher CLI v2.8.5
 
 Usage: punto <command>
 

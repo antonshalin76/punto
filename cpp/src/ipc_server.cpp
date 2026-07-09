@@ -136,17 +136,18 @@ void IpcServer::stop() {
 
   running_.store(false);
 
-  // Закрываем сокет, чтобы разблокировать poll()
-  if (server_fd_ >= 0) {
-    shutdown(server_fd_, SHUT_RDWR);
-    close(server_fd_);
-    server_fd_ = -1;
-  }
-
-  // Ждём завершения потока
+  // Сначала дожидаемся серверный поток (poll() имеет таймаут 500ms и проверяет
+  // running_), и только потом закрываем сокет. Закрытие fd, пока другой поток
+  // сидит в poll()/accept() на нём, приводит к гонке с переиспользованием
+  // номера дескриптора. shutdown() на listening AF_UNIX сокете poll() не будит.
   if (server_thread_.joinable()) {
     server_thread_.request_stop();
     server_thread_.join();
+  }
+
+  if (server_fd_ >= 0) {
+    close(server_fd_);
+    server_fd_ = -1;
   }
 
   // Удаляем файл сокета

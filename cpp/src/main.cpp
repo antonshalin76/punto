@@ -40,7 +40,7 @@ void signal_handler(int sig) {
 }
 
 void print_version() {
-  std::cout << "Punto Switcher 2.8.4 (C++20)\n"
+  std::cout << "Punto Switcher 2.8.5 (C++20)\n"
             << "Высокопроизводительный плагин для interception-tools\n"
             << "https://github.com/antonshalin76/punto\n";
 }

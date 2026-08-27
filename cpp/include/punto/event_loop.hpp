@@ -305,6 +305,7 @@ private:
   // Async pipeline: история + пул анализа
   HistoryManager history_{5};
   AnalysisWorkerPool analysis_pool_{dict_};
+  bool analysis_pool_failed_ = false;
 
   /// Детектор отмены коррекции — запоминает слова, которые пользователь отменил
   UndoDetector undo_detector_;

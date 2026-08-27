@@ -12,6 +12,7 @@
 #include <optional>
 #include <stop_token>
 #include <utility>
+#include <vector>
 
 namespace punto {
 
@@ -23,9 +24,19 @@ public:
   ConcurrentQueue &operator=(const ConcurrentQueue &) = delete;
 
   void push(T value) {
+    push(std::move(value), [](T &) noexcept {});
+  }
+
+  template <class OnCommit> void push(T value, OnCommit &&on_commit) {
     {
       std::lock_guard<std::mutex> lock(mu_);
       q_.push_back(std::move(value));
+      try {
+        std::forward<OnCommit>(on_commit)(q_.back());
+      } catch (...) {
+        q_.pop_back();
+        throw;
+      }
     }
     cv_.notify_one();
   }
@@ -59,6 +70,21 @@ public:
   [[nodiscard]] std::size_t size() const {
     std::lock_guard<std::mutex> lock(mu_);
     return q_.size();
+  }
+
+  template <class Predicate>
+  [[nodiscard]] std::vector<T> extract_if(Predicate &&predicate) {
+    std::vector<T> extracted;
+    std::lock_guard<std::mutex> lock(mu_);
+    for (auto it = q_.begin(); it != q_.end();) {
+      if (std::forward<Predicate>(predicate)(*it)) {
+        extracted.push_back(std::move(*it));
+        it = q_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    return extracted;
   }
 
 private:

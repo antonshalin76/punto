@@ -6,14 +6,19 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <stop_token>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -30,6 +35,7 @@ namespace punto {
 
 struct WordTask {
   std::uint64_t task_id = 0;
+  std::uint64_t epoch = 0;
 
   // Слово (полное) в KeyEntry (включая пунктуацию, если она набиралась).
   std::vector<KeyEntry> word;
@@ -56,8 +62,12 @@ enum class CorrectionType {
   CombinedFix     // Комбинированное исправление (раскладка + регистр)
 };
 
+enum class WordTerminalStatus { Completed, Failed, Cancelled };
+
 struct WordResult {
   std::uint64_t task_id = 0;
+  std::uint64_t epoch = 0;
+  WordTerminalStatus terminal_status = WordTerminalStatus::Completed;
   bool need_switch = false;
 
   /// Тип применённой коррекции
@@ -77,7 +87,11 @@ struct WordResult {
 
 class AnalysisWorkerPool {
 public:
-  explicit AnalysisWorkerPool(const Dictionary &dict) : dict_{&dict} {}
+  explicit AnalysisWorkerPool(const Dictionary &dict,
+                              std::function<void()> before_task = {},
+                              std::function<void()> on_stop_wait = {})
+      : dict_{&dict}, before_task_{std::move(before_task)},
+        on_stop_wait_{std::move(on_stop_wait)} {}
 
   AnalysisWorkerPool(const AnalysisWorkerPool &) = delete;
   AnalysisWorkerPool &operator=(const AnalysisWorkerPool &) = delete;
@@ -85,7 +99,12 @@ public:
   ~AnalysisWorkerPool() { stop(); }
 
   void start(std::size_t threads) {
+    std::lock_guard<std::mutex> state_lock(state_mu_);
     if (!threads_.empty()) {
+      return;
+    }
+
+    if (lifecycle_ != Lifecycle::Running || fatal_) {
       return;
     }
 
@@ -100,29 +119,163 @@ public:
   }
 
   void stop() {
-    for (auto &t : threads_) {
-      t.request_stop();
+    {
+      std::unique_lock<std::mutex> state_lock(state_mu_);
+      const auto caller = std::this_thread::get_id();
+      for (const auto &thread : threads_) {
+        if (thread.get_id() == caller) {
+          throw std::logic_error(
+              "AnalysisWorkerPool::stop cannot run on a worker thread");
+        }
+      }
+      if (lifecycle_ == Lifecycle::Stopped) {
+        return;
+      }
+      if (lifecycle_ == Lifecycle::Stopping) {
+        const auto on_stop_wait = on_stop_wait_;
+        state_lock.unlock();
+        if (on_stop_wait) {
+          on_stop_wait();
+        }
+        state_lock.lock();
+        state_cv_.wait(state_lock,
+                       [this] { return lifecycle_ == Lifecycle::Stopped; });
+        return;
+      }
+      accepting_ = false;
+      lifecycle_ = Lifecycle::Stopping;
+      for (auto &t : threads_) {
+        t.request_stop();
+      }
     }
+
+    WordTask queued;
+    while (tasks_.try_pop(queued)) {
+      WordResult cancelled;
+      cancelled.task_id = queued.task_id;
+      cancelled.epoch = queued.epoch;
+      cancelled.terminal_status = WordTerminalStatus::Cancelled;
+      cancelled.word_len = queued.word.size();
+      cancelled.analysis_len = queued.analysis_len;
+      cancelled.layout_at_boundary = queued.layout_at_boundary;
+      publish_terminal(std::move(cancelled));
+    }
+
     tasks_.notify_all();
     for (auto &t : threads_) {
       if (t.joinable()) {
         t.join();
       }
     }
-    threads_.clear();
+    {
+      std::lock_guard<std::mutex> state_lock(state_mu_);
+      synthesize_outstanding_locked(fatal_ ? WordTerminalStatus::Failed
+                                           : WordTerminalStatus::Cancelled);
+      threads_.clear();
+      lifecycle_ = Lifecycle::Stopped;
+    }
+    state_cv_.notify_all();
   }
 
-  void submit(WordTask task) { tasks_.push(std::move(task)); }
+  [[nodiscard]] bool submit(WordTask task) {
+    std::lock_guard<std::mutex> state_lock(state_mu_);
+    if (!accepting_ || lifecycle_ != Lifecycle::Running || fatal_ ||
+        task_states_.contains(task.task_id)) {
+      return false;
+    }
+
+    task.epoch = epoch_;
+    TaskState state;
+    state.epoch = task.epoch;
+    state.word_len = task.word.size();
+    state.analysis_len = task.analysis_len;
+    state.layout_at_boundary = task.layout_at_boundary;
+    task_states_.emplace(task.task_id, state);
+    try {
+      tasks_.push(std::move(task), [this](WordTask &committed) {
+        const auto accepted_at = std::chrono::steady_clock::now();
+        committed.submitted_at = accepted_at;
+        task_states_.at(committed.task_id).accepted_at = accepted_at;
+      });
+    } catch (...) {
+      task_states_.erase(task.task_id);
+      throw;
+    }
+    return true;
+  }
 
   [[nodiscard]] bool try_pop_result(WordResult &out) {
-    return results_.try_pop(out);
+    if (results_.try_pop(out)) {
+      std::lock_guard<std::mutex> state_lock(state_mu_);
+      auto it = task_states_.find(out.task_id);
+      if (it != task_states_.end() && it->second.epoch == out.epoch &&
+          it->second.terminal_status.has_value()) {
+        task_states_.erase(it);
+      }
+      return true;
+    }
+
+    std::lock_guard<std::mutex> state_lock(state_mu_);
+    for (auto it = task_states_.begin(); it != task_states_.end(); ++it) {
+      const TaskState &state = it->second;
+      if (!state.terminal_status.has_value() || state.result_queued) {
+        continue;
+      }
+      out = WordResult{};
+      out.task_id = it->first;
+      out.epoch = state.epoch;
+      out.terminal_status = *state.terminal_status;
+      out.word_len = state.word_len;
+      out.analysis_len = state.analysis_len;
+      out.layout_at_boundary = state.layout_at_boundary;
+      task_states_.erase(it);
+      return true;
+    }
+    return false;
+  }
+
+  [[nodiscard]] bool has_fatal_error() const {
+    std::lock_guard<std::mutex> state_lock(state_mu_);
+    return fatal_;
+  }
+
+  void begin_new_epoch() {
+    std::vector<WordResult> cancelled;
+    {
+      std::lock_guard<std::mutex> state_lock(state_mu_);
+      if (fatal_ || lifecycle_ != Lifecycle::Running) {
+        return;
+      }
+      ++epoch_;
+      const auto retired_tasks = tasks_.extract_if(
+          [current_epoch = epoch_](const WordTask &task) {
+            return task.epoch < current_epoch;
+          });
+      (void)retired_tasks;
+      cancelled.reserve(task_states_.size());
+      for (const auto &[task_id, state] : task_states_) {
+        if (state.epoch < epoch_ && !state.terminal_status.has_value()) {
+          WordResult result;
+          result.task_id = task_id;
+          result.epoch = state.epoch;
+          result.terminal_status = WordTerminalStatus::Cancelled;
+          cancelled.push_back(std::move(result));
+        }
+      }
+    }
+    for (auto &result : cancelled) {
+      publish_terminal(std::move(result));
+    }
   }
 
   [[nodiscard]] std::size_t pending_task_count() const {
     return tasks_.size();
   }
 
-  [[nodiscard]] std::size_t worker_count() const { return threads_.size(); }
+  [[nodiscard]] std::size_t worker_count() const {
+    std::lock_guard<std::mutex> state_lock(state_mu_);
+    return threads_.size();
+  }
 
 private:
   void worker_main(std::stop_token st) {
@@ -134,9 +287,13 @@ private:
         }
 
         WordTask task = std::move(*opt);
+        if (before_task_) {
+          before_task_();
+        }
 
         WordResult res;
         res.task_id = task.task_id;
+        res.epoch = task.epoch;
         res.need_switch = false;
         res.correction_type = CorrectionType::NoCorrection;
         res.word_len = task.word.size();
@@ -157,7 +314,7 @@ private:
           // Проверяем что слово достаточно длинное
           if (task.analysis_len < task.cfg.min_word_len) {
             res.analysis_us = 0;
-            results_.push(std::move(res));
+            publish_terminal(std::move(res));
             continue;
           }
 
@@ -376,19 +533,23 @@ private:
         } catch (const std::exception &ex) {
           std::cerr << "[punto] AnalysisWorkerPool: task " << res.task_id
                     << " failed: " << ex.what() << "\n";
+          res.terminal_status = WordTerminalStatus::Failed;
           finish_and_push(res, t0);
         } catch (...) {
           std::cerr << "[punto] AnalysisWorkerPool: task " << res.task_id
                     << " failed with unknown exception\n";
+          res.terminal_status = WordTerminalStatus::Failed;
           finish_and_push(res, t0);
         }
       }
     } catch (const std::exception &ex) {
       std::cerr << "[punto] AnalysisWorkerPool: worker terminated: "
                 << ex.what() << "\n";
+      latch_fatal();
     } catch (...) {
       std::cerr
           << "[punto] AnalysisWorkerPool: worker terminated by unknown exception\n";
+      latch_fatal();
     }
   }
 
@@ -398,7 +559,60 @@ private:
     const auto t1 = std::chrono::steady_clock::now();
     res.analysis_us = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
-    results_.push(std::move(res));
+    publish_terminal(std::move(res));
+  }
+
+  void publish_terminal(WordResult res) {
+    std::lock_guard<std::mutex> state_lock(state_mu_);
+    auto it = task_states_.find(res.task_id);
+    if (it == task_states_.end() || it->second.epoch != res.epoch ||
+        it->second.terminal_status.has_value()) {
+      return;
+    }
+    const WordTerminalStatus status = res.terminal_status;
+    try {
+      results_.push(std::move(res));
+      it->second.terminal_status = status;
+      it->second.result_queued = true;
+    } catch (...) {
+      mark_fatal_locked();
+    }
+  }
+
+  void latch_fatal() {
+    std::lock_guard<std::mutex> state_lock(state_mu_);
+    mark_fatal_locked();
+  }
+
+  void mark_fatal_locked() {
+    fatal_ = true;
+    accepting_ = false;
+    synthesize_outstanding_locked(WordTerminalStatus::Failed);
+  }
+
+  void synthesize_outstanding_locked(WordTerminalStatus status) {
+    for (auto &[task_id, state] : task_states_) {
+      if (state.terminal_status.has_value()) {
+        continue;
+      }
+      WordResult result;
+      result.task_id = task_id;
+      result.epoch = state.epoch;
+      result.word_len = state.word_len;
+      result.analysis_len = state.analysis_len;
+      result.layout_at_boundary = state.layout_at_boundary;
+      result.terminal_status = fatal_ ? WordTerminalStatus::Failed : status;
+      try {
+        results_.push(std::move(result));
+        state.terminal_status = fatal_ ? WordTerminalStatus::Failed : status;
+        state.result_queued = true;
+      } catch (...) {
+        fatal_ = true;
+        accepting_ = false;
+        state.terminal_status = WordTerminalStatus::Failed;
+        state.result_queued = false;
+      }
+    }
   }
 
   // Helper: проверить и применить sticky shift fix
@@ -432,11 +646,32 @@ private:
   }
 
   const Dictionary *dict_ = nullptr;
+  std::function<void()> before_task_;
+  std::function<void()> on_stop_wait_;
+
+  struct TaskState {
+    std::uint64_t epoch = 0;
+    std::optional<WordTerminalStatus> terminal_status;
+    bool result_queued = false;
+    std::chrono::steady_clock::time_point accepted_at{};
+    std::size_t word_len = 0;
+    std::size_t analysis_len = 0;
+    int layout_at_boundary = 0;
+  };
+
+  enum class Lifecycle { Running, Stopping, Stopped };
 
   ConcurrentQueue<WordTask> tasks_;
   ConcurrentQueue<WordResult> results_;
 
   std::vector<std::jthread> threads_;
+  mutable std::mutex state_mu_;
+  std::condition_variable state_cv_;
+  std::unordered_map<std::uint64_t, TaskState> task_states_;
+  std::uint64_t epoch_ = 0;
+  bool accepting_ = true;
+  Lifecycle lifecycle_ = Lifecycle::Running;
+  bool fatal_ = false;
 };
 
 } // namespace punto

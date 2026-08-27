@@ -809,7 +809,7 @@ void EventLoop::handle_event(const input_event &ev) {
     }
 
     // Каждому слову — свой task_id для строгого порядка применения.
-    const std::uint64_t task_id = next_task_id_++;
+    const std::uint64_t task_id = next_task_id_;
 
     // Проверяем, включено ли автопереключение через IPC.
     const bool ipc_enabled = ipc_enabled_.load(std::memory_order_relaxed);
@@ -824,6 +824,7 @@ void EventLoop::handle_event(const input_event &ev) {
       ready_results_[task_id] = res;
       lifetime_telemetry_.ready_results.store(ready_results_.size(),
                                               std::memory_order_relaxed);
+      ++next_task_id_;
       return;
     }
 
@@ -850,6 +851,7 @@ void EventLoop::handle_event(const input_event &ev) {
       ready_results_[task_id] = res;
       lifetime_telemetry_.ready_results.store(ready_results_.size(),
                                               std::memory_order_relaxed);
+      ++next_task_id_;
       return;
     }
 
@@ -866,11 +868,17 @@ void EventLoop::handle_event(const input_event &ev) {
     task.analysis_len = meta.analysis_len;
     task.layout_at_boundary = meta.layout_at_boundary;
     task.cfg = cfg->auto_switch;
-    task.submitted_at = std::chrono::steady_clock::now();
+    if (!analysis_pool_.submit(std::move(task))) {
+      pending_words_.erase(task_id);
+      lifetime_telemetry_.pending_words.store(pending_words_.size(),
+                                              std::memory_order_relaxed);
+      return;
+    }
+    ++next_task_id_;
 
-    analysis_pool_.submit(std::move(task));
-
-    // Ограничиваем память: храним метаданные только для последних N слов.
+    // Correction metadata is useful only inside the rollback window. Task
+    // terminality remains owned by AnalysisWorkerPool, so pruning metadata
+    // cannot create a sequencer hole even if analysis is stalled or fatal.
     const std::uint64_t max_words =
         static_cast<std::uint64_t>(cfg->auto_switch.max_rollback_words);
     if (max_words > 0 && task_id + 1 > max_words) {
@@ -1055,6 +1063,7 @@ HotkeyAction EventLoop::determine_hotkey_action(ScanCode code) const {
 }
 
 void EventLoop::reset_async_state(bool bump_task_barrier) {
+  analysis_pool_.begin_new_epoch();
   pending_words_.clear();
   ready_results_.clear();
   clear_external_layout_sound(external_layout_sound_);
@@ -2479,10 +2488,15 @@ void EventLoop::process_ready_results() {
       continue;
     }
 
-    telemetry_.analyzed_words++;
+    if (r.terminal_status == WordTerminalStatus::Completed) {
+      telemetry_.analyzed_words++;
+    }
     telemetry_.analysis_us_sum += r.analysis_us;
     telemetry_.queue_us_sum += r.queue_us;
-    lifetime_telemetry_.analyzed_words.fetch_add(1, std::memory_order_relaxed);
+    if (r.terminal_status == WordTerminalStatus::Completed) {
+      lifetime_telemetry_.analyzed_words.fetch_add(1,
+                                                    std::memory_order_relaxed);
+    }
     lifetime_telemetry_.analysis_us_sum.fetch_add(r.analysis_us,
                                                   std::memory_order_relaxed);
     lifetime_telemetry_.queue_us_sum.fetch_add(r.queue_us,
@@ -2495,13 +2509,17 @@ void EventLoop::process_ready_results() {
       telemetry_.queue_us_max = r.queue_us;
     }
 
-    if (r.need_switch) {
+    if (r.terminal_status == WordTerminalStatus::Completed && r.need_switch) {
       telemetry_.need_switch_words++;
       lifetime_telemetry_.need_switch_words.fetch_add(
           1, std::memory_order_relaxed);
     }
 
     ready_results_[r.task_id] = r;
+  }
+
+  if (!analysis_pool_failed_ && analysis_pool_.has_fatal_error()) {
+    analysis_pool_failed_ = true;
   }
   lifetime_telemetry_.ready_results.store(ready_results_.size(),
                                           std::memory_order_relaxed);
@@ -2518,6 +2536,7 @@ void EventLoop::process_ready_results() {
 
     // Проверяем, нужна ли какая-либо коррекция
     const bool has_correction =
+        res.terminal_status == WordTerminalStatus::Completed &&
         (res.correction_type != CorrectionType::NoCorrection);
 
     if (has_correction) {

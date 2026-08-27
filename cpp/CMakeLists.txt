@@ -222,12 +222,18 @@ if(BUILD_TESTING)
         src/text_processor.cpp
         src/terminal_detection.cpp
         src/typo_corrector.cpp
+        src/layout_analyzer.cpp
+        src/dictionary.cpp
+        src/smart_bypass.cpp
     )
 
     target_include_directories(punto-tests
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${HUNSPELL_INCLUDE_DIRS}
     )
+
+    target_link_libraries(punto-tests PRIVATE ${HUNSPELL_LIBRARIES})
 
     target_compile_definitions(punto-tests
         PRIVATE

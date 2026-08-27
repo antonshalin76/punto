@@ -1,3 +1,4 @@
+#include "punto/analysis_worker_pool.hpp"
 #include "punto/input_buffer.hpp"
 #include "punto/ipc_server.hpp"
 #include "punto/history_manager.hpp"
@@ -14,6 +15,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -110,6 +112,184 @@ void test_input_buffer_overflow() {
 
   expect(buffer.push_char(KEY_C, true), "buffer reusable after overflow");
   expect(buffer.current_length() == 1, "buffer reusable length");
+}
+
+void test_analysis_pool_terminality_on_stop() {
+  Dictionary dictionary;
+  AnalysisWorkerPool pool(dictionary);
+
+  WordTask task;
+  task.task_id = 7;
+  expect(pool.submit(task), "analysis task accepted");
+  expect(!pool.submit(task), "duplicate analysis task rejected");
+
+  pool.stop();
+
+  WordResult result;
+  expect(pool.try_pop_result(result), "accepted task has terminal result");
+  expect(result.task_id == 7, "terminal result preserves task id");
+  expect(result.terminal_status == WordTerminalStatus::Cancelled,
+         "queued task cancelled on stop");
+  expect(!pool.try_pop_result(result), "accepted task has one terminal result");
+  expect(!pool.submit(std::move(task)), "analysis admission closed after stop");
+}
+
+void test_analysis_pool_epoch_has_one_terminal_winner() {
+  Dictionary dictionary;
+  AnalysisWorkerPool pool(dictionary);
+
+  WordTask task;
+  task.task_id = 11;
+  expect(pool.submit(task), "epoch task accepted");
+
+  pool.begin_new_epoch();
+  expect(pool.pending_task_count() == 0,
+         "retired epoch removes queued work before new submissions");
+  pool.stop();
+
+  WordResult result;
+  expect(pool.try_pop_result(result), "retired epoch publishes terminal");
+  expect(result.task_id == 11, "retired epoch preserves task id");
+  expect(result.terminal_status == WordTerminalStatus::Cancelled,
+         "retired epoch cancels outstanding task");
+  expect(!pool.try_pop_result(result),
+         "stop cannot publish a second terminal for retired task");
+}
+
+void test_analysis_pool_worker_stop_race_has_one_terminal() {
+  Dictionary dictionary;
+  for (std::uint64_t task_id = 20; task_id < 36; ++task_id) {
+    AnalysisWorkerPool pool(dictionary);
+    pool.start(1);
+
+    WordTask task;
+    task.task_id = task_id;
+    task.analysis_len = 0;
+    expect(pool.submit(std::move(task)), "worker race task accepted");
+    pool.stop();
+
+    WordResult result;
+    expect(pool.try_pop_result(result), "worker race has terminal result");
+    expect(result.task_id == task_id, "worker race preserves task id");
+    expect(result.terminal_status == WordTerminalStatus::Completed ||
+               result.terminal_status == WordTerminalStatus::Cancelled,
+           "worker race terminal status");
+    expect(!pool.try_pop_result(result), "worker race has one terminal result");
+  }
+}
+
+void test_analysis_pool_concurrent_stop_is_a_barrier() {
+  Dictionary dictionary;
+  std::mutex gate_mu;
+  std::condition_variable gate_cv;
+  bool task_started = false;
+  bool release_task = false;
+  bool stop_waiter_entered = false;
+  bool task_gate_timed_out = false;
+  AnalysisWorkerPool pool(
+      dictionary,
+      [&] {
+        std::unique_lock<std::mutex> lock(gate_mu);
+        task_started = true;
+        gate_cv.notify_all();
+        if (!gate_cv.wait_for(lock, std::chrono::seconds(1),
+                              [&] { return release_task; })) {
+          task_gate_timed_out = true;
+        }
+      },
+      [&] {
+        std::lock_guard<std::mutex> lock(gate_mu);
+        stop_waiter_entered = true;
+        gate_cv.notify_all();
+      });
+  pool.start(1);
+  WordTask task;
+  task.task_id = 40;
+  task.analysis_len = 0;
+  expect(pool.submit(std::move(task)), "concurrent stop task accepted");
+  {
+    std::unique_lock<std::mutex> lock(gate_mu);
+    expect(gate_cv.wait_for(lock, std::chrono::seconds(1),
+                            [&] { return task_started; }),
+           "worker reaches controlled task gate");
+  }
+
+  std::thread first([&] { pool.stop(); });
+
+  WordTask probe;
+  probe.task_id = 41;
+  bool admission_closed = false;
+  for (std::size_t attempt = 0; attempt < 10000; ++attempt) {
+    if (!pool.submit(probe)) {
+      admission_closed = true;
+      break;
+    }
+    ++probe.task_id;
+    std::this_thread::yield();
+  }
+  expect(admission_closed, "first stop closes admission");
+
+  std::mutex returned_mu;
+  std::condition_variable returned_cv;
+  bool second_returned = false;
+  std::thread second([&] {
+    pool.stop();
+    {
+      std::lock_guard<std::mutex> lock(returned_mu);
+      second_returned = true;
+    }
+    returned_cv.notify_one();
+  });
+  {
+    std::unique_lock<std::mutex> lock(gate_mu);
+    expect(gate_cv.wait_for(lock, std::chrono::seconds(1),
+                            [&] { return stop_waiter_entered; }),
+           "second stop reaches actual stopping wait path");
+  }
+  {
+    std::unique_lock<std::mutex> lock(returned_mu);
+    expect(!returned_cv.wait_for(lock, std::chrono::milliseconds(20),
+                                 [&] { return second_returned; }),
+           "second stop waits for shutdown owner");
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(gate_mu);
+    release_task = true;
+  }
+  gate_cv.notify_all();
+  first.join();
+  second.join();
+  expect(!task_gate_timed_out, "controlled task gate released before deadline");
+
+  WordResult result;
+  std::size_t task_terminal_count = 0;
+  while (pool.try_pop_result(result)) {
+    if (result.task_id == 40) {
+      ++task_terminal_count;
+      expect(result.terminal_status == WordTerminalStatus::Completed,
+             "running task completes before stop barrier returns");
+    }
+  }
+  expect(task_terminal_count == 1,
+         "concurrent stop returns after one running-task terminal");
+}
+
+void test_analysis_sequencing_regression_guards() {
+  const auto event_loop = read_text_file(
+      std::filesystem::path(PUNTO_SOURCE_DIR) / "src/event_loop.cpp");
+  expect(event_loop.find("max_rollback_words") != std::string::npos,
+         "accepted correction metadata remains rollback-bounded");
+  expect(event_loop.find("terminality remains owned by AnalysisWorkerPool") !=
+             std::string::npos,
+         "metadata pruning documents terminality ownership");
+
+  const auto pool = read_text_file(std::filesystem::path(PUNTO_SOURCE_DIR) /
+                                   "include/punto/analysis_worker_pool.hpp");
+  expect(pool.find("tasks_.extract_if") != std::string::npos,
+         "epoch retirement drains obsolete queued tasks");
+  expect(pool.find("state.result_queued) {") != std::string::npos,
+         "pool exposes allocation-free terminal fallback");
 }
 
 void test_ipc_server() {
@@ -371,6 +551,11 @@ void test_control_plane_generation_seeding() {
 int main() {
   test_text_processor();
   test_input_buffer_overflow();
+  test_analysis_pool_terminality_on_stop();
+  test_analysis_pool_epoch_has_one_terminal_winner();
+  test_analysis_pool_worker_stop_race_has_one_terminal();
+  test_analysis_pool_concurrent_stop_is_a_barrier();
+  test_analysis_sequencing_regression_guards();
   test_ipc_server();
   test_typo_corrector();
   test_history_manager();
@@ -384,3 +569,4 @@ int main() {
   std::cout << "punto-tests: OK\n";
   return 0;
 }
+#include <latch>

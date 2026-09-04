@@ -8,12 +8,21 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <streambuf>
 #include <string>
 #include <syslog.h>
+#include <thread>
+#include <unordered_map>
+#include <utility>
 
 namespace punto {
 
@@ -23,16 +32,27 @@ namespace {
 // чтение уровня происходит из всех потоков, пишущих в std::cerr.
 std::atomic<LogLevel> g_min_log_level{LogLevel::Info};
 std::streambuf *g_original_cerr = nullptr;
+bool g_restore_cerr_unitbuf = false;
 std::string g_ident = "punto";
+std::atomic<std::uint64_t> g_dropped_records{0};
+
+using WriterId = std::uint64_t;
+
+[[nodiscard]] WriterId current_writer_id() noexcept {
+  static std::atomic<WriterId> next_writer_id{1};
+  thread_local const WriterId writer_id =
+      next_writer_id.fetch_add(1, std::memory_order_relaxed);
+  return writer_id;
+}
 
 [[nodiscard]] bool contains_case_insensitive(std::string_view haystack,
                                              std::string_view needle) {
-  auto it = std::search(
-      haystack.begin(), haystack.end(), needle.begin(), needle.end(),
-      [](char lhs, char rhs) {
-        return std::tolower(static_cast<unsigned char>(lhs)) ==
-               std::tolower(static_cast<unsigned char>(rhs));
-      });
+  auto it =
+      std::search(haystack.begin(), haystack.end(), needle.begin(),
+                  needle.end(), [](char lhs, char rhs) {
+                    return std::tolower(static_cast<unsigned char>(lhs)) ==
+                           std::tolower(static_cast<unsigned char>(rhs));
+                  });
   return it != haystack.end();
 }
 
@@ -81,43 +101,167 @@ std::string g_ident = "punto";
 
 class SyslogStreamBuf final : public std::streambuf {
 public:
-  explicit SyslogStreamBuf(std::streambuf *fallback) : fallback_{fallback} {}
+  explicit SyslogStreamBuf(std::streambuf *fallback)
+      : fallback_{fallback}, echo_to_stderr_{should_echo_to_stderr()},
+        sink_thread_{[this] { sink_loop(); }} {}
 
-  ~SyslogStreamBuf() override { sync(); }
+  ~SyslogStreamBuf() override { shutdown(); }
+
+  void shutdown() noexcept {
+    if (shutdown_complete_) {
+      return;
+    }
+    try {
+      flush_all();
+    } catch (...) {
+      note_drop();
+    }
+    {
+      const std::lock_guard lock{queue_mutex_};
+      stop_requested_ = true;
+    }
+    queue_condition_.notify_one();
+
+    std::unique_lock completion_lock{completion_mutex_};
+    if (!completion_condition_.wait_for(completion_lock, kShutdownDeadline,
+                                        [this] { return sink_complete_; })) {
+      // A sink stuck in libc or a diagnostic fallback may still reference
+      // this object and process-static state. Destruction would race it.
+      std::_Exit(3);
+    }
+    completion_lock.unlock();
+    if (sink_thread_.joinable()) {
+      sink_thread_.join();
+    }
+    shutdown_complete_ = true;
+  }
 
 protected:
-  int overflow(int ch) override {
-    if (ch == traits_type::eof()) {
-      return sync() == 0 ? 0 : traits_type::eof();
+  int_type overflow(int_type ch) override {
+    if (traits_type::eq_int_type(ch, traits_type::eof())) {
+      return sync() == 0 ? traits_type::not_eof(ch) : traits_type::eof();
     }
 
-    buffer_.push_back(static_cast<char>(ch));
-    if (ch == '\n') {
-      flush_buffer();
+    const char value = traits_type::to_char_type(ch);
+    return xsputn(&value, 1) == 1 ? ch : traits_type::eof();
+  }
+
+  std::streamsize xsputn(const char *data, std::streamsize count) override {
+    if (count <= 0) {
+      return 0;
     }
-    return ch;
+
+    const auto size = static_cast<std::size_t>(count);
+    std::size_t offset = 0;
+    while (offset < size) {
+      auto record = take_next_record(data, size, offset);
+      if (record.has_value()) {
+        enqueue_line(std::move(*record));
+      }
+    }
+    return count;
   }
 
   int sync() override {
-    flush_buffer();
-    return 0;
-  }
-
-private:
-  void flush_buffer() {
-    while (!buffer_.empty()) {
-      const std::size_t newline = buffer_.find('\n');
-      if (newline == std::string::npos) {
-        break;
+    try {
+      auto record = take_current_partial();
+      if (record.has_value()) {
+        enqueue_line(std::move(*record));
       }
-
-      std::string line = buffer_.substr(0, newline);
-      buffer_.erase(0, newline + 1);
-      emit_line(line);
+      return 0;
+    } catch (...) {
+      return -1;
     }
   }
 
-  void emit_line(const std::string &line) const {
+private:
+  static constexpr std::size_t kMaxRecordBytes = 8192;
+  static constexpr std::size_t kMaxPartialWriters =
+      config_limits::kAnalysisThreadsMax + 32U;
+  static constexpr std::size_t kMaxQueuedRecords = 1024;
+  static constexpr auto kShutdownDeadline = std::chrono::seconds{3};
+
+  struct QueuedRecord {
+    int priority = LOG_INFO;
+    std::string line;
+  };
+
+  [[nodiscard]] std::optional<std::string>
+  take_next_record(const char *data, std::size_t size, std::size_t &offset) {
+    const std::lock_guard lock{state_mutex_};
+    const WriterId writer = current_writer_id();
+
+    auto it = partials_.find(writer);
+    if (it == partials_.end()) {
+      if (partials_.size() >= kMaxPartialWriters) {
+        auto evicted = partials_.begin();
+        std::string record = std::move(evicted->second);
+        partials_.erase(evicted);
+        return record;
+      }
+      it = partials_.try_emplace(writer).first;
+    }
+
+    std::string &partial = it->second;
+    while (offset < size) {
+      if (data[offset] == '\n') {
+        ++offset;
+        if (partial.empty()) {
+          partials_.erase(it);
+          return std::nullopt;
+        }
+        std::string record = std::move(partial);
+        partials_.erase(it);
+        return record;
+      }
+
+      const std::size_t available = kMaxRecordBytes - partial.size();
+      const std::size_t newline =
+          std::string_view{data + offset, size - offset}.find('\n');
+      const std::size_t until_newline =
+          newline == std::string_view::npos ? size - offset : newline;
+      const std::size_t append_size = std::min(available, until_newline);
+      partial.append(data + offset, append_size);
+      offset += append_size;
+
+      if (partial.size() == kMaxRecordBytes) {
+        std::string record = std::move(partial);
+        partials_.erase(it);
+        return record;
+      }
+    }
+
+    return std::nullopt;
+  }
+
+  [[nodiscard]] std::optional<std::string> take_current_partial() {
+    const std::lock_guard lock{state_mutex_};
+    const auto it = partials_.find(current_writer_id());
+    if (it == partials_.end() || it->second.empty()) {
+      return std::nullopt;
+    }
+
+    std::string record = std::move(it->second);
+    partials_.erase(it);
+    return record;
+  }
+
+  void flush_all() {
+    decltype(partials_) partials;
+    {
+      const std::lock_guard lock{state_mutex_};
+      partials.swap(partials_);
+    }
+
+    for (auto &entry : partials) {
+      std::string &record = entry.second;
+      if (!record.empty()) {
+        enqueue_line(std::move(record));
+      }
+    }
+  }
+
+  void enqueue_line(std::string line) noexcept {
     if (line.empty()) {
       return;
     }
@@ -128,20 +272,82 @@ private:
       return;
     }
 
-    syslog(to_syslog_priority(level), "%s", line.c_str());
-    if (fallback_ != nullptr && should_echo_to_stderr()) {
-      fallback_->sputn(line.data(), static_cast<std::streamsize>(line.size()));
-      fallback_->sputc('\n');
+    try {
+      {
+        const std::lock_guard lock{queue_mutex_};
+        if (!accepting_ || queue_.size() >= kMaxQueuedRecords) {
+          note_drop();
+          return;
+        }
+        queue_.push_back(
+            QueuedRecord{to_syslog_priority(level), std::move(line)});
+      }
+      queue_condition_.notify_one();
+    } catch (...) {
+      note_drop();
     }
   }
 
-  [[nodiscard]] bool should_echo_to_stderr() const {
+  [[nodiscard]] static bool should_echo_to_stderr() noexcept {
     const char *env = std::getenv("PUNTO_LOG_STDERR");
     return env != nullptr && std::string_view{env} == "1";
   }
 
+  static void note_drop() noexcept {
+    g_dropped_records.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void sink_loop() noexcept {
+    for (;;) {
+      QueuedRecord record;
+      {
+        std::unique_lock lock{queue_mutex_};
+        queue_condition_.wait(
+            lock, [this] { return stop_requested_ || !queue_.empty(); });
+        if (queue_.empty()) {
+          if (stop_requested_) {
+            accepting_ = false;
+            break;
+          }
+          continue;
+        }
+        record = std::move(queue_.front());
+        queue_.pop_front();
+      }
+
+      try {
+        ::syslog(record.priority, "%s", record.line.c_str());
+        if (fallback_ != nullptr && echo_to_stderr_) {
+          fallback_->sputn(record.line.data(),
+                           static_cast<std::streamsize>(record.line.size()));
+          fallback_->sputc('\n');
+        }
+      } catch (...) {
+        note_drop();
+      }
+    }
+
+    {
+      const std::lock_guard lock{completion_mutex_};
+      sink_complete_ = true;
+    }
+    completion_condition_.notify_all();
+  }
+
   std::streambuf *fallback_ = nullptr;
-  std::string buffer_;
+  bool echo_to_stderr_ = false;
+  std::mutex state_mutex_;
+  std::unordered_map<WriterId, std::string> partials_;
+  std::mutex queue_mutex_;
+  std::condition_variable queue_condition_;
+  std::deque<QueuedRecord> queue_;
+  bool stop_requested_ = false;
+  bool accepting_ = true;
+  std::mutex completion_mutex_;
+  std::condition_variable completion_condition_;
+  bool sink_complete_ = false;
+  bool shutdown_complete_ = false;
+  std::thread sink_thread_;
 };
 
 std::unique_ptr<SyslogStreamBuf> g_syslog_buf;
@@ -157,17 +363,37 @@ void init_logging(std::string_view ident, LogLevel level) {
     return;
   }
 
-  g_original_cerr = std::cerr.rdbuf();
-  g_syslog_buf = std::make_unique<SyslogStreamBuf>(g_original_cerr);
-  std::cerr.rdbuf(g_syslog_buf.get());
+  std::streambuf *const original_cerr = std::cerr.rdbuf();
+  auto syslog_buf = std::make_unique<SyslogStreamBuf>(original_cerr);
+  const bool restore_cerr_unitbuf =
+      (std::cerr.flags() & std::ios_base::unitbuf) != std::ios_base::fmtflags{};
+  std::cerr.unsetf(std::ios_base::unitbuf);
+  std::cerr.rdbuf(syslog_buf.get());
+  g_original_cerr = original_cerr;
+  g_restore_cerr_unitbuf = restore_cerr_unitbuf;
+  g_syslog_buf = std::move(syslog_buf);
 }
 
 void update_log_level(LogLevel level) noexcept { g_min_log_level = level; }
 
+std::uint64_t dropped_log_records() noexcept {
+  return g_dropped_records.load(std::memory_order_relaxed);
+}
+
 void shutdown_logging() noexcept {
+  if (g_syslog_buf) {
+    // EventLoop has already stopped every producer. Keep the streambuf
+    // installed during the drain so sink-side reentrant diagnostics cannot
+    // race the original stderr buffer.
+    g_syslog_buf->shutdown();
+  }
   if (g_original_cerr != nullptr) {
     std::cerr.rdbuf(g_original_cerr);
     g_original_cerr = nullptr;
+  }
+  if (g_restore_cerr_unitbuf) {
+    std::cerr.setf(std::ios_base::unitbuf);
+    g_restore_cerr_unitbuf = false;
   }
   g_syslog_buf.reset();
   ::closelog();

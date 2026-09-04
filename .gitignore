@@ -31,6 +31,11 @@ build-deb/
 # clangd cache
 .cache/
 
+# Python test caches
+__pycache__/
+*.py[cod]
+.ruff_cache/
+
 WARP.md
 CLAUDE.md
 

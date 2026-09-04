@@ -22,14 +22,14 @@ struct SettingsData {
   int max_rollback_words = 5;
 
   // Typo correction (v2.7+)
-  bool typo_correction_enabled = true;
-  int max_typo_diff = 1;
+  bool typo_correction_enabled = false;
+  int max_typo_diff = 2;
   bool sticky_shift_correction_enabled = true;
 
   // Sound
   bool sound_enabled = true;
 
-  // Hotkey
+  // Hotkey schema/persistence compatibility only; no active UI or mutation.
   std::string modifier = "leftctrl";
   std::string key = "grave";
 };

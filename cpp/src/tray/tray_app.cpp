@@ -6,8 +6,12 @@
 #include "punto/tray_app.hpp"
 #include "punto/settings_dialog.hpp"
 
-#include <cstdlib>
+#include <atomic>
+#include <cstdint>
+#include <new>
 #include <string>
+#include <thread>
+#include <utility>
 
 #include <glib.h>
 
@@ -50,31 +54,30 @@ constexpr const char *kIconUnknown = "dialog-question";
 /// ID приложения для AppIndicator
 constexpr const char *kAppIndicatorId = "punto-switcher";
 
-bool apply_settings_change_with_reload(const SettingsData &old_settings,
-                                       const SettingsData &new_settings) {
-  if (!SettingsDialog::save_settings(new_settings)) {
-    return false;
-  }
-
-  const std::string cfg_path = SettingsDialog::get_user_config_path();
-  if (cfg_path.empty()) {
-    (void)SettingsDialog::save_settings(old_settings);
-    return false;
-  }
-
-  if (!IpcClient::reload_config(cfg_path)) {
-    (void)SettingsDialog::save_settings(old_settings);
-    return false;
-  }
-
-  return true;
-}
-
 } // namespace
 
-TrayApp::TrayApp() = default;
+struct TrayApp::StatusPollState {
+  std::atomic<TrayApp *> owner{nullptr};
+  std::atomic<bool> in_flight{false};
+  std::atomic<std::uint64_t> generation{0};
+};
+
+struct TrayApp::StatusPollResult {
+  std::shared_ptr<StatusPollState> state;
+  ServiceStatus status = ServiceStatus::Unknown;
+  std::uint64_t generation = 0;
+};
+
+TrayApp::TrayApp()
+    : status_poll_state_{std::make_shared<StatusPollState>()},
+      status_provider_{[] { return IpcClient::get_status(); }} {
+  status_poll_state_->owner.store(this, std::memory_order_release);
+}
 
 TrayApp::~TrayApp() {
+  status_poll_state_->owner.store(nullptr, std::memory_order_release);
+  (void)status_poll_state_->generation.fetch_add(1, std::memory_order_acq_rel);
+
   if (status_timer_id_ != 0) {
     g_source_remove(status_timer_id_);
   }
@@ -107,8 +110,8 @@ bool TrayApp::initialize() {
   menu_ = create_menu();
   app_indicator_set_menu(indicator_, GTK_MENU(menu_));
 
-  // Получаем начальный статус
-  current_status_ = IpcClient::get_status();
+  // Первый IPC poll, как и последующие, не блокирует GTK main thread.
+  request_status_update();
   update_icon();
   update_auto_toggle_state();
 
@@ -131,16 +134,16 @@ int TrayApp::run() {
 GtkWidget *TrayApp::create_menu() {
   GtkWidget *menu = gtk_menu_new();
 
-  // Автопереключение (toggle)
-  toggle_item_ = gtk_check_menu_item_new_with_label("Автопереключение");
-  g_signal_connect(toggle_item_, "toggled", G_CALLBACK(on_auto_toggle_changed),
-                   this);
+  // Report the effective capability, not the configured analysis intent.
+  toggle_item_ =
+      gtk_check_menu_item_new_with_label("Изменение текста отключено (v" PUNTO_VERSION ")");
+  gtk_widget_set_sensitive(toggle_item_, FALSE);
   gtk_menu_shell_append(GTK_MENU_SHELL(menu), toggle_item_);
 
-  // Звук (toggle)
-  sound_toggle_item_ = gtk_check_menu_item_new_with_label("Звук");
-  g_signal_connect(sound_toggle_item_, "toggled",
-                   G_CALLBACK(on_sound_toggle_changed), this);
+  // Correction sound is inactive while text mutations are unavailable.
+  sound_toggle_item_ =
+      gtk_check_menu_item_new_with_label("Звук исправлений недоступен");
+  gtk_widget_set_sensitive(sound_toggle_item_, FALSE);
   gtk_menu_shell_append(GTK_MENU_SHELL(menu), sound_toggle_item_);
 
   // Разделитель
@@ -172,6 +175,9 @@ GtkWidget *TrayApp::create_menu() {
 }
 
 void TrayApp::update_icon() {
+  if (indicator_ == nullptr) {
+    return;
+  }
   const char *icon_name = kIconUnknown;
 
   switch (current_status_) {
@@ -194,8 +200,6 @@ void TrayApp::update_auto_toggle_state() {
     return;
   }
 
-  suppress_menu_signals_ = true;
-
   auto *item = GTK_CHECK_MENU_ITEM(toggle_item_);
 
   if (current_status_ == ServiceStatus::Unknown) {
@@ -206,8 +210,6 @@ void TrayApp::update_auto_toggle_state() {
     gtk_check_menu_item_set_active(item,
                                    current_status_ == ServiceStatus::Enabled);
   }
-
-  suppress_menu_signals_ = false;
 }
 
 void TrayApp::update_sound_toggle_state() {
@@ -215,73 +217,9 @@ void TrayApp::update_sound_toggle_state() {
     return;
   }
 
-  suppress_menu_signals_ = true;
-
   auto *item = GTK_CHECK_MENU_ITEM(sound_toggle_item_);
   gtk_check_menu_item_set_inconsistent(item, FALSE);
   gtk_check_menu_item_set_active(item, sound_enabled_);
-
-  suppress_menu_signals_ = false;
-}
-
-void TrayApp::on_auto_toggle_changed(GtkCheckMenuItem *item,
-                                     gpointer user_data) {
-  auto *app = static_cast<TrayApp *>(user_data);
-  if (!app || app->suppress_menu_signals_) {
-    return;
-  }
-
-  const bool enabled = gtk_check_menu_item_get_active(item);
-
-  SettingsData old_settings = SettingsDialog::load_settings();
-  SettingsData new_settings = old_settings;
-  new_settings.auto_enabled = enabled;
-
-  if (!apply_settings_change_with_reload(old_settings, new_settings)) {
-    // Откатываем UI в исходное состояние.
-    app->suppress_menu_signals_ = true;
-    gtk_check_menu_item_set_active(item, old_settings.auto_enabled);
-    app->suppress_menu_signals_ = false;
-    return;
-  }
-
-  app->current_status_ = IpcClient::get_status();
-  app->update_icon();
-  app->update_auto_toggle_state();
-}
-
-void TrayApp::on_sound_toggle_changed(GtkCheckMenuItem *item,
-                                      gpointer user_data) {
-  auto *app = static_cast<TrayApp *>(user_data);
-  if (!app || app->suppress_menu_signals_) {
-    return;
-  }
-
-  const bool enabled = gtk_check_menu_item_get_active(item);
-
-  SettingsData old_settings = SettingsDialog::load_settings();
-  SettingsData new_settings = old_settings;
-  new_settings.sound_enabled = enabled;
-
-  if (!apply_settings_change_with_reload(old_settings, new_settings)) {
-    // Откатываем UI в исходное состояние.
-    app->suppress_menu_signals_ = true;
-    gtk_check_menu_item_set_active(item, old_settings.sound_enabled);
-    app->suppress_menu_signals_ = false;
-    return;
-  }
-
-  app->sound_enabled_ = new_settings.sound_enabled;
-  app->update_sound_toggle_state();
-
-  // RELOAD может также синхронизировать статус автопереключения с конфигом.
-  ServiceStatus new_status = IpcClient::get_status();
-  if (new_status != ServiceStatus::Unknown &&
-      new_status != app->current_status_) {
-    app->current_status_ = new_status;
-    app->update_icon();
-    app->update_auto_toggle_state();
-  }
 }
 
 void TrayApp::on_settings_clicked(GtkMenuItem *item, gpointer user_data) {
@@ -296,10 +234,7 @@ void TrayApp::on_settings_clicked(GtkMenuItem *item, gpointer user_data) {
     const std::string cfg_path = SettingsDialog::get_user_config_path();
     bool success = IpcClient::reload_config(cfg_path);
     if (success) {
-      // Обновляем статус
-      app->current_status_ = IpcClient::get_status();
-      app->update_icon();
-      app->update_auto_toggle_state();
+      app->request_status_update();
     }
 
     // Обновляем статус звука из конфига (даже если сервис сейчас недоступен)
@@ -337,7 +272,8 @@ void TrayApp::on_about_clicked(GtkMenuItem *item, gpointer user_data) {
 
   const char *markup =
       "<b>Punto Switcher for Linux</b>\n"
-      "Version 2.8.5\n"
+      "Version " PUNTO_VERSION "\n"
+      "Безопасный режим: изменение текста отключено\n"
       "Лицензия: Personal Use Only\n"
       "Автор: Anton Shalin\n"
       "email: <a "
@@ -368,16 +304,58 @@ void TrayApp::on_quit_clicked(GtkMenuItem *item, gpointer user_data) {
 
 gboolean TrayApp::on_status_update(gpointer user_data) {
   auto *app = static_cast<TrayApp *>(user_data);
+  app->request_status_update();
+  return G_SOURCE_CONTINUE;
+}
 
-  ServiceStatus new_status = IpcClient::get_status();
-
-  if (new_status != app->current_status_) {
-    app->current_status_ = new_status;
+gboolean TrayApp::on_status_result(gpointer user_data) {
+  auto *result = static_cast<StatusPollResult *>(user_data);
+  const auto state = result->state;
+  TrayApp *app = state->owner.load(std::memory_order_acquire);
+  if (app != nullptr &&
+      state->generation.load(std::memory_order_acquire) == result->generation &&
+      result->status != app->current_status_) {
+    app->current_status_ = result->status;
     app->update_icon();
     app->update_auto_toggle_state();
   }
+  state->in_flight.store(false, std::memory_order_release);
+  return G_SOURCE_REMOVE;
+}
 
-  return G_SOURCE_CONTINUE;
+void TrayApp::request_status_update() {
+  bool expected = false;
+  if (!status_poll_state_->in_flight.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel,
+          std::memory_order_acquire)) {
+    return;
+  }
+
+  const auto state = status_poll_state_;
+  const auto provider = status_provider_;
+  const std::uint64_t generation =
+      state->generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+  try {
+    std::thread{[state, provider, generation] {
+      ServiceStatus status = ServiceStatus::Unknown;
+      try {
+        status = provider();
+      } catch (...) {
+        status = ServiceStatus::Unknown;
+      }
+      auto *result =
+          new (std::nothrow) StatusPollResult{state, status, generation};
+      if (result == nullptr) {
+        state->in_flight.store(false, std::memory_order_release);
+        return;
+      }
+      (void)g_idle_add_full(
+          G_PRIORITY_DEFAULT, &TrayApp::on_status_result, result,
+          [](gpointer data) { delete static_cast<StatusPollResult *>(data); });
+    }}.detach();
+  } catch (...) {
+    state->in_flight.store(false, std::memory_order_release);
+  }
 }
 
 } // namespace punto

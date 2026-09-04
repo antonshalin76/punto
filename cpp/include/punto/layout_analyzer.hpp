@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <span>
+#include <string>
 
 #include "punto/config.hpp"
 #include "punto/types.hpp"
@@ -21,8 +22,8 @@ enum class Language { English, Russian };
 
 /// Результат анализа слова
 struct AnalysisResult {
-  double en_score = 0.0;            // Скор для английской раскладки
-  double ru_score = 0.0;            // Скор для русской раскладки
+  double en_score = 0.0; // Скор для английской раскладки
+  double ru_score = 0.0; // Скор для русской раскладки
   std::size_t en_invalid_count = 0; // Количество невалидных EN биграмм
   std::size_t ru_invalid_count = 0; // Количество невалидных RU биграмм
   Language likely_lang = Language::English;
@@ -94,11 +95,10 @@ private:
   /**
    * @brief Конвертирует буфер в строку ASCII символов
    * @param word Буфер слова
-   * @param buffer Выходной буфер (должен быть >= word.size())
-   * @return Количество записанных символов
+   * @return ASCII representation without unknown scancodes
    */
-  [[nodiscard]] static std::size_t word_to_ascii(std::span<const KeyEntry> word,
-                                                 char *buffer);
+  [[nodiscard]] static std::string
+  word_to_ascii(std::span<const KeyEntry> word);
 
   AutoSwitchConfig config_;
 };

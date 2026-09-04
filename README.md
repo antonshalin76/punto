@@ -1,9 +1,14 @@
 # Punto Switcher для Linux
 
 Высокопроизводительная реализация Punto Switcher на C++20 для Linux.
-Позволяет исправлять текст, набранный в неправильной раскладке клавиатуры.
 
-![Version](https://img.shields.io/badge/version-2.8.5-blue)
+> **Безопасный режим v2.8.6.** Анализ, passthrough, CLI, tray и runtime-
+> диагностика работают штатно, но автоматические и ручные изменения текста
+> временно пропускаются до отправки клавиш. Универсальный X11 clipboard не даёт
+> причинно связанного подтверждения, что именно подготовленный paste уже применён
+> редактором; восстановление старого clipboard при задержке могло повредить текст.
+
+![Version](https://img.shields.io/badge/version-2.8.6-blue)
 ![C++](https://img.shields.io/badge/C%2B%2B-20-orange)
 ![License](https://img.shields.io/badge/license-Personal%20Use%20Only-red)
 
@@ -12,36 +17,45 @@
 ### Управление через трей (v2.4+)
 
 Иконка `punto-tray` в системном трее позволяет:
-- **Визуальный статус** — видно, включено ли автопереключение
-- **Автопереключение (toggle)** — быстро вкл/выкл без перезапуска `udevmon`
-- **Звук (toggle)** — вкл/выкл звуковой индикации (пишется в `~/.config/punto/config.yaml`, применяется через RELOAD)
-- **Настройки...** — диалог (GTK3): автопереключение, звук, хоткей раскладки (`~/.config/punto/config.yaml`)
-  - **max_rollback_words** — максимальная глубина отката (сколько последних слов можно безопасно перепечатать при позднем срабатывании анализа)
-  - **Синхронизация хоткея с системой**: GNOME (через gsettings) и Generic X11 (через setxkbmap / XKB grp:*_toggle)
-  - Вкладка «Горячие клавиши» показывает, какие комбинации применимы для GNOME и для X11
+- **Визуальный статус** — показывает, доступно ли изменение текста; в v2.8.6
+  всегда `disabled`
+- **Безопасный режим** — пункт изменения текста явно недоступен, поэтому tray
+  не может показать ложный статус `enabled`
+- **Звук исправлений** — явно недоступен, пока изменение текста отключено;
+  настройка сохраняется в YAML только для совместимости
+- **Настройки...** — диалог (GTK3): параметры анализа и совместимая настройка
+  звука (`~/.config/punto/config.yaml`)
+  - **max_rollback_words** сохраняется для совместимости конфига, но откат и
+    повторный ввод в v2.8.6 не выполняются
 - **О программе** — окно со справкой/версией
-- **Автозапуск** — desktop entry в `/etc/xdg/autostart/` (если `punto-tray` включён в пакет)
+- **Автозапуск** — desktop entry в `/etc/xdg/autostart/` идемпотентно
+  активирует package-owned `systemd --user` unit; PID-файлы и raw PID signals
+  не используются
 
 ### Автоматическое переключение (v2.1+, async в v2.5)
 
 | Режим                       | Действие                                                  |
 | --------------------------- | --------------------------------------------------------- |
-| **АВТО** (при пробеле/табе) | Анализирует слово и переключает раскладку, если это нужно |
+| **АВТО** (при пробеле/табе) | Анализирует слово; в v2.8.6 не изменяет текст или раскладку |
 
-#### v2.5: асинхронный pipeline (быстрый ввод без блокировок)
+#### Асинхронный pipeline анализа
 
-- **Анализ в фоне**: ввод не блокируется — слово уходит в пул воркеров, результаты применяются позже.
-- **Строгий порядок**: решения применяются строго по `task_id` (без перемешивания слов при быстром наборе).
-- **Rollback/Replay**: корректировка может откатывать и перепечатывать до `auto_switch.max_rollback_words` последних слов.
-- **Инвариант длины**: число удалённых токенов (KeyEntry) должно совпасть с числом вставленных (слово + хвост). При нарушении — коррекция пропускается.
-- **Input Guard**: во время макроса события ввода буферизуются; release-события могут форвардиться раньше, чтобы не "пропадали" пробелы/буквы при очень быстром нажатии.
+- **Анализ в фоне**: слово может уходить в пул воркеров после passthrough; путь
+  ввода не ждёт X11 или классификатор.
+- **Строгий порядок телеметрии**: результаты учитываются по `task_id`, но в
+  v2.8.6 ни один результат не применяется к документу.
+- **Fail-before-dispatch**: rollback/replay, clipboard и эмуляция клавиш
+  недостижимы из product entry points.
 
 Гибридный анализ (v2.6+):
 - **Словари** (приоритет): если слово есть только в одной раскладке — решение однозначно
 - **N-граммы**: используются только в случае, когда слово есть в обоих словарях (ambiguous)
-- **Если слова нет в словарях** — раскладка не меняется (но могут применяться Sticky Shift / Typo Fix)
+- **Если слова нет в словарях** — анализ не предлагает смену раскладки.
 
-#### v2.7: исправление залипшего Shift + typo fix + CLI
+#### Классификаторы v2.7 и CLI
+
+Перечисленные ниже преобразования описывают классификацию и историческое
+поведение. В v2.8.6 результаты не изменяют документ.
 
 - **Sticky Shift Fix**: автоматическое исправление ошибок регистра:
   - `ПРивет` → `Привет` (паттерн UU+L+: несколько заглавных в начале)
@@ -66,14 +80,14 @@
 
 | Комбинация           | Действие                                                                              |
 | -------------------- | ------------------------------------------------------------------------------------- |
-| **Pause**            | Инвертировать раскладку последнего слова                                              |
-| **Shift+Pause**      | Инвертировать раскладку выделенного текста                                            |
-| **Ctrl+Pause**       | Инвертировать регистр последнего слова                                                |
-| **Alt+Pause**        | Инвертировать регистр выделенного текста                                              |
-| **LCtrl+LAlt+Pause** | Транслитерировать выделенный текст                                                    |
-| **Ctrl+Z**           | Отменить последнее исправление Punto (перехватывается только сразу после исправления) |
+| **Pause**            | Зарезервировано; в v2.8.6 событие поглощается без изменения текста                    |
+| **Shift+Pause**      | Зарезервировано; в v2.8.6 событие поглощается без изменения selection/clipboard       |
+| **Ctrl+Pause**       | Зарезервировано; в v2.8.6 событие поглощается без изменения текста                    |
+| **Alt+Pause**        | Зарезервировано; в v2.8.6 событие поглощается без изменения selection/clipboard       |
+| **LCtrl+LAlt+Pause** | Зарезервировано; в v2.8.6 событие поглощается без изменения selection/clipboard       |
+| **Ctrl+Z**           | Обычный undo приложения; Punto не создаёт новые correction-record в безопасном режиме |
 
-### Примеры
+### Примеры поведения до v2.8.6
 
 ```
 ghbdtn[пробел]  →  [АВТО]  →  привет 
@@ -100,21 +114,17 @@ Privet  →  [LCtrl+LAlt+Pause]  →  Привет
 ┌─────────────────────────────────────────────────────────────┐
 │                    punto (C++20)                            │
 │  ┌─────────────┐ ┌─────────────┐ ┌──────────────────┐       │
-│  │ EventLoop   │ │ InputBuffer │ │ ClipboardManager │       │
-│  └─────────────┘ └─────────────┘ └──────────────────┘       │
-│  ┌─────────────┐ ┌───────────────┐ ┌─────────────────┐       │
-│  │ KeyInjector │ │ HistoryManager │ │ AnalysisWorker  │       │
-│  └─────────────┘ └───────────────┘ │ Pool (async)     │       │
-│  ┌─────────────┐ ┌─────────────┐ └─────────────────┘       │
-│  │TextProcessor│ │   X11Session │  ┌──────────────────┐      │
-│  └─────────────┘ └─────────────┘  │ Sequencer/Replay │      │
-│  ┌───────────────┐ ┌────────────┐ │ + Telemetry      │      │
-│  │LayoutAnalyzer │ │ Dictionary │ └──────────────────┘      │
-│  └───────────────┘ └────────────┘ ┌──────────────────┐      │
-│  ┌───────────────┐ ┌────────────┐ │   IpcServer       │      │
-│  │  punto-tray   │ │            │ └──────────────────┘      │
-│  │  (GTK3)       │ │            │                           │
-│  └───────────────┘ └────────────┘                           │
+│  │ EventLoop   │ │ InputBuffer │ │ AnalysisWorker    │       │
+│  └─────────────┘ └─────────────┘ │ Pool (async)      │       │
+│  ┌───────────────┐ ┌───────────────┐ ┌────────────────┐      │
+│  │ RuntimeHealth │ │   X11Session  │ │ Sequencer      │      │
+│  └───────────────┘ └───────────────┘ │ + Telemetry    │      │
+│  ┌───────────────┐ ┌───────────────┐ └────────────────┘      │
+│  │LayoutAnalyzer │ │  Dictionary   │ ┌────────────────┐      │
+│  └───────────────┘ └───────────────┘ │   IpcServer    │      │
+│  ┌───────────────┐ ┌───────────────┐ └────────────────┘      │
+│  │TextProcessor  │ │ Config loader │                         │
+│  └───────────────┘ └───────────────┘                         │
 └─────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -124,44 +134,123 @@ Privet  →  [LCtrl+LAlt+Pause]  →  Привет
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Ключевые особенности v2.5
+### Текущий runtime v2.8.6
 
-- **Асинхронное автопереключение** — анализ слова в фоне (worker pool), ввод не блокируется
-- **Строгая упорядоченность** — применение коррекций строго по порядку слов (`task_id`)
-- **Rollback/Replay** — исправление может перепечатать до `auto_switch.max_rollback_words` последних слов
-- **Защита от "пропавших" пробелов/букв** — Input Guard буферизует ввод во время макросов и умеет ранний форвард release-событий
+- **Асинхронный анализ** — анализ слова в фоне (worker pool), ввод не блокируется
+- **Строгая упорядоченность** — результаты анализа учитываются по порядку слов (`task_id`)
+- **Нулевая мутация** — автоматические и ручные ветки завершаются до X11,
+  clipboard, смены раскладки или эмуляции исправляющих клавиш
 - **Телеметрия** — логирует `queue_us`, `analysis_us`, `macro_us`, длину хвоста (удобно смотреть в `journalctl -u udevmon -f`)
 - **Auto-budget worker pool** — при нескольких `punto-daemon` суммарный analysis pool автоматически делится между процессами и не раздувается линейно от числа клавиатур
 - **Primary control-plane** — только один `punto-daemon` держит `/var/run/punto.sock`; secondary daemons синхронизируют `RELOAD`/`SET_STATUS` через shared state в `/var/run/punto-control.state`
-- **KeyInjector оптимизирован** — меньше overhead на вывод событий (пакетная запись EV_KEY+SYN одним write)
 
 Также доступны возможности v2.4:
-- **Управление через трей** — `punto-tray` (GTK3 + AppIndicator/Ayatana), toggle-пункты, "О программе"
-- **Синхронизация хоткея раскладки с системой** — GNOME (gsettings) и Generic X11 (setxkbmap / XKB grp:*_toggle)
-- **Настройки + hot reload** — редактирование `~/.config/punto/config.yaml` и мгновенное применение через IPC (без перезапуска `udevmon`)
+- **Управление через трей** — `punto-tray` (GTK3 + AppIndicator/Ayatana),
+  честный disabled-статус изменения текста и параметры анализа
+- **Layout snapshot** — читается только подтверждённым X11 probe; конфигурационный
+  `hotkey` в v2.8.6 оставлен исключительно для совместимости схемы и игнорируется
+- **Настройки + bounded reload** — чтение пользовательского конфига выполняется
+  вне input-thread; IPC принимает задачу без остановки passthrough
 - **IPC через Unix Socket** — `/var/run/punto.sock` (GET_STATUS, SET_STATUS, RELOAD, STATS)
-- **Автопереключение раскладки** — словарь-first; N-граммы используются только для ambiguous слов (есть в обоих словарях)
-- **Звуковая индикация** — `paplay`/`aplay` (если доступны)
-- **Нативный X11** — чтение и запись selection напрямую (без xsel/xclip)
+- **Анализ раскладки** — словарь-first; N-граммы используются только для
+  ambiguous слов (есть в обоих словарях). Применение исправлений в v2.8.6
+  отключено описанной выше безопасной границей.
+- **Звуковая настройка** сохраняется для совместимости, но в безопасном режиме
+  v2.8.6 звук исправлений не воспроизводится
+- **Изолированный X11 clipboard backend** — отдельный проверяемый компонент и
+  contract-test target; product runtime v2.8.6 его не вызывает
 
 ## Production Checklist
 
-- IPC socket `/var/run/punto.sock` и macro lock рассчитаны на режим `root:punto` с правами `0660`.
+- IPC socket `/var/run/punto.sock` рассчитан на режим `root:punto` с правами `0660`.
 - Shared control-plane state `/var/run/punto-control.state` и lease `/var/run/punto-control.lock` также создаются с `root:punto` и служат для failover primary daemon.
+- После захвата lease новый primary сначала применяет последний безопасный
+  state snapshot. Если прежний user-path больше не разрешён текущей desktop-
+  сессией, выполняется reload стандартного config этой сессии; если явно
+  сохранённый path исчез, допускается только успешно загруженный fallback.
+  Пока ни один разрешённый config не применён, процесс остаётся secondary,
+  не создаёт primary IPC и не повышает generation. Успешный failover всегда
+  публикует строго следующее поколение.
 - Пользователи tray и локальных IPC-клиентов должны состоять в группе `punto`.
-- `RELOAD <path>` разрешён только для `/etc/punto/`, `$XDG_CONFIG_HOME/punto/` и `~/.config/punto/`.
+- Tray поддерживается в графической сессии с `systemd --user` версии 249 или
+  новее. Desktop entry и CLI управляют только статическим package-owned unit
+  `punto-tray.service`; отсутствие user manager выдаёт `WARN tray-unavailable`
+  и не меняет состояние уже здорового backend. User manager должен получить
+  `DISPLAY`/`WAYLAND_DISPLAY` и `XAUTHORITY` от desktop session; это штатно для
+  GNOME, а в иных окружениях переменные нужно импортировать в user manager до
+  запуска unit. Несколько одновременных GUI-сессий одного UID разделяют один
+  tray unit и не являются поддержанной конфигурацией.
+- Периодический `STATS` tray выполняет в single-flight background worker:
+  недоступный IPC не замораживает GTK main loop и не накапливает запросы.
+- При старте daemon доверяет только `/etc/punto/config.yaml`; пользовательский
+  конфиг становится доступен после подтверждения активного desktop-сеанса.
+- `RELOAD <path>` разрешён только для `/etc/punto/`, `$XDG_CONFIG_HOME/punto/`
+  и `~/.config/punto/`. Путь открывается относительно закреплённого корневого
+  дескриптора; обход от `/` не следует ни одному symlink-компоненту, а подмена
+  каталога не позволяет выйти из закреплённого root: читается уже открытый
+  inode либо операция отклоняется. Чтение и YAML parse выполняются в
+  single-flight background loader: команда возвращает `OK Scheduled`,
+  параллельный пользовательский reload — `ERROR Config reload in progress`.
+  Смена подтверждённой X11-сессии создаёт внутреннее поколение reload: если
+  loader занят, последний session intent выполняется после завершения старой
+  работы, а результат прежней сессии не может быть опубликован.
 - `echo "STATS" | nc -U /var/run/punto.sock` возвращает агрегированные runtime-счётчики.
-- В `STATS` видны `daemon_peers` и `analysis_mode`, чтобы контролировать текущий thread budget.
+- В `STATS` видны `daemon_peers`, `analysis_mode`, `log_dropped`,
+  `text_mutation=disabled`, эффективный `enabled=0` и отдельный
+  `configured_enabled`, чтобы не смешивать возможность мутации с намерением
+  запускать анализ. `config_pending`, `config_generation` и `config_result`
+  (`none|ok|error`) показывают завершение асинхронного reload.
+- Словари загружаются в отдельном потоке после безопасного запуска passthrough,
+  signal-fd и диагностического IPC. Пока immutable snapshot не готов, `STATS`
+  показывает `analysis_health=degraded` и `worker_threads=0`; ввод при этом
+  проходит без блокировки. Один файл ограничен 16 MiB, общий объём —
+  32 MiB, строка — 4096 байт, загрузка — 2 000 000 строк.
 - Диагностические сообщения демона уходят в syslog/journald; уровень задаётся через `logging.level`.
-- При отсутствии словарей daemon завершает старт с фатальной ошибкой вместо degraded-режима.
-- Для CI и безголовой упаковки используйте `./build-deb.sh --non-interactive --skip-runtime-installs`.
+- При отсутствии, повреждении или превышении лимита словарей daemon публикует
+  диагностическое состояние, затем завершает старт с кодом 2 и удаляет свой
+  IPC socket вместо перехода в бессрочный degraded-режим.
+- Для CI используйте `./build-deb.sh --non-interactive --skip-runtime-installs`.
+  Состав пакета детерминирован: tray обязателен по умолчанию; явный
+  `--without-tray` собирает daemon-only вариант. Без внешнего
+  `SOURCE_DATE_EPOCH` применяется каноническая дата релиза v2.8.6
+  (`1788480000`, 2026-09-04 UTC), а заданное окружением значение позволяет
+  независимо воспроизвести сборку с другой закреплённой датой.
 
 ## Known Limitations / Threat Model
 
-- Полной поддержки Wayland пока нет. Если обнаружен Wayland без X11, daemon продолжает анализ, но отключает переключение раскладки.
+- Полной поддержки Wayland пока нет. Без подтверждённого X11 probe layout-
+  snapshot остаётся неизвестным/default EN; это может снизить точность только
+  телеметрии анализа, потому что изменение документа в v2.8.6 отключено.
+- Подтверждённый X11 layout обновляется периодическим probe, поэтому после
+  внешней смены раскладки snapshot может отставать до следующего цикла (обычно
+  не более 3 секунд). После временной ошибки сохраняется последний
+  подтверждённый snapshot; до первого успешного probe используется default EN.
+  Поле `hotkey` это окно не сокращает.
+- При logout или невалидном конфиге нового desktop-пользователя сохраняется
+  последний успешно проверенный config snapshot. В v2.8.6 он влияет только на
+  анализ, уровень логов и resource policy, но не может включить изменение
+  документа; исправленный конфиг применяется командой `RELOAD` или следующим
+  успешным session reload.
+- Maintainer scripts не стартуют и не перезапускают статический user unit от
+  root. Обычный upgrade делает только user-manager daemon-reload: уже активный
+  tray обновится после `punto restart` или следующего login. Явный переход на
+  `--without-tray` останавливает только `punto-tray.service` и помечает
+  системный XDG autostart conffile как `remove-on-upgrade`.
 - Compose/dead keys/AltGr пока не поддерживаются полноценно и считаются отдельной инициативой.
+- Безопасная замена слова и преобразование выделения требуют проверяемой,
+  причинно связанной с действием редактора транзакции. Такого подтверждения нет
+  у универсального X11 clipboard, поэтому в v2.8.6 эти операции во всех окнах
+  пропускаются до изменения `PRIMARY`, `CLIPBOARD` или отправки клавиш.
+- Clipboard backend ограничен payload 4 KiB и поддерживает только проверяемые
+  text-targets без INCR. В v2.8.6 product entry points не вызывают его для
+  изменения текста: ручное Pause-действие завершается до чтения или смены
+  ownership.
 - Демон работает в root-контексте и читает `/proc/<pid>/environ` только для процессов активного GUI-пользователя.
 - Логи должны содержать только типы IPC-команд и агрегированные счётчики, а не содержимое набранных слов.
+
+Undo-обучение и его файл `/etc/punto/undo_exclusions.txt` не читаются и не
+изменяются product runtime v2.8.6. Компонент сохранён только как изолированный
+contract-test до появления доказуемо безопасной транзакции изменения текста.
 
 ## Установка
 
@@ -169,35 +258,48 @@ Privet  →  [LCtrl+LAlt+Pause]  →  Привет
 
 `build-deb.sh`:
 - проверит зависимости;
-- соберёт `punto` и `punto-tray` (если доступны GTK3/AppIndicator dev-пакеты);
+- соберёт `punto` и `punto-tray`; отсутствие GTK3/AppIndicator dev-пакетов
+  завершает default-сборку явной ошибкой;
 - соберёт deb-пакет;
-- установит зависимости только при явном `--allow-apt-installs`.
+- не будет устанавливать или изменять пакеты в системе сборки.
 
 ```bash
 git clone https://github.com/antonshalin76/punto.git
 cd punto
-./build-deb.sh --install
 ./build-deb.sh --non-interactive --skip-runtime-installs
+sudo dpkg -i "punto-switcher_2.8.6_$(dpkg --print-architecture).deb"
 ```
 
 ### Способ 2: Сборка из исходников
 
 #### Зависимости
 
-> Примечание: `build-deb.sh` рассчитан на Debian/Ubuntu. В CI и автоматизации используйте `--non-interactive`; для host-mutating установки пакетов нужен явный `--allow-apt-installs`.
+> Примечание: `build-deb.sh` рассчитан на Debian/Ubuntu. В CI и автоматизации
+> используйте `--non-interactive`; `--skip-runtime-installs` разрешает собрать
+> пакет без установки runtime-зависимостей, а `--without-tray` — явно выбрать
+> daemon-only состав. Наличие dev-пакетов больше не меняет состав молча.
 
 ```bash
 # Ubuntu/Debian (минимум для сборки punto)
-sudo apt install build-essential cmake pkg-config libx11-dev interception-tools
+sudo apt install build-essential cmake pkg-config libyaml-cpp-dev \
+  libsystemd-dev libxcb1-dev libxcb-xkb-dev libxau-dev \
+  libhunspell-dev \
+  interception-tools util-linux
 
-# Опционально: сборка tray-приложения (GTK3 + AppIndicator/Ayatana)
+# Только для сборки clipboard contract-тестов (не product runtime)
+sudo apt install libxcb-xfixes0-dev
+
+# Обязательно для default-пакета с tray (GTK3 + AppIndicator/Ayatana)
 sudo apt install libgtk-3-dev libayatana-appindicator3-dev
 
-# Опционально: словари для более точного авто-определения языка
-sudo apt install hunspell hunspell-en-us hunspell-ru wamerican-huge
+# Runtime-словари: daemon требует рабочие EN и RU словари и завершает старт,
+# если ни один поддерживаемый источник для языка не найден. .deb устанавливает
+# hunspell-en-us и hunspell-ru как зависимости.
+sudo apt install hunspell hunspell-en-us hunspell-ru
 
-# Опционально: звук при переключении раскладки (paplay/aplay)
-sudo apt install pulseaudio-utils alsa-utils
+# Опционально: дополнительный расширенный английский словарь
+sudo apt install wamerican-huge
+
 ```
 
 #### Сборка
@@ -206,7 +308,7 @@ sudo apt install pulseaudio-utils alsa-utils
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh
-sudo dpkg -i punto-switcher_2.8.5_amd64.deb
+sudo dpkg -i punto-switcher_2.8.6_amd64.deb
 ```
 
 #### Ручная сборка без пакета
@@ -214,18 +316,29 @@ sudo dpkg -i punto-switcher_2.8.5_amd64.deb
 ```bash
 cd cpp
 mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
 cmake --build . -j$(nproc)
-sudo cp punto /usr/local/bin/
+sudo install -m 0755 punto /usr/bin/punto-daemon
 sudo cp ../../config.yaml /etc/punto/
 ```
 
+Этот минимальный ручной путь является daemon-only: он не создаёт проверяемый
+`/etc/punto/runtime-gid`, не устанавливает CLI/tray user unit и поэтому не
+обещает IPC. Для полного контракта `0660 root:punto`, CLI и tray используйте
+`.deb`, чей maintainer script атомарно публикует runtime GID. Не создавайте этот
+файл через world-writable каталог или ослабленные права.
+
 ### Настройка udevmon
 
-Создайте `/etc/interception/udevmon.yaml` (пример — `udevmon.yaml` в корне репозитория):
+Пакет намеренно не перезаписывает `/etc/interception/udevmon.yaml` и не
+перезапускает/останавливает чужой `udevmon.service`: в нём могут быть другие
+interception-пайплайны. Создайте или вручную объедините конфигурацию
+`/etc/interception/udevmon.yaml`; после установки `.deb` пример находится в
+`/usr/share/doc/punto-switcher/examples/udevmon.yaml` (в исходниках —
+`udevmon.yaml`):
 
 ```yaml
-- JOB: "interception -g $DEVNODE | /usr/local/bin/punto-daemon | uinput -d $DEVNODE"
+- JOB: "interception -g $DEVNODE | /usr/bin/punto-daemon | uinput -d $DEVNODE"
   DEVICE:
     EVENTS:
       EV_KEY: [KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H, KEY_I, KEY_J, KEY_K, KEY_L, KEY_M, KEY_N, KEY_O, KEY_P, KEY_Q, KEY_R, KEY_S, KEY_T, KEY_U, KEY_V, KEY_W, KEY_X, KEY_Y, KEY_Z, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0, KEY_MINUS, KEY_EQUAL, KEY_BACKSPACE, KEY_TAB, KEY_ENTER, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTALT, KEY_RIGHTALT, KEY_COMMA, KEY_DOT, KEY_SLASH, KEY_SEMICOLON, KEY_APOSTROPHE, KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_BACKSLASH, KEY_GRAVE, KEY_SPACE, KEY_PAUSE, KEY_LEFT, KEY_RIGHT, KEY_UP, KEY_DOWN, KEY_HOME, KEY_END, KEY_PAGEUP, KEY_PAGEDOWN, KEY_INSERT, KEY_DELETE]
@@ -242,6 +355,14 @@ punto restart   # Перезапуск (после изменения конфи
 punto stop      # Остановка
 ```
 
+Команды `start`, `restart` и `stop` вызывают `sudo -n systemctl`: нужен уже
+активный sudo-сеанс или узкое правило `NOPASSWD` только для `udevmon.service`.
+При отсутствии такого доступа CLI завершается с `ERROR service-error` и не
+показывает интерактивный запрос пароля.
+Если `udevmon` уже активен, `punto start` только проверяет существующий IPC и
+не перезапускает общий сервис при `denied`, timeout или ошибке протокола;
+явный перезапуск выполняет только команда `punto restart`.
+
 #### Вручную через systemd
 
 ```bash
@@ -253,25 +374,26 @@ sudo systemctl start udevmon
 
 Конфигурация по умолчанию: `/etc/punto/config.yaml`
 
-Пользовательский конфиг (используется в приоритете): `~/.config/punto/config.yaml`
+Пользовательский конфиг (получает приоритет после подтверждения активного
+desktop-сеанса): `~/.config/punto/config.yaml`
 
 ```yaml
-# Хоткей переключения раскладки (ваша системная комбинация)
+# Совместимость схемы: v2.8.6 принимает, сохраняет и игнорирует это поле
 hotkey:
   modifier: leftctrl   # leftctrl, rightctrl, leftalt, rightalt, leftshift, rightshift, leftmeta, rightmeta
   key: grave           # grave (` ~), space, tab, backslash, capslock, а также left/right: shift/ctrl/alt/meta
 
-# Примечание: в v2.8.0 раздел delays удалён. Задержки эмуляции ввода теперь
-# фиксированы (зашиты в код) и не настраиваются через YAML.
-# Автоматическое переключение раскладки при нажатии пробела
+# Раздел delays удалён в v2.8.0 и строгой схемой не принимается. Product runtime
+# v2.8.6 не выполняет эмуляцию исправляющих клавиш.
+# Анализ слова при нажатии пробела/таба; в v2.8.6 без изменения текста
 auto_switch:
-  enabled: true        # Включить автопереключение
+  enabled: true        # Включить анализ; не включает изменение текста
   threshold: 3.5       # Порог срабатывания (разница скоров)
   min_word_len: 2      # Минимальная длина слова для анализа
   min_score: 5.0       # Минимальный скор для уверенного решения
-  max_rollback_words: 5 # Глубина отката (сколько последних слов можно перепечатать)
+  max_rollback_words: 5 # Совместимость; в v2.8.6 rollback не выполняется
 
-# Звуковая индикация переключения раскладки
+# Совместимость: в безопасном режиме v2.8.6 звук исправлений не воспроизводится
 sound:
   enabled: true
 
@@ -283,18 +405,12 @@ runtime:
   max_analysis_threads_per_daemon: 4
 ```
 
-### Синхронизация хоткея с системой
+### Переключение раскладки
 
-- **GNOME**: применяется автоматически через `gsettings`.
-- **Generic X11**: применяется через `setxkbmap` (XKB `grp:*_toggle`). Поддерживаются только:
-  - Alt+Shift
-  - Ctrl+Shift
-  - Ctrl+Alt
-  - Alt+Space
-  - Ctrl+Space
-  - Win+Space
-  - Shift+CapsLock
-- **KDE/Plasma**: автоматическая синхронизация пока не поддерживается (настройте хоткей в системе вручную).
+Настройте реальное переключение раскладки средствами GNOME/KDE/X11. Поля
+`hotkey.modifier` и `hotkey.key` в v2.8.6 оставлены только для обратной
+совместимости конфигурации: daemon их не использует, а tray не показывает их и
+не запускает `gsettings`/`setxkbmap`.
 
 После изменения можно применить настройки без перезапуска:
 
@@ -304,10 +420,13 @@ runtime:
 # Или через командную строку:
 
 echo "RELOAD" | nc -U /var/run/punto.sock
+# OK Scheduled; завершение: STATS config_pending=0 config_result=ok
 
-# Быстро вкл/выкл автопереключение (не меняя конфиг):
+# Эффективная возможность изменения текста фиксированно отключена:
 echo "SET_STATUS 1" | nc -U /var/run/punto.sock
-# echo "SET_STATUS 0" | nc -U /var/run/punto.sock
+# ERROR Text mutation disabled
+echo "SET_STATUS 0" | nc -U /var/run/punto.sock
+# OK DISABLED
 
 # Проверить текущий статус:
 echo "GET_STATUS" | nc -U /var/run/punto.sock
@@ -327,10 +446,10 @@ punto/
 │   │   ├── scancode_map.hpp      # Маппинги клавиш и раскладок
 │   │   ├── config.hpp            # Конфигурация
 │   │   ├── input_buffer.hpp      # Буфер ввода
-│   │   ├── key_injector.hpp      # Генератор input_event
-│   │   ├── clipboard_manager.hpp # X11 clipboard (чтение/запись напрямую)
+│   │   ├── key_injector.hpp      # Изолированный mutation contract-test
+│   │   ├── clipboard_manager.hpp # Изолированный X11 contract-test
 │   │   ├── x11_session.hpp       # Управление X11 сессией
-│   │   ├── sound_manager.hpp     # Звуковая индикация (paplay/aplay)
+│   │   ├── sound_manager.hpp     # Изолированный sound contract-test
 │   │   ├── text_processor.hpp    # Обработка текста
 │   │   ├── event_loop.hpp        # Главный цикл
 │   │   ├── layout_analyzer.hpp   # Анализатор раскладки (биграммы+триграммы)
@@ -339,7 +458,7 @@ punto/
 │   │   ├── ipc_client.hpp        # IPC клиент (для tray)
 │   │   ├── tray_app.hpp          # Tray UI
 │   │   ├── settings_dialog.hpp   # Диалог настроек (GTK)
-│   │   ├── history_manager.hpp   # История токенов для rollback/replay (async)
+│   │   ├── history_manager.hpp   # Изолированный history contract-test
 │   │   ├── concurrent_queue.hpp  # Потокобезопасная очередь (worker pool)
 │   │   ├── analysis_worker_pool.hpp # Пул воркеров анализа (async)
 │   │   ├── typo_corrector.hpp    # Алгоритмы исправления опечаток
@@ -351,7 +470,8 @@ punto/
 ├── DEBIAN/                       # Файлы для deb-пакета
 │   ├── control
 │   ├── postinst
-│   └── prerm
+│   ├── prerm
+│   └── postrm
 ├── config.yaml                   # Конфигурация по умолчанию
 ├── udevmon.yaml                  # Пример конфигурации udevmon
 ├── punto-cli.sh                  # CLI wrapper для управления сервисом
@@ -377,25 +497,28 @@ sudo journalctl -u udevmon -f
 
 ### Инверсия выделенного текста не работает
 
-1. Проверьте, что у сервиса есть доступ к активной X11-сессии (валидный DISPLAY/XAUTHORITY).
-2. Посмотрите логи: `sudo journalctl -u udevmon -f` и найдите сообщения про X11/Clipboard.
+Это ожидаемое поведение безопасного режима v2.8.6: комбинация поглощается до
+чтения или изменения X11 selection и до отправки paste.
 
 ### Автопереключение не срабатывает
 
-1. Проверьте, что `auto_switch.enabled: true` в конфиге
+Изменение документа ожидаемо отключено в v2.8.6. Для проверки только анализа:
+
+1. Проверьте, что `auto_switch.enabled: true` в конфиге.
 2. Убедитесь, что установлены hunspell словари:
 
 ```bash
 sudo apt install hunspell-en-us hunspell-ru
 ```
 
-3. Проверьте логи: `sudo journalctl -u udevmon -f`
+3. Проверьте `STATS`: `configured_enabled` отражает конфиг, а
+   `text_mutation=disabled enabled=0` — эффективную безопасную границу.
 
 ### Переключение раскладки не срабатывает
 
-1. Проверьте, что хоткей в `~/.config/punto/config.yaml` (или `/etc/punto/config.yaml`) соответствует вашей системной комбинации.
-2. В `punto-tray` откройте "Настройки..." → вкладка "Горячие клавиши" и убедитесь, что выбранная комбинация "применима" для вашего backend (GNOME/X11).
-3. Если у вас KDE/Plasma или Wayland-ограничения — настройте хоткей в системе вручную и выставьте такое же значение в конфиге.
+Punto v2.8.6 сам не переключает раскладку. Настройте комбинацию средствами
+рабочего стола. Поле `hotkey` в конфиге совместимое, но неактивное; анализатор
+обновляет layout-snapshot только периодическим подтверждённым X11 probe.
 
 ## Удаление
 
@@ -412,17 +535,61 @@ sudo rm -rf /etc/punto
 | CMake                      | ≥ 3.16                    |
 | GCC                        | ≥ 10 или Clang ≥ 11       |
 | interception-tools         | любая                     |
-| libX11                     | любая                     |
+| libsystemd                 | любая                     |
+| libxcb + libxcb-xkb        | любая                     |
+| XFixes                     | любая (только тесты)      |
+| libyaml-cpp                | 0.8                       |
 | libgtk-3-0                 | любая (tray, опционально) |
 | libayatana-appindicator3-1 | любая (tray, опционально) |
-| pulseaudio-utils           | любая (звук, опционально) |
-| alsa-utils                 | любая (звук, опционально) |
-| libhunspell                | любая (рекомендуется)     |
-| hunspell-en-us             | любая (опционально)       |
-| hunspell-ru                | любая (опционально)       |
+| libhunspell                | любая                     |
+| hunspell-en-us             | любая (runtime)           |
+| hunspell-ru                | любая (runtime)           |
 | wamerican-huge             | любая (опционально)       |
 
 ## История изменений
+
+### v2.8.6 — Fail-closed runtime и воспроизводимый релиз
+
+- Конфигурация разбирается строгим `yaml-cpp`: неизвестные/повторные ключи, неверные типы и небезопасные значения отклоняются целиком.
+- Startup использует только системный конфиг до установления активного
+  desktop-пользователя; `RELOAD` в bounded background lane читает файл через
+  descriptor-rooted walk от `/`, отклоняет symlink/rename escape и публикует
+  typed completion в `STATS`.
+- IPC, runtime-файлы и control plane получили ограниченные очереди, строгие протоколы, безопасные права и отдельный трёхсекундный deadline для каждого shutdown-барьера.
+- X11/clipboard backend переведён на bounded XCB, проверку владельца сессии и
+  сериализованную generation lease. Product entry points v2.8.6 завершаются до
+  X11 clipboard I/O и эмуляции клавиш: ни terminal `Ctrl+Shift+V`, ни GUI
+  `Ctrl+V` вместе с наблюдаемыми selection-событиями не дают причинно связанного
+  подтверждения применения подготовленного payload.
+- Rich/custom clipboard не упрощается до текста: такие операции завершаются
+  безопасным пропуском до смены X11 ownership.
+- Desktop-сессия обнаруживается в фоне. Sound backend изолирован в отдельном
+  contract-test target и не входит в product runtime безопасного режима.
+- Session config reload получил generation-owned latest-intent retry: смена
+  пользователя во время занятого loader не оставляет daemon на старом пути.
+- Failover control plane выполняет reconcile сохранённого config до promotion:
+  трёхролевой commit→crash→promotion не может переопубликовать stale snapshot
+  с прежним generation, а отсутствующий config не открывает primary IPC без
+  успешного fallback текущей authority.
+- Tray status poll переведён с синхронного IPC на coalesced background worker;
+  lifecycle процесса принадлежит статическому `systemd --user` unit.
+- Запись в syslog вынесена из input/worker threads в отдельный sink с
+  ограниченной очередью; переполнение учитывается в `STATS`, а зависший sink не
+  блокирует ввод и аварийно завершает shutdown по трёхсекундному deadline.
+- CLI и `.deb` используют `/usr/bin`, единый файл `VERSION`, неинтерактивную воспроизводимую сборку и идемпотентные lifecycle-скрипты.
+- Пакет не владеет глобальным `udevmon.yaml` и не управляет чужим `udevmon.service`; пример конфигурации устанавливается отдельно для явного ручного merge.
+- Mutation-компоненты (clipboard, key injection, sound, macro/history/undo)
+  физически исключены из production target и проверяются только отдельными
+  contract-test target.
+- Загрузка словарей и сканирование `/proc` имеют строгие byte/entry/candidate/
+  time limits; диагностический IPC доступен в состоянии pending, а фатальная
+  инициализация завершается с детерминированным кодом.
+- `SET_STATUS 0` — совместимый no-op, `SET_STATUS 1` честно отклоняется:
+  управление анализом определяется только `auto_switch.enabled`, а возможность
+  изменения текста в этой версии всегда выключена.
+- XFixes удалён из production link graph и требуется только clipboard
+  contract-тесту.
+- Добавлены contract/e2e-тесты для daemon, IPC, nested-X11 GTK/VTE platform integration, конфигурации, CLI и package lifecycle.
 
 ### v2.8.5 — Стабильность control plane и IPC
 
@@ -462,14 +629,18 @@ sudo rm -rf /etc/punto
   - если слово есть в текущем словаре и нет в противоположном — инверсию не делаем;
   - если слова нет в обоих словарях — инверсию не делаем;
   - если слово есть в обоих словарях — решение через N-граммы.
-- **Хоткеи по выделению** теперь заменяют выделенный текст (а не вставляют рядом с курсором).
+- **Хоткеи по выделению** стали заменять выделенный текст (а не вставлять рядом с курсором).
+  - В версии 2.8.2 это относилось к GUI-редакторам; терминальные хоткеи тогда
+    вставляли преобразованный текст в позицию курсора. Начиная с 2.8.6
+    терминальные преобразования fail-closed пропускаются до отправки клавиш.
 
 ### v2.8.1 — Исправление oneshot вставки в терминалах
 
 - **Исправлена вставка в терминалах** после oneshot-замены:
   - расширена детекция терминальных окон по `WM_CLASS` (instance/class);
   - добавлен подъём по дереву окон (активным может быть дочерний window);
-  - paste выполняется через layout-независимый hotkey `Shift+Insert`;
+  - в терминалах paste выполняется через `Ctrl+Shift+V`, в остальных окнах —
+    через `Shift+Insert`;
   - перед paste выставляются оба selection: `CLIPBOARD` и `PRIMARY`;
   - увеличены паузы вокруг `Clipboard+Paste`, чтобы избежать гонок и раннего restore.
 
@@ -497,7 +668,8 @@ sudo rm -rf /etc/punto
 - **Персистентные исключения Undo**: теперь сохраняются между сессиями
   - Файл хранения: `/etc/punto/undo_exclusions.txt`
   - Автозагрузка при старте сервиса
-  - Инкрементальное сохранение при добавлении
+  - Атомарное сохранение с межпроцессной блокировкой
+  - До 128 lowercase ASCII-слов по 63 байта, файл `0600`
   - Система самообучается по мере использования
 
 ### v2.7.2 — Улучшение точности

@@ -16,8 +16,9 @@ bool InputBuffer::push_char(ScanCode code, bool shifted) noexcept {
     return false;
   }
 
-  if (current_len_ >= kMaxWordLen - 1) {
+  if (current_len_ >= kMaxWordLen) {
     current_len_ = 0;
+    last_len_ = 0;
     trailing_len_ = 0;
     current_overflowed_ = true;
     return false;
@@ -79,7 +80,12 @@ void InputBuffer::reset_current() noexcept {
 }
 
 bool InputBuffer::push_trailing(ScanCode code) noexcept {
-  if (trailing_len_ >= kMaxWordLen - 1) {
+  if (trailing_len_ >= kMaxWordLen) {
+    // A manual correction must replay the complete suffix. Once it no longer
+    // fits, discard both pieces rather than correcting a stale word while
+    // silently omitting part of what the user typed.
+    trailing_len_ = 0;
+    last_len_ = 0;
     return false;
   }
   trailing_buf_[trailing_len_] = code;

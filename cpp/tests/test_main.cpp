@@ -1,13 +1,14 @@
 #include "punto/analysis_worker_pool.hpp"
+#include "punto/config.hpp"
+#include "punto/control_plane_state.hpp"
+#include "punto/history_manager.hpp"
 #include "punto/input_buffer.hpp"
 #include "punto/ipc_server.hpp"
-#include "punto/history_manager.hpp"
 #include "punto/layout_sync_sound.hpp"
-#include "punto/control_plane_state.hpp"
 #include "punto/runtime_tuning.hpp"
+#include "punto/terminal_detection.hpp"
 #include "punto/text_processor.hpp"
 #include "punto/typo_corrector.hpp"
-#include "punto/config.hpp"
 
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -15,15 +16,18 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
-#include <iterator>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <utility>
 
 using namespace punto;
 
@@ -73,13 +77,6 @@ std::string send_ipc_command(const std::string &socket_path,
   return response;
 }
 
-std::string read_text_file(const std::filesystem::path &path) {
-  std::ifstream input(path);
-  expect(input.good(), "source file open failed");
-  return {std::istreambuf_iterator<char>{input},
-          std::istreambuf_iterator<char>{}};
-}
-
 void test_text_processor() {
   expect(utf8_codepoint_count("") == 0, "utf8 empty");
   expect(utf8_codepoint_count("a") == 1, "utf8 ascii");
@@ -95,11 +92,11 @@ void test_text_processor() {
 void test_input_buffer_overflow() {
   InputBuffer buffer;
 
-  for (std::size_t i = 0; i < kMaxWordLen - 1; ++i) {
+  for (std::size_t i = 0; i < kMaxWordLen; ++i) {
     expect(buffer.push_char(KEY_A, false), "fill buffer");
   }
 
-  expect(buffer.current_length() == kMaxWordLen - 1, "buffer length");
+  expect(buffer.current_length() == kMaxWordLen, "buffer length");
   expect(!buffer.current_overflowed(), "buffer not overflowed initially");
   expect(!buffer.push_char(KEY_B, false), "buffer overflow trigger");
   expect(buffer.current_overflowed(), "overflow flag set");
@@ -120,8 +117,8 @@ void test_analysis_pool_terminality_on_stop() {
 
   WordTask task;
   task.task_id = 7;
-  expect(pool.submit(task), "analysis task accepted");
-  expect(!pool.submit(task), "duplicate analysis task rejected");
+  expect(pool.submit(task).accepted, "analysis task accepted");
+  expect(!pool.submit(task).accepted, "duplicate analysis task rejected");
 
   pool.stop();
 
@@ -131,7 +128,8 @@ void test_analysis_pool_terminality_on_stop() {
   expect(result.terminal_status == WordTerminalStatus::Cancelled,
          "queued task cancelled on stop");
   expect(!pool.try_pop_result(result), "accepted task has one terminal result");
-  expect(!pool.submit(std::move(task)), "analysis admission closed after stop");
+  expect(!pool.submit(std::move(task)).accepted,
+         "analysis admission closed after stop");
 }
 
 void test_analysis_pool_epoch_has_one_terminal_winner() {
@@ -140,7 +138,7 @@ void test_analysis_pool_epoch_has_one_terminal_winner() {
 
   WordTask task;
   task.task_id = 11;
-  expect(pool.submit(task), "epoch task accepted");
+  expect(pool.submit(task).accepted, "epoch task accepted");
 
   pool.begin_new_epoch();
   expect(pool.pending_task_count() == 0,
@@ -165,7 +163,7 @@ void test_analysis_pool_worker_stop_race_has_one_terminal() {
     WordTask task;
     task.task_id = task_id;
     task.analysis_len = 0;
-    expect(pool.submit(std::move(task)), "worker race task accepted");
+    expect(pool.submit(std::move(task)).accepted, "worker race task accepted");
     pool.stop();
 
     WordResult result;
@@ -206,7 +204,8 @@ void test_analysis_pool_concurrent_stop_is_a_barrier() {
   WordTask task;
   task.task_id = 40;
   task.analysis_len = 0;
-  expect(pool.submit(std::move(task)), "concurrent stop task accepted");
+  expect(pool.submit(std::move(task)).accepted,
+         "concurrent stop task accepted");
   {
     std::unique_lock<std::mutex> lock(gate_mu);
     expect(gate_cv.wait_for(lock, std::chrono::seconds(1),
@@ -220,7 +219,7 @@ void test_analysis_pool_concurrent_stop_is_a_barrier() {
   probe.task_id = 41;
   bool admission_closed = false;
   for (std::size_t attempt = 0; attempt < 10000; ++attempt) {
-    if (!pool.submit(probe)) {
+    if (!pool.submit(probe).accepted) {
       admission_closed = true;
       break;
     }
@@ -275,21 +274,53 @@ void test_analysis_pool_concurrent_stop_is_a_barrier() {
          "concurrent stop returns after one running-task terminal");
 }
 
-void test_analysis_sequencing_regression_guards() {
-  const auto event_loop = read_text_file(
-      std::filesystem::path(PUNTO_SOURCE_DIR) / "src/event_loop.cpp");
-  expect(event_loop.find("max_rollback_words") != std::string::npos,
-         "accepted correction metadata remains rollback-bounded");
-  expect(event_loop.find("terminality remains owned by AnalysisWorkerPool") !=
-             std::string::npos,
-         "metadata pruning documents terminality ownership");
+void test_analysis_pool_admission_can_close_before_drain() {
+  Dictionary dictionary;
+  AnalysisWorkerPool pool(dictionary);
+  pool.start(1);
 
-  const auto pool = read_text_file(std::filesystem::path(PUNTO_SOURCE_DIR) /
-                                   "include/punto/analysis_worker_pool.hpp");
-  expect(pool.find("tasks_.extract_if") != std::string::npos,
-         "epoch retirement drains obsolete queued tasks");
-  expect(pool.find("state.result_queued) {") != std::string::npos,
-         "pool exposes allocation-free terminal fallback");
+  pool.close_admission();
+
+  WordTask task;
+  task.task_id = 50;
+  task.layout_at_boundary = 0;
+  expect(!pool.submit(std::move(task)).accepted,
+         "explicit admission barrier rejects work before drain");
+  pool.stop();
+}
+
+void test_analysis_pool_admission_receipt_and_bound() {
+  Dictionary dictionary;
+  AnalysisWorkerPool pool(dictionary, {}, {}, 2);
+
+  const auto before = std::chrono::steady_clock::now();
+  WordTask first;
+  first.task_id = 50;
+  const AnalysisAdmission first_admission = pool.submit(first);
+  const auto after = std::chrono::steady_clock::now();
+  expect(first_admission.accepted, "first bounded task accepted");
+  expect(first_admission.accepted_at >= before &&
+             first_admission.accepted_at <= after,
+         "admission receipt uses queue-commit time");
+
+  WordTask second;
+  second.task_id = 51;
+  expect(pool.submit(second).accepted, "second bounded task accepted");
+
+  WordTask overflow;
+  overflow.task_id = 52;
+  expect(!pool.submit(overflow).accepted,
+         "bounded pool rejects excess outstanding task");
+  expect(pool.pending_task_count() == 2,
+         "rejected overflow never enters task queue");
+
+  pool.stop();
+  WordResult result;
+  std::size_t terminals = 0;
+  while (pool.try_pop_result(result)) {
+    ++terminals;
+  }
+  expect(terminals == 2, "each bounded accepted task has one terminal");
 }
 
 void test_ipc_server() {
@@ -300,16 +331,48 @@ void test_ipc_server() {
   const std::filesystem::path socket_path =
       std::filesystem::path(dir) / "punto-test.sock";
 
+  auto mailbox = std::make_shared<IpcCommandMailbox>();
   std::atomic<bool> enabled{true};
+  std::mutex reload_mutex;
   std::string reloaded_path;
-  IpcServer server(
-      enabled,
-      [&reloaded_path](const std::string &path) {
-        reloaded_path = path;
-        return IpcResult{true, "reloaded"};
-      },
-      []() { return IpcResult{true, "analyzed=3 corrections=1"}; },
-      socket_path.string());
+  std::jthread owner([&](std::stop_token stop_token) {
+    while (!stop_token.stop_requested() || mailbox->size() != 0) {
+      if (auto pending = mailbox->try_dequeue()) {
+        IpcResult response;
+        switch (pending->request.verb) {
+        case IpcVerb::GetStatus:
+          response = {true, enabled.load() ? "ENABLED" : "DISABLED"};
+          break;
+        case IpcVerb::SetStatus:
+          enabled.store(pending->request.argument == "1");
+          response = {true, enabled.load() ? "ENABLED" : "DISABLED"};
+          break;
+        case IpcVerb::Reload: {
+          std::lock_guard<std::mutex> lock(reload_mutex);
+          reloaded_path = pending->request.argument;
+        }
+          response = {true, "reloaded"};
+          break;
+        case IpcVerb::Stats:
+          response = {true, "analyzed=3 corrections=1"};
+          break;
+        case IpcVerb::Shutdown:
+          response = {false, "Shutdown not allowed via IPC"};
+          break;
+        }
+        pending->complete(std::move(response));
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+      }
+    }
+  });
+
+  IpcServerOptions options;
+  options.primary_socket_path = socket_path.string();
+  const RuntimeFileSecurity runtime_security = default_runtime_file_security();
+  options.socket_identity = {runtime_security.owner_uid,
+                             runtime_security.group_gid, runtime_security.mode};
+  IpcServer server(mailbox, std::move(options));
 
   expect(server.start(), "ipc server start");
 
@@ -330,32 +393,42 @@ void test_ipc_server() {
   expect(send_ipc_command(socket_path.string(), "RELOAD /tmp/config.yaml\n") ==
              "OK reloaded\n",
          "RELOAD response");
-  expect(reloaded_path == "/tmp/config.yaml", "reload callback arg");
+  {
+    std::lock_guard<std::mutex> lock(reload_mutex);
+    expect(reloaded_path == "/tmp/config.yaml", "reload callback arg");
+  }
   expect(send_ipc_command(socket_path.string(), "NOPE\n") ==
              "ERROR Unknown command\n",
          "unknown command response");
 
+  expect(mailbox->close(), "mailbox close reached its admission barrier");
   server.stop();
+  owner.request_stop();
+  owner.join();
   expect(!std::filesystem::exists(socket_path), "socket removed on stop");
+  const std::filesystem::path lease_path =
+      socket_path.parent_path() /
+      ("." + socket_path.filename().string() + ".lock");
+  expect(::unlink(lease_path.c_str()) == 0, "persistent socket lease removed");
   expect(::rmdir(dir) == 0, "tmp dir removed");
 }
 
 void test_typo_corrector() {
-  const std::vector<KeyEntry> api{
-      {KEY_A, true}, {KEY_P, true}, {KEY_I, true}};
+  const std::vector<KeyEntry> api{{KEY_A, true}, {KEY_P, true}, {KEY_I, true}};
   expect(detect_case_pattern(api) == CasePattern::Mixed,
          "known abbreviation is not corrected");
 
-  const std::vector<KeyEntry> ghbdtn{
-      {KEY_G, true}, {KEY_H, true}, {KEY_B, false},
-      {KEY_D, false}, {KEY_T, false}, {KEY_Y, false}};
+  const std::vector<KeyEntry> ghbdtn{{KEY_G, true},  {KEY_H, true},
+                                     {KEY_B, false}, {KEY_D, false},
+                                     {KEY_T, false}, {KEY_Y, false}};
   const StickyShiftResult sticky =
       detect_sticky_shift_with_layout(ghbdtn, /*current_layout=*/0);
   expect(sticky.detected, "sticky shift with layout detected");
   expect(sticky.needs_layout_fix, "sticky shift requires layout fix");
   expect(sticky.corrected.size() == ghbdtn.size(),
          "sticky shift corrected size");
-  expect(sticky.corrected.front().shifted, "first corrected letter stays upper");
+  expect(sticky.corrected.front().shifted,
+         "first corrected letter stays upper");
   for (std::size_t i = 1; i < sticky.corrected.size(); ++i) {
     expect(!sticky.corrected[i].shifted, "remaining corrected letters lower");
   }
@@ -396,12 +469,14 @@ void test_config_logging_level() {
     FILE *fp = std::fopen(config_path.c_str(), "w");
     expect(fp != nullptr, "config fopen failed");
     std::fputs("hotkey:\n  modifier: leftctrl\n  key: grave\n", fp);
-    std::fputs("auto_switch:\n  enabled: true\n  threshold: 2.0\n  min_word_len: 3\n  min_score: 5.0\n  max_rollback_words: 5\n", fp);
+    std::fputs("auto_switch:\n  enabled: true\n  threshold: 2.0\n  "
+               "min_word_len: 3\n  min_score: 5.0\n  max_rollback_words: 5\n",
+               fp);
     std::fputs("sound:\n  enabled: true\n", fp);
     std::fputs("logging:\n  level: debug\n", fp);
-    std::fputs(
-        "runtime:\n  analysis_threads: 3\n  max_analysis_threads_per_daemon: 2\n",
-        fp);
+    std::fputs("runtime:\n  analysis_threads: 3\n  "
+               "max_analysis_threads_per_daemon: 2\n",
+               fp);
     std::fclose(fp);
   }
 
@@ -431,26 +506,28 @@ void test_external_layout_sound_state() {
          "invalid layout does not play sound");
   expect(!external_layout_sound_expired(state, now),
          "fresh external sound state not expired");
-  expect(external_layout_sound_expired(state, now + std::chrono::milliseconds{700}),
+  expect(external_layout_sound_expired(state,
+                                       now + std::chrono::milliseconds{700}),
          "external sound state expires after window");
 
   clear_external_layout_sound(state);
   expect(!state.pending, "external sound state cleared");
 }
 
-void test_x11_threading_regression_guards() {
-  const std::filesystem::path source_root = PUNTO_SOURCE_DIR;
-  const std::string x11_session =
-      read_text_file(source_root / "src" / "x11_session.cpp");
-  expect(x11_session.find("seteuid(") == std::string::npos,
-         "x11 session must not switch euid in multithreaded daemon");
-  expect(x11_session.find("setegid(") == std::string::npos,
-         "x11 session must not switch egid in multithreaded daemon");
-
-  const std::string main_source =
-      read_text_file(source_root / "src" / "main.cpp");
-  expect(main_source.find("XInitThreads()") != std::string::npos,
-         "main must initialize Xlib threading support");
+void test_terminal_detection_boundaries() {
+  expect(is_terminal_wm_class("st", "St"), "st exact terminal match");
+  expect(is_terminal_wm_class("org.suckless.st", ""),
+         "st identifier component match");
+  expect(is_terminal_wm_class("gnome-terminal-server", "Gnome-terminal"),
+         "gnome terminal match");
+  expect(is_terminal_wm_class("org.example.Terminal", ""),
+         "generic terminal component match");
+  expect(!is_terminal_wm_class("postman", "Postman"),
+         "Postman is not classified as st");
+  expect(!is_terminal_wm_class("steam", "Steam"),
+         "Steam is not classified as st");
+  expect(!is_terminal_wm_class("studio", "JetBrains Studio"),
+         "Studio is not classified as st");
 }
 
 void test_runtime_thread_budget() {
@@ -546,6 +623,76 @@ void test_control_plane_generation_seeding() {
   expect(::rmdir(dir) == 0, "seed dir removed");
 }
 
+void test_control_plane_promotion_planning() {
+  SharedControlPlaneState committed;
+  committed.config_generation = 6;
+  committed.status_generation = 4;
+  committed.config_path = "/home/b/.config/punto/config.yaml";
+
+  auto action = plan_control_plane_promotion(
+      committed, 5, "/home/a/.config/punto/config.yaml",
+      /*authoritative_path_allowed=*/true,
+      /*current_path_allowed=*/true);
+  expect(action == ControlPlanePromotionAction::ReloadAuthoritativePath,
+         "stale secondary reloads the committed primary path");
+
+  action = plan_control_plane_promotion(committed, 6,
+                                        "/home/b/.config/punto/config.yaml",
+                                        /*authoritative_path_allowed=*/true,
+                                        /*current_path_allowed=*/true);
+  expect(action == ControlPlanePromotionAction::Ready,
+         "reconciled secondary may promote");
+
+  committed.config_path = "/home/a/.config/punto/config.yaml";
+  action = plan_control_plane_promotion(committed, 6,
+                                        "/home/a/.config/punto/config.yaml",
+                                        /*authoritative_path_allowed=*/false,
+                                        /*current_path_allowed=*/false);
+  expect(action == ControlPlanePromotionAction::ReloadCurrentAuthority,
+         "new user replaces an unauthorized prior-user snapshot");
+
+  action = plan_control_plane_promotion(committed, 6,
+                                        "/home/b/.config/punto/config.yaml",
+                                        /*authoritative_path_allowed=*/false,
+                                        /*current_path_allowed=*/true);
+  expect(action == ControlPlanePromotionAction::Ready,
+         "new-user config reconciled at the inherited generation");
+
+  // Three roles: primary A commits generation 6, stale B must apply it before
+  // publishing generation 7, and already-synced peer C must observe 7 != 6.
+  committed.config_path = "/etc/punto/alternate.yaml";
+  action = plan_control_plane_promotion(committed, 5, "/etc/punto/config.yaml",
+                                        /*authoritative_path_allowed=*/true,
+                                        /*current_path_allowed=*/true);
+  expect(action == ControlPlanePromotionAction::ReloadAuthoritativePath,
+         "three-role failover fences stale role B");
+  action =
+      plan_control_plane_promotion(committed, 6, "/etc/punto/alternate.yaml",
+                                   /*authoritative_path_allowed=*/true,
+                                   /*current_path_allowed=*/true);
+  expect(action == ControlPlanePromotionAction::Ready,
+         "three-role failover admits reconciled role B");
+  const std::uint64_t promoted_generation = committed.config_generation + 1;
+  expect(promoted_generation == 7,
+         "promoted primary publishes a strictly newer generation");
+  expect(promoted_generation != committed.config_generation,
+         "synced role C observes the promoted publication");
+
+  action = plan_control_plane_promotion(committed, 5, "/etc/punto/config.yaml",
+                                        /*authoritative_path_allowed=*/true,
+                                        /*current_path_allowed=*/true,
+                                        /*authority_fallback_applied=*/true);
+  expect(action == ControlPlanePromotionAction::ReloadAuthoritativePath,
+         "failed snapshot load cannot authorize stale promotion");
+
+  action = plan_control_plane_promotion(committed, 6, "/etc/punto/config.yaml",
+                                        /*authoritative_path_allowed=*/true,
+                                        /*current_path_allowed=*/true,
+                                        /*authority_fallback_applied=*/true);
+  expect(action == ControlPlanePromotionAction::Ready,
+         "successfully committed authority fallback may promote");
+}
+
 } // namespace
 
 int main() {
@@ -555,16 +702,18 @@ int main() {
   test_analysis_pool_epoch_has_one_terminal_winner();
   test_analysis_pool_worker_stop_race_has_one_terminal();
   test_analysis_pool_concurrent_stop_is_a_barrier();
-  test_analysis_sequencing_regression_guards();
+  test_analysis_pool_admission_can_close_before_drain();
+  test_analysis_pool_admission_receipt_and_bound();
   test_ipc_server();
   test_typo_corrector();
   test_history_manager();
   test_config_logging_level();
   test_external_layout_sound_state();
-  test_x11_threading_regression_guards();
+  test_terminal_detection_boundaries();
   test_runtime_thread_budget();
   test_control_plane_state_round_trip();
   test_control_plane_generation_seeding();
+  test_control_plane_promotion_planning();
 
   std::cout << "punto-tests: OK\n";
   return 0;

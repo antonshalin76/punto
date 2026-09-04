@@ -614,6 +614,7 @@ inline constexpr std::array<BigramEntry, 256> kRuBigrams = {{
 /// Например, 4+ согласных подряд, мягкий знак в начале, и т.д.
 [[nodiscard]] constexpr bool is_invalid_ru_bigram(char first,
                                                   char second) noexcept {
+  (void)second;
   // Мягкий/твёрдый знак в начале слова (в QWERTY: m и ])
   if (first == 'm' || first == ']') {
     return true;

@@ -8,8 +8,11 @@
 
 #pragma once
 
+#include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -31,6 +34,33 @@ enum class DictResult {
   Both     // Слово найдено в обоих (редко)
 };
 
+enum class DictionaryLoadResult {
+  Ok,
+  NoUsableSource,
+  Oversize,
+  Malformed,
+  IoError,
+};
+
+struct DictionaryLoadLimits {
+  std::uint64_t max_file_bytes = 16U * 1024U * 1024U;
+  std::uint64_t max_aggregate_bytes = 32U * 1024U * 1024U;
+  std::size_t max_line_bytes = 4096;
+  std::size_t max_entries = 2'000'000;
+};
+
+struct DictionaryLoadSpec {
+  std::vector<std::filesystem::path> english_paths;
+  std::vector<std::filesystem::path> russian_paths;
+  std::optional<std::filesystem::path> english_affix;
+  std::optional<std::filesystem::path> english_hunspell_dictionary;
+  std::optional<std::filesystem::path> russian_affix;
+  std::optional<std::filesystem::path> russian_hunspell_dictionary;
+  DictionaryLoadLimits limits;
+
+  [[nodiscard]] static DictionaryLoadSpec system_default();
+};
+
 /**
  * @brief Словарный анализатор языка
  *
@@ -47,6 +77,11 @@ public:
    * @return true если успешно загружены
    */
   bool initialize();
+
+  /** Loads only the supplied sources under strict byte, line, and entry caps.
+   */
+  [[nodiscard]] DictionaryLoadResult
+  initialize_bounded(const DictionaryLoadSpec &spec);
 
   /**
    * @brief Ищет слово в словарях
@@ -115,6 +150,12 @@ public:
   }
 
 private:
+  struct LoadBudget {
+    std::uint64_t aggregate_bytes = 0;
+    std::size_t lines = 0;
+    std::size_t entries = 0;
+  };
+
   /**
    * @brief Проверяет наличие хеша в отсортированном векторе
    * @param hash Хеш слова
@@ -130,14 +171,20 @@ private:
    * @param path Путь к .dic файлу
    * @return Количество загруженных слов
    */
-  std::size_t load_en_dictionary(const std::string &path);
+  DictionaryLoadResult load_en_dictionary(const std::filesystem::path &path,
+                                          const DictionaryLoadLimits &limits,
+                                          LoadBudget &budget,
+                                          std::size_t &loaded);
 
   /**
    * @brief Загружает русский словарь из hunspell, конвертируя в QWERTY
    * @param path Путь к .dic файлу
    * @return Количество загруженных слов
    */
-  std::size_t load_ru_dictionary(const std::string &path);
+  DictionaryLoadResult load_ru_dictionary(const std::filesystem::path &path,
+                                          const DictionaryLoadLimits &limits,
+                                          LoadBudget &budget,
+                                          std::size_t &loaded);
 
   /**
    * @brief Конвертирует UTF-8 кириллицу в QWERTY-последовательность
@@ -190,6 +237,11 @@ private:
 
   bool initialized_ = false;
   bool hunspell_available_ = false;
+};
+
+struct DictionaryLoadOutcome {
+  DictionaryLoadResult result = DictionaryLoadResult::IoError;
+  std::unique_ptr<Dictionary> dictionary;
 };
 
 } // namespace punto

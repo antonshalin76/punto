@@ -8,19 +8,20 @@
 #include "punto/scancode_map.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <cerrno>
+#include <charconv>
 #include <cstring>
-#include <fstream>
+#include <fcntl.h>
 #include <iostream>
 #include <linux/input.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace punto {
 
 namespace {
-
-// Пути к hunspell словарям
-constexpr const char *kEnDictPath = "/usr/share/hunspell/en_US.dic";
-constexpr const char *kRuDictPath = "/usr/share/hunspell/ru_RU.dic";
 
 // Дополнительные английские словари (scowl, wamerican-huge)
 constexpr const char *kEnDictPaths[] = {
@@ -147,6 +148,114 @@ constexpr const char *kEnDicPathHunspell = "/usr/share/hunspell/en_US.dic";
 constexpr const char *kRuAffPath = "/usr/share/hunspell/ru_RU.aff";
 constexpr const char *kRuDicPathHunspell = "/usr/share/hunspell/ru_RU.dic";
 
+struct BoundedReadResult {
+  DictionaryLoadResult result = DictionaryLoadResult::Ok;
+  bool present = false;
+};
+
+template <typename Consumer>
+BoundedReadResult read_bounded_lines(const std::filesystem::path &path,
+                                     const DictionaryLoadLimits &limits,
+                                     std::uint64_t &aggregate_bytes,
+                                     std::size_t &aggregate_lines,
+                                     Consumer consumer) {
+  const int fd =
+      ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
+  if (fd < 0) {
+    return {(errno == ENOENT || errno == ELOOP) ? DictionaryLoadResult::Ok
+                                                : DictionaryLoadResult::IoError,
+            false};
+  }
+
+  struct CloseFd {
+    int value;
+    ~CloseFd() { ::close(value); }
+  } close_fd{fd};
+
+  struct stat metadata {};
+  if (::fstat(fd, &metadata) != 0) {
+    return {DictionaryLoadResult::IoError, true};
+  }
+  if (!S_ISREG(metadata.st_mode) || metadata.st_size < 0) {
+    return {DictionaryLoadResult::Malformed, true};
+  }
+  const auto advertised_size = static_cast<std::uint64_t>(metadata.st_size);
+  if (advertised_size > limits.max_file_bytes ||
+      aggregate_bytes > limits.max_aggregate_bytes ||
+      advertised_size > limits.max_aggregate_bytes - aggregate_bytes) {
+    return {DictionaryLoadResult::Oversize, true};
+  }
+  aggregate_bytes += advertised_size;
+
+  std::array<char, 8192> buffer{};
+  std::string line;
+  line.reserve(std::min<std::size_t>(limits.max_line_bytes, 256));
+  std::uint64_t actual_size = 0;
+  std::size_t line_number = 0;
+  bool last_was_newline = true;
+
+  const auto finish_line = [&]() -> DictionaryLoadResult {
+    if (aggregate_lines >= limits.max_entries) {
+      return DictionaryLoadResult::Oversize;
+    }
+    ++aggregate_lines;
+    const DictionaryLoadResult result = consumer(line, line_number++);
+    line.clear();
+    return result;
+  };
+
+  while (true) {
+    const ssize_t count = ::read(fd, buffer.data(), buffer.size());
+    if (count == 0) {
+      break;
+    }
+    if (count < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return {DictionaryLoadResult::IoError, true};
+    }
+    actual_size += static_cast<std::uint64_t>(count);
+    if (actual_size > limits.max_file_bytes ||
+        (actual_size > advertised_size &&
+         actual_size - advertised_size >
+             limits.max_aggregate_bytes - aggregate_bytes)) {
+      return {DictionaryLoadResult::Oversize, true};
+    }
+
+    for (ssize_t i = 0; i < count; ++i) {
+      const char ch = buffer[static_cast<std::size_t>(i)];
+      if (ch == '\0') {
+        return {DictionaryLoadResult::Malformed, true};
+      }
+      if (ch == '\n') {
+        const DictionaryLoadResult result = finish_line();
+        if (result != DictionaryLoadResult::Ok) {
+          return {result, true};
+        }
+        last_was_newline = true;
+        continue;
+      }
+      if (line.size() >= limits.max_line_bytes) {
+        return {DictionaryLoadResult::Oversize, true};
+      }
+      line.push_back(ch);
+      last_was_newline = false;
+    }
+  }
+
+  if (actual_size > advertised_size) {
+    aggregate_bytes += actual_size - advertised_size;
+  }
+  if (!last_was_newline) {
+    const DictionaryLoadResult result = finish_line();
+    if (result != DictionaryLoadResult::Ok) {
+      return {result, true};
+    }
+  }
+  return {DictionaryLoadResult::Ok, true};
+}
+
 /// Извлекает слово из строки hunspell (формат: word/flags)
 std::string extract_word(const std::string &line) {
   auto slash_pos = line.find('/');
@@ -180,7 +289,43 @@ bool is_ascii_alpha_only(const std::string &s) {
   return true;
 }
 
+bool is_cyrillic_alpha_only(std::string_view word) {
+  std::size_t offset = 0;
+  std::size_t letters = 0;
+  while (offset < word.size()) {
+    bool matched = false;
+    for (const auto &entry : kCyrillicMap) {
+      const std::string_view letter{entry.utf8};
+      if (word.substr(offset).starts_with(letter)) {
+        offset += letter.size();
+        ++letters;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      return false;
+    }
+  }
+  return letters >= kDictMinWordLen && letters <= kDictMaxWordLen;
+}
+
 } // namespace
+
+DictionaryLoadSpec DictionaryLoadSpec::system_default() {
+  DictionaryLoadSpec spec;
+  for (const char *path : kEnDictPaths) {
+    spec.english_paths.emplace_back(path);
+  }
+  for (const char *path : kRuDictPaths) {
+    spec.russian_paths.emplace_back(path);
+  }
+  spec.english_affix = kEnAffPath;
+  spec.english_hunspell_dictionary = kEnDicPathHunspell;
+  spec.russian_affix = kRuAffPath;
+  spec.russian_hunspell_dictionary = kRuDicPathHunspell;
+  return spec;
+}
 
 std::string Dictionary::cyrillic_to_qwerty(const std::string &cyrillic) {
   std::string result;
@@ -226,208 +371,344 @@ bool Dictionary::hash_exists(
   return std::binary_search(hashes.begin(), hashes.end(), hash);
 }
 
-std::size_t Dictionary::load_en_dictionary(const std::string &path) {
-  std::ifstream file(path);
-  if (!file.is_open()) {
-    // Не логируем ошибку — словарь может быть опциональным
-    return 0;
+DictionaryLoadResult
+Dictionary::load_en_dictionary(const std::filesystem::path &path,
+                               const DictionaryLoadLimits &limits,
+                               LoadBudget &budget, std::size_t &loaded) {
+  loaded = 0;
+  const bool hunspell_format = path.extension() == ".dic";
+  bool header_seen = !hunspell_format;
+  std::optional<std::uint64_t> declared_count;
+  std::uint64_t observed_count = 0;
+  const BoundedReadResult read = read_bounded_lines(
+      path, limits, budget.aggregate_bytes, budget.lines,
+      [&](const std::string &line, std::size_t line_number) {
+        if (hunspell_format && line_number == 0) {
+          std::string_view header{line};
+          while (!header.empty() &&
+                 (header.back() == '\r' || header.back() == ' ')) {
+            header.remove_suffix(1);
+          }
+          std::uint64_t parsed_count = 0;
+          const auto parsed = std::from_chars(
+              header.data(), header.data() + header.size(), parsed_count);
+          if (header.empty() || parsed.ec != std::errc{} ||
+              parsed.ptr != header.data() + header.size()) {
+            return DictionaryLoadResult::Malformed;
+          }
+          if (parsed_count > limits.max_entries) {
+            return DictionaryLoadResult::Oversize;
+          }
+          declared_count = parsed_count;
+          header_seen = true;
+          return DictionaryLoadResult::Ok;
+        }
+
+        ++observed_count;
+
+        std::string word = hunspell_format ? extract_word(line) : line;
+        while (!word.empty() && (word.back() == '\r' || word.back() == ' ')) {
+          word.pop_back();
+        }
+        while (!word.empty() && word.front() == ' ') {
+          word.erase(0, 1);
+        }
+
+        if (word.size() < kDictMinWordLen || word.size() > kDictMaxWordLen ||
+            !is_ascii_alpha_only(word)) {
+          return DictionaryLoadResult::Ok;
+        }
+        if (budget.entries >= limits.max_entries) {
+          return DictionaryLoadResult::Oversize;
+        }
+        const std::string lower = to_lowercase_ascii(word);
+        en_hashes_.push_back(Hasher::hash_string(lower));
+        en_bloom_.add(lower);
+        ++budget.entries;
+        ++loaded;
+        return DictionaryLoadResult::Ok;
+      });
+
+  if (read.result != DictionaryLoadResult::Ok) {
+    return read.result;
   }
-
-  std::string line;
-  std::size_t count = 0;
-
-  // Резервируем память (wamerican-huge содержит ~300k слов)
-  if (en_hashes_.capacity() < 350000) {
-    en_hashes_.reserve(350000);
+  if (read.present && !header_seen) {
+    return DictionaryLoadResult::Malformed;
   }
-
-  // Определяем формат файла: hunspell (.dic) или plain text
-  bool is_hunspell = (path.find(".dic") != std::string::npos);
-
-  // Первая строка hunspell — количество слов, пропускаем
-  if (is_hunspell) {
-    std::getline(file, line);
+  if (read.present && declared_count && *declared_count != observed_count) {
+    return DictionaryLoadResult::Malformed;
   }
-
-  while (std::getline(file, line)) {
-    std::string word = is_hunspell ? extract_word(line) : line;
-
-    // Убираем пробелы в начале/конце
-    while (!word.empty() &&
-           (word.back() == '\r' || word.back() == '\n' || word.back() == ' ')) {
-      word.pop_back();
-    }
-    while (!word.empty() && (word.front() == ' ')) {
-      word.erase(0, 1);
-    }
-
-    // Фильтруем по длине и содержимому
-    if (word.size() >= kDictMinWordLen && word.size() <= kDictMaxWordLen &&
-        is_ascii_alpha_only(word)) {
-      std::string lower = to_lowercase_ascii(word);
-
-      // Вычисляем хеш и добавляем в структуры
-      std::uint64_t hash = Hasher::hash_string(lower);
-      en_hashes_.push_back(hash);
-      en_bloom_.add(lower);
-
-      ++count;
-    }
-  }
-
-  return count;
+  return DictionaryLoadResult::Ok;
 }
 
-std::size_t Dictionary::load_ru_dictionary(const std::string &path) {
-  std::ifstream file(path);
-  if (!file.is_open()) {
-    // Не логируем ошибку — словарь может быть опциональным
-    return 0;
-  }
+DictionaryLoadResult
+Dictionary::load_ru_dictionary(const std::filesystem::path &path,
+                               const DictionaryLoadLimits &limits,
+                               LoadBudget &budget, std::size_t &loaded) {
+  loaded = 0;
+  const bool hunspell_format = path.extension() == ".dic";
+  bool header_seen = !hunspell_format;
+  std::optional<std::uint64_t> declared_count;
+  std::uint64_t observed_count = 0;
+  const BoundedReadResult read = read_bounded_lines(
+      path, limits, budget.aggregate_bytes, budget.lines,
+      [&](const std::string &line, std::size_t line_number) {
+        if (hunspell_format && line_number == 0) {
+          std::string_view header{line};
+          while (!header.empty() &&
+                 (header.back() == '\r' || header.back() == ' ')) {
+            header.remove_suffix(1);
+          }
+          std::uint64_t parsed_count = 0;
+          const auto parsed = std::from_chars(
+              header.data(), header.data() + header.size(), parsed_count);
+          if (header.empty() || parsed.ec != std::errc{} ||
+              parsed.ptr != header.data() + header.size()) {
+            return DictionaryLoadResult::Malformed;
+          }
+          if (parsed_count > limits.max_entries) {
+            return DictionaryLoadResult::Oversize;
+          }
+          declared_count = parsed_count;
+          header_seen = true;
+          return DictionaryLoadResult::Ok;
+        }
 
-  std::string line;
-  std::size_t count = 0;
+        ++observed_count;
 
-  // Резервируем память (типичный RU словарь ~150k слов)
-  if (ru_hashes_.capacity() < 200000) {
-    ru_hashes_.reserve(200000);
-  }
+        std::string word = hunspell_format ? extract_word(line) : line;
+        while (!word.empty() && (word.back() == '\r' || word.back() == ' ')) {
+          word.pop_back();
+        }
+        while (!word.empty() && word.front() == ' ') {
+          word.erase(0, 1);
+        }
+        if (!is_cyrillic_alpha_only(word)) {
+          return DictionaryLoadResult::Ok;
+        }
 
-  // Определяем формат файла: hunspell (.dic) или plain text
-  bool is_hunspell = (path.find(".dic") != std::string::npos);
-
-  // Первая строка hunspell — количество слов, пропускаем
-  if (is_hunspell) {
-    std::getline(file, line);
-  }
-
-  while (std::getline(file, line)) {
-    std::string word = is_hunspell ? extract_word(line) : line;
-
-    // Убираем пробелы в начале/конце
-    while (!word.empty() &&
-           (word.back() == '\r' || word.back() == '\n' || word.back() == ' ')) {
-      word.pop_back();
-    }
-    while (!word.empty() && (word.front() == ' ')) {
-      word.erase(0, 1);
-    }
-
-    // Фильтруем по длине (в символах UTF-8 это примерно word.size()/2)
-    if (word.size() >= kDictMinWordLen * 2 &&
-        word.size() <= kDictMaxWordLen * 2) {
-      std::string qwerty = cyrillic_to_qwerty(word);
-
-      // Проверяем, что конвертация прошла успешно
-      if (qwerty.size() >= kDictMinWordLen &&
-          qwerty.size() <= kDictMaxWordLen) {
-        // Вычисляем хеш и добавляем в структуры
-        std::uint64_t hash = Hasher::hash_string(qwerty);
-        ru_hashes_.push_back(hash);
+        const std::string qwerty = cyrillic_to_qwerty(word);
+        if (qwerty.size() < kDictMinWordLen ||
+            qwerty.size() > kDictMaxWordLen) {
+          return DictionaryLoadResult::Ok;
+        }
+        if (budget.entries >= limits.max_entries) {
+          return DictionaryLoadResult::Oversize;
+        }
+        ru_hashes_.push_back(Hasher::hash_string(qwerty));
         ru_bloom_.add(qwerty);
+        ++budget.entries;
+        ++loaded;
+        return DictionaryLoadResult::Ok;
+      });
 
-        ++count;
-      }
-    }
+  if (read.result != DictionaryLoadResult::Ok) {
+    return read.result;
   }
-
-  return count;
+  if (read.present && !header_seen) {
+    return DictionaryLoadResult::Malformed;
+  }
+  if (read.present && declared_count && *declared_count != observed_count) {
+    return DictionaryLoadResult::Malformed;
+  }
+  return DictionaryLoadResult::Ok;
 }
 
 bool Dictionary::initialize() {
+  return initialize_bounded(DictionaryLoadSpec::system_default()) ==
+         DictionaryLoadResult::Ok;
+}
+
+DictionaryLoadResult
+Dictionary::initialize_bounded(const DictionaryLoadSpec &spec) {
   if (initialized_) {
-    return true;
+    return DictionaryLoadResult::Ok;
+  }
+  if (spec.limits.max_file_bytes == 0 || spec.limits.max_aggregate_bytes == 0 ||
+      spec.limits.max_line_bytes == 0 || spec.limits.max_entries == 0) {
+    return DictionaryLoadResult::Oversize;
   }
 
+  en_bloom_.clear();
+  ru_bloom_.clear();
+  en_hashes_.clear();
+  ru_hashes_.clear();
+#ifdef HAVE_HUNSPELL
+  hunspell_en_.reset();
+  hunspell_ru_.reset();
+#endif
+  hunspell_available_ = false;
+
+  LoadBudget budget;
   std::size_t fallback_en_count = 0;
   std::size_t fallback_ru_count = 0;
 
+  const auto fail = [this](DictionaryLoadResult result) {
+    en_bloom_.clear();
+    ru_bloom_.clear();
+    en_hashes_.clear();
+    ru_hashes_.clear();
 #ifdef HAVE_HUNSPELL
-  // Инициализируем Hunspell для проверки словоформ (падежи, склонения, времена)
-  std::ifstream test_en(kEnAffPath);
-  std::ifstream test_ru(kRuAffPath);
+    hunspell_en_.reset();
+    hunspell_ru_.reset();
+#endif
+    hunspell_available_ = false;
+    initialized_ = false;
+    return result;
+  };
 
-  if (test_en.good()) {
-    try {
-      hunspell_en_ = std::make_unique<Hunspell>(kEnAffPath, kEnDicPathHunspell);
-      std::cerr << "[punto] Hunspell EN loaded (with word forms support)\n";
-    } catch (...) {
-      std::cerr << "[punto] Hunspell EN init failed\n";
-    }
-  }
+#ifdef HAVE_HUNSPELL
+  const auto validate_hunspell_pair =
+      [&](const std::optional<std::filesystem::path> &affix,
+          const std::optional<std::filesystem::path> &dictionary, bool english,
+          std::unique_ptr<Hunspell> &destination) {
+        if (!affix || !dictionary) {
+          return DictionaryLoadResult::Ok;
+        }
 
-  if (test_ru.good()) {
-    try {
-      hunspell_ru_ = std::make_unique<Hunspell>(kRuAffPath, kRuDicPathHunspell);
-      std::cerr << "[punto] Hunspell RU loaded (with word forms support)\n";
-    } catch (...) {
-      std::cerr << "[punto] Hunspell RU init failed\n";
-    }
-  }
+        const BoundedReadResult affix_read = read_bounded_lines(
+            *affix, spec.limits, budget.aggregate_bytes, budget.lines,
+            [](const std::string &, std::size_t) {
+              return DictionaryLoadResult::Ok;
+            });
+        if (affix_read.result != DictionaryLoadResult::Ok) {
+          return affix_read.result;
+        }
 
-  hunspell_available_ = (hunspell_en_ != nullptr || hunspell_ru_ != nullptr);
-  if (hunspell_available_) {
-    std::cerr << "[punto] Hunspell enabled: full word forms support (cases, "
-                 "declensions, tenses)\n";
+        bool header_seen = false;
+        std::optional<std::uint64_t> declared_count;
+        std::uint64_t observed_count = 0;
+        std::uint64_t usable_count = 0;
+        const BoundedReadResult dictionary_read = read_bounded_lines(
+            *dictionary, spec.limits, budget.aggregate_bytes, budget.lines,
+            [&](const std::string &line, std::size_t line_number) {
+              if (line_number != 0) {
+                ++observed_count;
+                std::string word = extract_word(line);
+                while (!word.empty() &&
+                       (word.back() == '\r' || word.back() == ' ')) {
+                  word.pop_back();
+                }
+                while (!word.empty() && word.front() == ' ') {
+                  word.erase(0, 1);
+                }
+                const bool usable = english
+                                        ? word.size() >= kDictMinWordLen &&
+                                              word.size() <= kDictMaxWordLen &&
+                                              is_ascii_alpha_only(word)
+                                        : is_cyrillic_alpha_only(word);
+                if (usable) {
+                  ++usable_count;
+                }
+                return DictionaryLoadResult::Ok;
+              }
+              std::string_view header{line};
+              while (!header.empty() &&
+                     (header.back() == '\r' || header.back() == ' ')) {
+                header.remove_suffix(1);
+              }
+              std::uint64_t parsed_count = 0;
+              const auto parsed = std::from_chars(
+                  header.data(), header.data() + header.size(), parsed_count);
+              if (header.empty() || parsed.ec != std::errc{} ||
+                  parsed.ptr != header.data() + header.size()) {
+                return DictionaryLoadResult::Malformed;
+              }
+              if (parsed_count > spec.limits.max_entries) {
+                return DictionaryLoadResult::Oversize;
+              }
+              declared_count = parsed_count;
+              header_seen = true;
+              return DictionaryLoadResult::Ok;
+            });
+        if (dictionary_read.result != DictionaryLoadResult::Ok) {
+          return dictionary_read.result;
+        }
+        if (!affix_read.present || !dictionary_read.present) {
+          return DictionaryLoadResult::Ok;
+        }
+        if (!header_seen) {
+          return DictionaryLoadResult::Malformed;
+        }
+        if (!declared_count || *declared_count != observed_count) {
+          return DictionaryLoadResult::Malformed;
+        }
+        if (*declared_count == 0 || usable_count == 0) {
+          return DictionaryLoadResult::Ok;
+        }
+
+        try {
+          destination =
+              std::make_unique<Hunspell>(affix->c_str(), dictionary->c_str());
+        } catch (...) {
+          return DictionaryLoadResult::IoError;
+        }
+        return DictionaryLoadResult::Ok;
+      };
+
+  DictionaryLoadResult result = validate_hunspell_pair(
+      spec.english_affix, spec.english_hunspell_dictionary, true, hunspell_en_);
+  if (result != DictionaryLoadResult::Ok) {
+    return fail(result);
   }
+  result = validate_hunspell_pair(spec.russian_affix,
+                                  spec.russian_hunspell_dictionary, false,
+                                  hunspell_ru_);
+  if (result != DictionaryLoadResult::Ok) {
+    return fail(result);
+  }
+  hunspell_available_ = hunspell_en_ != nullptr || hunspell_ru_ != nullptr;
 #endif
 
-  // Загружаем все доступные английские словари (для hash-based fallback)
-  for (const char *path : kEnDictPaths) {
-    std::size_t loaded = load_en_dictionary(path);
-    if (loaded > 0) {
-      std::cerr << "[punto] Loaded EN dict: " << path << " (+" << loaded
-                << " words)\n";
-      fallback_en_count += loaded;
+  for (const auto &path : spec.english_paths) {
+    std::size_t loaded = 0;
+    const DictionaryLoadResult result =
+        load_en_dictionary(path, spec.limits, budget, loaded);
+    if (result != DictionaryLoadResult::Ok) {
+      return fail(result);
     }
+    fallback_en_count += loaded;
+  }
+  for (const auto &path : spec.russian_paths) {
+    std::size_t loaded = 0;
+    const DictionaryLoadResult result =
+        load_ru_dictionary(path, spec.limits, budget, loaded);
+    if (result != DictionaryLoadResult::Ok) {
+      return fail(result);
+    }
+    fallback_ru_count += loaded;
   }
 
-  // Загружаем все доступные русские словари (для hash-based fallback)
-  for (const char *path : kRuDictPaths) {
-    std::size_t loaded = load_ru_dictionary(path);
-    if (loaded > 0) {
-      std::cerr << "[punto] Loaded RU dict: " << path << " (+" << loaded
-                << " words)\n";
-      fallback_ru_count += loaded;
-    }
-  }
-
-  // Загружаем встроенные IT-термины (docker, kubernetes, etc)
-  std::size_t it_count = 0;
   for (const char *term : kBuiltinITTerms) {
-    std::string word_str(term);
-    if (word_str.size() >= kDictMinWordLen &&
-        word_str.size() <= kDictMaxWordLen) {
-      std::string lower = to_lowercase_ascii(word_str);
-      std::uint64_t hash = Hasher::hash_string(lower);
-      en_hashes_.push_back(hash);
-      en_bloom_.add(lower);
-      ++it_count;
+    const std::string word{term};
+    if (word.size() < kDictMinWordLen || word.size() > kDictMaxWordLen) {
+      continue;
     }
-  }
-  if (it_count > 0) {
-    std::cerr << "[punto] Loaded built-in IT terms: +" << it_count
-              << " words\n";
+    if (budget.entries >= spec.limits.max_entries) {
+      return fail(DictionaryLoadResult::Oversize);
+    }
+    const std::string lower = to_lowercase_ascii(word);
+    en_hashes_.push_back(Hasher::hash_string(lower));
+    en_bloom_.add(lower);
+    ++budget.entries;
   }
 
-  // Сортируем и удаляем дубликаты после загрузки всех словарей
   finalize_hashes();
-
-  initialized_ =
-      (fallback_en_count > 0 || fallback_ru_count > 0 || hunspell_available_);
+  bool english_ready = fallback_en_count > 0;
+  bool russian_ready = fallback_ru_count > 0;
+#ifdef HAVE_HUNSPELL
+  english_ready = english_ready || hunspell_en_ != nullptr;
+  russian_ready = russian_ready || hunspell_ru_ != nullptr;
+#endif
+  initialized_ = english_ready && russian_ready;
+  if (!initialized_) {
+    return fail(DictionaryLoadResult::NoUsableSource);
+  }
 
   std::cerr << "[punto] Dictionary: EN=" << en_hashes_.size()
             << " RU=" << ru_hashes_.size() << " unique words (hash-based)\n";
-  std::cerr << "[punto] Bloom fill: EN="
-            << static_cast<int>(en_bloom_.fill_ratio() * 100)
-            << "% RU=" << static_cast<int>(ru_bloom_.fill_ratio() * 100)
-            << "%\n";
-  std::cerr << "[punto] Hash memory: EN=" << (en_hashes_.size() * 8 / 1024)
-            << "KB RU=" << (ru_hashes_.size() * 8 / 1024) << "KB\n";
-
-  return initialized_;
+  return DictionaryLoadResult::Ok;
 }
-
 void Dictionary::finalize_hashes() {
   // Сортируем хеши для бинарного поиска
   std::sort(en_hashes_.begin(), en_hashes_.end());
@@ -500,7 +781,8 @@ DictResult Dictionary::lookup(std::span<const KeyEntry> entries) const {
 #endif
 
   // Приоритет 2: Hash-based проверка (fallback)
-  std::uint64_t h1, h2;
+  std::uint64_t h1 = 0;
+  std::uint64_t h2 = 0;
   Hasher::hash_entries_double(entries, h1, h2);
 
   if (h1 == 0) {

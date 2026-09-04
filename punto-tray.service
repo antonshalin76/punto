@@ -1,0 +1,15 @@
+[Unit]
+Description=Punto Switcher system tray
+PartOf=graphical-session.target
+After=graphical-session.target
+StartLimitIntervalSec=30s
+StartLimitBurst=3
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/punto-tray
+TimeoutStartSec=10s
+TimeoutStopSec=5s
+KillMode=control-group
+Restart=on-failure
+RestartSec=2s

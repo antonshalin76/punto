@@ -4,21 +4,22 @@
  */
 
 #include "punto/event_loop.hpp"
-#include "punto/key_entry_text.hpp"
 #include "punto/logger.hpp"
-#include "punto/macro_lock.hpp"
 #include "punto/scancode_map.hpp"
-#include "punto/sound_manager.hpp"
-#include "punto/text_processor.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
-#include <cstring>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <mutex>
 #include <poll.h>
 #include <thread>
 #include <unistd.h>
@@ -27,67 +28,115 @@ namespace punto {
 
 namespace {
 
-struct OneshotPasteWaits {
-  std::chrono::microseconds pre_paste;
-  std::chrono::microseconds post_paste;
-  std::chrono::microseconds after_backspace;
-};
-
-[[nodiscard]] constexpr OneshotPasteWaits
-oneshot_paste_waits(bool is_terminal) noexcept {
-  if (is_terminal) {
-    return {
-        /*pre_paste=*/std::chrono::microseconds{150000},
-        /*post_paste=*/std::chrono::microseconds{250000},
-        /*after_backspace=*/std::chrono::microseconds{60000},
-    };
-  }
-
-  return {
-      /*pre_paste=*/std::chrono::microseconds{100000},
-      // В некоторых приложениях (особенно IDE) обработка paste может быть
-      // асинхронной. Даем больше времени, чтобы не восстановить CLIPBOARD
-      // слишком рано.
-      /*post_paste=*/std::chrono::microseconds{250000},
-      // FIX: Для GUI-приложений тоже нужна пауза после Backspace, иначе Paste
-      // может прийти до фактического удаления символов (гонка).
-      /*after_backspace=*/std::chrono::microseconds{25000},
-  };
-}
-
 constexpr std::uint64_t kTaskIdFenceStride = 1024;
 constexpr auto kControlPlanePollInterval = std::chrono::seconds{2};
+constexpr auto kRuntimeShutdownDeadline = std::chrono::seconds{3};
+constexpr auto kOutputWriteTimeout = std::chrono::seconds{2};
+
+class ShutdownDeadlineGuard {
+public:
+  ShutdownDeadlineGuard(std::chrono::milliseconds timeout, const char *phase)
+      : state_{std::make_shared<State>()}, watcher_{[state = state_, timeout] {
+          std::unique_lock<std::mutex> lock{state->mutex};
+          if (state->cv.wait_for(lock, timeout,
+                                 [&state] { return state->complete; })) {
+            return;
+          }
+          // The timed-out phase may own every runtime lock, including an
+          // iostream or a full stderr pipe. _Exit is the only bounded action.
+          std::_Exit(3);
+        }} {}
+
+  ShutdownDeadlineGuard(const ShutdownDeadlineGuard &) = delete;
+  ShutdownDeadlineGuard &operator=(const ShutdownDeadlineGuard &) = delete;
+
+  ~ShutdownDeadlineGuard() { complete(); }
+
+  void complete() noexcept {
+    if (!state_) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock{state_->mutex};
+      state_->complete = true;
+    }
+    state_->cv.notify_all();
+    if (watcher_.joinable()) {
+      watcher_.join();
+    }
+    state_.reset();
+  }
+
+private:
+  struct State {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool complete = false;
+  };
+
+  std::shared_ptr<State> state_;
+  std::thread watcher_;
+};
+
+template <typename Function>
+bool run_shutdown_phase(const char *name, Function &&function) noexcept {
+  try {
+    ShutdownDeadlineGuard deadline{kRuntimeShutdownDeadline, name};
+    try {
+      std::forward<Function>(function)();
+      deadline.complete();
+      return true;
+    } catch (...) {
+      deadline.complete();
+      return false;
+    }
+  } catch (...) {
+    // Diagnostics are deliberately omitted here: even write(2) can block on
+    // a full pipe, defeating the shutdown guarantee.
+    std::_Exit(3);
+  }
+}
 
 enum class ReadEventStatus {
   Ok,
   Eof,
   Again,
+  Truncated,
   Error,
 };
 
-ReadEventStatus read_input_event(int fd, input_event &ev) {
-  auto *dst = reinterpret_cast<std::uint8_t *>(&ev);
-  std::size_t total = 0;
-
-  while (total < sizeof(ev)) {
-    const ssize_t n = ::read(fd, dst + total, sizeof(ev) - total);
-    if (n > 0) {
-      total += static_cast<std::size_t>(n);
-      continue;
-    }
-    if (n == 0) {
-      return total == 0 ? ReadEventStatus::Eof : ReadEventStatus::Error;
-    }
-    if (errno == EINTR) {
-      continue;
-    }
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-      return total == 0 ? ReadEventStatus::Again : ReadEventStatus::Error;
-    }
+ReadEventStatus
+read_input_event(int fd, input_event &ev,
+                 std::span<std::uint8_t, sizeof(input_event)> frame,
+                 std::size_t &frame_size) {
+  if (frame_size >= frame.size()) {
+    frame_size = 0;
+    errno = EOVERFLOW;
     return ReadEventStatus::Error;
   }
 
-  return ReadEventStatus::Ok;
+  const ssize_t n =
+      ::read(fd, frame.data() + frame_size, frame.size() - frame_size);
+  if (n > 0) {
+    frame_size += static_cast<std::size_t>(n);
+    if (frame_size != frame.size()) {
+      return ReadEventStatus::Again;
+    }
+    std::memcpy(&ev, frame.data(), sizeof(ev));
+    frame_size = 0;
+    return ReadEventStatus::Ok;
+  }
+  if (n == 0) {
+    if (frame_size == 0) {
+      return ReadEventStatus::Eof;
+    }
+    frame_size = 0;
+    return ReadEventStatus::Truncated;
+  }
+  if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+    return ReadEventStatus::Again;
+  }
+  return ReadEventStatus::Error;
 }
 
 void drain_fd(int fd) {
@@ -108,24 +157,9 @@ void drain_fd(int fd) {
   }
 }
 
-bool path_within(const std::filesystem::path &child,
-                 const std::filesystem::path &parent) {
-  auto child_it = child.begin();
-  auto parent_it = parent.begin();
-
-  for (; parent_it != parent.end(); ++parent_it, ++child_it) {
-    if (child_it == child.end() || *child_it != *parent_it) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
 std::string trim_newline(std::string value) {
-  while (!value.empty() &&
-         (value.back() == '\n' || value.back() == '\r' ||
-          value.back() == '\0')) {
+  while (!value.empty() && (value.back() == '\n' || value.back() == '\r' ||
+                            value.back() == '\0')) {
     value.pop_back();
   }
   return value;
@@ -133,130 +167,423 @@ std::string trim_newline(std::string value) {
 
 bool is_numeric_component(std::string_view value) {
   return !value.empty() &&
-         std::all_of(value.begin(), value.end(), [](unsigned char ch) {
-           return std::isdigit(ch) != 0;
-         });
+         std::all_of(value.begin(), value.end(),
+                     [](unsigned char ch) { return std::isdigit(ch) != 0; });
 }
 
-std::string read_proc_comm(pid_t pid) {
-  std::ifstream input{"/proc/" + std::to_string(pid) + "/comm"};
-  if (!input.is_open()) {
+std::string read_proc_comm_bounded(const std::filesystem::path &path) {
+  const int fd =
+      ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
+  if (fd < 0) {
     return {};
   }
-
-  std::string comm;
-  std::getline(input, comm);
-  return trim_newline(std::move(comm));
+  std::array<char, 64> bytes{};
+  const ssize_t count = ::read(fd, bytes.data(), bytes.size());
+  const int saved_errno = errno;
+  ::close(fd);
+  errno = saved_errno;
+  if (count <= 0 || static_cast<std::size_t>(count) == bytes.size()) {
+    return {};
+  }
+  return trim_newline(
+      std::string{bytes.data(), static_cast<std::size_t>(count)});
 }
 
-std::size_t count_running_punto_daemons() {
-  const std::string self_comm = read_proc_comm(::getpid());
-  std::size_t count = 0;
+ConfigLoadOutcome config_load_failure(std::filesystem::path path,
+                                      ConfigResult result,
+                                      std::string message) {
+  ConfigLoadOutcome outcome;
+  outcome.used_path = std::move(path);
+  outcome.result = result;
+  outcome.error = std::move(message);
+  return outcome;
+}
 
-  std::error_code ec;
-  for (const auto &entry : std::filesystem::directory_iterator("/proc", ec)) {
-    if (ec) {
-      break;
+ConfigLoadOutcome load_config_from_authorized_roots(
+    const std::filesystem::path &system_root,
+    const std::optional<std::filesystem::path> &user_root,
+    const std::string &requested_path) {
+  const std::filesystem::path system_path{std::string{kConfigPath}};
+  if (!requested_path.empty()) {
+    const std::filesystem::path requested{requested_path};
+    const std::array<std::optional<std::filesystem::path>, 2> roots{system_root,
+                                                                    user_root};
+    for (const auto &root : roots) {
+      if (!root) {
+        continue;
+      }
+      RestrictedConfigLoadOutcome candidate =
+          load_config_beneath_checked(*root, requested);
+      if (!candidate.path_allowed) {
+        continue;
+      }
+      if (candidate.load.result == ConfigResult::FileNotFound) {
+        return config_load_failure(requested, ConfigResult::InvalidValue,
+                                   "Invalid path");
+      }
+      return std::move(candidate.load);
     }
+    return config_load_failure(requested, ConfigResult::InvalidValue,
+                               "Invalid path");
+  }
 
-    const std::string pid_name = entry.path().filename().string();
-    if (!is_numeric_component(pid_name)) {
-      continue;
+  if (user_root) {
+    RestrictedConfigLoadOutcome user =
+        load_config_beneath_checked(*user_root, *user_root / "config.yaml");
+    if (!user.path_allowed) {
+      return config_load_failure(*user_root / "config.yaml",
+                                 ConfigResult::InvalidValue, "Invalid path");
     }
-
-    std::ifstream input{entry.path() / "comm"};
-    if (!input.is_open()) {
-      continue;
-    }
-
-    std::string comm;
-    std::getline(input, comm);
-    comm = trim_newline(std::move(comm));
-
-    if (comm == "punto-daemon" || (!self_comm.empty() && comm == self_comm)) {
-      ++count;
+    if (user.load.result != ConfigResult::FileNotFound) {
+      return std::move(user.load);
     }
   }
 
-  return std::max<std::size_t>(count, 1);
+  RestrictedConfigLoadOutcome system =
+      load_config_beneath_checked(system_root, system_path);
+  if (!system.path_allowed) {
+    return config_load_failure(system_path, ConfigResult::InvalidValue,
+                               "Invalid path");
+  }
+  return std::move(system.load);
+}
+
+bool path_is_beneath(const std::filesystem::path &path,
+                     const std::filesystem::path &root) {
+  const std::filesystem::path relative =
+      path.lexically_normal().lexically_relative(root.lexically_normal());
+  if (relative.empty()) {
+    return false;
+  }
+  const auto first = relative.begin();
+  return first != relative.end() && *first != "..";
+}
+
+bool same_config_authority(const X11SessionInfo &left,
+                           const X11SessionInfo &right) noexcept {
+  return left.session_id == right.session_id &&
+         left.username == right.username && left.uid == right.uid &&
+         left.gid == right.gid && left.home_dir == right.home_dir &&
+         left.xdg_config_home == right.xdg_config_home;
+}
+
+DictionaryLoadOutcome load_system_dictionary() {
+  DictionaryLoadOutcome outcome;
+  auto dictionary = std::make_unique<Dictionary>();
+  outcome.result =
+      dictionary->initialize_bounded(DictionaryLoadSpec::system_default());
+  if (outcome.result == DictionaryLoadResult::Ok) {
+    outcome.dictionary = std::move(dictionary);
+  }
+  return outcome;
+}
+
+const char *dictionary_load_result_name(DictionaryLoadResult result) noexcept {
+  switch (result) {
+  case DictionaryLoadResult::Ok:
+    return "ok";
+  case DictionaryLoadResult::NoUsableSource:
+    return "no-source";
+  case DictionaryLoadResult::Oversize:
+    return "oversize";
+  case DictionaryLoadResult::Malformed:
+    return "malformed";
+  case DictionaryLoadResult::IoError:
+    return "io-error";
+  }
+  return "unknown";
 }
 
 } // namespace
 
-EventLoop::EventLoop(Config config)
-    : config_{std::make_shared<Config>(std::move(config))},
-      analyzer_{std::make_shared<LayoutAnalyzer>(config_->auto_switch)} {
-  ipc_enabled_.store(config_->auto_switch.enabled, std::memory_order_relaxed);
-  history_.set_max_words(config_->auto_switch.max_rollback_words);
+std::size_t event_loop_detail::count_running_punto_daemons(
+    const std::filesystem::path &proc_root, std::size_t max_numeric_candidates,
+    std::chrono::milliseconds time_budget) {
+  const std::string self_comm = read_proc_comm_bounded(proc_root / "self/comm");
+  const auto deadline = std::chrono::steady_clock::now() + time_budget;
+  const std::size_t conservative_fallback = std::max<std::size_t>(
+      std::thread::hardware_concurrency(), static_cast<unsigned int>(1));
+  std::size_t candidates = 0;
+  std::size_t count = 0;
+
+  std::error_code error;
+  for (const auto &entry :
+       std::filesystem::directory_iterator(proc_root, error)) {
+    if (error) {
+      return std::max(count, conservative_fallback);
+    }
+    const std::string pid_name = entry.path().filename().string();
+    if (!is_numeric_component(pid_name)) {
+      continue;
+    }
+    if (candidates >= max_numeric_candidates ||
+        std::chrono::steady_clock::now() >= deadline) {
+      return std::max(count, conservative_fallback);
+    }
+    ++candidates;
+
+    const std::string comm = read_proc_comm_bounded(entry.path() / "comm");
+    if (comm == "punto-daemon" || (!self_comm.empty() && comm == self_comm)) {
+      ++count;
+    }
+  }
+  if (error) {
+    return std::max(count, conservative_fallback);
+  }
+  return std::max<std::size_t>(count, 1);
 }
 
-EventLoop::~EventLoop() = default;
+EventLoop::EventLoop(Config config, X11Session::ProbeFunction x11_probe,
+                     ConfigLoaderFunction config_loader,
+                     DictionaryLoaderFunction dictionary_loader)
+    : config_{std::make_shared<Config>(std::move(config))},
+      x11_session_{std::make_unique<X11Session>(std::move(x11_probe))},
+      config_loader_state_{std::make_shared<ConfigLoaderState>()},
+      dictionary_loader_state_{std::make_shared<DictionaryLoaderState>()} {
+  config_loader_state_->loader =
+      config_loader ? std::move(config_loader)
+                    : ConfigLoaderFunction{load_config_from_authorized_roots};
+  dictionary_loader_state_->loader =
+      dictionary_loader ? std::move(dictionary_loader)
+                        : DictionaryLoaderFunction{load_system_dictionary};
+}
+
+EventLoop::~EventLoop() { shutdown_runtime(); }
 
 void EventLoop::set_stop_signal_fd(int fd) noexcept { stop_signal_fd_ = fd; }
+
+bool EventLoop::start_config_loader() noexcept {
+  if (config_loader_thread_.joinable()) {
+    return true;
+  }
+  try {
+    const auto state = config_loader_state_;
+    config_loader_thread_ = std::thread{[state] {
+      while (true) {
+        ConfigLoadTask task;
+        {
+          std::unique_lock<std::mutex> lock{state->mutex};
+          state->condition.wait(lock, [&] {
+            return state->stop_requested || state->request.has_value();
+          });
+          if (state->stop_requested) {
+            state->exited = true;
+            state->condition.notify_all();
+            return;
+          }
+          task = std::move(*state->request);
+          state->request.reset();
+        }
+
+        ConfigLoadOutcome outcome;
+        bool used_promotion_fallback = false;
+        try {
+          outcome = state->loader(task.system_root, task.user_root,
+                                  task.requested_path);
+          if (task.promotion_reconciliation && !task.requested_path.empty() &&
+              outcome.result != ConfigResult::Ok) {
+            used_promotion_fallback = true;
+            outcome = state->loader(task.system_root, task.user_root, {});
+          }
+        } catch (...) {
+          outcome =
+              config_load_failure(task.requested_path, ConfigResult::IoError,
+                                  "Config loader failure");
+        }
+
+        {
+          std::lock_guard<std::mutex> lock{state->mutex};
+          if (state->stop_requested) {
+            state->exited = true;
+            state->condition.notify_all();
+            return;
+          }
+          state->completion = ConfigLoadCompletion{
+              std::move(task), std::move(outcome), used_promotion_fallback};
+        }
+        state->condition.notify_all();
+      }
+    }};
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool EventLoop::stop_config_loader(std::chrono::milliseconds timeout) noexcept {
+  const auto state = config_loader_state_;
+  if (!state || !config_loader_thread_.joinable()) {
+    return true;
+  }
+  {
+    std::lock_guard<std::mutex> lock{state->mutex};
+    state->stop_requested = true;
+    state->request.reset();
+  }
+  state->condition.notify_all();
+
+  bool exited = false;
+  {
+    std::unique_lock<std::mutex> lock{state->mutex};
+    exited =
+        state->condition.wait_for(lock, timeout, [&] { return state->exited; });
+  }
+  if (exited) {
+    config_loader_thread_.join();
+  } else {
+    config_loader_thread_.detach();
+  }
+  return exited;
+}
+
+bool EventLoop::start_dictionary_loader() noexcept {
+  if (dictionary_loader_thread_.joinable()) {
+    return true;
+  }
+  try {
+    const auto state = dictionary_loader_state_;
+    dictionary_load_pending_ = true;
+    dictionary_loader_thread_ = std::thread{[state] {
+      DictionaryLoadOutcome outcome;
+      try {
+        outcome = state->loader();
+      } catch (...) {
+        outcome.result = DictionaryLoadResult::IoError;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock{state->mutex};
+        if (!state->stop_requested) {
+          state->completion = std::move(outcome);
+        }
+        state->exited = true;
+      }
+      state->condition.notify_all();
+    }};
+    return true;
+  } catch (...) {
+    dictionary_load_pending_ = false;
+    return false;
+  }
+}
+
+bool EventLoop::stop_dictionary_loader(
+    std::chrono::milliseconds timeout) noexcept {
+  const auto state = dictionary_loader_state_;
+  if (!state || !dictionary_loader_thread_.joinable()) {
+    return true;
+  }
+  {
+    std::lock_guard<std::mutex> lock{state->mutex};
+    state->stop_requested = true;
+  }
+  state->condition.notify_all();
+
+  bool exited = false;
+  {
+    std::unique_lock<std::mutex> lock{state->mutex};
+    exited =
+        state->condition.wait_for(lock, timeout, [&] { return state->exited; });
+  }
+  if (exited) {
+    dictionary_loader_thread_.join();
+  } else {
+    dictionary_loader_thread_.detach();
+  }
+  return exited;
+}
+
+void EventLoop::poll_dictionary_load_completion() {
+  std::optional<DictionaryLoadOutcome> completion;
+  {
+    std::lock_guard<std::mutex> lock{dictionary_loader_state_->mutex};
+    if (dictionary_loader_state_->completion) {
+      completion = std::move(dictionary_loader_state_->completion);
+      dictionary_loader_state_->completion.reset();
+    }
+  }
+  if (!completion) {
+    return;
+  }
+
+  dictionary_load_pending_ = false;
+  if (completion->result != DictionaryLoadResult::Ok ||
+      !completion->dictionary || !completion->dictionary->is_ready()) {
+    const DictionaryLoadResult failure =
+        completion->result == DictionaryLoadResult::Ok
+            ? DictionaryLoadResult::IoError
+            : completion->result;
+    analysis_health_.fail();
+    exit_code_ = exit_code_ == 0 ? 2 : exit_code_;
+    std::cerr << "[punto] FATAL: dictionary initialization failed: "
+              << dictionary_load_result_name(failure) << "\n";
+    request_stop();
+    return;
+  }
+
+  dictionary_ =
+      std::shared_ptr<const Dictionary>{std::move(completion->dictionary)};
+  analysis_pool_ = std::make_unique<AnalysisWorkerPool>(*dictionary_);
+  analysis_pool_->start(analysis_thread_budget_.worker_threads);
+  analysis_health_.mark_progress();
+  std::cerr << "[punto] Analysis pool ready with dictionary\n";
+}
 
 bool EventLoop::initialize() {
   if (initialized_) {
     return true;
   }
 
-  // Создаём минимальный KeyInjector из текущего снапшота конфига.
-  // Важно: reload_config() может заменить его на новый.
-  {
-    auto injector = std::make_shared<KeyInjector>();
-    injector->set_wait_func(
-        [this](std::chrono::microseconds us) { this->wait_and_buffer(us); });
-
-    std::shared_ptr<const KeyInjector> injector_const = injector;
-    std::atomic_store(&injector_, std::move(injector_const));
-  }
-
-  // Инициализируем словарь для гибридного анализа
-  if (!dict_.initialize()) {
-    std::cerr << "[punto] FATAL: no dictionaries available\n";
+  if (!start_config_loader()) {
     exit_code_ = 2;
     return false;
   }
 
-  // Инициализируем X11 сессию
-  x11_session_ = std::make_unique<X11Session>();
-  bool x11_ok = x11_session_->initialize();
-
-  // После X11 инициализации можем вычислить реальный $HOME активного
-  // пользователя и перечитать ~/.config/... (если существует).
-  {
-    IpcResult res = reload_config();
-    if (!res.success) {
-      std::cerr << "[punto] Warning: initial config reload failed: "
-                << res.message << "\n";
-    }
+  if (!start_dictionary_loader()) {
+    exit_code_ = 2;
+    analysis_health_.fail();
+    return false;
   }
 
-  control_plane_primary_.store(control_plane_lease_.try_acquire(),
-                               std::memory_order_release);
-  if (control_plane_primary_.load(std::memory_order_acquire)) {
-    {
-      std::lock_guard<std::mutex> lock(control_plane_mutex_);
-      shared_control_plane_state_ =
-          seed_control_plane_generations(shared_control_plane_state_);
-    }
+  const int output_flags = ::fcntl(STDOUT_FILENO, F_GETFL);
+  if (output_flags < 0 ||
+      (!(output_flags & O_NONBLOCK) &&
+       ::fcntl(STDOUT_FILENO, F_SETFL, output_flags | O_NONBLOCK) != 0)) {
+    exit_code_ = 3;
+    return false;
+  }
+
+  // Session/account discovery may enter NSS. It always starts on the bounded
+  // background refresh lane; keyboard passthrough and shutdown stay live.
+  x11_session_->start_background_refresh();
+  x11_refresh_pending_ = true;
+  x11_health_.degrade();
+
+  const bool control_plane_lease_acquired = control_plane_lease_.try_acquire();
+  const bool control_plane_ready = control_plane_lease_acquired &&
+                                   reconcile_control_plane_before_promotion();
+  control_plane_primary_.store(control_plane_ready, std::memory_order_release);
+  if (control_plane_ready) {
     std::cerr << "[punto] Control plane role: primary\n";
+  } else if (control_plane_lease_acquired) {
+    std::cerr << "[punto] Control plane role: promotion pending authoritative "
+                 "state\n";
   } else {
     std::cerr << "[punto] Control plane role: secondary\n";
     sync_control_plane_from_shared_state(/*force=*/true);
   }
 
-  // Применяем настройки истории (max_rollback_words) и поднимаем пул анализа.
+  // Compute the worker budget now; the pool starts only after the immutable
+  // dictionary snapshot reaches the event-loop thread.
   {
     auto cfg = std::atomic_load(&config_);
-    history_.set_max_words(cfg->auto_switch.max_rollback_words);
-
     analysis_thread_budget_ = compute_analysis_thread_budget(
-        std::thread::hardware_concurrency(), count_running_punto_daemons(),
+        std::thread::hardware_concurrency(),
+        event_loop_detail::count_running_punto_daemons(),
         cfg->runtime.analysis_threads,
         cfg->runtime.max_analysis_threads_per_daemon);
 
-    analysis_pool_.start(analysis_thread_budget_.worker_threads);
-    std::cerr << "[punto] Analysis pool: "
+    std::cerr << "[punto] Analysis pool budget: "
               << analysis_thread_budget_.worker_threads << " threads ("
               << (analysis_thread_budget_.manual_override ? "fixed" : "auto")
               << ", daemons=" << analysis_thread_budget_.daemon_count
@@ -264,37 +591,16 @@ bool EventLoop::initialize() {
               << cfg->runtime.max_analysis_threads_per_daemon << ")\n";
   }
 
-  // SoundManager зависит от X11Session (uid/gid/env активного пользователя)
-  {
-    auto cfg = std::atomic_load(&config_);
-    std::atomic_store(&sound_manager_, std::make_shared<SoundManager>(
-                                           *x11_session_, cfg->sound));
-  }
-
-  if (!x11_ok) {
-    std::cerr << "[punto] Предупреждение: X11 сессия не инициализирована (нет "
-                 "активной "
-                 "user-сессии или недоступен DISPLAY/XAUTHORITY).\n"
-              << "[punto] Ожидается на экране логина: сервис автоматически "
-                 "перепривяжется после входа пользователя.\n";
-    const X11SessionInfo info = x11_session_->info();
-    if (!wayland_warning_emitted_ && !info.wayland_display.empty()) {
-      wayland_warning_emitted_ = true;
-      std::cerr << "[punto] WARN: Wayland session detected, layout switching "
-                   "disabled until X11 becomes available.\n";
-    }
-    // Не фатальная ошибка — базовая функциональность работает
-  } else {
-    // Создаём ClipboardManager
-    clipboard_ = std::make_unique<ClipboardManager>(*x11_session_);
-
-    // Определяем текущую раскладку
-    current_layout_ = x11_session_->get_current_keyboard_layout();
-    if (current_layout_ < 0) {
-      current_layout_ = 0; // По умолчанию английская
-    }
-    std::cerr << "[punto] Текущая раскладка: "
-              << (current_layout_ == 0 ? "EN" : "RU") << "\n";
+  std::cerr << "[punto] Предупреждение: X11-наблюдение пока недоступно "
+               "(нет активной user-сессии или недоступен "
+               "DISPLAY/XAUTHORITY).\n"
+            << "[punto] Наблюдение автоматически перепривяжется после "
+               "появления user-сессии.\n";
+  const X11SessionInfo info = x11_session_->info();
+  if (!wayland_warning_emitted_ && !info.wayland_display.empty()) {
+    wayland_warning_emitted_ = true;
+    std::cerr << "[punto] WARN: Wayland session detected, X11 layout "
+                 "observation unavailable until X11 appears.\n";
   }
 
   if (control_plane_primary_.load(std::memory_order_acquire)) {
@@ -305,8 +611,12 @@ bool EventLoop::initialize() {
       publish_control_plane_state(/*bump_config_generation=*/true,
                                   /*bump_status_generation=*/true);
     }
+  } else if (!start_primary_ipc_server()) {
+    std::cerr << "[punto] Warning: secondary diagnostic IPC server failed "
+                 "to start\n";
   } else {
-    std::cerr << "[punto] Secondary daemon: IPC served by primary process\n";
+    std::cerr << "[punto] Secondary daemon: primary control plus "
+                 "instance-local diagnostic IPC available\n";
   }
 
   initialized_ = true;
@@ -320,15 +630,10 @@ void EventLoop::request_stop() noexcept {
 int EventLoop::run() {
   if (!initialize()) {
     std::cerr << "[punto] Failed to initialize event loop\n";
-    return exit_code_ != 0 ? exit_code_ : 1;
+    return exit_code_ != 0 ? exit_code_ : 2;
   }
 
-  // Пытаемся синхронизировать раскладку на старте
-  sync_current_layout_from_os("startup");
   std::cerr << "[punto] Startup layout group: " << current_layout_ << "\n";
-  last_sync_time_ = std::chrono::steady_clock::now();
-
-  std::setbuf(stdout, nullptr);
 
   input_event ev{};
 
@@ -343,60 +648,43 @@ int EventLoop::run() {
   bool x11_wait_log_emitted = false;
 
   auto rebuild_x11_deps = [&]() {
-    // Смена GUI-сессии может менять источник конфигурации (~/.config/...)
-    // поэтому всегда делаем best-effort reload.
-    {
-      IpcResult res = reload_config();
-      if (!res.success) {
-        std::cerr << "[punto] Warning: config reload after X11 refresh failed: "
-                  << res.message << "\n";
-      }
-    }
-
-    // На новой сессии пробуем снова включить прямой XKB set.
-    xkb_set_available_ = true;
-    xkb_disabled_at_ = {};
+    // A GUI-session change may alter the authorized ~/.config source. Keep a
+    // generation-owned intent when another load is still in flight so the
+    // latest session is re-read after that obsolete work completes.
+    request_x11_config_reload();
 
     {
       const X11SessionInfo info = x11_session_->info();
+      if (info.observed_keyboard_layout == 0 ||
+          info.observed_keyboard_layout == 1) {
+        current_layout_ = info.observed_keyboard_layout;
+      }
       std::cerr << "[punto] X11 session: id=" << info.session_id
                 << " user=" << info.username << " display=" << info.display
                 << "\n";
     }
 
-    // Пересоздаём Clipboard/Sound (они завязаны на
-    // DISPLAY/XDG_RUNTIME_DIR/uid).
-    clipboard_ = std::make_unique<ClipboardManager>(*x11_session_);
-
-    auto cfg = std::atomic_load(&config_);
-    std::atomic_store(&sound_manager_, std::make_shared<SoundManager>(
-                                           *x11_session_, cfg->sound));
-
-    // Синхронизируем раскладку.
-    sync_current_layout_from_os("x11 refresh");
-    std::cerr << "[punto] X11 session refreshed, layout: "
+    std::cerr << "[punto] X11 observation refreshed, layout: "
               << (current_layout_ == 0 ? "EN" : "RU") << "\n";
-
-    last_sync_time_ = std::chrono::steady_clock::now();
-    layout_desynced_ = false;
+    x11_dependencies_ready_ = true;
     wayland_warning_emitted_ = false;
   };
 
   auto teardown_x11_deps = [&]() {
-    clipboard_.reset();
-    std::atomic_store(&sound_manager_, std::shared_ptr<SoundManager>{});
-    // Не трогаем current_layout_: оно используется как внутренний стейт,
-    // но без валидной X11-сессии операции set/get всё равно станут no-op.
+    x11_dependencies_ready_ = false;
+    ++x11_config_generation_;
+    pending_x11_config_generation_.reset();
+    // Keep the last observed layout for diagnostic analysis. The input path
+    // performs no X11 operations and never changes the desktop layout.
   };
 
   // Главный цикл: проверяем флаг остановки на каждой итерации
   while (!stop_requested_.load(std::memory_order_relaxed)) {
-    // Обслуживаем X11 selection ownership (clipboard/primary).
-    if (clipboard_) {
-      clipboard_->pump_events();
-    }
-    flush_pending_clipboard_restore(false);
-    maybe_handle_injector_failure("main loop");
+    poll_dictionary_load_completion();
+    poll_config_load_completion();
+    service_ipc_commands();
+    poll_config_load_completion();
+    observe_ipc_fatal();
     if (stop_requested_.load(std::memory_order_relaxed)) {
       break;
     }
@@ -414,7 +702,8 @@ int EventLoop::run() {
           if (!control_plane_primary_.load(std::memory_order_acquire)) {
             sync_control_plane_from_shared_state(/*force=*/false);
           }
-        } else if (!ipc_server_ || !ipc_server_->is_running()) {
+        } else if ((!ipc_server_ || !ipc_server_->is_running()) &&
+                   (!ipc_server_ || !ipc_server_->fatal_reason().has_value())) {
           // Primary без IPC (например, при промоушене сокет ещё держал
           // умирающий процесс) — иначе управление из трея потеряно навсегда.
           if (start_primary_ipc_server()) {
@@ -426,24 +715,46 @@ int EventLoop::run() {
       }
 
       // Запускаем фоновый refresh если пришло время и нет активного
-      if (!x11_refresh_pending_ && now - last_x11_check_time >= kX11CheckInterval) {
+      if (!x11_refresh_pending_ &&
+          now - last_x11_check_time >= kX11CheckInterval) {
         x11_session_->start_background_refresh();
         x11_refresh_pending_ = true;
       }
 
       // Проверяем результат фонового refresh (неблокирующий poll)
       if (x11_refresh_pending_) {
+        // A failed probe invalidates the session snapshot before the bounded
+        // retry sequence finishes. A later healthy commit publishes a fresh
+        // immutable observation snapshot.
+        if (!x11_session_->is_valid() && x11_dependencies_ready_) {
+          x11_health_.degrade();
+          teardown_x11_deps();
+        }
         auto result = x11_session_->poll_refresh_result();
         if (result.has_value()) {
           x11_refresh_pending_ = false;
           last_x11_check_time = now;
 
-          if (*result == X11Session::RefreshResult::Updated) {
+          if (*result == X11Session::RefreshResult::HealthyUpdated) {
+            x11_health_.ready();
+            x11_health_.mark_progress();
             rebuild_x11_deps();
-          } else if (*result == X11Session::RefreshResult::Invalidated) {
+          } else if (*result == X11Session::RefreshResult::HealthyUnchanged) {
+            x11_health_.ready();
+            x11_health_.mark_progress();
+            if (!x11_dependencies_ready_) {
+              rebuild_x11_deps();
+            }
+          } else if (*result == X11Session::RefreshResult::SessionAbsent) {
+            x11_health_.degrade();
             teardown_x11_deps();
             std::cerr
                 << "[punto] X11 session invalidated (no active user session)\n";
+          } else {
+            x11_health_.degrade();
+            teardown_x11_deps();
+            std::cerr << "[punto] X11 session probe failed; observation "
+                         "remains unavailable until a healthy refresh\n";
           }
         }
       }
@@ -462,20 +773,17 @@ int EventLoop::run() {
       const X11SessionInfo info = x11_session_->info();
       if (!wayland_warning_emitted_ && !info.wayland_display.empty()) {
         wayland_warning_emitted_ = true;
-        std::cerr << "[punto] WARN: Wayland session detected, layout "
-                     "switching disabled, analysis continues in read-only "
-                     "mode.\n";
+        std::cerr << "[punto] WARN: Wayland session detected, X11 layout "
+                     "observation unavailable; analysis remains read-only.\n";
       }
     } else {
       x11_wait_log_emitted = false;
       wayland_warning_emitted_ = false;
     }
 
-    // Важно: даже если пользователь перестал печатать, мы должны
-    // применять готовые результаты анализа (иначе автоинверсия может не
-    // сработать).
+    // Drain completed analysis even while input is idle so health and
+    // diagnostic counters stay current.
     process_ready_results();
-    maybe_handle_injector_failure("post-result processing");
     if (stop_requested_.load(std::memory_order_relaxed)) {
       break;
     }
@@ -503,33 +811,56 @@ int EventLoop::run() {
       // POLLHUP возникает когда udevmon закрывает пайп (остановка сервиса).
       // Если установлен POLLIN вместе с POLLHUP, сначала читаем оставшиеся
       // данные.
-      if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
-        // Если данных нет (только HUP/ERR), выходим из цикла
-        if (!(pfd.revents & POLLIN)) {
-          std::cerr << "[punto] stdin closed (revents=0x" << std::hex
-                    << pfd.revents << std::dec << "), exiting gracefully\n";
-          break;
+      if ((pfd.revents & (POLLERR | POLLNVAL)) && !(pfd.revents & POLLIN)) {
+        fail_input_pipeline();
+        exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
+        std::cerr << "[punto] stdin poll failure (revents=0x" << std::hex
+                  << pfd.revents << std::dec << ")\n";
+        break;
+      }
+      if ((pfd.revents & POLLHUP) && !(pfd.revents & POLLIN)) {
+        if (input_frame_size_ != 0 || !input_frame_accepts_.empty()) {
+          fail_input_pipeline();
+          exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
+          std::cerr << "[punto] stdin closed with an incomplete input frame\n";
+        } else {
+          std::cerr << "[punto] stdin closed, exiting gracefully\n";
         }
-        // Иначе сначала читаем оставшиеся данные, а выйдем на следующей
-        // итерации
+        break;
       }
 
       if (pfd.revents & POLLIN) {
-        switch (read_input_event(STDIN_FILENO, ev)) {
+        switch (read_input_event(STDIN_FILENO, ev, input_frame_bytes_,
+                                 input_frame_size_)) {
         case ReadEventStatus::Ok:
+          note_input_event_accepted(ev);
           handle_event(ev);
+          note_input_event_committed(ev);
           process_ready_results();
-          maybe_handle_injector_failure("stdin event processing");
           continue;
         case ReadEventStatus::Again:
           continue;
         case ReadEventStatus::Eof:
-          std::cerr << "[punto] stdin closed, exiting gracefully\n";
+          if (!input_frame_accepts_.empty()) {
+            fail_input_pipeline();
+            exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
+            std::cerr
+                << "[punto] stdin closed with an incomplete input frame\n";
+          } else {
+            std::cerr << "[punto] stdin closed, exiting gracefully\n";
+          }
+          stop_requested_.store(true, std::memory_order_relaxed);
+          continue;
+        case ReadEventStatus::Truncated:
+          fail_input_pipeline();
+          exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
+          std::cerr << "[punto] stdin closed with an incomplete input_event\n";
           stop_requested_.store(true, std::memory_order_relaxed);
           continue;
         case ReadEventStatus::Error:
         default:
-          exit_code_ = (exit_code_ == 0) ? 1 : exit_code_;
+          fail_input_pipeline();
+          exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
           std::cerr << "[punto] stdin read failed: " << std::strerror(errno)
                     << "\n";
           stop_requested_.store(true, std::memory_order_relaxed);
@@ -547,438 +878,244 @@ int EventLoop::run() {
         // Сигнал прервал poll — проверяем флаг остановки на следующей итерации
         continue;
       }
-      exit_code_ = (exit_code_ == 0) ? 1 : exit_code_;
+      exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
+      fail_input_pipeline();
       std::cerr << "[punto] poll failed: " << std::strerror(errno) << "\n";
       break;
     }
   }
 
+  shutdown_runtime();
   std::cerr << "[punto] Event loop terminated gracefully\n";
   return exit_code_;
 }
 
 void EventLoop::emit_passthrough_event(const input_event &ev) {
-  if (ev.type == EV_KEY) {
-    const ScanCode code = ev.code;
-    if (code < key_down_.size()) {
-      key_down_[code] = (ev.value != 0) ? 1U : 0U;
+  const auto *next = reinterpret_cast<const std::uint8_t *>(&ev);
+  std::size_t remaining = sizeof(ev);
+  const auto deadline = std::chrono::steady_clock::now() + kOutputWriteTimeout;
+
+  while (remaining > 0) {
+    const ssize_t written = ::write(STDOUT_FILENO, next, remaining);
+    if (written > 0) {
+      next += static_cast<std::size_t>(written);
+      remaining -= static_cast<std::size_t>(written);
+      continue;
     }
-  }
-
-  auto injector = std::atomic_load(&injector_);
-  if (!injector) {
-    return;
-  }
-  injector->emit_event(ev);
-  maybe_handle_injector_failure("passthrough");
-}
-
-void EventLoop::handle_event(const input_event &ev) {
-  // If we are processing a macro, buffer ALL events (including EV_SYN, EV_MSC)
-  if (is_processing_macro_.load(std::memory_order_acquire)) {
-    constexpr std::size_t kPendingEventsCap = 5000;
-    constexpr std::size_t kOverflowAbortThreshold = 4000; // 80% - прерываем макрос
-
-    // Проверяем порог аварийного прерывания
-    if (pending_events_.size() >= kOverflowAbortThreshold &&
-        !event_overflow_abort_requested_) {
-      event_overflow_abort_requested_ = true;
-      std::cerr << "[punto] ABORT: event queue near overflow ("
-                << pending_events_.size() << "/" << kPendingEventsCap
-                << "), aborting macro execution\n";
+    if (written < 0 && errno == EINTR) {
+      continue;
     }
-
-    if (pending_events_.size() < kPendingEventsCap) {
-      pending_events_.push_back(ev);
-    } else {
-      // Fail-fast на уровне логов: потеря событий ввода недопустима,
-      // но лучше деградировать, чем зависнуть.
-      static bool warned = false;
-      if (!warned) {
-        warned = true;
-        std::cerr << "[punto] Input Guard: pending_events overflow cap="
-                  << kPendingEventsCap << " (dropping input events)\n";
+    if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now < deadline) {
+        auto timeout = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now);
+        if (timeout.count() == 0) {
+          timeout = std::chrono::milliseconds{1};
+        }
+        pollfd descriptor{STDOUT_FILENO, POLLOUT, 0};
+        const int ready =
+            ::poll(&descriptor, 1,
+                   static_cast<int>(std::min<std::int64_t>(
+                       timeout.count(), std::numeric_limits<int>::max())));
+        if (ready > 0 && (descriptor.revents & POLLOUT)) {
+          continue;
+        }
+        if (ready < 0 && errno == EINTR) {
+          continue;
+        }
       }
     }
+
+    fail_input_pipeline();
+    exit_code_ = exit_code_ == 0 ? 3 : exit_code_;
+    request_stop();
+    return;
+  }
+}
+
+void EventLoop::note_input_event_accepted(const input_event &event) {
+  if (!input_read_frame_started_) {
+    const auto accepted_at = std::chrono::steady_clock::now();
+    input_frame_accepts_.push_back(accepted_at);
+    if (input_frame_accepts_.size() == 1) {
+      input_health_.begin(accepted_at);
+    }
+    input_read_frame_started_ = true;
+  }
+
+  if (event.type == EV_SYN && event.code == SYN_REPORT) {
+    input_read_frame_started_ = false;
+  }
+}
+
+void EventLoop::note_input_event_committed(const input_event &event) {
+  if (event.type != EV_SYN || event.code != SYN_REPORT) {
+    return;
+  }
+  if (input_frame_accepts_.empty()) {
+    fail_input_pipeline();
     return;
   }
 
+  input_frame_accepts_.pop_front();
+  input_health_.mark_progress();
+  if (input_frame_accepts_.empty()) {
+    input_health_.clear_in_flight();
+  } else {
+    input_health_.begin(input_frame_accepts_.front());
+  }
+}
+
+void EventLoop::fail_input_pipeline() noexcept { input_health_.fail(); }
+
+void EventLoop::handle_event(const input_event &ev) {
   if (ev.type != EV_KEY) {
     emit_passthrough_event(ev);
     return;
   }
 
   const ScanCode code = ev.code;
-  const bool is_release = (ev.value == 0);
-  const bool is_press = (ev.value == 1);
-  const bool is_repeat = (ev.value == 2);
-  const bool pressed = !is_release;
+  const bool is_release = ev.value == 0;
+  const bool is_repeat = ev.value == 2;
 
-  // Если мы перехватили Ctrl+Z и не отдали press наружу, то все последующие
-  // repeat/release для Z нужно проглотить (иначе приложение увидит release без
-  // press).
-  if (code == KEY_Z && swallow_z_until_release_) {
-    if (!pressed) {
-      swallow_z_until_release_ = false;
-    }
+  // Text mutation is intentionally unavailable until an application-bound
+  // acknowledgement exists. Swallow every Pause event independently so a
+  // release-only or repeat-only frame after restart cannot leak downstream.
+  if (code == KEY_PAUSE) {
     return;
   }
-
-  auto cfg = std::atomic_load(&config_);
-
-  // Применяем изменения max_rollback_words безопасно (только в main thread).
-  if (history_.max_words() != cfg->auto_switch.max_rollback_words) {
-    history_.set_max_words(cfg->auto_switch.max_rollback_words);
-    reset_async_state();
-  }
-
-  // =========================================================================
-  // Обновление состояния модификаторов
-  // =========================================================================
 
   if (is_modifier(code)) {
-    const bool hotkey_press = is_configured_layout_hotkey_press(code, is_press);
-    update_modifier_state(code, pressed);
+    update_modifier_state(code, !is_release);
     emit_passthrough_event(ev);
-    if (hotkey_press) {
-      arm_external_layout_sound(external_layout_sound_,
-                                std::chrono::steady_clock::now());
-      mark_layout_desynced("user layout hotkey");
-    }
-    maybe_complete_external_layout_hotkey(code, is_release);
     return;
   }
 
-  // =========================================================================
-  // Обрабатываем только нажатия/повторы (release пропускаем)
-  // =========================================================================
   if (is_release) {
     emit_passthrough_event(ev);
-    maybe_complete_external_layout_hotkey(code, true);
     return;
   }
 
-  // Повторы разделителей (SPACE/TAB) должны проходить в приложение,
-  // но не должны повторно запускать автоанализ/автозамену.
-  // Иначе возможны дубли пробела и рассинхронизация контекста слова.
   if (is_repeat && (code == KEY_SPACE || code == KEY_TAB)) {
     emit_passthrough_event(ev);
     return;
   }
 
-  // Ctrl+Z: Undo последнего исправления. Перехватываем только если:
-  //  - есть валидная запись последней коррекции;
-  //  - после неё не было другого ввода;
-  //  - прошло мало времени.
-  // Иначе Ctrl+Z пропускается в приложение как обычный системный хоткей.
-  if (code == KEY_Z && modifiers_.any_ctrl() && !modifiers_.any_alt() &&
-      !modifiers_.any_meta() && is_press) {
-    if (action_undo_last_correction()) {
-      swallow_z_until_release_ = true;
-      return;
-    }
+  auto cfg = std::atomic_load(&config_);
+
+  if (modifiers_.any_ctrl() || modifiers_.any_alt() || modifiers_.any_meta()) {
+    reset_async_state();
+    buffer_.reset_current();
+    emit_passthrough_event(ev);
+    return;
   }
-
-  // Любой key-press (кроме модификаторов) считаем "разрывом" для undo.
-  // Ctrl+Z обработан выше и сюда не попадает.
-  ++user_seq_;
-  last_undo_.reset();
-
-  // =========================================================================
-  // Backspace
-  // =========================================================================
 
   if (code == KEY_BACKSPACE) {
     buffer_.pop_char();
-    (void)history_.pop_token();
-
-    // Детектируем отмену коррекции (быстрые Backspace сразу после auto-fix)
-    if (undo_detector_.on_backspace(std::chrono::steady_clock::now())) {
-      std::cerr << "[punto] Undo detected! Word added to session exclusions\n";
-    }
-
     emit_passthrough_event(ev);
     return;
   }
-
-  // =========================================================================
-  // Горячие клавиши (PAUSE + модификаторы)
-  // =========================================================================
-
-  if (code == KEY_PAUSE) {
-    // По хоткею нужна реакция только на физическое нажатие.
-    // Повтор клавиши (EV_KEY value=2) может запускать макрос многократно,
-    // что временно ломает обработку ввода.
-    if (!is_press) {
-      emit_passthrough_event(ev);
-      return;
-    }
-    // Любой макрос по хоткею делает "переписывание" текста.
-    // Чтобы избежать гонок/рассинхронизации, сбрасываем async-состояние.
-    reset_async_state();
-    history_.reset();
-
-    auto action = determine_hotkey_action(code);
-
-    switch (action) {
-    case HotkeyAction::TranslitSelection:
-      action_transliterate_selection();
-      return;
-    case HotkeyAction::InvertLayoutSelection:
-      action_invert_layout_selection();
-      return;
-    case HotkeyAction::InvertCaseSelection:
-      action_invert_case_selection();
-      return;
-    case HotkeyAction::InvertCaseWord:
-      action_invert_case_word();
-      return;
-    case HotkeyAction::InvertLayoutWord:
-      action_invert_layout_word();
-      return;
-    case HotkeyAction::NoAction:
-      break;
-    }
-    return;
-  }
-
-  // =========================================================================
-  // Пользовательский hotkey переключения раскладки
-  // =========================================================================
-
-  if (is_configured_layout_hotkey_press(code, is_press)) {
-    reset_async_state();
-    history_.reset();
-    arm_external_layout_sound(external_layout_sound_,
-                              std::chrono::steady_clock::now());
-    mark_layout_desynced("user layout hotkey");
-    buffer_.reset_current();
-    emit_passthrough_event(ev);
-    return;
-  }
-
-  // =========================================================================
-  // Bypass для системных hotkeys (Ctrl+C, etc.)
-  // =========================================================================
-
-  if (modifiers_.any_ctrl() || modifiers_.any_alt() || modifiers_.any_meta()) {
-    // Системные хоткеи/комбинации потенциально меняют курсор/контекст.
-    // Для надёжности сбрасываем async-состояние.
-    reset_async_state();
-    history_.reset();
-
-    buffer_.reset_current();
-    emit_passthrough_event(ev);
-    return;
-  }
-
-  // =========================================================================
-  // Разделители слов (пробел, таб)
-  // =========================================================================
 
   if (code == KEY_SPACE || code == KEY_TAB) {
-    auto full_word = buffer_.current_word();
-
-    // 1. Синхронизируем раскладку (на каждом разделителе!)
-    if (!is_processing_macro_.load(std::memory_order_acquire)) {
-      sync_current_layout_from_os(code == KEY_SPACE ? "space boundary"
-                                                    : "tab boundary");
-    }
-
-    // 2. Очищаем слово от пунктуации для анализа
+    const auto full_word = buffer_.current_word();
     std::span<const KeyEntry> analysis_word = full_word;
     while (!analysis_word.empty()) {
-      ScanCode last = analysis_word.back().code;
+      const ScanCode last = analysis_word.back().code;
       if (last == KEY_DOT || last == KEY_COMMA || last == KEY_SEMICOLON ||
           last == KEY_APOSTROPHE || last == KEY_SLASH || last == KEY_MINUS) {
-        analysis_word = analysis_word.subspan(0, analysis_word.size() - 1);
+        analysis_word = analysis_word.first(analysis_word.size() - 1);
       } else {
         break;
       }
     }
 
-    // Сначала эмулируем ввод разделителя (чтобы ввод не тормозил).
-    history_.push_token(KeyEntry{code, false});
-    buffer_.commit_word();
-    buffer_.push_trailing(code);
+    // Physical input is committed before all analysis bookkeeping and never
+    // waits on X11 or configuration I/O.
     emit_passthrough_event(ev);
-
-    // Пустое слово (двойной пробел/таб) не анализируем.
+    buffer_.commit_word();
+    if (!buffer_.push_trailing(code)) {
+      reset_async_state();
+    }
     if (full_word.empty()) {
       return;
     }
 
-    // Каждому слову — свой task_id для строгого порядка применения.
     const std::uint64_t task_id = next_task_id_;
-
-    // Проверяем, включено ли автопереключение через IPC.
-    const bool ipc_enabled = ipc_enabled_.load(std::memory_order_relaxed);
-
-    if (!ipc_enabled || analysis_word.size() < cfg->auto_switch.min_word_len) {
-      WordResult res;
-      res.task_id = task_id;
-      res.need_switch = false;
-      res.word_len = full_word.size();
-      res.analysis_len = analysis_word.size();
-      res.layout_at_boundary = current_layout_;
-      ready_results_[task_id] = res;
+    if (!analysis_pool_ || !cfg->auto_switch.enabled ||
+        analysis_word.size() < cfg->auto_switch.min_word_len) {
+      WordResult result;
+      result.task_id = task_id;
+      result.word_len = full_word.size();
+      result.analysis_len = analysis_word.size();
+      result.layout_at_boundary = current_layout_;
+      ready_results_[task_id] = result;
+      analysis_accepted_at_[task_id] = std::chrono::steady_clock::now();
       lifetime_telemetry_.ready_results.store(ready_results_.size(),
                                               std::memory_order_relaxed);
       ++next_task_id_;
+      refresh_analysis_health_head();
       return;
     }
-
-    PendingWordMeta meta;
-    meta.task_id = task_id;
-    meta.word.assign(full_word.begin(), full_word.end());
-    meta.analysis_len = analysis_word.size();
-    meta.layout_at_boundary = current_layout_;
-    meta.boundary_at = std::chrono::steady_clock::now();
-
-    // Координаты: delimiter уже в истории.
-    const std::uint64_t delim_pos = history_.cursor_pos() - 1;
-    meta.end_pos = delim_pos;
-
-    if (meta.end_pos < meta.word.size()) {
-      // Не должно происходить, но fail-fast: не ставим задачу, чтобы не сломать
-      // sequencer.
-      WordResult res;
-      res.task_id = task_id;
-      res.need_switch = false;
-      res.word_len = meta.word.size();
-      res.analysis_len = meta.analysis_len;
-      res.layout_at_boundary = meta.layout_at_boundary;
-      ready_results_[task_id] = res;
-      lifetime_telemetry_.ready_results.store(ready_results_.size(),
-                                              std::memory_order_relaxed);
-      ++next_task_id_;
-      return;
-    }
-
-    meta.start_pos =
-        meta.end_pos - static_cast<std::uint64_t>(meta.word.size());
-
-    pending_words_[task_id] = meta;
-    lifetime_telemetry_.pending_words.store(pending_words_.size(),
-                                            std::memory_order_relaxed);
 
     WordTask task;
     task.task_id = task_id;
-    task.word = meta.word;
-    task.analysis_len = meta.analysis_len;
-    task.layout_at_boundary = meta.layout_at_boundary;
+    task.word.assign(full_word.begin(), full_word.end());
+    task.analysis_len = analysis_word.size();
+    task.layout_at_boundary = current_layout_;
     task.cfg = cfg->auto_switch;
-    if (!analysis_pool_.submit(std::move(task))) {
-      pending_words_.erase(task_id);
-      lifetime_telemetry_.pending_words.store(pending_words_.size(),
-                                              std::memory_order_relaxed);
+    const AnalysisAdmission admission = analysis_pool_->submit(std::move(task));
+    if (!admission.accepted) {
       return;
     }
+    analysis_accepted_at_[task_id] = admission.accepted_at;
     ++next_task_id_;
-
-    // Correction metadata is useful only inside the rollback window. Task
-    // terminality remains owned by AnalysisWorkerPool, so pruning metadata
-    // cannot create a sequencer hole even if analysis is stalled or fatal.
-    const std::uint64_t max_words =
-        static_cast<std::uint64_t>(cfg->auto_switch.max_rollback_words);
-    if (max_words > 0 && task_id + 1 > max_words) {
-      const std::uint64_t min_keep = (task_id + 1) - max_words;
-      for (auto it = pending_words_.begin(); it != pending_words_.end();) {
-        if (it->first < min_keep) {
-          it = pending_words_.erase(it);
-        } else {
-          ++it;
-        }
-      }
-      lifetime_telemetry_.pending_words.store(pending_words_.size(),
-                                              std::memory_order_relaxed);
-    }
-
+    refresh_analysis_health_head();
     return;
   }
 
   if (code == KEY_DOT || code == KEY_COMMA || code == KEY_SEMICOLON ||
       code == KEY_APOSTROPHE || code == KEY_SLASH || code == KEY_MINUS) {
-
-    // Синхронизируем раскладку (только синхронизация, без анализа)
-    if (!is_processing_macro_.load(std::memory_order_acquire)) {
-      sync_current_layout_from_os("punctuation");
-    }
-
+    emit_passthrough_event(ev);
     const bool was_overflowed = buffer_.current_overflowed();
     if (!buffer_.push_char(code, modifiers_.any_shift()) && !was_overflowed) {
-      std::cerr << "[punto] word too long, skipped\n";
+      reset_async_state();
     }
-    history_.push_token(KeyEntry{code, modifiers_.any_shift()});
-    emit_passthrough_event(ev);
     return;
   }
-
-  // =========================================================================
-  // Enter — полный сброс
-  // =========================================================================
 
   if (code == KEY_ENTER || code == KEY_KPENTER) {
     buffer_.reset_all();
-    history_.reset();
     reset_async_state();
-
     emit_passthrough_event(ev);
     return;
   }
-
-  // =========================================================================
-  // Буквенные клавиши
-  // =========================================================================
 
   if (is_letter_key(code)) {
     const bool was_overflowed = buffer_.current_overflowed();
     if (!buffer_.push_char(code, modifiers_.any_shift()) && !was_overflowed) {
-      std::cerr << "[punto] word too long, skipped\n";
+      reset_async_state();
     }
-    history_.push_token(KeyEntry{code, modifiers_.any_shift()});
-
-    // Сбрасываем счётчик backspace при наборе буквы
-    undo_detector_.on_key_typed();
-
     emit_passthrough_event(ev);
     return;
   }
-
-  // =========================================================================
-  // Навигационные клавиши — полный сброс буфера
-  // =========================================================================
 
   if (is_navigation_key(code)) {
     buffer_.reset_all();
-    history_.reset();
     reset_async_state();
-
     emit_passthrough_event(ev);
     return;
   }
-
-  // =========================================================================
-  // Функциональные клавиши — пропускаем без сброса
-  // =========================================================================
 
   if (is_function_key(code)) {
     emit_passthrough_event(ev);
     return;
   }
 
-  // =========================================================================
-  // Неизвестные клавиши — сброс текущего слова
-  // =========================================================================
-
   buffer_.reset_current();
-  // Неизвестная клавиша = потенциальный разрыв контекста.
-  history_.reset();
   reset_async_state();
-
   emit_passthrough_event(ev);
 }
-
 void EventLoop::update_modifier_state(ScanCode code, bool pressed) {
   switch (code) {
   case KEY_LEFTSHIFT:
@@ -1010,63 +1147,14 @@ void EventLoop::update_modifier_state(ScanCode code, bool pressed) {
   }
 }
 
-void EventLoop::reset_modifiers_state() {
-  // Сбрасываем флаги модификаторов
-  modifiers_.reset_all();
-
-  // Сбрасываем key_down_ для модификаторов
-  if (KEY_LEFTSHIFT < key_down_.size())
-    key_down_[KEY_LEFTSHIFT] = 0;
-  if (KEY_RIGHTSHIFT < key_down_.size())
-    key_down_[KEY_RIGHTSHIFT] = 0;
-  if (KEY_LEFTCTRL < key_down_.size())
-    key_down_[KEY_LEFTCTRL] = 0;
-  if (KEY_RIGHTCTRL < key_down_.size())
-    key_down_[KEY_RIGHTCTRL] = 0;
-  if (KEY_LEFTALT < key_down_.size())
-    key_down_[KEY_LEFTALT] = 0;
-  if (KEY_RIGHTALT < key_down_.size())
-    key_down_[KEY_RIGHTALT] = 0;
-  if (KEY_LEFTMETA < key_down_.size())
-    key_down_[KEY_LEFTMETA] = 0;
-  if (KEY_RIGHTMETA < key_down_.size())
-    key_down_[KEY_RIGHTMETA] = 0;
-}
-
-HotkeyAction EventLoop::determine_hotkey_action(ScanCode code) const {
-  if (code != KEY_PAUSE) {
-    return HotkeyAction::NoAction;
-  }
-
-  // LCtrl + LAlt + Pause = Transliterate
-  if (modifiers_.left_ctrl && modifiers_.left_alt) {
-    return HotkeyAction::TranslitSelection;
-  }
-
-  // Shift + Pause = Invert Layout Selection
-  if (modifiers_.any_shift()) {
-    return HotkeyAction::InvertLayoutSelection;
-  }
-
-  // Alt + Pause = Invert Case Selection
-  if (modifiers_.any_alt()) {
-    return HotkeyAction::InvertCaseSelection;
-  }
-
-  // Ctrl + Pause = Invert Case Word
-  if (modifiers_.any_ctrl()) {
-    return HotkeyAction::InvertCaseWord;
-  }
-
-  // Pause only = Invert Layout Word
-  return HotkeyAction::InvertLayoutWord;
-}
-
 void EventLoop::reset_async_state(bool bump_task_barrier) {
-  analysis_pool_.begin_new_epoch();
-  pending_words_.clear();
+  if (analysis_pool_) {
+    analysis_pool_->begin_new_epoch();
+  }
   ready_results_.clear();
-  clear_external_layout_sound(external_layout_sound_);
+  analysis_accepted_at_.clear();
+  analysis_health_.clear_in_flight();
+  analysis_health_.mark_progress();
 
   if (bump_task_barrier) {
     const std::uint64_t fence =
@@ -1077,149 +1165,234 @@ void EventLoop::reset_async_state(bool bump_task_barrier) {
     next_apply_task_id_ = next_task_id_;
   }
 
-  lifetime_telemetry_.pending_words.store(0, std::memory_order_relaxed);
   lifetime_telemetry_.ready_results.store(0, std::memory_order_relaxed);
 }
 
-void EventLoop::mark_layout_desynced(std::string_view reason) {
-  if (!layout_desynced_) {
-    std::cerr << "[punto] Layout marked desynced: " << reason << "\n";
+void EventLoop::refresh_analysis_health_head() {
+  if (analysis_pool_failed_) {
+    analysis_health_.fail();
+    return;
   }
-  layout_desynced_ = true;
-}
-
-bool EventLoop::is_configured_layout_hotkey_press(ScanCode code,
-                                                  bool is_press) const {
-  if (!is_press) {
-    return false;
-  }
-
-  auto cfg = std::atomic_load(&config_);
-  if (code != cfg->hotkey.key) {
-    return false;
-  }
-
-  switch (cfg->hotkey.modifier) {
-  case KEY_LEFTCTRL:
-    return modifiers_.left_ctrl;
-  case KEY_RIGHTCTRL:
-    return modifiers_.right_ctrl;
-  case KEY_LEFTALT:
-    return modifiers_.left_alt;
-  case KEY_RIGHTALT:
-    return modifiers_.right_alt;
-  case KEY_LEFTSHIFT:
-    return modifiers_.left_shift;
-  case KEY_RIGHTSHIFT:
-    return modifiers_.right_shift;
-  default:
-    return false;
-  }
-}
-
-bool EventLoop::is_configured_layout_hotkey_release(ScanCode code,
-                                                    bool is_release) const {
-  if (!is_release || !external_layout_sound_.pending) {
-    return false;
-  }
-
-  auto cfg = std::atomic_load(&config_);
-  return code == cfg->hotkey.key || code == cfg->hotkey.modifier;
-}
-
-void EventLoop::maybe_complete_external_layout_hotkey(ScanCode code,
-                                                      bool is_release) {
-  if (!is_configured_layout_hotkey_release(code, is_release)) {
+  if (!analysis_pool_) {
+    analysis_health_.clear_in_flight();
     return;
   }
 
-  sync_current_layout_from_os("user layout hotkey release");
-}
-
-int EventLoop::sync_layout_from_os() {
-  if (!x11_session_ || !x11_session_->is_valid()) {
-    return -1;
-  }
-
-  const int os_layout = x11_session_->get_current_keyboard_layout();
-  if ((os_layout == 0 || os_layout == 1) && os_layout != current_layout_) {
-    std::cerr << "[punto] Layout PRE-SYNC: " << current_layout_ << " -> "
-              << os_layout << "\n";
-    current_layout_ = os_layout;
-    last_sync_time_ = std::chrono::steady_clock::now();
-  }
-  if (os_layout == 0 || os_layout == 1) {
-    layout_desynced_ = false;
-  }
-  return os_layout;
-}
-
-void EventLoop::sync_current_layout_from_os(std::string_view reason) {
-  const int previous_layout = current_layout_;
-  const bool was_desynced = layout_desynced_;
-  const auto now = std::chrono::steady_clock::now();
-  const int os_layout = sync_layout_from_os();
-
-  if (external_layout_sound_expired(external_layout_sound_, now)) {
-    clear_external_layout_sound(external_layout_sound_);
-  }
-
-  if (os_layout == 0 || os_layout == 1) {
-    auto sound_manager = std::atomic_load(&sound_manager_);
-    if (should_play_external_layout_sound(external_layout_sound_, now,
-                                          previous_layout, os_layout) &&
-        sound_manager) {
-      sound_manager->play_for_layout(os_layout);
-      clear_external_layout_sound(external_layout_sound_);
-    }
-
-    if (was_desynced) {
-      std::cerr << "[punto] Layout resynced via " << reason << ": "
-                << os_layout << "\n";
-    }
-    layout_desynced_ = false;
+  const auto head = analysis_accepted_at_.find(next_apply_task_id_);
+  if (head == analysis_accepted_at_.end()) {
+    analysis_health_.clear_in_flight();
     return;
   }
-  if (!reason.empty()) {
-    mark_layout_desynced(reason);
-  }
+  analysis_health_.begin(head->second);
 }
 
-void EventLoop::maybe_handle_injector_failure(std::string_view context) {
-  auto injector = std::atomic_load(&injector_);
-  if (!injector || !injector->has_fatal_io_error()) {
-    return;
-  }
-
-  const int err = injector->fatal_io_errno();
-  injector->clear_fatal_io_error();
-  exit_code_ = (exit_code_ == 0) ? 1 : exit_code_;
-  std::cerr << "[punto] Fatal output I/O error in " << context
-            << ": errno=" << err << " (" << std::strerror(err) << ")\n";
-  request_stop();
+void EventLoop::commit_analysis_terminal(std::uint64_t task_id) {
+  analysis_accepted_at_.erase(task_id);
+  ++next_apply_task_id_;
+  analysis_health_.mark_progress();
+  refresh_analysis_health_head();
 }
 
 bool EventLoop::start_primary_ipc_server() {
-  if (ipc_server_ && ipc_server_->is_running()) {
-    return true;
+  const bool primary = control_plane_primary_.load(std::memory_order_acquire);
+  if (ipc_server_) {
+    if (ipc_server_->is_running()) {
+      if (!primary || !ipc_server_is_fallback_) {
+        return true;
+      }
+      ipc_server_->stop();
+      ipc_server_.reset();
+      ipc_server_is_fallback_ = false;
+    }
+    if (ipc_server_ && ipc_server_->fatal_reason().has_value()) {
+      return false;
+    }
+    if (ipc_server_) {
+      return ipc_server_->start();
+    }
   }
 
-  ipc_server_ = std::make_unique<IpcServer>(
-      ipc_enabled_,
-      [this](const std::string &path) { return reload_config(path); },
-      [this]() { return stats_report(); },
-      std::string{kIpcSocketPath},
-      [this](bool /*enabled*/) {
-        publish_control_plane_state(/*bump_config_generation=*/false,
-                                    /*bump_status_generation=*/true);
-      },
-      /*allow_fallback_sockets=*/false);
+  IpcServerOptions options;
+  if (primary) {
+    options.primary_socket_path = kIpcSocketPath;
+  } else {
+    const std::filesystem::path primary_path{kIpcSocketPath};
+    options.primary_socket_path =
+        (primary_path.parent_path() /
+         (primary_path.stem().string() + "-" + std::to_string(::getpid()) +
+          primary_path.extension().string()))
+            .string();
+    ipc_server_is_fallback_ = true;
+    options.endpoint_mode = IpcEndpointMode::DiagnosticReadOnly;
+  }
+  options.allow_fallback_sockets = false;
+  ipc_server_ = std::make_unique<IpcServer>(ipc_mailbox_, std::move(options));
 
   return ipc_server_->start();
 }
 
+IpcResult EventLoop::execute_ipc_command(const IpcRequest &request) {
+  switch (request.verb) {
+  case IpcVerb::GetStatus:
+    return {true, "DISABLED"};
+  case IpcVerb::SetStatus: {
+    if (request.argument != "0" && request.argument != "1") {
+      return {false, "Invalid status"};
+    }
+    if (request.argument == "1") {
+      return {false, "Text mutation disabled"};
+    }
+    return {true, "DISABLED"};
+  }
+  case IpcVerb::Reload:
+    return reload_config(request.argument);
+  case IpcVerb::Stats:
+    return stats_report();
+  case IpcVerb::Shutdown:
+    return {false, "Shutdown not allowed via IPC"};
+  }
+  return {false, "Unknown command"};
+}
+
+void EventLoop::service_ipc_commands() noexcept {
+  if (!ipc_mailbox_) {
+    return;
+  }
+
+  while (auto pending = ipc_mailbox_->try_dequeue()) {
+    IpcResult response;
+    try {
+      response = execute_ipc_command(pending->request);
+    } catch (...) {
+      response = {false, "Internal failure"};
+      exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
+      request_stop();
+    }
+
+    try {
+      pending->complete(std::move(response));
+    } catch (...) {
+      exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
+      request_stop();
+    }
+  }
+}
+
+void EventLoop::cancel_ipc_commands_for_shutdown() noexcept {
+  if (!ipc_mailbox_) {
+    return;
+  }
+  while (auto pending = ipc_mailbox_->try_dequeue()) {
+    try {
+      pending->complete({false, "Shutting down"});
+    } catch (...) {
+      exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
+    }
+  }
+}
+
+void EventLoop::observe_ipc_fatal() noexcept {
+  if (!ipc_server_) {
+    return;
+  }
+  const auto fatal = ipc_server_->fatal_reason();
+  if (!fatal.has_value()) {
+    return;
+  }
+  if (!ipc_fatal_reported_) {
+    ipc_fatal_reported_ = true;
+    std::cerr << "[punto] Fatal IPC server failure: reason="
+              << static_cast<int>(*fatal) << "\n";
+  }
+  exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
+  request_stop();
+}
+
+void EventLoop::shutdown_runtime() noexcept {
+  if (runtime_shutdown_started_) {
+    return;
+  }
+  runtime_shutdown_started_ = true;
+  try {
+    if (analysis_pool_) {
+      analysis_pool_->close_admission();
+    }
+  } catch (...) {
+    exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
+  }
+
+  if (ipc_mailbox_ && !run_shutdown_phase("ipc-admission", [this] {
+        if (!ipc_mailbox_->close(std::chrono::milliseconds{2800})) {
+          std::_Exit(3);
+        }
+        // Do not execute state-changing commands after shutdown owns
+        // admission. Complete the bounded mailbox with an explicit terminal
+        // response so the poller can finish its response/descriptor barrier.
+        cancel_ipc_commands_for_shutdown();
+      })) {
+    std::_Exit(3);
+  }
+
+  if (ipc_server_ &&
+      !run_shutdown_phase("ipc-poller", [this] { ipc_server_->stop(); })) {
+    std::_Exit(3);
+  }
+  observe_ipc_fatal();
+
+  if (!run_shutdown_phase("config-loader", [this] {
+        if (!stop_config_loader(std::chrono::milliseconds{2800})) {
+          // The loader may be blocked in a filesystem implementation and can
+          // still execute yaml-cpp/libc code. Avoid concurrent static teardown.
+          std::_Exit(3);
+        }
+      })) {
+    std::_Exit(3);
+  }
+
+  if (!run_shutdown_phase("dictionary-loader", [this] {
+        if (!stop_dictionary_loader(std::chrono::milliseconds{2800})) {
+          std::_Exit(3);
+        }
+      })) {
+    std::_Exit(3);
+  }
+
+  if (x11_session_ && !run_shutdown_phase("x11-refresh", [this] {
+        if (!x11_session_->shutdown_background_refresh(
+                std::chrono::milliseconds{2800})) {
+          // A timed-out probe was detached and may still run process-static
+          // library code. Do not execute destructors concurrently with it.
+          std::_Exit(3);
+        }
+      })) {
+    std::_Exit(3);
+  }
+
+  if (analysis_pool_ && !run_shutdown_phase("analysis-workers", [this] {
+        analysis_pool_->stop();
+      })) {
+    std::_Exit(3);
+  }
+  try {
+    WordResult terminal;
+    if (analysis_pool_) {
+      while (analysis_pool_->try_pop_result(terminal)) {
+        analysis_accepted_at_.erase(terminal.task_id);
+      }
+    }
+    analysis_accepted_at_.clear();
+    analysis_health_.clear_in_flight();
+  } catch (...) {
+    exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
+  }
+  ipc_server_.reset();
+}
+
 void EventLoop::publish_control_plane_state(bool bump_config_generation,
                                             bool bump_status_generation) {
+  if (!control_plane_primary_.load(std::memory_order_acquire)) {
+    return;
+  }
   auto cfg = std::atomic_load(&config_);
 
   // Мьютекс обязателен: publish вызывается и из main-потока (initialize,
@@ -1228,9 +1401,16 @@ void EventLoop::publish_control_plane_state(bool bump_config_generation,
   std::lock_guard<std::mutex> lock(control_plane_mutex_);
 
   SharedControlPlaneState next = shared_control_plane_state_;
-  next.enabled = ipc_enabled_.load(std::memory_order_relaxed);
+  next.enabled = false;
   next.config_path = cfg ? cfg->config_path.string() : std::string{};
 
+  if ((bump_config_generation &&
+       next.config_generation == std::numeric_limits<std::uint64_t>::max()) ||
+      (bump_status_generation &&
+       next.status_generation == std::numeric_limits<std::uint64_t>::max())) {
+    std::cerr << "[punto] Warning: control-plane generation exhausted\n";
+    return;
+  }
   if (bump_config_generation) {
     next.config_generation += 1;
   }
@@ -1246,6 +1426,88 @@ void EventLoop::publish_control_plane_state(bool bump_config_generation,
   shared_control_plane_state_ = next;
   applied_config_generation_ = next.config_generation;
   applied_status_generation_ = next.status_generation;
+}
+
+bool EventLoop::reconcile_control_plane_before_promotion() {
+  // The lease is already held here, so a previous primary can no longer
+  // publish. Keep the externally visible role secondary until its last safe
+  // snapshot has actually been applied; otherwise a stale daemon can reuse the
+  // same generation and permanently split its peers.
+  if (config_load_pending_) {
+    return false;
+  }
+
+  SharedControlPlaneState authoritative;
+  if (!read_shared_control_plane_state(authoritative)) {
+    return true;
+  }
+
+  std::uint64_t applied_config = 0;
+  {
+    std::lock_guard<std::mutex> lock(control_plane_mutex_);
+    shared_control_plane_state_ = authoritative;
+    applied_config = applied_config_generation_;
+    applied_status_generation_ = authoritative.status_generation;
+  }
+
+  const auto cfg = std::atomic_load(&config_);
+  const std::string current_config_path =
+      cfg ? cfg->config_path.string() : std::string{};
+  const std::filesystem::path system_root{"/etc/punto"};
+  std::optional<std::filesystem::path> user_root;
+  if (x11_session_) {
+    auto session_lease = x11_session_->acquire_write_lease();
+    if (session_lease) {
+      const X11SessionInfo &info = session_lease->info();
+      if (!info.xdg_config_home.empty()) {
+        user_root = std::filesystem::path{info.xdg_config_home} / "punto";
+      } else if (!info.home_dir.empty()) {
+        user_root = std::filesystem::path{info.home_dir} / ".config" / "punto";
+      }
+    }
+  }
+  const auto path_allowed = [&system_root,
+                             &user_root](const std::string &raw_path) {
+    if (raw_path.empty()) {
+      return true;
+    }
+    const std::filesystem::path path{raw_path};
+    if (!path.is_absolute()) {
+      return false;
+    }
+    const std::filesystem::path normalized = path.lexically_normal();
+    return path_is_beneath(normalized, system_root) ||
+           (user_root && path_is_beneath(normalized, *user_root));
+  };
+  const bool authoritative_path_allowed =
+      path_allowed(authoritative.config_path);
+  const bool current_path_allowed =
+      !current_config_path.empty() && path_allowed(current_config_path);
+  const bool authority_fallback_applied =
+      promotion_fallback_applied_generation_ &&
+      *promotion_fallback_applied_generation_ ==
+          authoritative.config_generation;
+  const ControlPlanePromotionAction action = plan_control_plane_promotion(
+      authoritative, applied_config, current_config_path,
+      authoritative_path_allowed, current_path_allowed,
+      authority_fallback_applied);
+  if (action == ControlPlanePromotionAction::Ready) {
+    return true;
+  }
+
+  const std::string reload_path =
+      action == ControlPlanePromotionAction::ReloadAuthoritativePath
+          ? authoritative.config_path
+          : std::string{};
+  const IpcResult reload =
+      reload_config(reload_path, authoritative.config_generation, std::nullopt,
+                    /*promotion_reconciliation=*/true);
+  if (!reload.success) {
+    std::cerr << "[punto] Warning: control-plane promotion reconciliation "
+                 "deferred: "
+              << reload.message << "\n";
+  }
+  return false;
 }
 
 void EventLoop::sync_control_plane_from_shared_state(bool force) {
@@ -1273,7 +1535,7 @@ void EventLoop::sync_control_plane_from_shared_state(bool force) {
   const bool status_changed = force || next.status_generation != applied_status;
 
   if (config_changed) {
-    IpcResult res = reload_config(next.config_path);
+    IpcResult res = reload_config(next.config_path, next.config_generation);
     if (!res.success) {
       std::cerr << "[punto] Warning: shared control-plane config sync failed: "
                 << res.message << "\n";
@@ -1281,14 +1543,7 @@ void EventLoop::sync_control_plane_from_shared_state(bool force) {
     }
   }
 
-  if (status_changed) {
-    ipc_enabled_.store(next.enabled, std::memory_order_relaxed);
-  }
-
   std::lock_guard<std::mutex> lock(control_plane_mutex_);
-  if (config_changed) {
-    applied_config_generation_ = next.config_generation;
-  }
   if (status_changed) {
     applied_status_generation_ = next.status_generation;
   }
@@ -1304,2055 +1559,390 @@ void EventLoop::maybe_promote_to_control_plane_primary() {
     return;
   }
 
+  if (!reconcile_control_plane_before_promotion()) {
+    return;
+  }
+
   control_plane_primary_.store(true, std::memory_order_release);
   std::cerr << "[punto] Control plane failover: promoted to primary\n";
   if (!start_primary_ipc_server()) {
     // Не фатально: main loop будет ретраить запуск IPC в control-plane poll.
-    std::cerr << "[punto] Warning: promoted primary failed to start IPC server\n";
+    std::cerr
+        << "[punto] Warning: promoted primary failed to start IPC server\n";
     return;
   }
   publish_control_plane_state(/*bump_config_generation=*/true,
                               /*bump_status_generation=*/true);
 }
 
-bool EventLoop::verify_clipboard_ownership() const {
-  if (!clipboard_) {
-    return false;
-  }
-  return clipboard_->verify_ownership();
-}
-
-void EventLoop::switch_layout(bool play_sound) {
-  auto cfg = std::atomic_load(&config_);
-  auto injector = std::atomic_load(&injector_);
-  if (!injector) {
-    mark_layout_desynced("missing injector");
-    return;
-  }
-
-  // Эмулируем нажатие горячей клавиши (fallback).
-  injector->send_layout_hotkey(cfg->hotkey.modifier, cfg->hotkey.key);
-  maybe_handle_injector_failure("layout hotkey");
-  if (stop_requested_.load(std::memory_order_relaxed)) {
-    return;
-  }
-
-  const int previous_layout = current_layout_;
-  sync_current_layout_from_os("hotkey toggle");
-  if (layout_desynced_) {
-    current_layout_ = previous_layout;
-    return;
-  }
-
-  last_sync_time_ = std::chrono::steady_clock::now();
-  if (play_sound) {
-    if (auto sound_manager = std::atomic_load(&sound_manager_)) {
-      sound_manager->play_for_layout(current_layout_);
-    }
-  }
-}
-
-bool EventLoop::set_layout(int target_layout, bool play_sound) {
-  if (target_layout != 0 && target_layout != 1) {
-    return false;
-  }
-
-  sync_current_layout_from_os("set_layout pre-check");
-
-  if (!layout_desynced_ && current_layout_ == target_layout) {
-    return true;
-  }
-
-  // Периодическая ре-проверка XKB: если был отключён, но прошло достаточно
-  // времени — пробуем снова. Это нужно для восстановления после гонок при
-  // старте нескольких экземпляров punto-daemon.
-  constexpr auto kXkbRetryInterval = std::chrono::seconds{10};
-  if (!xkb_set_available_ && x11_session_ && x11_session_->is_valid()) {
-    const auto now = std::chrono::steady_clock::now();
-    if (xkb_disabled_at_.time_since_epoch().count() == 0 ||
-        now - xkb_disabled_at_ >= kXkbRetryInterval) {
-      std::cerr << "[punto] XKB set: re-enabling after "
-                << std::chrono::duration_cast<std::chrono::seconds>(
-                       now - xkb_disabled_at_)
-                       .count()
-                << "s\n";
-      xkb_set_available_ = true;
-    }
-  }
-
-  // Примечание: XKB LockGroup отключён, т.к. при нескольких экземплярах
-  // punto-daemon возникает гонка — один устанавливает раскладку, другой
-  // перезаписывает. Используем только hotkey fallback (эмуляция нажатия).
-  //
-  // Если нужно включить XKB set, раскомментируйте блок ниже.
-  /*
-  if (xkb_set_available_ && x11_session_ && x11_session_->is_valid()) {
-    bool ok = x11_session_->set_keyboard_layout(target_layout);
-
-    if (ok) {
-      current_layout_ = target_layout;
-      last_sync_time_ = std::chrono::steady_clock::now();
-
-      if (play_sound && sound_manager_) {
-        sound_manager_->play_for_layout(current_layout_);
-      }
-
-      return true;
-    }
-
-    std::cerr
-        << "[punto] Layout SET via XKB did not apply, trying hotkey fallback\n";
-  }
-  */
-
-  // Fallback: hotkey toggle (работает только если 2 раскладки).
-  // Используется если XKB не доступен ИЛИ если XKB set не сработал.
-  if (target_layout == 0 || target_layout == 1) {
-    // Если уже в нужной раскладке — ничего не делаем
-    if (!layout_desynced_ && current_layout_ == target_layout) {
-      return true;
-    }
-
-    // Hotkey переключает раскладку (toggle)
-    switch_layout(play_sound);
-    if (layout_desynced_) {
-      return false;
-    }
-    return current_layout_ == target_layout;
-  }
-
-  return false;
-}
-
-std::optional<int>
-EventLoop::maybe_switch_layout_to_en_for_terminal_paste(bool is_terminal) {
-  if (!is_terminal) {
-    return std::nullopt;
-  }
-
-  // 0 = EN, 1 = RU. По умолчанию используем текущий внутренний стейт,
-  // но если есть валидная X11-сессия — уточняем у ОС.
-  int before = current_layout_;
-
-  if (x11_session_ && x11_session_->is_valid()) {
-    const int os_layout = x11_session_->get_current_keyboard_layout();
-    if (os_layout == 0 || os_layout == 1) {
-      before = os_layout;
-    }
-  }
-
-  if (before == 0) {
-    return std::nullopt;
-  }
-  if (before != 1) {
-    // Неизвестное значение — не меняем раскладку.
-    return std::nullopt;
-  }
-
-  // В терминалах Ctrl+Shift+V может быть чувствителен к раскладке,
-  // поэтому временно ставим EN.
-  (void)set_layout(/*target_layout=*/0, /*play_sound=*/false);
-
-  return before; // restore to RU
-}
-
-bool EventLoop::paste_text_oneshot(std::string_view text,
-                                   bool restore_clipboard) {
-  if (!clipboard_) {
-    std::cerr << "[punto] Clipboard: недоступен (oneshot paste skipped)\n";
-    return false;
-  }
-  flush_pending_clipboard_restore(true);
-
-  auto injector = std::atomic_load(&injector_);
-  if (!injector) {
-    return false;
-  }
-
-  const bool is_terminal = clipboard_->is_active_window_terminal();
-
-  // Пытаемся сохранить CLIPBOARD (best-effort), чтобы не ломать
-  // пользовательский буфер обмена.
-  std::optional<std::string> prev_clip;
-  if (restore_clipboard) {
-    prev_clip = clipboard_->get_text(Selection::Clipboard);
-    if (!prev_clip.has_value()) {
-      std::cerr << "[punto] Clipboard: cannot read CLIPBOARD for restore "
-                   "(oneshot paste skipped)\n";
-      return false;
-    }
-  }
-
-  // Для Shift+Insert нам нужен PRIMARY, но для Ctrl+Shift+V достаточно
-  // CLIPBOARD.
-  std::optional<std::string> prev_primary;
-  if (!is_terminal) {
-    prev_primary = clipboard_->get_text(Selection::Primary);
-  }
-
-  const ClipboardResult set_clip =
-      clipboard_->set_text(Selection::Clipboard, text);
-  if (set_clip != ClipboardResult::Ok) {
-    std::cerr << "[punto] Clipboard: failed to set CLIPBOARD (res="
-              << static_cast<int>(set_clip) << ")\n";
-    return false;
-  }
-
-  if (!is_terminal) {
-    const ClipboardResult set_primary =
-        clipboard_->set_text(Selection::Primary, text);
-    if (set_primary != ClipboardResult::Ok) {
-      std::cerr << "[punto] Clipboard: failed to set PRIMARY (res="
-                << static_cast<int>(set_primary) << ")\n";
-      return false;
-    }
-  }
-
-  // Проверяем, что другой экземпляр punto-daemon не перехватил selection.
-  if (!clipboard_->verify_ownership()) {
-    std::cerr << "[punto] Clipboard: ownership stolen after set_text "
-                 "(another instance?), aborting paste\n";
-    return false;
-  }
-
-  // Даём X11 шанс обновить CLIPBOARD, иначе приложение может прочитать
-  // старое значение.
-  //
-  // В терминалах (и в целом в «медленных» UI-циклах) запрос буфера обмена может
-  // приходить с задержкой.
-  const OneshotPasteWaits waits = oneshot_paste_waits(is_terminal);
-  const std::uint64_t clip_seq =
-      clipboard_->selection_request_seq(Selection::Clipboard);
-  const std::uint64_t primary_seq =
-      is_terminal ? 0 : clipboard_->selection_request_seq(Selection::Primary);
-
-  wait_and_buffer(waits.pre_paste);
-
-  injector->release_all_modifiers();
-  reset_modifiers_state();
-
-  // Для Ctrl+Shift+V в некоторых терминалах нужен EN layout.
-  const std::optional<int> restore_layout =
-      maybe_switch_layout_to_en_for_terminal_paste(is_terminal);
-
-  injector->send_paste(is_terminal);
-
-  const bool watch_clip = restore_clipboard && prev_clip.has_value();
-  const bool watch_primary = !is_terminal;
-
-  auto has_request = [this, clip_seq, primary_seq, watch_clip,
-                      watch_primary]() {
-    if (!clipboard_) {
-      return false;
-    }
-    if (watch_clip &&
-        clipboard_->selection_request_seq(Selection::Clipboard) != clip_seq) {
-      return true;
-    }
-    if (watch_primary &&
-        clipboard_->selection_request_seq(Selection::Primary) != primary_seq) {
-      return true;
-    }
-    return false;
-  };
-
-  if (watch_clip || watch_primary) {
-    wait_and_buffer_until(waits.post_paste, has_request);
-  } else {
-    wait_and_buffer(waits.post_paste);
-  }
-
-  if (restore_layout.has_value()) {
-    (void)set_layout(*restore_layout, /*play_sound=*/false);
-  }
-
-  const bool request_seen = (watch_clip || watch_primary) ? has_request() : true;
-
-  PendingClipboardRestore plan;
-  plan.restore_clipboard = watch_clip;
-  plan.restore_primary = watch_primary;
-  plan.clipboard = std::move(prev_clip);
-  plan.primary = std::move(prev_primary);
-  plan.clip_req_seq = clip_seq;
-  plan.primary_req_seq = primary_seq;
-  plan.deadline = std::chrono::steady_clock::now() + waits.post_paste * 4;
-
-  finalize_clipboard_restore(std::move(plan), request_seen);
-
-  return true;
-}
-
-bool EventLoop::replace_text_oneshot(std::size_t backspace_count,
-                                     std::string_view text,
-                                     std::optional<int> final_layout,
-                                     bool play_sound) {
-  if (!clipboard_) {
-    std::cerr << "[punto] Clipboard: недоступен (oneshot replace skipped)\n";
-    return false;
-  }
-  flush_pending_clipboard_restore(true);
-
-  auto injector = std::atomic_load(&injector_);
-  if (!injector) {
-    return false;
-  }
-
-  const bool is_terminal = clipboard_->is_active_window_terminal();
-
-  // Важно: стараемся НЕ удалять текст, пока не убедились, что можем выставить
-  // буфер для вставки.
-  std::optional<std::string> prev_clip =
-      clipboard_->get_text(Selection::Clipboard);
-  if (!prev_clip.has_value()) {
-    std::cerr << "[punto] Clipboard: cannot read CLIPBOARD for restore "
-                 "(oneshot replace skipped)\n";
-    return false;
-  }
-
-  // PRIMARY нужен только для Shift+Insert.
-  std::optional<std::string> prev_primary;
-  if (!is_terminal) {
-    prev_primary = clipboard_->get_text(Selection::Primary);
-  }
-
-  const ClipboardResult set_clip =
-      clipboard_->set_text(Selection::Clipboard, text);
-  if (set_clip != ClipboardResult::Ok) {
-    std::cerr << "[punto] Clipboard: failed to set CLIPBOARD (res="
-              << static_cast<int>(set_clip) << ")\n";
-    return false;
-  }
-
-  if (!is_terminal) {
-    const ClipboardResult set_primary =
-        clipboard_->set_text(Selection::Primary, text);
-    if (set_primary != ClipboardResult::Ok) {
-      std::cerr << "[punto] Clipboard: failed to set PRIMARY (res="
-                << static_cast<int>(set_primary) << ")\n";
-      return false;
-    }
-  }
-
-  // Проверяем, что другой экземпляр punto-daemon не перехватил selection
-  // между нашим set_text и этой проверкой.
-  if (!clipboard_->verify_ownership()) {
-    std::cerr << "[punto] Clipboard: ownership stolen after set_text "
-                 "(another instance?), aborting replace\n";
-    return false;
-  }
-
-  // Даём X11 шанс обновить CLIPBOARD.
-  //
-  // В терминалах часто есть дополнительная задержка между hotkey paste и
-  // фактическим запросом clipboard.
-  const OneshotPasteWaits waits = oneshot_paste_waits(is_terminal);
-  const std::uint64_t clip_seq =
-      clipboard_->selection_request_seq(Selection::Clipboard);
-  const std::uint64_t primary_seq =
-      is_terminal ? 0 : clipboard_->selection_request_seq(Selection::Primary);
-
-  wait_and_buffer(waits.pre_paste);
-
-  // Важно: replace вызывается только из main thread в режиме macro.
-  injector->release_all_modifiers();
-  reset_modifiers_state();
-
-  // Даем физическим key-release шанс прийти в stdin.
-  wait_and_buffer(std::chrono::microseconds{30000});
-  flush_pending_release_frames();
-
-  // Удаляем то, что заменяем.
-  if (backspace_count > 0) {
-    injector->send_backspace(backspace_count, true);
-    flush_pending_release_frames();
-
-    // КРИТИЧЕСКАЯ ПАУЗА: приложения обрабатывают Backspace асинхронно.
-    // Без паузы Paste может прийти до фактического удаления символов.
-    // Гарантируем минимум 25ms даже если config указывает меньше.
-    constexpr auto kMinBackspaceWait = std::chrono::microseconds{25000};
-    const auto actual_wait = std::max(waits.after_backspace, kMinBackspaceWait);
-    wait_and_buffer(actual_wait);
-  }
-
-  // Для Ctrl+Shift+V в некоторых терминалах нужен EN layout.
-  const std::optional<int> restore_layout =
-      maybe_switch_layout_to_en_for_terminal_paste(is_terminal);
-
-  injector->send_paste(is_terminal);
-  const bool watch_clip = prev_clip.has_value();
-  const bool watch_primary = !is_terminal;
-
-  auto has_request = [this, clip_seq, primary_seq, watch_clip,
-                      watch_primary]() {
-    if (!clipboard_) {
-      return false;
-    }
-    if (watch_clip &&
-        clipboard_->selection_request_seq(Selection::Clipboard) != clip_seq) {
-      return true;
-    }
-    if (watch_primary &&
-        clipboard_->selection_request_seq(Selection::Primary) != primary_seq) {
-      return true;
-    }
-    return false;
-  };
-
-  if (watch_clip || watch_primary) {
-    wait_and_buffer_until(waits.post_paste, has_request);
-  } else {
-    wait_and_buffer(waits.post_paste);
-  }
-
-  if (final_layout.has_value()) {
-    // Best-effort: если не получилось — текст всё равно уже вставлен.
-    (void)set_layout(*final_layout, play_sound);
-  } else if (restore_layout.has_value()) {
-    (void)set_layout(*restore_layout, /*play_sound=*/false);
-  }
-
-  const bool request_seen = (watch_clip || watch_primary) ? has_request() : true;
-
-  PendingClipboardRestore plan;
-  plan.restore_clipboard = watch_clip;
-  plan.restore_primary = watch_primary;
-  plan.clipboard = std::move(prev_clip);
-  plan.primary = std::move(prev_primary);
-  plan.clip_req_seq = clip_seq;
-  plan.primary_req_seq = primary_seq;
-  plan.deadline = std::chrono::steady_clock::now() + waits.post_paste * 4;
-
-  finalize_clipboard_restore(std::move(plan), request_seen);
-
-  return true;
-}
-
-void EventLoop::set_last_undo_record(std::string original_text,
-                                     std::string_view inserted_text,
-                                     std::optional<int> restore_layout,
-                                     bool is_auto_correction) {
-  UndoRecord rec;
-  rec.original_text = std::move(original_text);
-  rec.inserted_len = utf8_codepoint_count(inserted_text);
-  rec.restore_layout = restore_layout;
-  rec.is_auto_correction = is_auto_correction;
-  rec.applied_at = std::chrono::steady_clock::now();
-  rec.user_seq_at_apply = user_seq_;
-
-  std::cerr << "[punto] Undo record saved: inserted_len=" << rec.inserted_len
-            << " restore_layout="
-            << (rec.restore_layout.has_value()
-                    ? std::to_string(*rec.restore_layout)
-                    : std::string{"-"})
-            << "\n";
-
-  last_undo_ = std::move(rec);
-}
-
-bool EventLoop::action_undo_last_correction() {
-  if (!last_undo_.has_value()) {
-    return false;
-  }
-
-  // Перехватываем Ctrl+Z только в узком окне времени.
-  // Иначе это должен быть обычный undo приложения.
-  static constexpr auto kUndoWindow = std::chrono::milliseconds{2500};
-
-  const auto now = std::chrono::steady_clock::now();
-  if (last_undo_->applied_at.time_since_epoch().count() == 0 ||
-      now - last_undo_->applied_at > kUndoWindow) {
-    last_undo_.reset();
-    return false;
-  }
-
-  // Если после исправления был любой другой key-press — не перехватываем.
-  if (last_undo_->user_seq_at_apply != user_seq_) {
-    last_undo_.reset();
-    return false;
-  }
-
-  auto injector = std::atomic_load(&injector_);
-  if (!injector) {
-    last_undo_.reset();
-    return false;
-  }
-
-  // Переносим запись в локальную переменную (и очищаем state) до выполнения
-  // макроса — чтобы не переиспользовать её в случае реэнтранси.
-  UndoRecord rec = std::move(*last_undo_);
-  last_undo_.reset();
-
-  if (rec.inserted_len == 0 && !rec.original_text.empty()) {
-    // Некорректное состояние: нечего удалять, но есть что вставлять.
-    // Лучше не делать ничего, чем повредить текст.
-    return false;
-  }
-
-  // Undo — это макрос переписывания текста; сбрасываем async-состояние.
-  reset_async_state();
-  history_.reset();
-  buffer_.reset_all();
-
-  MacroLockGuard lock_guard(macro_lock_);
-  if (!lock_guard.owns_lock()) {
-    std::cerr << "[punto] Undo: не удалось захватить macro lock (skip)\n";
-    return false;
-  }
-  sync_layout_from_os();
-
-  is_processing_macro_.store(true, std::memory_order_release);
-  struct DrainGuard {
-    EventLoop *self;
-    ~DrainGuard() { self->drain_pending_events(); }
-  } drain_guard{this};
-
-  std::cerr << "[punto] Undo: start (erase=" << rec.inserted_len
-            << " restore_layout="
-            << (rec.restore_layout.has_value()
-                    ? std::to_string(*rec.restore_layout)
-                    : std::string{"-"})
-            << ")\n";
-
-  const bool ok = replace_text_oneshot(rec.inserted_len, rec.original_text,
-                                       /*final_layout=*/rec.restore_layout,
-                                       /*play_sound=*/false);
-  if (!ok) {
-    std::cerr << "[punto] Undo: oneshot replace failed (skip)\n";
-    return false;
-  }
-
-  if (rec.is_auto_correction) {
-    // Ctrl+Z как явный сигнал "отменяю автокоррекцию" → пишем слово в
-    // exclusions.
-    undo_detector_.on_undo();
-  }
-
-  std::cerr << "[punto] Undo: done\n";
-  return true;
-}
-
-void EventLoop::action_invert_layout_word() {
-  auto word = buffer_.get_active_word();
-  if (word.empty()) {
-    return;
-  }
-
-  const int restore_layout_for_undo = current_layout_;
-
-  // Важно: слово инвертируем относительно текущей раскладки.
-  const int target_layout = (current_layout_ == 0) ? 1 : 0;
-
-  // Оригинальный текст (для Ctrl+Z).
-  std::optional<std::string> original_text_opt =
-      key_entries_to_visible_text_checked(word, restore_layout_for_undo);
-
-  // Строим видимый текст так, как если бы мы перепечатали те же скан-коды в
-  // target_layout.
-  auto replacement_opt =
-      key_entries_to_visible_text_checked(word, target_layout);
-  if (!replacement_opt.has_value()) {
-    std::cerr << "[punto] Invert-layout: cannot build visible text (layout="
-              << target_layout << ")\n";
-    return;
-  }
-  std::string replacement = std::move(*replacement_opt);
-
-  // Добавляем trailing whitespace (пробелы/табы) в конец.
-  for (ScanCode c : buffer_.trailing()) {
-    if (c == KEY_SPACE) {
-      replacement.push_back(' ');
-      if (original_text_opt.has_value()) {
-        original_text_opt->push_back(' ');
-      }
-    } else if (c == KEY_TAB) {
-      replacement.push_back('\t');
-      if (original_text_opt.has_value()) {
-        original_text_opt->push_back('\t');
-      }
-    }
-  }
-
-  // Удаляем слово + trailing и вставляем replacement одной операцией.
-  MacroLockGuard lock_guard(macro_lock_);
-  if (!lock_guard.owns_lock()) {
-    std::cerr << "[punto] Invert-layout-word: не удалось захватить macro lock (skip)\n";
-    return;
-  }
-  sync_layout_from_os();
-
-  is_processing_macro_.store(true, std::memory_order_release);
-  struct DrainGuard {
-    EventLoop *self;
-    ~DrainGuard() { self->drain_pending_events(); }
-  } drain_guard{this};
-
-  const std::size_t total_len = word.size() + buffer_.trailing_length();
-  const bool ok = replace_text_oneshot(total_len, replacement,
-                                       /*final_layout=*/target_layout,
-                                       /*play_sound=*/true);
-  if (ok && original_text_opt.has_value()) {
-    set_last_undo_record(std::move(*original_text_opt), replacement,
-                         /*restore_layout=*/restore_layout_for_undo,
-                         /*is_auto_correction=*/false);
-  }
-}
-
-void EventLoop::action_auto_invert_word(std::span<const KeyEntry> word,
-                                        ScanCode trigger_code) {
-  if (word.empty())
-    return;
-
-  std::cerr << "[punto] AUTO-INVERT: start (len=" << word.size() << ")\n";
-  MacroLockGuard lock_guard(macro_lock_);
-  if (!lock_guard.owns_lock()) {
-    std::cerr << "[punto] AUTO-INVERT: не удалось захватить macro lock (skip)\n";
-    return;
-  }
-  sync_layout_from_os();
-
-  is_processing_macro_.store(true, std::memory_order_release);
-  struct DrainGuard {
-    EventLoop *self;
-    ~DrainGuard() { self->drain_pending_events(); }
-  } drain_guard{this};
-
-  auto injector = std::atomic_load(&injector_);
-  if (!injector) {
-    return;
-  }
-
-  // 1. Отпускаем всё
-  injector->release_all_modifiers();
-  reset_modifiers_state();
-  wait_and_buffer(std::chrono::microseconds{5000});
-
-  // 2. Удаляем слово (turbo)
-  injector->send_backspace(word.size(), true);
-
-  // КРИТИЧЕСКАЯ ПАУЗА: даём приложению время обработать все Backspace
-  // и обновить позицию курсора перед началом ввода новых символов.
-  // Без этой паузы в медленных приложениях (Electron, Java Swing)
-  // возникает гонка: новые символы вводятся до того, как удалены старые.
-  wait_and_buffer(KeyInjector::kAfterBackspaceWaitTerminal);
-
-  // 3. Переключаем раскладку
-  switch_layout(true);
-
-  // ДАЕМ ОС ВРЕМЯ НА ПЕРЕКЛЮЧЕНИЕ
-  wait_and_buffer(KeyInjector::kPostLayoutSwitchWait);
-
-  // 4. Перепечатываем слово (turbo)
-  injector->retype_buffer(word, true);
-
-  // 5. Печатаем финализирующий символ, если он есть
-  if (trigger_code != 0) {
-    // Даем время на завершение перепечатывания слова
-    wait_and_buffer(std::chrono::microseconds{25000});
-    // Печатаем триггерный символ без turbo для надежности
-    injector->tap_key(trigger_code, false, false);
-  }
-
-  std::cerr << "[punto] AUTO-INVERT: done\n";
-}
-
-void EventLoop::action_invert_case_word() {
-  auto word = buffer_.get_active_word();
-  if (word.empty()) {
-    return;
-  }
-
-  auto visible_opt = key_entries_to_visible_text_checked(word, current_layout_);
-  if (!visible_opt.has_value()) {
-    std::cerr << "[punto] Invert-case: cannot build visible text (layout="
-              << current_layout_ << ")\n";
-    return;
-  }
-
-  std::string original_text = *visible_opt;
-  std::string replacement = invert_case(*visible_opt);
-
-  // Добавляем trailing whitespace (пробелы/табы) в конец.
-  for (ScanCode c : buffer_.trailing()) {
-    if (c == KEY_SPACE) {
-      original_text.push_back(' ');
-      replacement.push_back(' ');
-    } else if (c == KEY_TAB) {
-      original_text.push_back('\t');
-      replacement.push_back('\t');
-    }
-  }
-
-  MacroLockGuard lock_guard(macro_lock_);
-  if (!lock_guard.owns_lock()) {
-    std::cerr << "[punto] Invert-case-word: не удалось захватить macro lock (skip)\n";
-    return;
-  }
-  sync_layout_from_os();
-
-  is_processing_macro_.store(true, std::memory_order_release);
-  struct DrainGuard {
-    EventLoop *self;
-    ~DrainGuard() { self->drain_pending_events(); }
-  } drain_guard{this};
-
-  const std::size_t total_len = word.size() + buffer_.trailing_length();
-  const bool ok = replace_text_oneshot(total_len, replacement,
-                                       /*final_layout=*/std::nullopt,
-                                       /*play_sound=*/false);
-  if (ok) {
-    set_last_undo_record(std::move(original_text), replacement,
-                         /*restore_layout=*/std::nullopt,
-                         /*is_auto_correction=*/false);
-  }
-}
-
-bool EventLoop::process_selection(
-    std::function<std::string(std::string_view)> transform,
-    std::optional<int> restore_layout_for_undo) {
-
-  if (!clipboard_) {
-    std::cerr << "[punto] Clipboard: недоступен\n";
-    return false;
-  }
-
-  auto injector = std::atomic_load(&injector_);
-  if (!injector) {
-    return false;
-  }
-
-  const bool is_terminal = clipboard_->is_active_window_terminal();
-
-  injector->release_all_modifiers();
-  reset_modifiers_state();
-  // Увеличенная пауза для VS Code и других приложений где Alt активирует меню
-  wait_and_buffer(std::chrono::microseconds{150000});
-  flush_pending_release_frames();
-
-  std::optional<std::string> text;
-
-  if (is_terminal) {
-    // В терминале: читаем PRIMARY selection (автоматически заполняется при
-    // выделении).
-    text = clipboard_->get_text(Selection::Primary);
-  } else {
-    // В обычных приложениях: Ctrl+C для копирования выделения.
-    //
-    // Важно: если выделения нет, то Ctrl+C обычно не меняет CLIPBOARD.
-    // Чтобы не трансформировать "старый" clipboard, читаем значение до и после.
-    const std::optional<std::string> before_clip =
-        clipboard_->get_text(Selection::Clipboard);
-    if (!before_clip.has_value()) {
-      std::cerr << "[punto] Clipboard: cannot read CLIPBOARD before copy\n";
-      return false;
-    }
-
-    injector->send_key(KEY_LEFTCTRL, KeyState::Press);
-    wait_and_buffer(std::chrono::microseconds{20000});
-    injector->send_key(KEY_C, KeyState::Press);
-    wait_and_buffer(std::chrono::microseconds{20000});
-    injector->send_key(KEY_C, KeyState::Release);
-    wait_and_buffer(std::chrono::microseconds{20000});
-    injector->send_key(KEY_LEFTCTRL, KeyState::Release);
-
-    // Даём приложению время выставить CLIPBOARD.
-    wait_and_buffer(std::chrono::microseconds{200000});
-
-    text = clipboard_->get_text(Selection::Clipboard);
-
-    if (!text.has_value() || text->empty()) {
-      return false;
-    }
-
-    if (*text == *before_clip) {
-      // Скорее всего, выделения не было.
-      return false;
-    }
-  }
-
-  if (!text || text->empty()) {
-    return false;
-  }
-
-  const std::string transformed = transform(*text);
-
-  const ClipboardResult set_clip =
-      clipboard_->set_text(Selection::Clipboard, transformed);
-  if (set_clip != ClipboardResult::Ok) {
-    std::cerr << "[punto] Clipboard: failed to set CLIPBOARD (res="
-              << static_cast<int>(set_clip) << ")\n";
-    return false;
-  }
-
-  const ClipboardResult set_primary =
-      clipboard_->set_text(Selection::Primary, transformed);
-  if (set_primary != ClipboardResult::Ok) {
-    std::cerr << "[punto] Clipboard: failed to set PRIMARY (res="
-              << static_cast<int>(set_primary) << ")\n";
-    return false;
-  }
-
-  // Даём X11 шанс обновить selections.
-  wait_and_buffer(KeyInjector::kPrePasteWaitTerminal);
-
-  // Для Ctrl+Shift+V в некоторых терминалах нужен EN layout.
-  const std::optional<int> restore_layout =
-      maybe_switch_layout_to_en_for_terminal_paste(is_terminal);
-
-  if (!is_terminal) {
-    // Критично: некоторые приложения НЕ заменяют выделение при paste hotkey.
-    // Удаляем выделение вручную (Backspace удаляет весь selection).
-    injector->tap_key(KEY_BACKSPACE, /*with_shift=*/false, /*turbo=*/false);
-
-    wait_and_buffer(std::chrono::microseconds{30000});
-    flush_pending_release_frames();
-  }
-
-  injector->send_paste(is_terminal);
-
-  // Даем приложению время запросить содержимое clipboard.
-  wait_and_buffer(std::chrono::microseconds{250000});
-
-  if (restore_layout.has_value()) {
-    (void)set_layout(*restore_layout, /*play_sound=*/false);
-  }
-
-  // Undo: в терминале мы вставляем "как есть" в позицию курсора, т.е.
-  // откат = удалить вставку (в исходном состоянии текста не было).
-  std::string undo_original = is_terminal ? std::string{} : *text;
-  set_last_undo_record(std::move(undo_original), transformed,
-                       restore_layout_for_undo,
-                       /*is_auto_correction=*/false);
-
-  return true;
-}
-
-void EventLoop::wait_and_buffer(std::chrono::microseconds us) {
-  wait_and_buffer_until(us, {});
-}
-
-void EventLoop::wait_and_buffer_until(
-    std::chrono::microseconds us,
-    const std::function<bool()> &stop_pred) {
-  if (us.count() <= 0) {
-    return;
-  }
-
-  const auto start = std::chrono::steady_clock::now();
-  const auto end = start + us;
-
-  while (true) {
-    // Аварийный выход при переполнении очереди событий
-    if (event_overflow_abort_requested_) {
-      break;
-    }
-    if (stop_requested_.load(std::memory_order_relaxed)) {
-      break;
-    }
-    if (stop_pred && stop_pred()) {
-      break;
-    }
-    const auto now = std::chrono::steady_clock::now();
-    if (now >= end) {
-      break;
-    }
-
-    // Обслуживаем X11 selection ownership, даже когда stdin молчит.
-    if (clipboard_) {
-      clipboard_->pump_events();
-    }
-
-    const auto remaining_us =
-        std::chrono::duration_cast<std::chrono::microseconds>(end - now);
-
-    int timeout_ms = static_cast<int>(remaining_us.count() / 1000);
-
-    // Ensure timeout is at least 1ms if there's time remaining.
-    if (timeout_ms < 1 && remaining_us.count() > 0) {
-      timeout_ms = 1;
-    }
-
-    // Мы должны регулярно обслуживать X11 события, иначе paste может не
-    // получить содержимое selection. Поэтому дробим длинные ожидания.
-    constexpr int kMaxPollSliceMs = 5;
-    if (timeout_ms > kMaxPollSliceMs) {
-      timeout_ms = kMaxPollSliceMs;
-    }
-
-    std::array<pollfd, 2> pfds{};
-    nfds_t nfds = 1;
-    pfds[0] = pollfd{STDIN_FILENO, POLLIN, 0};
-    if (stop_signal_fd_ >= 0) {
-      pfds[1] = pollfd{stop_signal_fd_, POLLIN, 0};
-      nfds = 2;
-    }
-
-    const int ret = poll(pfds.data(), nfds, timeout_ms);
-
-    if (ret > 0 && stop_signal_fd_ >= 0 && (pfds[1].revents & POLLIN)) {
-      drain_fd(stop_signal_fd_);
-      request_stop();
-      break;
-    }
-
-    if (ret > 0 && (pfds[0].revents & POLLIN)) {
-      input_event ev;
-      while (true) {
-        const ReadEventStatus status = read_input_event(STDIN_FILENO, ev);
-        if (status == ReadEventStatus::Ok) {
-          constexpr std::size_t kPendingEventsCap = 5000;
-          constexpr std::size_t kOverflowAbortThreshold = 4000;
-
-          // Проверяем порог аварийного прерывания
-          if (pending_events_.size() >= kOverflowAbortThreshold &&
-              !event_overflow_abort_requested_) {
-            event_overflow_abort_requested_ = true;
-            std::cerr << "[punto] ABORT(wait): event queue near overflow ("
-                      << pending_events_.size() << "/" << kPendingEventsCap
-                      << "), aborting macro\n";
-          }
-
-          if (pending_events_.size() < kPendingEventsCap) {
-            pending_events_.push_back(ev);
-          } else {
-            static bool warned = false;
-            if (!warned) {
-              warned = true;
-              std::cerr
-                  << "[punto] Input Guard(wait): pending_events overflow cap="
-                  << kPendingEventsCap << " (dropping input events)\n";
-            }
-          }
-        }
-        if (status == ReadEventStatus::Eof) {
-          request_stop();
-          break;
-        }
-        if (status == ReadEventStatus::Error) {
-          exit_code_ = (exit_code_ == 0) ? 1 : exit_code_;
-          std::cerr << "[punto] stdin read failed while buffering: "
-                    << std::strerror(errno) << "\n";
-          request_stop();
-          break;
-        }
-
-        pfds[0].revents = 0;
-        if (poll(&pfds[0], 1, 0) <= 0 || !(pfds[0].revents & POLLIN)) {
-          break;
-        }
-      }
-      // Проверяем флаг abort после чтения событий
-      if (event_overflow_abort_requested_) {
-        break;
-      }
-      if (stop_pred && stop_pred()) {
-        break;
-      }
-      continue;
-    }
-
-    if (ret < 0) {
-      if (errno == EINTR) {
-        continue; // Interrupted by signal, retry poll
-      }
-      break; // Other error
-    }
-
-    // ret == 0 (timeout) или без POLLIN: продолжаем ждать до end.
-  }
-}
-
-void EventLoop::flush_pending_clipboard_restore(bool force) {
-  if (!pending_clip_restore_.has_value()) {
-    return;
-  }
-  if (!clipboard_) {
-    pending_clip_restore_.reset();
-    return;
-  }
-
-  auto &p = *pending_clip_restore_;
-
-  const bool clip_req =
-      p.restore_clipboard && p.clipboard.has_value() &&
-      (clipboard_->selection_request_seq(Selection::Clipboard) != p.clip_req_seq);
-  const bool prim_req =
-      p.restore_primary &&
-      (clipboard_->selection_request_seq(Selection::Primary) !=
-       p.primary_req_seq);
-
-  const bool request_seen = clip_req || prim_req;
-  const bool deadline_reached =
-      (p.deadline.time_since_epoch().count() != 0) &&
-      (std::chrono::steady_clock::now() >= p.deadline);
-
-  if (!force && !request_seen && !deadline_reached) {
-    return;
-  }
-
-  // Если ownership уже потерян, значит другой процесс/приложение успел
-  // перехватить selection и восстановление старых данных может испортить
-  // актуальный буфер обмена. В этом случае отменяем restore.
-  if (!clipboard_->verify_ownership()) {
-    std::cerr << "[punto] Clipboard: skip deferred restore (ownership lost)\n";
-    pending_clip_restore_.reset();
-    return;
-  }
-
-  if (p.restore_primary) {
-    if (p.primary.has_value()) {
-      (void)clipboard_->set_text(Selection::Primary, *p.primary);
-    } else {
-      (void)clipboard_->set_text(Selection::Primary, "");
-    }
-  }
-
-  if (p.restore_clipboard && p.clipboard.has_value()) {
-    (void)clipboard_->set_text(Selection::Clipboard, *p.clipboard);
-  }
-
-  pending_clip_restore_.reset();
-}
-
-void EventLoop::finalize_clipboard_restore(PendingClipboardRestore plan,
-                                           bool request_seen) {
-  if (!plan.restore_clipboard && !plan.restore_primary) {
-    return;
-  }
-
-  if (request_seen) {
-    if (!clipboard_) {
-      return;
-    }
-
-    if (!clipboard_->verify_ownership()) {
-      std::cerr << "[punto] Clipboard: skip immediate restore (ownership lost)\n";
-      return;
-    }
-
-    if (plan.restore_primary) {
-      if (plan.primary.has_value()) {
-        (void)clipboard_->set_text(Selection::Primary, *plan.primary);
-      } else {
-        (void)clipboard_->set_text(Selection::Primary, "");
-      }
-    }
-
-    if (plan.restore_clipboard && plan.clipboard.has_value()) {
-      (void)clipboard_->set_text(Selection::Clipboard, *plan.clipboard);
-    }
-
-    return;
-  }
-
-  pending_clip_restore_ = std::move(plan);
-}
-
-void EventLoop::flush_pending_release_frames() {
-  if (pending_events_.empty()) {
-    return;
-  }
-
-  std::deque<input_event> keep;
-  std::vector<input_event> frame;
-  frame.reserve(16);
-
-  std::size_t forwarded = 0;
-  std::size_t kept = 0;
-  std::size_t forwarded_safe_release = 0;
-  std::size_t forwarded_full_frames = 0;
-
-  auto flush_frame = [&]() {
-    if (frame.empty()) {
-      return;
-    }
-
-    bool frame_has_press = false;
-    for (const auto &e : frame) {
-      if (e.type == EV_KEY && e.value != 0) {
-        frame_has_press = true;
-        break;
-      }
-    }
-
-    if (!frame_has_press) {
-      // Fast path: release-only frame (safe to forward whole frame).
-      for (const auto &e : frame) {
-        emit_passthrough_event(e);
-      }
-      forwarded += frame.size();
-      forwarded_full_frames++;
-      frame.clear();
-      return;
-    }
-
-    // Mixed frame: try to forward ONLY those EV_KEY releases that correspond
-    // to keys already pressed in the app (key_down_ == true). Keep everything
-    // else.
-    bool forwarded_any = false;
-
-    for (const auto &e : frame) {
-      if (e.type == EV_KEY && e.value == 0) {
-        const ScanCode code = e.code;
-        if (code < key_down_.size() && key_down_[code] != 0) {
-          emit_passthrough_event(e);
-          forwarded++;
-          forwarded_safe_release++;
-          forwarded_any = true;
-          continue;
-        }
-      }
-
-      keep.push_back(e);
-      kept++;
-    }
-
-    // If we forwarded releases from this mixed frame, emit an extra SYN_REPORT
-    // so that the target app applies them immediately.
-    if (forwarded_any) {
-      input_event syn{};
-      syn.type = EV_SYN;
-      syn.code = SYN_REPORT;
-      syn.value = 0;
-      emit_passthrough_event(syn);
-      forwarded++;
-    }
-
-    frame.clear();
-  };
-
-  while (!pending_events_.empty()) {
-    input_event ev = pending_events_.front();
-    pending_events_.pop_front();
-
-    frame.push_back(ev);
-
-    if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-      flush_frame();
-    }
-  }
-
-  // Хвост без SYN_REPORT: безопаснее не выпускать наружу (оставляем в keep).
-  if (!frame.empty()) {
-    for (const auto &e : frame) {
-      keep.push_back(e);
-    }
-    kept += frame.size();
-  }
-
-  if (forwarded > 0) {
-    std::cerr << "[punto] Input Guard: early-flush releases: forwarded="
-              << forwarded << " (full_frames=" << forwarded_full_frames
-              << " safe_release=" << forwarded_safe_release << ") kept=" << kept
-              << "\n";
-  }
-
-  pending_events_ = std::move(keep);
-}
-
-void EventLoop::drain_pending_events() {
-  // FIX: Сначала изымаем все события атомарно (swap), затем сбрасываем флаг.
-  // Это предотвращает рассинхронизацию, если handle_event() вызовет новый макрос.
-  std::deque<input_event> events_to_process;
-  events_to_process.swap(pending_events_);
-
-  if (!events_to_process.empty()) {
-    std::cerr << "[punto] Input Guard: draining " << events_to_process.size()
-              << " events\n";
-  }
-
-  // Сбрасываем флаги ПОСЛЕ изъятия очереди, но ДО обработки.
-  // Новые макросы будут буферизовать в свежую pending_events_.
-  is_processing_macro_.store(false, std::memory_order_release);
-  event_overflow_abort_requested_ = false;
-
-  for (const auto &ev : events_to_process) {
-    handle_event(ev);
-  }
-}
-
 void EventLoop::process_ready_results() {
-  if (is_processing_macro_.load(std::memory_order_acquire)) {
-    return;
-  }
-
   const auto now = std::chrono::steady_clock::now();
   if (telemetry_.last_report_at.time_since_epoch().count() == 0) {
     telemetry_.last_report_at = now;
   }
 
-  // Забираем все готовые результаты от воркеров.
-  WordResult r;
-  while (analysis_pool_.try_pop_result(r)) {
-    // Stale results после сброса контекста.
-    if (r.task_id < next_apply_task_id_) {
+  WordResult result;
+  while (analysis_pool_ && analysis_pool_->try_pop_result(result)) {
+    if (result.task_id < next_apply_task_id_) {
       continue;
     }
 
-    if (r.terminal_status == WordTerminalStatus::Completed) {
-      telemetry_.analyzed_words++;
-    }
-    telemetry_.analysis_us_sum += r.analysis_us;
-    telemetry_.queue_us_sum += r.queue_us;
-    if (r.terminal_status == WordTerminalStatus::Completed) {
+    if (result.terminal_status == WordTerminalStatus::Completed) {
+      ++telemetry_.analyzed_words;
       lifetime_telemetry_.analyzed_words.fetch_add(1,
-                                                    std::memory_order_relaxed);
-    }
-    lifetime_telemetry_.analysis_us_sum.fetch_add(r.analysis_us,
-                                                  std::memory_order_relaxed);
-    lifetime_telemetry_.queue_us_sum.fetch_add(r.queue_us,
-                                               std::memory_order_relaxed);
-
-    if (r.analysis_us > telemetry_.analysis_us_max) {
-      telemetry_.analysis_us_max = r.analysis_us;
-    }
-    if (r.queue_us > telemetry_.queue_us_max) {
-      telemetry_.queue_us_max = r.queue_us;
-    }
-
-    if (r.terminal_status == WordTerminalStatus::Completed && r.need_switch) {
-      telemetry_.need_switch_words++;
-      lifetime_telemetry_.need_switch_words.fetch_add(
-          1, std::memory_order_relaxed);
-    }
-
-    ready_results_[r.task_id] = r;
-  }
-
-  if (!analysis_pool_failed_ && analysis_pool_.has_fatal_error()) {
-    analysis_pool_failed_ = true;
-  }
-  lifetime_telemetry_.ready_results.store(ready_results_.size(),
-                                          std::memory_order_relaxed);
-
-  // Применяем строго по порядку.
-  while (true) {
-    auto it = ready_results_.find(next_apply_task_id_);
-    if (it == ready_results_.end()) {
-      break;
-    }
-
-    WordResult res = std::move(it->second);
-    ready_results_.erase(it);
-
-    // Проверяем, нужна ли какая-либо коррекция
-    const bool has_correction =
-        res.terminal_status == WordTerminalStatus::Completed &&
-        (res.correction_type != CorrectionType::NoCorrection);
-
-    if (has_correction) {
-      std::cerr << "[punto] Async-DECISION: task_id=" << res.task_id
-                << " word_len=" << res.word_len
-                << " analysis_len=" << res.analysis_len
-                << " correction_type=" << static_cast<int>(res.correction_type)
-                << " queue_us=" << res.queue_us
-                << " analysis_us=" << res.analysis_us << "\n";
-
-      auto mit = pending_words_.find(res.task_id);
-      if (mit != pending_words_.end()) {
-        // Проверяем, не находится ли слово в сессионных исключениях
-        // (пользователь ранее отменял коррекцию этого слова)
-        std::string word_ascii;
-        for (const auto &entry : mit->second.word) {
-          if (entry.code < kScancodeToChar.size()) {
-            char c = kScancodeToChar[entry.code];
-            if (c >= 'A' && c <= 'Z') {
-              c = static_cast<char>(c + 32);
-            }
-            if (c != '\0') {
-              word_ascii += c;
-            }
-          }
-        }
-
-        if (undo_detector_.is_excluded(word_ascii)) {
-          std::cerr << "[punto] Skipping correction for excluded word entry\n";
-          pending_words_.erase(res.task_id);
-          lifetime_telemetry_.pending_words.store(
-              pending_words_.size(), std::memory_order_relaxed);
-          ++next_apply_task_id_;
-          continue;
-        }
-
-        // Определяем тип коррекции и вызываем соответствующий метод
-        switch (res.correction_type) {
-        case CorrectionType::LayoutSwitch: {
-          // Стандартное переключение раскладки (v2.6 логика)
-          const int target_layout =
-              (mit->second.layout_at_boundary == 0) ? 1 : 0;
-          apply_correction(mit->second, target_layout);
-          undo_detector_.on_correction_applied(res.task_id, word_ascii);
-          break;
-        }
-
-        case CorrectionType::StickyShiftFix: {
-          // Исправление регистра БЕЗ смены раскладки (ПРивет -> Привет)
-          if (res.correction.has_value()) {
-            apply_case_correction(mit->second, res.correction.value());
-            undo_detector_.on_correction_applied(res.task_id, word_ascii);
-          }
-          break;
-        }
-
-        case CorrectionType::CombinedFix: {
-          // Комбинированное исправление: смена раскладки + исправление регистра
-          // (GHbdtn -> Привет)
-          if (res.correction.has_value()) {
-            const int target_layout =
-                (mit->second.layout_at_boundary == 0) ? 1 : 0;
-            apply_combined_correction(mit->second, target_layout,
-                                      res.correction.value());
-            undo_detector_.on_correction_applied(res.task_id, word_ascii);
-          }
-          break;
-        }
-
-        case CorrectionType::TypoFix: {
-          // Исправление опечатки (v2.7+)
-          // Используем ту же логику, что и для case fix —
-          // она поддерживает разную длину слов
-          if (res.correction.has_value()) {
-            std::cerr << "[punto] TYPO-FIX: task_id=" << res.task_id
-                      << " original_len=" << mit->second.word.size()
-                      << " corrected_len=" << res.correction.value().size()
-                      << "\n";
-            apply_case_correction(mit->second, res.correction.value());
-            undo_detector_.on_correction_applied(res.task_id, word_ascii);
-          }
-          break;
-        }
-
-        case CorrectionType::NoCorrection:
-        default:
-          break;
-        }
-      } else {
-        std::cerr << "[punto] Async: missing meta for task_id=" << res.task_id
-                  << " (skip)\n";
+                                                   std::memory_order_relaxed);
+      if (result.need_switch) {
+        ++telemetry_.need_switch_words;
+        lifetime_telemetry_.need_switch_words.fetch_add(
+            1, std::memory_order_relaxed);
       }
     }
-
-    pending_words_.erase(res.task_id);
-    ++next_apply_task_id_;
+    telemetry_.analysis_us_sum += result.analysis_us;
+    telemetry_.queue_us_sum += result.queue_us;
+    telemetry_.analysis_us_max =
+        std::max(telemetry_.analysis_us_max, result.analysis_us);
+    telemetry_.queue_us_max =
+        std::max(telemetry_.queue_us_max, result.queue_us);
+    lifetime_telemetry_.analysis_us_sum.fetch_add(result.analysis_us,
+                                                  std::memory_order_relaxed);
+    lifetime_telemetry_.queue_us_sum.fetch_add(result.queue_us,
+                                               std::memory_order_relaxed);
+    ready_results_[result.task_id] = std::move(result);
   }
-  lifetime_telemetry_.pending_words.store(pending_words_.size(),
-                                          std::memory_order_relaxed);
+
+  if (analysis_pool_ && !analysis_pool_failed_ &&
+      analysis_pool_->has_fatal_error()) {
+    analysis_pool_failed_ = true;
+    analysis_health_.fail();
+  }
+
+  while (ready_results_.erase(next_apply_task_id_) != 0) {
+    commit_analysis_terminal(next_apply_task_id_);
+  }
   lifetime_telemetry_.ready_results.store(ready_results_.size(),
                                           std::memory_order_relaxed);
 
-  // Периодическая телеметрия (агрегировано, чтобы не спамить).
-  const auto dt = now - telemetry_.last_report_at;
-  if (dt >= std::chrono::seconds{1}) {
-    const std::uint64_t words = telemetry_.analyzed_words;
-    const std::uint64_t corr = telemetry_.corrections;
-
-    const std::uint64_t avg_queue =
-        (words > 0) ? (telemetry_.queue_us_sum / words) : 0;
-    const std::uint64_t avg_analysis =
-        (words > 0) ? (telemetry_.analysis_us_sum / words) : 0;
-
-    const std::uint64_t avg_tail =
-        (corr > 0) ? (telemetry_.tail_len_sum / corr) : 0;
-    const std::uint64_t avg_macro =
-        (corr > 0) ? (telemetry_.correction_us_sum / corr) : 0;
-
-    std::cerr << "[punto] Telemetry: words=" << words
-              << " need_switch=" << telemetry_.need_switch_words
-              << " avg_queue_us=" << avg_queue
-              << " max_queue_us=" << telemetry_.queue_us_max
-              << " avg_analysis_us=" << avg_analysis
-              << " max_analysis_us=" << telemetry_.analysis_us_max
-              << " corrections=" << corr << " avg_macro_us=" << avg_macro
-              << " max_macro_us=" << telemetry_.correction_us_max
-              << " avg_tail_len=" << avg_tail
-              << " max_tail_len=" << telemetry_.tail_len_max
-              << " xkb_set=" << (xkb_set_available_ ? "on" : "off") << "\n";
-
-    telemetry_.last_report_at = now;
-
-    // Сбрасываем интервальные счётчики.
-    telemetry_.analyzed_words = 0;
-    telemetry_.need_switch_words = 0;
-    telemetry_.analysis_us_sum = 0;
-    telemetry_.analysis_us_max = 0;
-    telemetry_.queue_us_sum = 0;
-    telemetry_.queue_us_max = 0;
-    telemetry_.corrections = 0;
-    telemetry_.correction_us_sum = 0;
-    telemetry_.correction_us_max = 0;
-    telemetry_.tail_len_sum = 0;
-    telemetry_.tail_len_max = 0;
+  if (now - telemetry_.last_report_at < std::chrono::seconds{1}) {
+    return;
   }
+
+  const std::uint64_t words = telemetry_.analyzed_words;
+  const std::uint64_t avg_queue =
+      words > 0 ? telemetry_.queue_us_sum / words : 0;
+  const std::uint64_t avg_analysis =
+      words > 0 ? telemetry_.analysis_us_sum / words : 0;
+  std::cerr << "[punto] Telemetry: words=" << words
+            << " need_switch=" << telemetry_.need_switch_words
+            << " avg_queue_us=" << avg_queue
+            << " max_queue_us=" << telemetry_.queue_us_max
+            << " avg_analysis_us=" << avg_analysis
+            << " max_analysis_us=" << telemetry_.analysis_us_max
+            << " corrections=0 avg_macro_us=0 max_macro_us=0"
+               " avg_tail_len=0 max_tail_len=0 xkb_set=off\n";
+
+  telemetry_.last_report_at = now;
+  telemetry_.analyzed_words = 0;
+  telemetry_.need_switch_words = 0;
+  telemetry_.analysis_us_sum = 0;
+  telemetry_.analysis_us_max = 0;
+  telemetry_.queue_us_sum = 0;
+  telemetry_.queue_us_max = 0;
 }
-
-void EventLoop::apply_correction(const PendingWordMeta &meta,
-                                 int target_layout) {
-  if (meta.word.empty()) {
-    return;
-  }
-
-  const int original_layout = meta.layout_at_boundary;
-  if ((original_layout != 0 && original_layout != 1) ||
-      (target_layout != 0 && target_layout != 1)) {
-    std::cerr << "[punto] Async: invalid layout values for task_id="
-              << meta.task_id << " original=" << original_layout
-              << " target=" << target_layout << "\n";
-    return;
-  }
-
-  const std::uint64_t cursor = history_.cursor_pos();
-  const std::uint64_t base = history_.base_pos();
-
-  if (meta.start_pos < base || meta.end_pos > cursor) {
-    std::cerr << "[punto] Async: history window miss for task_id="
-              << meta.task_id << " (base=" << base << " end=" << cursor
-              << " start=" << meta.start_pos << " word_end=" << meta.end_pos
-              << ")\n";
-    return;
-  }
-
-  // Tail = всё после слова (включая разделитель) до текущей позиции.
-  if (!history_.get_range(meta.end_pos, cursor, tail_scratch_)) {
-    std::cerr << "[punto] Async: failed to get tail for task_id="
-              << meta.task_id << "\n";
-    return;
-  }
-
-  const std::uint64_t erase64 = cursor - meta.start_pos;
-  const std::size_t erase = static_cast<std::size_t>(erase64);
-
-  const std::size_t expected_retype = meta.word.size() + tail_scratch_.size();
-  if (expected_retype != erase) {
-    std::cerr << "[punto] Async: length invariant violated for task_id="
-              << meta.task_id << " erase=" << erase
-              << " retype=" << expected_retype << " (skip)\n";
-    return;
-  }
-
-  auto word_text_opt = key_entries_to_visible_text_checked(
-      std::span<const KeyEntry>{meta.word.data(), meta.word.size()},
-      target_layout);
-  if (!word_text_opt.has_value()) {
-    std::cerr << "[punto] Async: cannot build corrected word text for task_id="
-              << meta.task_id << " (layout=" << target_layout << ")\n";
-    return;
-  }
-
-  auto tail_text_opt = key_entries_to_visible_text_checked(
-      std::span<const KeyEntry>{tail_scratch_.data(), tail_scratch_.size()},
-      original_layout);
-  if (!tail_text_opt.has_value()) {
-    std::cerr << "[punto] Async: cannot build tail text for task_id="
-              << meta.task_id << " (layout=" << original_layout << ")\n";
-    return;
-  }
-
-  std::string replacement;
-  replacement.reserve(word_text_opt->size() + tail_text_opt->size());
-  replacement += *word_text_opt;
-  replacement += *tail_text_opt;
-
-  // Оригинальный текст (для Ctrl+Z).
-  std::optional<std::string> original_text_opt;
-  {
-    auto orig_word_text_opt = key_entries_to_visible_text_checked(
-        std::span<const KeyEntry>{meta.word.data(), meta.word.size()},
-        original_layout);
-    if (orig_word_text_opt.has_value()) {
-      std::string tmp = std::move(*orig_word_text_opt);
-      tmp += *tail_text_opt;
-      original_text_opt = std::move(tmp);
-    }
-  }
-
-  std::cerr << "[punto] Async-CORRECT(oneshot): task_id=" << meta.task_id
-            << " word_len=" << meta.word.size()
-            << " tail_len=" << tail_scratch_.size() << " erase=" << erase
-            << "\n";
-
-  MacroLockGuard lock_guard(macro_lock_);
-  if (!lock_guard.owns_lock()) {
-    std::cerr << "[punto] Async: не удалось захватить macro lock for task_id="
-              << meta.task_id << " (skip)\n";
-    return;
-  }
-  sync_layout_from_os();
-
-  is_processing_macro_.store(true, std::memory_order_release);
-  struct DrainGuard {
-    EventLoop *self;
-    ~DrainGuard() { self->drain_pending_events(); }
-  } drain_guard{this};
-
-  const auto macro_start = std::chrono::steady_clock::now();
-
-  const bool ok = replace_text_oneshot(erase, replacement,
-                                       /*final_layout=*/target_layout,
-                                       /*play_sound=*/true);
-  if (!ok) {
-    std::cerr << "[punto] Async: oneshot replace failed for task_id="
-              << meta.task_id << " (skip)\n";
-    return;
-  }
-
-  // Пост-коррекционная верификация раскладки: другой экземпляр мог переключить.
-  {
-    const int post_layout = sync_layout_from_os();
-    if (post_layout >= 0 && post_layout != target_layout) {
-      std::cerr << "[punto] Async: post-correction layout mismatch "
-                << post_layout << " != " << target_layout
-                << ", retrying set_layout\n";
-      (void)set_layout(target_layout, /*play_sound=*/false);
-    }
-  }
-
-  if (original_text_opt.has_value()) {
-    set_last_undo_record(std::move(*original_text_opt), replacement,
-                         /*restore_layout=*/original_layout,
-                         /*is_auto_correction=*/true);
-  }
-
-  const auto macro_end = std::chrono::steady_clock::now();
-  const auto macro_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            macro_end - macro_start)
-                            .count();
-
-  telemetry_.corrections++;
-  telemetry_.correction_us_sum += static_cast<std::uint64_t>(macro_us);
-  if (static_cast<std::uint64_t>(macro_us) > telemetry_.correction_us_max) {
-    telemetry_.correction_us_max = static_cast<std::uint64_t>(macro_us);
-  }
-
-  telemetry_.tail_len_sum += static_cast<std::uint64_t>(tail_scratch_.size());
-  if (tail_scratch_.size() > telemetry_.tail_len_max) {
-    telemetry_.tail_len_max = tail_scratch_.size();
-  }
-  lifetime_telemetry_.corrections.fetch_add(1, std::memory_order_relaxed);
-  lifetime_telemetry_.correction_us_sum.fetch_add(
-      static_cast<std::uint64_t>(macro_us), std::memory_order_relaxed);
-  lifetime_telemetry_.tail_len_sum.fetch_add(
-      static_cast<std::uint64_t>(tail_scratch_.size()),
-      std::memory_order_relaxed);
-
-  std::cerr << "[punto] Async-MACRO: task_id=" << meta.task_id
-            << " macro_us=" << macro_us << "\n";
-}
-
-void EventLoop::apply_case_correction(
-    const PendingWordMeta &meta, const std::vector<KeyEntry> &corrected_word) {
-
-  if (meta.word.empty() || corrected_word.empty()) {
-    return;
-  }
-
-  const int layout = meta.layout_at_boundary;
-  if (layout != 0 && layout != 1) {
-    std::cerr << "[punto] Async: invalid layout for case correction task_id="
-              << meta.task_id << " layout=" << layout << "\n";
-    return;
-  }
-
-  const std::uint64_t cursor = history_.cursor_pos();
-  const std::uint64_t base = history_.base_pos();
-
-  if (meta.start_pos < base || meta.end_pos > cursor) {
-    std::cerr
-        << "[punto] Async: history window miss for case correction task_id="
-        << meta.task_id << "\n";
-    return;
-  }
-
-  // Tail = всё после слова до текущей позиции
-  if (!history_.get_range(meta.end_pos, cursor, tail_scratch_)) {
-    std::cerr
-        << "[punto] Async: failed to get tail for case correction task_id="
-        << meta.task_id << "\n";
-    return;
-  }
-
-  const std::uint64_t erase64 = cursor - meta.start_pos;
-  const std::size_t erase = static_cast<std::size_t>(erase64);
-
-  std::cerr << "[punto] Async-CASE-FIX(oneshot): task_id=" << meta.task_id
-            << " word_len=" << meta.word.size()
-            << " corrected_len=" << corrected_word.size()
-            << " tail_len=" << tail_scratch_.size() << " erase=" << erase
-            << "\n";
-
-  auto word_text_opt = key_entries_to_visible_text_checked(
-      std::span<const KeyEntry>{corrected_word.data(), corrected_word.size()},
-      layout);
-  if (!word_text_opt.has_value()) {
-    std::cerr << "[punto] Async: cannot build corrected word text for task_id="
-              << meta.task_id << " (layout=" << layout << ")\n";
-    return;
-  }
-
-  auto tail_text_opt = key_entries_to_visible_text_checked(
-      std::span<const KeyEntry>{tail_scratch_.data(), tail_scratch_.size()},
-      layout);
-  if (!tail_text_opt.has_value()) {
-    std::cerr << "[punto] Async: cannot build tail text for task_id="
-              << meta.task_id << " (layout=" << layout << ")\n";
-    return;
-  }
-
-  std::string replacement;
-  replacement.reserve(word_text_opt->size() + tail_text_opt->size());
-  replacement += *word_text_opt;
-  replacement += *tail_text_opt;
-
-  // Оригинальный текст (для Ctrl+Z).
-  std::optional<std::string> original_text_opt;
-  {
-    auto orig_word_text_opt = key_entries_to_visible_text_checked(
-        std::span<const KeyEntry>{meta.word.data(), meta.word.size()}, layout);
-    if (orig_word_text_opt.has_value()) {
-      std::string tmp = std::move(*orig_word_text_opt);
-      tmp += *tail_text_opt;
-      original_text_opt = std::move(tmp);
-    }
-  }
-
-  MacroLockGuard lock_guard(macro_lock_);
-  if (!lock_guard.owns_lock()) {
-    std::cerr << "[punto] Async: не удалось захватить macro lock for case task_id="
-              << meta.task_id << " (skip)\n";
-    return;
-  }
-  sync_layout_from_os();
-
-  is_processing_macro_.store(true, std::memory_order_release);
-  struct DrainGuard {
-    EventLoop *self;
-    ~DrainGuard() { self->drain_pending_events(); }
-  } drain_guard{this};
-
-  const auto macro_start = std::chrono::steady_clock::now();
-
-  const bool ok = replace_text_oneshot(erase, replacement,
-                                       /*final_layout=*/std::nullopt,
-                                       /*play_sound=*/false);
-  if (!ok) {
-    std::cerr << "[punto] Async: oneshot replace failed for task_id="
-              << meta.task_id << " (skip)\n";
-    return;
-  }
-
-  if (original_text_opt.has_value()) {
-    set_last_undo_record(std::move(*original_text_opt), replacement,
-                         /*restore_layout=*/std::nullopt,
-                         /*is_auto_correction=*/true);
-  }
-
-  const auto macro_end = std::chrono::steady_clock::now();
-  const auto macro_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            macro_end - macro_start)
-                            .count();
-
-  telemetry_.corrections++;
-  telemetry_.correction_us_sum += static_cast<std::uint64_t>(macro_us);
-  if (static_cast<std::uint64_t>(macro_us) > telemetry_.correction_us_max) {
-    telemetry_.correction_us_max = static_cast<std::uint64_t>(macro_us);
-  }
-  lifetime_telemetry_.corrections.fetch_add(1, std::memory_order_relaxed);
-  lifetime_telemetry_.correction_us_sum.fetch_add(
-      static_cast<std::uint64_t>(macro_us), std::memory_order_relaxed);
-
-  std::cerr << "[punto] Async-CASE-MACRO: task_id=" << meta.task_id
-            << " macro_us=" << macro_us << "\n";
-}
-
-void EventLoop::apply_combined_correction(
-    const PendingWordMeta &meta, int target_layout,
-    const std::vector<KeyEntry> &corrected_word) {
-
-  if (meta.word.empty() || corrected_word.empty()) {
-    return;
-  }
-
-  const int original_layout = meta.layout_at_boundary;
-  if ((original_layout != 0 && original_layout != 1) ||
-      (target_layout != 0 && target_layout != 1)) {
-    std::cerr
-        << "[punto] Async: invalid layout values for combined fix task_id="
-        << meta.task_id << " original=" << original_layout
-        << " target=" << target_layout << "\n";
-    return;
-  }
-
-  const std::uint64_t cursor = history_.cursor_pos();
-  const std::uint64_t base = history_.base_pos();
-
-  if (meta.start_pos < base || meta.end_pos > cursor) {
-    std::cerr
-        << "[punto] Async: history window miss for combined correction task_id="
-        << meta.task_id << "\n";
-    return;
-  }
-
-  if (!history_.get_range(meta.end_pos, cursor, tail_scratch_)) {
-    std::cerr
-        << "[punto] Async: failed to get tail for combined correction task_id="
-        << meta.task_id << "\n";
-    return;
-  }
-
-  const std::uint64_t erase64 = cursor - meta.start_pos;
-  const std::size_t erase = static_cast<std::size_t>(erase64);
-
-  std::cerr << "[punto] Async-COMBINED-FIX(oneshot): task_id=" << meta.task_id
-            << " word_len=" << meta.word.size()
-            << " corrected_len=" << corrected_word.size()
-            << " tail_len=" << tail_scratch_.size() << " erase=" << erase
-            << " target_layout=" << target_layout << "\n";
-
-  auto word_text_opt = key_entries_to_visible_text_checked(
-      std::span<const KeyEntry>{corrected_word.data(), corrected_word.size()},
-      target_layout);
-  if (!word_text_opt.has_value()) {
-    std::cerr << "[punto] Async: cannot build corrected word text for task_id="
-              << meta.task_id << " (layout=" << target_layout << ")\n";
-    return;
-  }
-
-  auto tail_text_opt = key_entries_to_visible_text_checked(
-      std::span<const KeyEntry>{tail_scratch_.data(), tail_scratch_.size()},
-      original_layout);
-  if (!tail_text_opt.has_value()) {
-    std::cerr << "[punto] Async: cannot build tail text for task_id="
-              << meta.task_id << " (layout=" << original_layout << ")\n";
-    return;
-  }
-
-  std::string replacement;
-  replacement.reserve(word_text_opt->size() + tail_text_opt->size());
-  replacement += *word_text_opt;
-  replacement += *tail_text_opt;
-
-  // Оригинальный текст (для Ctrl+Z).
-  std::optional<std::string> original_text_opt;
-  {
-    auto orig_word_text_opt = key_entries_to_visible_text_checked(
-        std::span<const KeyEntry>{meta.word.data(), meta.word.size()},
-        original_layout);
-    if (orig_word_text_opt.has_value()) {
-      // Tail в original_layout уже посчитан в tail_text_opt.
-      std::string tmp = std::move(*orig_word_text_opt);
-      tmp += *tail_text_opt;
-      original_text_opt = std::move(tmp);
-    }
-  }
-
-  MacroLockGuard lock_guard(macro_lock_);
-  if (!lock_guard.owns_lock()) {
-    std::cerr << "[punto] Async: не удалось захватить macro lock for combined task_id="
-              << meta.task_id << " (skip)\n";
-    return;
-  }
-  sync_layout_from_os();
-
-  is_processing_macro_.store(true, std::memory_order_release);
-  struct DrainGuard {
-    EventLoop *self;
-    ~DrainGuard() { self->drain_pending_events(); }
-  } drain_guard{this};
-
-  const auto macro_start = std::chrono::steady_clock::now();
-
-  const bool ok = replace_text_oneshot(erase, replacement,
-                                       /*final_layout=*/target_layout,
-                                       /*play_sound=*/true);
-  if (!ok) {
-    std::cerr << "[punto] Async: oneshot replace failed for task_id="
-              << meta.task_id << " (skip)\n";
-    return;
-  }
-
-  // Пост-коррекционная верификация раскладки.
-  {
-    const int post_layout = sync_layout_from_os();
-    if (post_layout >= 0 && post_layout != target_layout) {
-      std::cerr << "[punto] Async: post-combined layout mismatch "
-                << post_layout << " != " << target_layout
-                << ", retrying set_layout\n";
-      (void)set_layout(target_layout, /*play_sound=*/false);
-    }
-  }
-
-  if (original_text_opt.has_value()) {
-    set_last_undo_record(std::move(*original_text_opt), replacement,
-                         /*restore_layout=*/original_layout,
-                         /*is_auto_correction=*/true);
-  }
-
-  const auto macro_end = std::chrono::steady_clock::now();
-  const auto macro_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            macro_end - macro_start)
-                            .count();
-
-  telemetry_.corrections++;
-  telemetry_.correction_us_sum += static_cast<std::uint64_t>(macro_us);
-  if (static_cast<std::uint64_t>(macro_us) > telemetry_.correction_us_max) {
-    telemetry_.correction_us_max = static_cast<std::uint64_t>(macro_us);
-  }
-  lifetime_telemetry_.corrections.fetch_add(1, std::memory_order_relaxed);
-  lifetime_telemetry_.correction_us_sum.fetch_add(
-      static_cast<std::uint64_t>(macro_us), std::memory_order_relaxed);
-
-  std::cerr << "[punto] Async-COMBINED-MACRO: task_id=" << meta.task_id
-            << " macro_us=" << macro_us << "\n";
-}
-
-void EventLoop::action_invert_layout_selection() {
-  MacroLockGuard lock_guard(macro_lock_);
-  if (!lock_guard.owns_lock()) {
-    std::cerr << "[punto] Invert-layout-selection: не удалось захватить macro lock (skip)\n";
-    return;
-  }
-  sync_layout_from_os();
-  is_processing_macro_.store(true, std::memory_order_release);
-
-  const int restore_layout_for_undo = current_layout_;
-
-  if (process_selection(
-          [](std::string_view text) { return invert_layout(text); },
-          /*restore_layout_for_undo=*/restore_layout_for_undo)) {
-    // Переключаем раскладку после успешной инверсии
-    wait_and_buffer(std::chrono::microseconds{100000});
-    switch_layout(true);
-  }
-
-  drain_pending_events();
-}
-
-void EventLoop::action_invert_case_selection() {
-  MacroLockGuard lock_guard(macro_lock_);
-  if (!lock_guard.owns_lock()) {
-    std::cerr << "[punto] Invert-case-selection: не удалось захватить macro lock (skip)\n";
-    return;
-  }
-  sync_layout_from_os();
-  is_processing_macro_.store(true, std::memory_order_release);
-  (void)process_selection(
-      [](std::string_view text) { return invert_case(text); },
-      /*restore_layout_for_undo=*/std::nullopt);
-  drain_pending_events();
-}
-
-void EventLoop::action_transliterate_selection() {
-  MacroLockGuard lock_guard(macro_lock_);
-  if (!lock_guard.owns_lock()) {
-    std::cerr << "[punto] Transliterate-selection: не удалось захватить macro lock (skip)\n";
-    return;
-  }
-  sync_layout_from_os();
-  is_processing_macro_.store(true, std::memory_order_release);
-  (void)process_selection(
-      [](std::string_view text) { return transliterate(text); },
-      /*restore_layout_for_undo=*/std::nullopt);
-  drain_pending_events();
-}
-
 IpcResult EventLoop::stats_report() const {
+  const StallHealthSnapshot x11_health = x11_health_.snapshot();
+  StallHealthSnapshot analysis_health = analysis_health_.snapshot();
+  if (!analysis_pool_ && analysis_health.health != ComponentHealth::Failed) {
+    analysis_health.health = ComponentHealth::Degraded;
+    analysis_health.in_flight = dictionary_load_pending_;
+  }
+  const StallHealthSnapshot input_health = input_health_.snapshot();
   const std::uint64_t analyzed =
       lifetime_telemetry_.analyzed_words.load(std::memory_order_relaxed);
-  const std::uint64_t corrections =
-      lifetime_telemetry_.corrections.load(std::memory_order_relaxed);
   const std::uint64_t queue_sum =
       lifetime_telemetry_.queue_us_sum.load(std::memory_order_relaxed);
   const std::uint64_t analysis_sum =
       lifetime_telemetry_.analysis_us_sum.load(std::memory_order_relaxed);
-  const std::uint64_t correction_sum =
-      lifetime_telemetry_.correction_us_sum.load(std::memory_order_relaxed);
-  const std::uint64_t tail_sum =
-      lifetime_telemetry_.tail_len_sum.load(std::memory_order_relaxed);
 
   std::string stats;
-  stats.reserve(256);
-  stats += "enabled=";
-  stats += ipc_enabled_.load(std::memory_order_relaxed) ? "1" : "0";
+  stats.reserve(512);
+  stats += "x11_health=";
+  stats += component_health_name(x11_health.health);
+  stats += " analysis_health=";
+  stats += component_health_name(analysis_health.health);
+  stats += " input_health=";
+  stats += component_health_name(input_health.health);
+  stats +=
+      " x11_last_progress_ms=" + std::to_string(x11_health.last_progress_ms);
+  stats += " analysis_last_progress_ms=" +
+           std::to_string(analysis_health.last_progress_ms);
+  stats += " input_last_progress_ms=" +
+           std::to_string(input_health.last_progress_ms);
+  stats +=
+      " analysis_outstanding=" + std::to_string(analysis_accepted_at_.size());
+  stats += " input_in_flight=";
+  stats += input_health.in_flight ? "1" : "0";
+  stats += " log_dropped=" + std::to_string(dropped_log_records());
+  stats += " text_mutation=disabled";
+  stats += " enabled=0";
+  stats += " configured_enabled=";
+  const auto configured = std::atomic_load(&config_);
+  stats += configured && configured->auto_switch.enabled ? "1" : "0";
+  stats += " config_pending=";
+  stats += config_load_pending_ ? "1" : "0";
+  stats += " config_generation=" + std::to_string(config_load_generation_);
+  stats += " config_result=";
+  switch (config_load_status_) {
+  case ConfigLoadStatus::None:
+    stats += "none";
+    break;
+  case ConfigLoadStatus::Ok:
+    stats += "ok";
+    break;
+  case ConfigLoadStatus::Error:
+    stats += "error";
+    break;
+  }
   stats += " analyzed=" + std::to_string(analyzed);
   stats += " need_switch=" +
            std::to_string(lifetime_telemetry_.need_switch_words.load(
                std::memory_order_relaxed));
-  stats += " corrections=" + std::to_string(corrections);
-  stats += " pending_words=" +
-           std::to_string(lifetime_telemetry_.pending_words.load(
-               std::memory_order_relaxed));
-  stats += " ready_results=" +
-           std::to_string(lifetime_telemetry_.ready_results.load(
-               std::memory_order_relaxed));
-  stats += " worker_threads=" + std::to_string(analysis_pool_.worker_count());
+  stats += " corrections=0";
+  stats += " pending_words=0";
+  stats +=
+      " ready_results=" + std::to_string(lifetime_telemetry_.ready_results.load(
+                              std::memory_order_relaxed));
+  stats += " worker_threads=" +
+           std::to_string(analysis_pool_ ? analysis_pool_->worker_count() : 0);
   stats +=
       " daemon_peers=" + std::to_string(analysis_thread_budget_.daemon_count);
   stats += " analysis_mode=";
   stats += analysis_thread_budget_.manual_override ? "fixed" : "auto";
   stats += " control_plane=";
-  stats += control_plane_primary_.load(std::memory_order_acquire)
-               ? "primary"
-               : "secondary";
-  stats += " queued_tasks=" + std::to_string(analysis_pool_.pending_task_count());
+  stats += control_plane_primary_.load(std::memory_order_acquire) ? "primary"
+                                                                  : "secondary";
+  stats +=
+      " queued_tasks=" +
+      std::to_string(analysis_pool_ ? analysis_pool_->pending_task_count() : 0);
   stats += " avg_queue_us=" +
            std::to_string(analyzed > 0 ? queue_sum / analyzed : 0);
   stats += " avg_analysis_us=" +
            std::to_string(analyzed > 0 ? analysis_sum / analyzed : 0);
-  stats += " avg_macro_us=" +
-           std::to_string(corrections > 0 ? correction_sum / corrections : 0);
-  stats += " avg_tail_len=" +
-           std::to_string(corrections > 0 ? tail_sum / corrections : 0);
+  stats += " avg_macro_us=0";
+  stats += " avg_tail_len=0";
 
   return {true, std::move(stats)};
 }
 
-std::optional<std::filesystem::path>
-EventLoop::validate_reload_path(const std::string &config_path) const {
-  std::filesystem::path candidate{config_path};
-  std::error_code ec;
-  if (!std::filesystem::exists(candidate, ec) || ec) {
-    return std::nullopt;
+IpcResult
+EventLoop::reload_config(const std::string &config_path,
+                         std::optional<std::uint64_t> control_plane_generation,
+                         std::optional<std::uint64_t> x11_config_generation,
+                         bool promotion_reconciliation) {
+  if (config_load_pending_) {
+    return {false, "Config reload in progress"};
   }
 
-  const std::filesystem::path canonical_candidate =
-      std::filesystem::weakly_canonical(candidate, ec);
-  if (ec) {
-    return std::nullopt;
-  }
-
-  std::vector<std::filesystem::path> allowed_roots{
-      std::filesystem::path{"/etc/punto"}};
-
-  if (x11_session_) {
-    const X11SessionInfo info = x11_session_->info();
+  const std::filesystem::path system_root{"/etc/punto"};
+  std::optional<std::filesystem::path> user_root;
+  std::optional<X11SessionInfo> session_authority;
+  auto session_lease = [this]() -> std::optional<X11Session::WriteLease> {
+    if (!x11_session_) {
+      return std::nullopt;
+    }
+    return x11_session_->acquire_write_lease();
+  }();
+  if (session_lease) {
+    const X11SessionInfo &info = session_lease->info();
+    session_authority = info;
     if (!info.xdg_config_home.empty()) {
-      allowed_roots.emplace_back(std::filesystem::path{info.xdg_config_home} /
-                                 "punto");
-    }
-    if (!info.home_dir.empty()) {
-      allowed_roots.emplace_back(std::filesystem::path{info.home_dir} /
-                                 ".config/punto");
+      user_root = std::filesystem::path{info.xdg_config_home} / "punto";
+    } else if (!info.home_dir.empty()) {
+      user_root = std::filesystem::path{info.home_dir} / ".config" / "punto";
     }
   }
 
-  for (const auto &root : allowed_roots) {
-    const std::filesystem::path canonical_root =
-        std::filesystem::weakly_canonical(root, ec);
-    if (ec) {
-      ec.clear();
-      continue;
-    }
-    if (path_within(canonical_candidate, canonical_root)) {
-      return canonical_candidate;
-    }
-  }
-
-  return std::nullopt;
-}
-
-IpcResult EventLoop::reload_config(const std::string &config_path) {
-  std::filesystem::path system_path{std::string{kConfigPath}};
-  std::filesystem::path load_path = system_path;
-  bool tried_user = false;
-  bool user_exists = false;
-
-  const bool explicit_path = !config_path.empty();
-
-  if (explicit_path) {
-    auto validated = validate_reload_path(config_path);
-    if (!validated.has_value()) {
-      std::cerr << "[punto] Invalid RELOAD path: " << config_path << "\n";
+  std::string normalized_requested_path;
+  if (!config_path.empty()) {
+    const std::filesystem::path requested{config_path};
+    if (!requested.is_absolute()) {
       return {false, "Invalid path"};
     }
-    load_path = std::move(*validated);
-    tried_user = true;
-    user_exists = true; // путь указан явно и существует
-  } else {
-    std::optional<std::filesystem::path> user_path;
-    if (x11_session_) {
-      // Важно: reload_config() может выполняться из IPC-потока.
-      // Не трогаем процессное окружение (setenv) здесь, берём снапшот данных.
-      const X11SessionInfo info = x11_session_->info();
-      if (!info.xdg_config_home.empty()) {
-        user_path = std::filesystem::path{info.xdg_config_home} / "punto" /
-                    "config.yaml";
-      } else if (!info.home_dir.empty()) {
-        user_path = std::filesystem::path{info.home_dir} /
-                    ".config/punto/config.yaml";
-      }
+    const std::filesystem::path normalized = requested.lexically_normal();
+    const bool allowed = path_is_beneath(normalized, system_root) ||
+                         (user_root && path_is_beneath(normalized, *user_root));
+    if (!allowed) {
+      return {false, "Invalid path"};
     }
-
-    tried_user = user_path.has_value();
-    if (user_path) {
-      std::error_code ec;
-      user_exists = std::filesystem::exists(*user_path, ec) && !ec;
-      if (user_exists) {
-        load_path = *user_path;
-      }
-    }
+    normalized_requested_path = normalized.string();
   }
 
-  ConfigLoadOutcome loaded = load_config_checked(load_path);
+  ConfigLoadTask task;
+  task.generation = ++config_load_generation_;
+  task.system_root = system_root;
+  task.user_root = std::move(user_root);
+  task.session_authority = std::move(session_authority);
+  task.control_plane_generation = control_plane_generation;
+  task.x11_config_generation = x11_config_generation;
+  task.requested_path = std::move(normalized_requested_path);
+  task.promotion_reconciliation = promotion_reconciliation;
+  {
+    std::lock_guard<std::mutex> lock{config_loader_state_->mutex};
+    if (config_loader_state_->stop_requested ||
+        config_loader_state_->request.has_value() ||
+        config_loader_state_->completion.has_value()) {
+      return {false, "Config loader unavailable"};
+    }
+    config_loader_state_->request = std::move(task);
+  }
+  config_load_pending_ = true;
+  config_load_status_ = ConfigLoadStatus::None;
+  config_loader_state_->condition.notify_all();
+  return {true, "Scheduled"};
+}
+
+void EventLoop::request_x11_config_reload() {
+  const std::uint64_t generation = ++x11_config_generation_;
+  if (config_load_pending_) {
+    pending_x11_config_generation_ = generation;
+    return;
+  }
+
+  IpcResult result = reload_config({}, std::nullopt, generation);
+  if (!result.success) {
+    pending_x11_config_generation_ = generation;
+    std::cerr << "[punto] Warning: config reload after X11 refresh deferred: "
+              << result.message << "\n";
+  }
+}
+
+void EventLoop::retry_pending_x11_config_reload() {
+  if (!pending_x11_config_generation_ || config_load_pending_ ||
+      !x11_session_ || !x11_session_->is_valid()) {
+    return;
+  }
+
+  const std::uint64_t generation = *pending_x11_config_generation_;
+  pending_x11_config_generation_.reset();
+  if (generation != x11_config_generation_) {
+    return;
+  }
+
+  IpcResult result = reload_config({}, std::nullopt, generation);
+  if (!result.success) {
+    if (generation == x11_config_generation_) {
+      pending_x11_config_generation_ = generation;
+    }
+    std::cerr << "[punto] Warning: deferred X11 config reload failed: "
+              << result.message << "\n";
+  }
+}
+
+void EventLoop::poll_config_load_completion() {
+  std::optional<ConfigLoadCompletion> completion;
+  {
+    std::lock_guard<std::mutex> lock{config_loader_state_->mutex};
+    if (config_loader_state_->completion) {
+      completion = std::move(config_loader_state_->completion);
+      config_loader_state_->completion.reset();
+    }
+  }
+  if (!completion) {
+    return;
+  }
+
+  config_load_pending_ = false;
+  const auto finish = [this]() { retry_pending_x11_config_reload(); };
+  if (completion->task.generation != config_load_generation_ ||
+      (completion->task.x11_config_generation &&
+       *completion->task.x11_config_generation != x11_config_generation_)) {
+    config_load_status_ = pending_x11_config_generation_
+                              ? ConfigLoadStatus::None
+                              : ConfigLoadStatus::Error;
+    std::cerr << "[punto] Config reload superseded by newer session\n";
+    finish();
+    return;
+  }
+
+  ConfigLoadOutcome &loaded = completion->outcome;
   if (loaded.result != ConfigResult::Ok) {
+    config_load_status_ = ConfigLoadStatus::Error;
     std::cerr << "[punto] Config reload failed: " << loaded.error << "\n";
-    return {false,
-            loaded.error.empty() ? "Config reload failed" : loaded.error};
+    finish();
+    return;
   }
 
-  auto old_cfg = std::atomic_load(&config_);
-  auto new_cfg = std::make_shared<Config>(std::move(loaded.config));
-
-  // Всегда синхронизируем runtime-статус автопереключения с конфигом при
-  // RELOAD. Это делает файл конфигурации единым источником истины и устраняет
-  // рассинхронизацию после SET_STATUS (runtime-only).
-  ipc_enabled_.store(new_cfg->auto_switch.enabled, std::memory_order_relaxed);
-
-  auto new_analyzer = std::make_shared<LayoutAnalyzer>(new_cfg->auto_switch);
-
-  auto new_injector = std::make_shared<KeyInjector>();
-  new_injector->set_wait_func(
-      [this](std::chrono::microseconds us) { this->wait_and_buffer(us); });
-
-  // Публикуем новые снапшоты (без блокировок, безопасно для main loop).
-  std::shared_ptr<const Config> cfg_const = new_cfg;
-  std::shared_ptr<const LayoutAnalyzer> analyzer_const = new_analyzer;
-  std::shared_ptr<const KeyInjector> injector_const = new_injector;
-
-  std::atomic_store(&config_, std::move(cfg_const));
-  std::atomic_store(&analyzer_, std::move(analyzer_const));
-  std::atomic_store(&injector_, std::move(injector_const));
-
-  // reload_config() может выполняться в IPC-потоке, а main-поток пересоздаёт
-  // SoundManager при смене X11-сессии — работаем только через снапшот.
-  if (auto sound_manager = std::atomic_load(&sound_manager_)) {
-    sound_manager->set_enabled(new_cfg->sound.enabled);
-  }
-  update_log_level(new_cfg->logging.level);
-
-  if (old_cfg &&
-      (old_cfg->runtime.analysis_threads != new_cfg->runtime.analysis_threads ||
-       old_cfg->runtime.max_analysis_threads_per_daemon !=
-           new_cfg->runtime.max_analysis_threads_per_daemon)) {
-    std::cerr << "[punto] runtime thread settings changed; restart punto/udevmon to apply\n";
+  auto authority_lease =
+      [this, &completion]() -> std::optional<X11Session::WriteLease> {
+    const auto &task = completion->task;
+    if (!task.user_root ||
+        !path_is_beneath(completion->outcome.used_path, *task.user_root)) {
+      return std::nullopt;
+    }
+    if (!task.session_authority || !x11_session_) {
+      return std::nullopt;
+    }
+    auto lease = x11_session_->acquire_write_lease();
+    if (!lease ||
+        !same_config_authority(lease->info(), *task.session_authority)) {
+      return std::nullopt;
+    }
+    return lease;
+  }();
+  const bool user_config =
+      completion->task.user_root &&
+      path_is_beneath(loaded.used_path, *completion->task.user_root);
+  if (user_config && !authority_lease) {
+    config_load_status_ = ConfigLoadStatus::Error;
+    std::cerr << "[punto] Config reload discarded after session change\n";
+    finish();
+    return;
   }
 
-  std::cerr << "[punto] Configuration reloaded: " << loaded.used_path << "\n";
-  std::cerr << "[punto] auto_switch: enabled=" << new_cfg->auto_switch.enabled
-            << ", threshold=" << new_cfg->auto_switch.threshold
-            << ", min_word_len=" << new_cfg->auto_switch.min_word_len
-            << ", min_score=" << new_cfg->auto_switch.min_score
-            << ", max_rollback_words="
-            << new_cfg->auto_switch.max_rollback_words << '\n';
+  try {
+    auto old_cfg = std::atomic_load(&config_);
+    auto new_cfg = std::make_shared<Config>(std::move(loaded.config));
 
-  if (control_plane_primary_.load(std::memory_order_acquire)) {
-    publish_control_plane_state(/*bump_config_generation=*/true,
-                                /*bump_status_generation=*/true);
+    std::shared_ptr<const Config> cfg_const = new_cfg;
+
+    std::atomic_store(&config_, std::move(cfg_const));
+    update_log_level(new_cfg->logging.level);
+
+    if (old_cfg && (old_cfg->runtime.analysis_threads !=
+                        new_cfg->runtime.analysis_threads ||
+                    old_cfg->runtime.max_analysis_threads_per_daemon !=
+                        new_cfg->runtime.max_analysis_threads_per_daemon)) {
+      std::cerr << "[punto] runtime thread settings changed; restart "
+                   "punto/udevmon to apply\n";
+    }
+
+    std::cerr << "[punto] Configuration reloaded: " << loaded.used_path << "\n";
+    std::cerr << "[punto] auto_switch: enabled=" << new_cfg->auto_switch.enabled
+              << ", threshold=" << new_cfg->auto_switch.threshold
+              << ", min_word_len=" << new_cfg->auto_switch.min_word_len
+              << ", min_score=" << new_cfg->auto_switch.min_score
+              << ", max_rollback_words="
+              << new_cfg->auto_switch.max_rollback_words << '\n';
+
+    if (completion->task.control_plane_generation) {
+      std::lock_guard<std::mutex> lock(control_plane_mutex_);
+      applied_config_generation_ = *completion->task.control_plane_generation;
+      if (completion->task.promotion_reconciliation &&
+          completion->used_promotion_fallback) {
+        promotion_fallback_applied_generation_ =
+            completion->task.control_plane_generation;
+      }
+    }
+
+    if (control_plane_primary_.load(std::memory_order_acquire)) {
+      publish_control_plane_state(/*bump_config_generation=*/true,
+                                  /*bump_status_generation=*/true);
+    }
+    config_load_status_ = ConfigLoadStatus::Ok;
+  } catch (...) {
+    config_load_status_ = ConfigLoadStatus::Error;
+    std::cerr << "[punto] Config commit failed\n";
   }
-
-  std::string message = "Loaded " + loaded.used_path.string();
-  if (!explicit_path && tried_user && !user_exists) {
-    message += " (user config not found; using system config)";
-  }
-
-  return {true, std::move(message)};
+  finish();
 }
 
 } // namespace punto

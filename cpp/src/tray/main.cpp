@@ -14,11 +14,11 @@
 namespace {
 
 void print_version() {
-  std::cout << "Punto Tray 2.8.5\n"
+  std::cout << "Punto Tray " PUNTO_VERSION "\n"
             << "Приложение для управления Punto Switcher\n";
 }
 
-void print_usage(const char* argv0) {
+void print_usage(const char *argv0) {
   std::cout << "Использование: " << argv0 << " [опции]\n"
             << "\n"
             << "Опции:\n"
@@ -31,7 +31,7 @@ void print_usage(const char* argv0) {
 
 } // namespace
 
-int main(int argc, char* argv[]) {
+int main(int argc, char *argv[]) {
   // Обработка аргументов командной строки
   for (int i = 1; i < argc; ++i) {
     std::string_view arg = argv[i];
@@ -48,12 +48,9 @@ int main(int argc, char* argv[]) {
   // Инициализация GTK
   gtk_init(&argc, &argv);
 
-  // Проверяем доступность сервиса (silent; сервис может появиться позже)
-  (void)punto::IpcClient::is_service_available();
-
   // Создаём и запускаем приложение
   punto::TrayApp app;
-  
+
   if (!app.initialize()) {
     return 1;
   }

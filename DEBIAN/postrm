@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+case "${1:-}" in
+    remove|purge)
+        deb-systemd-invoke --user daemon-reload >/dev/null 2>&1 || true
+        ;;
+esac
+
+case "${1:-}" in
+    purge)
+        runtime_gid=/etc/punto/runtime-gid
+        if [ -L "$runtime_gid" ] || [ -f "$runtime_gid" ]; then
+            rm -f -- "$runtime_gid"
+        elif [ -e "$runtime_gid" ]; then
+            echo "punto-switcher: refusing to remove unexpected $runtime_gid" >&2
+        fi
+        ;;
+esac
+
+exit 0

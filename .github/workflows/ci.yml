@@ -4,55 +4,121 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   release:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            bubblewrap \
+            busybox-static \
             cmake \
+            netcat-openbsd \
             pkg-config \
-            libx11-dev \
+            python3 \
+            python3-gi \
+            gir1.2-vte-2.91 \
+            shellcheck \
+            strace \
             libhunspell-dev \
+            libsystemd-dev \
+            libxcb1-dev \
+            libxcb-xkb-dev \
+            libxcb-xfixes0-dev \
+            libxau-dev \
+            libyaml-cpp-dev \
             libgtk-3-dev \
-            libayatana-appindicator3-dev
+            libayatana-appindicator3-dev \
+            xauth \
+            xclip \
+            xdotool \
+            xvfb
       - name: Configure
         run: cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build cpp/build -j"$(nproc)"
       - name: Test
+        env:
+          PUNTO_REQUIRE_EVENT_LOOP_E2E: "1"
         run: ctest --test-dir cpp/build --output-on-failure
+      - name: CLI contract
+        run: bash tests/test_cli_contract.sh
+      - name: Shell safety
+        run: shellcheck punto-cli.sh build-deb.sh DEBIAN/postinst DEBIAN/prerm DEBIAN/postrm tests/*.sh
 
   sanitizers:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            bubblewrap \
+            busybox-static \
             cmake \
+            netcat-openbsd \
             pkg-config \
-            libx11-dev \
+            python3 \
+            python3-gi \
+            gir1.2-vte-2.91 \
+            strace \
             libhunspell-dev \
+            libsystemd-dev \
+            libxcb1-dev \
+            libxcb-xkb-dev \
+            libxcb-xfixes0-dev \
+            libxau-dev \
+            libyaml-cpp-dev \
             libgtk-3-dev \
-            libayatana-appindicator3-dev
+            libayatana-appindicator3-dev \
+            xauth \
+            xclip \
+            xdotool \
+            xvfb
       - name: Configure
-        run: cmake -S cpp -B cpp/build-debug -DCMAKE_BUILD_TYPE=Debug
+        run: >-
+          cmake -S cpp -B cpp/build-debug
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer'
+          -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
       - name: Build
         run: cmake --build cpp/build-debug -j"$(nproc)"
-      - name: Test
-        run: ctest --test-dir cpp/build-debug --output-on-failure
+      - name: Test with ASan, UBSan, and LeakSanitizer
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          PUNTO_REQUIRE_EVENT_LOOP_E2E: "1"
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: >-
+          ctest --test-dir cpp/build-debug --output-on-failure
+          -E '^punto-clipboard-gtk-contract$'
+      - name: Test GTK clipboard with ASan and UBSan
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: >-
+          ctest --test-dir cpp/build-debug --output-on-failure
+          -R '^punto-clipboard-gtk-contract$'
 
   clang-tidy:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install deps
         run: |
           sudo apt-get update
@@ -61,33 +127,73 @@ jobs:
             cmake \
             pkg-config \
             clang-tidy \
-            libx11-dev \
             libhunspell-dev \
+            libsystemd-dev \
+            libxcb1-dev \
+            libxcb-xkb-dev \
+            libxcb-xfixes0-dev \
+            libxau-dev \
+            libyaml-cpp-dev \
             libgtk-3-dev \
             libayatana-appindicator3-dev
-      - name: Configure
-        run: cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+      - name: Configure production database
+        run: >-
+          cmake -S cpp -B cpp/build-tidy-product
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=OFF
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      - name: Configure contract database
+        run: >-
+          cmake -S cpp -B cpp/build-tidy-contract
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      - name: Select authoritative commands
+        run: |
+          python3 tests/select_clang_tidy_commands.py \
+            --source-root cpp/src \
+            --product-db cpp/build-tidy-product/compile_commands.json \
+            --contract-db cpp/build-tidy-contract/compile_commands.json \
+            --output cpp/build-tidy/compile_commands.json
       - name: Run clang-tidy
         run: |
-          mapfile -t files < <(find cpp/src cpp/include -type f \( -name '*.cpp' -o -name '*.hpp' \))
-          clang-tidy -p cpp/build "${files[@]}"
+          mapfile -t files < <(find cpp/src -type f -name '*.cpp' -print | sort)
+          clang-tidy \
+            --checks='-*,clang-analyzer-*,concurrency-*,-concurrency-mt-unsafe,bugprone-branch-clone,bugprone-dangling-handle,bugprone-exception-escape,bugprone-infinite-loop,bugprone-move-forwarding-reference,bugprone-not-null-terminated-result,bugprone-optional-value-conversion,bugprone-signal-handler,bugprone-sizeof-container,bugprone-sizeof-expression,bugprone-string-constructor,bugprone-string-integer-assignment,bugprone-string-literal-with-embedded-nul,bugprone-stringview-nullptr,bugprone-suspicious-enum-usage,bugprone-suspicious-include,bugprone-suspicious-memory-comparison,bugprone-suspicious-memset-usage,bugprone-suspicious-missing-comma,bugprone-suspicious-realloc-usage,bugprone-suspicious-semicolon,bugprone-suspicious-string-compare,bugprone-swapped-arguments,bugprone-terminating-continue,bugprone-throw-keyword-missing,bugprone-too-small-loop-variable,bugprone-unchecked-optional-access,bugprone-undefined-memory-manipulation,bugprone-unhandled-exception-at-new,bugprone-unhandled-self-assignment,bugprone-unsafe-functions,bugprone-use-after-move,cppcoreguidelines-init-variables,cppcoreguidelines-missing-std-forward,cppcoreguidelines-pro-type-member-init' \
+            --warnings-as-errors='*' \
+            -p cpp/build-tidy \
+            "${files[@]}"
 
   package:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            bubblewrap \
+            busybox-static \
+            binutils \
             cmake \
+            dpkg-dev \
+            file \
             pkg-config \
             lintian \
-            libx11-dev \
+            python3 \
+            strace \
             libhunspell-dev \
+            libsystemd-dev \
+            libxcb1-dev \
+            libxcb-xkb-dev \
+            libxau-dev \
+            libyaml-cpp-dev \
             libgtk-3-dev \
             libayatana-appindicator3-dev
+      - name: Packaging contract
+        run: bash tests/test_packaging_contract.sh
       - name: Build package
         run: ./build-deb.sh --non-interactive --skip-runtime-installs
       - name: Lint package

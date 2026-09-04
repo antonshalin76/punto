@@ -9,7 +9,7 @@
 #include "punto/scancode_map.hpp"
 
 #include <algorithm>
-#include <cstring>
+#include <string>
 
 namespace punto {
 
@@ -96,9 +96,8 @@ double LayoutAnalyzer::calculate_score(std::span<const KeyEntry> word,
   asm_utils::prefetch_read(kEnTrigrams.data());
   asm_utils::prefetch_read(kRuTrigrams.data());
 
-  // Конвертируем слово в ASCII
-  char buffer[kMaxWordLen];
-  std::size_t len = word_to_ascii(word, buffer);
+  const std::string buffer = word_to_ascii(word);
+  const std::size_t len = buffer.size();
 
   if (len < 2) {
     return 0.0;
@@ -199,9 +198,7 @@ bool LayoutAnalyzer::has_invalid_chars(std::span<const KeyEntry> word) {
     // Проверяем на спецсимволы (кроме допустимых)
     // Допустимые: буквы, некоторые знаки препинания для русского (,.;'[])
     if (c == '\0') {
-      // Неизвестный скан-код — возможно спецсимвол
-      // Но не считаем это ошибкой, просто пропускаем
-      continue;
+      return true;
     }
 
     // Проверяем ASCII спецсимволы
@@ -214,19 +211,18 @@ bool LayoutAnalyzer::has_invalid_chars(std::span<const KeyEntry> word) {
   return false;
 }
 
-std::size_t LayoutAnalyzer::word_to_ascii(std::span<const KeyEntry> word,
-                                          char *buffer) {
-  std::size_t len = 0;
+std::string LayoutAnalyzer::word_to_ascii(std::span<const KeyEntry> word) {
+  std::string result;
+  result.reserve(word.size());
 
   for (const auto &entry : word) {
     char c = scancode_to_lowercase(entry.code);
     if (c != '\0') {
-      buffer[len++] = c;
+      result.push_back(c);
     }
   }
 
-  buffer[len] = '\0';
-  return len;
+  return result;
 }
 
 void LayoutAnalyzer::count_invalid_bigrams(std::span<const KeyEntry> word,
@@ -239,8 +235,8 @@ void LayoutAnalyzer::count_invalid_bigrams(std::span<const KeyEntry> word,
     return;
   }
 
-  char buffer[kMaxWordLen];
-  std::size_t len = word_to_ascii(word, buffer);
+  const std::string buffer = word_to_ascii(word);
+  const std::size_t len = buffer.size();
 
   if (len < 2) {
     return;

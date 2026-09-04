@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -53,13 +54,22 @@ struct WordTask {
   std::chrono::steady_clock::time_point submitted_at{};
 };
 
-/// Тип коррекции, применённой к слову
+struct AnalysisAdmission {
+  bool accepted = false;
+  std::uint64_t epoch = 0;
+  std::chrono::steady_clock::time_point accepted_at{};
+
+  [[nodiscard]] explicit operator bool() const noexcept { return accepted; }
+};
+
+/// Тип распознанной коррекции. EventLoop v2.8.6 учитывает её только в
+/// телеметрии.
 enum class CorrectionType {
-  NoCorrection,   // Коррекция не требуется
-  LayoutSwitch,   // Переключение раскладки (EN <-> RU)
-  TypoFix,        // Исправление опечатки (перестановка, замена, пропуск, дубль)
+  NoCorrection, // Коррекция не требуется
+  LayoutSwitch, // Переключение раскладки (EN <-> RU)
+  TypoFix, // Исправление опечатки (перестановка, замена, пропуск, дубль)
   StickyShiftFix, // Исправление залипшего Shift (ПРивет -> Привет)
-  CombinedFix     // Комбинированное исправление (раскладка + регистр)
+  CombinedFix // Комбинированное исправление (раскладка + регистр)
 };
 
 enum class WordTerminalStatus { Completed, Failed, Cancelled };
@@ -87,11 +97,16 @@ struct WordResult {
 
 class AnalysisWorkerPool {
 public:
-  explicit AnalysisWorkerPool(const Dictionary &dict,
-                              std::function<void()> before_task = {},
-                              std::function<void()> on_stop_wait = {})
+  static constexpr std::size_t kDefaultMaxOutstandingTasks = 1024;
+
+  explicit AnalysisWorkerPool(
+      const Dictionary &dict, std::function<void()> before_task = {},
+      std::function<void()> on_stop_wait = {},
+      std::size_t max_outstanding_tasks = kDefaultMaxOutstandingTasks)
       : dict_{&dict}, before_task_{std::move(before_task)},
-        on_stop_wait_{std::move(on_stop_wait)} {}
+        on_stop_wait_{std::move(on_stop_wait)},
+        max_outstanding_tasks_{
+            std::max<std::size_t>(max_outstanding_tasks, 1)} {}
 
   AnalysisWorkerPool(const AnalysisWorkerPool &) = delete;
   AnalysisWorkerPool &operator=(const AnalysisWorkerPool &) = delete;
@@ -116,6 +131,11 @@ public:
     for (std::size_t i = 0; i < threads; ++i) {
       threads_.emplace_back([this](std::stop_token st) { worker_main(st); });
     }
+  }
+
+  void close_admission() noexcept {
+    std::lock_guard<std::mutex> state_lock(state_mu_);
+    accepting_ = false;
   }
 
   void stop() {
@@ -177,13 +197,18 @@ public:
     state_cv_.notify_all();
   }
 
-  [[nodiscard]] bool submit(WordTask task) {
+  [[nodiscard]] AnalysisAdmission submit(WordTask task) {
     std::lock_guard<std::mutex> state_lock(state_mu_);
-    if (!accepting_ || lifecycle_ != Lifecycle::Running || fatal_ ||
-        task_states_.contains(task.task_id)) {
-      return false;
+    if (task.word.size() > kMaxWordLen ||
+        task.analysis_len > task.word.size() ||
+        (task.layout_at_boundary != 0 && task.layout_at_boundary != 1) ||
+        !accepting_ || lifecycle_ != Lifecycle::Running || fatal_ ||
+        task_states_.contains(task.task_id) ||
+        task_states_.size() >= max_outstanding_tasks_) {
+      return {};
     }
 
+    const std::uint64_t task_id = task.task_id;
     task.epoch = epoch_;
     TaskState state;
     state.epoch = task.epoch;
@@ -198,10 +223,11 @@ public:
         task_states_.at(committed.task_id).accepted_at = accepted_at;
       });
     } catch (...) {
-      task_states_.erase(task.task_id);
+      task_states_.erase(task_id);
       throw;
     }
-    return true;
+    const TaskState &committed = task_states_.at(task_id);
+    return {true, committed.epoch, committed.accepted_at};
   }
 
   [[nodiscard]] bool try_pop_result(WordResult &out) {
@@ -247,8 +273,8 @@ public:
         return;
       }
       ++epoch_;
-      const auto retired_tasks = tasks_.extract_if(
-          [current_epoch = epoch_](const WordTask &task) {
+      const auto retired_tasks =
+          tasks_.extract_if([current_epoch = epoch_](const WordTask &task) {
             return task.epoch < current_epoch;
           });
       (void)retired_tasks;
@@ -268,9 +294,7 @@ public:
     }
   }
 
-  [[nodiscard]] std::size_t pending_task_count() const {
-    return tasks_.size();
-  }
+  [[nodiscard]] std::size_t pending_task_count() const { return tasks_.size(); }
 
   [[nodiscard]] std::size_t worker_count() const {
     std::lock_guard<std::mutex> state_lock(state_mu_);
@@ -322,212 +346,229 @@ private:
           std::span<const KeyEntry> analysis_span(task.word.data(),
                                                   task.analysis_len);
 
-      // =========================================================================
-      // Этап 0: Smart Bypass — определяем, нужно ли пропускать РЕГИСТРОВЫЕ
-      // исправления (sticky shift). Layout switch всегда разрешён!
-      // =========================================================================
-      BypassReason bypass_reason =
-          should_bypass(analysis_span, task.cfg.min_word_len);
+          // =========================================================================
+          // Этап 0: Smart Bypass — определяем, нужно ли пропускать РЕГИСТРОВЫЕ
+          // исправления (sticky shift). Layout-классификация остаётся
+          // разрешённой; product EventLoop не применяет это решение к
+          // документу.
+          // =========================================================================
+          BypassReason bypass_reason =
+              should_bypass(analysis_span, task.cfg.min_word_len);
 
-      // bypass_case_fix = true означает, что мы НЕ будем исправлять регистр
-      // (sticky shift), но БУДЕМ переключать раскладку при необходимости
-      const bool bypass_case_fix = (bypass_reason != BypassReason::None);
+          // bypass_case_fix = true означает, что мы НЕ будем исправлять регистр
+          // (sticky shift), но БУДЕМ переключать раскладку при необходимости
+          const bool bypass_case_fix = (bypass_reason != BypassReason::None);
 
-      const bool is_en_layout = (task.layout_at_boundary == 0);
+          const bool is_en_layout = (task.layout_at_boundary == 0);
 
-      // =========================================================================
-      // Этап 0.5: Проверка на цифры и спецсимволы
-      // Слова с цифрами не должны вызывать переключение раскладки,
-      // так как цифры на основной клавиатуре одинаковы для EN/RU.
-      // =========================================================================
-      if (LayoutAnalyzer::has_invalid_chars(analysis_span)) {
-        // Слово содержит цифры или спецсимволы — пропускаем без переключения
-        finish_and_push(res, t0);
-        continue;
-      }
-
-      // =========================================================================
-      // Этап 1: Словарная проверка (строго по словарям)
-      //
-      // Требование:
-      //  - если слова НЕТ в словаре текущей раскладки, но ЕСТЬ в противоположной
-      //    → переключаем раскладку (word inversion);
-      //  - если слова ЕСТЬ в текущей, но НЕТ в противоположной → НЕ переключаем;
-      //  - если слова НЕТ в обеих → НЕ переключаем;
-      //  - если слова ЕСТЬ в обеих → дополнительно решаем по N-граммам.
-      // =========================================================================
-      DictResult dict_result = dict_->lookup(analysis_span);
-
-      const bool in_en_dict = (dict_result == DictResult::English ||
-                               dict_result == DictResult::Both);
-      const bool in_ru_dict = (dict_result == DictResult::Russian ||
-                               dict_result == DictResult::Both);
-
-      const bool in_current_dict = is_en_layout ? in_en_dict : in_ru_dict;
-      const bool in_opposite_dict = is_en_layout ? in_ru_dict : in_en_dict;
-
-      // Case A: !in_current && in_opposite -> переключаем
-      if (!in_current_dict && in_opposite_dict) {
-        // Combined fix (layout + case) блокируется bypass.
-        if (!bypass_case_fix && task.cfg.sticky_shift_correction_enabled) {
-          CasePattern pattern = detect_case_pattern(analysis_span);
-          if (pattern == CasePattern::StickyShiftUU ||
-              pattern == CasePattern::StickyShiftLU) {
-            res.need_switch = true;
-            res.correction_type = CorrectionType::CombinedFix;
-            res.correction = make_title_case(analysis_span);
+          // =========================================================================
+          // Этап 0.5: Проверка на цифры и спецсимволы
+          // Слова с цифрами не должны вызывать переключение раскладки,
+          // так как цифры на основной клавиатуре одинаковы для EN/RU.
+          // =========================================================================
+          if (LayoutAnalyzer::has_invalid_chars(analysis_span)) {
+            // Слово содержит цифры или спецсимволы — пропускаем без
+            // переключения
             finish_and_push(res, t0);
             continue;
           }
-        }
 
-        res.need_switch = true;
-        res.correction_type = CorrectionType::LayoutSwitch;
-        finish_and_push(res, t0);
-        continue;
-      }
+          // =========================================================================
+          // Этап 1: Словарная проверка (строго по словарям)
+          //
+          // Требование:
+          //  - если слова НЕТ в словаре текущей раскладки, но ЕСТЬ в
+          //  противоположной
+          //    → переключаем раскладку (word inversion);
+          //  - если слова ЕСТЬ в текущей, но НЕТ в противоположной → НЕ
+          //  переключаем;
+          //  - если слова НЕТ в обеих → НЕ переключаем;
+          //  - если слова ЕСТЬ в обеих → дополнительно решаем по N-граммам.
+          // =========================================================================
+          DictResult dict_result = dict_->lookup(analysis_span);
 
-      // Case B: in_current && !in_opposite -> не переключаем
-      if (in_current_dict && !in_opposite_dict) {
-        // Но sticky shift fix в текущей раскладке по-прежнему возможен.
-        if (!bypass_case_fix && task.cfg.sticky_shift_correction_enabled) {
-          if (try_sticky_shift_fix(analysis_span, res)) {
-            finish_and_push(res, t0);
-            continue;
-          }
-        }
+          const bool in_en_dict = (dict_result == DictResult::English ||
+                                   dict_result == DictResult::Both);
+          const bool in_ru_dict = (dict_result == DictResult::Russian ||
+                                   dict_result == DictResult::Both);
 
-        finish_and_push(res, t0);
-        continue;
-      }
+          const bool in_current_dict = is_en_layout ? in_en_dict : in_ru_dict;
+          const bool in_opposite_dict = is_en_layout ? in_ru_dict : in_en_dict;
 
-      // Case D: слово есть в обоих словарях -> решаем через N-граммы
-      if (in_current_dict && in_opposite_dict) {
-        LayoutAnalyzer analyzer(task.cfg);
-        AnalysisResult ar = analyzer.analyze(analysis_span);
-
-        bool switch_target_is_en = false;
-        bool should_switch_by_ngram = false;
-
-        if (ar.should_switch) {
-          const bool ngram_suggests_en = (ar.en_score > ar.ru_score);
-          const bool ngram_suggests_ru = (ar.ru_score > ar.en_score);
-
-          const bool looks_like_valid_en = (ar.en_invalid_count == 0);
-          const bool looks_like_valid_ru = (ar.ru_invalid_count == 0);
-
-          // Дополнительные признаки на основе invalid биграмм
-          const bool invalid_suggests_en =
-              (ar.ru_invalid_count > 0 && ar.en_invalid_count == 0);
-          const bool invalid_suggests_ru =
-              (ar.en_invalid_count > 0 && ar.ru_invalid_count == 0);
-
-          if ((ngram_suggests_en && looks_like_valid_en) || invalid_suggests_en) {
-            should_switch_by_ngram = true;
-            switch_target_is_en = true;
-          } else if ((ngram_suggests_ru && looks_like_valid_ru) ||
-                     invalid_suggests_ru) {
-            should_switch_by_ngram = true;
-            switch_target_is_en = false;
-          }
-        }
-
-        if (should_switch_by_ngram) {
-          // Переключаем только если текущая раскладка не соответствует цели.
-          if ((switch_target_is_en && !is_en_layout) ||
-              (!switch_target_is_en && is_en_layout)) {
-            res.need_switch = true;
-
-            // Если есть sticky shift — делаем CombinedFix.
+          // Case A: !in_current && in_opposite -> переключаем
+          if (!in_current_dict && in_opposite_dict) {
+            // Combined fix (layout + case) блокируется bypass.
             if (!bypass_case_fix && task.cfg.sticky_shift_correction_enabled) {
               CasePattern pattern = detect_case_pattern(analysis_span);
               if (pattern == CasePattern::StickyShiftUU ||
                   pattern == CasePattern::StickyShiftLU) {
+                res.need_switch = true;
                 res.correction_type = CorrectionType::CombinedFix;
                 res.correction = make_title_case(analysis_span);
+                finish_and_push(res, t0);
+                continue;
+              }
+            }
+
+            res.need_switch = true;
+            res.correction_type = CorrectionType::LayoutSwitch;
+            finish_and_push(res, t0);
+            continue;
+          }
+
+          // Case B: in_current && !in_opposite -> не переключаем
+          if (in_current_dict && !in_opposite_dict) {
+            // Но sticky shift fix в текущей раскладке по-прежнему возможен.
+            if (!bypass_case_fix && task.cfg.sticky_shift_correction_enabled) {
+              if (try_sticky_shift_fix(analysis_span, res)) {
+                finish_and_push(res, t0);
+                continue;
+              }
+            }
+
+            finish_and_push(res, t0);
+            continue;
+          }
+
+          // Case D: слово есть в обоих словарях -> решаем через N-граммы
+          if (in_current_dict && in_opposite_dict) {
+            LayoutAnalyzer analyzer(task.cfg);
+            AnalysisResult ar = analyzer.analyze(analysis_span);
+
+            bool switch_target_is_en = false;
+            bool should_switch_by_ngram = false;
+
+            if (ar.should_switch) {
+              const bool ngram_suggests_en = (ar.en_score > ar.ru_score);
+              const bool ngram_suggests_ru = (ar.ru_score > ar.en_score);
+
+              const bool looks_like_valid_en = (ar.en_invalid_count == 0);
+              const bool looks_like_valid_ru = (ar.ru_invalid_count == 0);
+
+              // Дополнительные признаки на основе invalid биграмм
+              const bool invalid_suggests_en =
+                  (ar.ru_invalid_count > 0 && ar.en_invalid_count == 0);
+              const bool invalid_suggests_ru =
+                  (ar.en_invalid_count > 0 && ar.ru_invalid_count == 0);
+
+              if ((ngram_suggests_en && looks_like_valid_en) ||
+                  invalid_suggests_en) {
+                should_switch_by_ngram = true;
+                switch_target_is_en = true;
+              } else if ((ngram_suggests_ru && looks_like_valid_ru) ||
+                         invalid_suggests_ru) {
+                should_switch_by_ngram = true;
+                switch_target_is_en = false;
+              }
+            }
+
+            if (should_switch_by_ngram) {
+              // Переключаем только если текущая раскладка не соответствует
+              // цели.
+              if ((switch_target_is_en && !is_en_layout) ||
+                  (!switch_target_is_en && is_en_layout)) {
+                res.need_switch = true;
+
+                // Если есть sticky shift — делаем CombinedFix.
+                if (!bypass_case_fix &&
+                    task.cfg.sticky_shift_correction_enabled) {
+                  CasePattern pattern = detect_case_pattern(analysis_span);
+                  if (pattern == CasePattern::StickyShiftUU ||
+                      pattern == CasePattern::StickyShiftLU) {
+                    res.correction_type = CorrectionType::CombinedFix;
+                    res.correction = make_title_case(analysis_span);
+                  } else {
+                    res.correction_type = CorrectionType::LayoutSwitch;
+                  }
+                } else {
+                  res.correction_type = CorrectionType::LayoutSwitch;
+                }
+
+                finish_and_push(res, t0);
+                continue;
+              }
+            }
+
+            // N-gram не требует переключения — можно сделать sticky shift fix.
+            if (!bypass_case_fix && task.cfg.sticky_shift_correction_enabled) {
+              if (try_sticky_shift_fix(analysis_span, res)) {
+                finish_and_push(res, t0);
+                continue;
+              }
+            }
+
+            finish_and_push(res, t0);
+            continue;
+          }
+
+          // Case C: слова нет в обоих словарях -> раскладку НЕ переключаем.
+          // (можно продолжить на typo fix)
+
+          // =========================================================================
+          // Этап 2: Слово Unknown — пробуем typo fix
+          // =========================================================================
+          if (dict_result == DictResult::Unknown &&
+              task.cfg.typo_correction_enabled &&
+              dict_->is_hunspell_available()) {
+
+            std::string word_str = keys_to_utf8(analysis_span, is_en_layout);
+
+            if (!word_str.empty() &&
+                analysis_span.size() >= task.cfg.min_word_len) {
+              // КРИТИЧНО: проверяем что слово действительно неправильное через
+              // spell()
+              bool is_correct = dict_->spell(word_str, is_en_layout);
+
+              if (is_correct) {
+                // Слово корректное — не исправляем.
+                // Важно: для Unknown слов раскладку больше НЕ переключаем
+                // (требование).
               } else {
-                res.correction_type = CorrectionType::LayoutSwitch;
-              }
-            } else {
-              res.correction_type = CorrectionType::LayoutSwitch;
-            }
+                // Слово неправильное, запрашиваем предложения
+                std::vector<std::string> suggestions =
+                    dict_->suggest(word_str, is_en_layout, 5);
 
-            finish_and_push(res, t0);
-            continue;
-          }
-        }
+                bool typo_fix_found = false;
+                for (const auto &suggestion : suggestions) {
+                  // Проверяем что suggestion - это исправление оригинала
+                  if (suggestion == word_str) {
+                    // Слово уже правильное
+                    break;
+                  }
 
-        // N-gram не требует переключения — можно сделать sticky shift fix.
-        if (!bypass_case_fix && task.cfg.sticky_shift_correction_enabled) {
-          if (try_sticky_shift_fix(analysis_span, res)) {
-            finish_and_push(res, t0);
-            continue;
-          }
-        }
+                  std::vector<KeyEntry> corrected = utf8_to_keys(
+                      suggestion, is_en_layout, true, analysis_span);
+                  if (corrected.empty() || corrected.size() > kMaxWordLen) {
+                    continue;
+                  }
 
-        finish_and_push(res, t0);
-        continue;
-      }
+                  const std::size_t distance = damerau_levenshtein_distance(
+                      analysis_span, std::span<const KeyEntry>{
+                                         corrected.data(), corrected.size()});
 
-      // Case C: слова нет в обоих словарях -> раскладку НЕ переключаем.
-      // (можно продолжить на typo fix)
+                  // distance=0 означает слово правильное
+                  if (distance == 0) {
+                    break;
+                  }
 
-      // =========================================================================
-      // Этап 2: Слово Unknown — пробуем typo fix
-      // =========================================================================
-      if (dict_result == DictResult::Unknown &&
-          task.cfg.typo_correction_enabled && dict_->is_hunspell_available()) {
+                  if (distance > 0 && distance <= task.cfg.max_typo_diff) {
+                    // Нашли исправление!
+                    res.correction_type = CorrectionType::TypoFix;
+                    res.correction = std::move(corrected);
+                    typo_fix_found = true;
+                    break;
+                  }
+                }
 
-        std::string word_str = keys_to_utf8(analysis_span, is_en_layout);
-
-        if (!word_str.empty() &&
-            analysis_span.size() >= task.cfg.min_word_len) {
-          // КРИТИЧНО: проверяем что слово действительно неправильное через
-          // spell()
-          bool is_correct = dict_->spell(word_str, is_en_layout);
-
-          if (is_correct) {
-            // Слово корректное — не исправляем.
-            // Важно: для Unknown слов раскладку больше НЕ переключаем (требование).
-          } else {
-            // Слово неправильное, запрашиваем предложения
-            std::vector<std::string> suggestions =
-                dict_->suggest(word_str, is_en_layout, 5);
-
-            bool typo_fix_found = false;
-            for (const auto &suggestion : suggestions) {
-              // Проверяем что suggestion - это исправление оригинала
-              if (suggestion == word_str) {
-                // Слово уже правильное
-                break;
-              }
-
-              std::size_t distance =
-                  damerau_levenshtein_distance(word_str, suggestion);
-
-              // distance=0 означает слово правильное
-              if (distance == 0) {
-                break;
-              }
-
-              if (distance > 0 && distance <= task.cfg.max_typo_diff) {
-                // Нашли исправление!
-                res.correction_type = CorrectionType::TypoFix;
-                res.correction =
-                    utf8_to_keys(suggestion, is_en_layout, true, analysis_span);
-                typo_fix_found = true;
-                break;
+                // Если нашли typo fix — отправляем результат и переходим к
+                // следующей задаче
+                if (typo_fix_found) {
+                  finish_and_push(res, t0);
+                  continue;
+                }
               }
             }
-
-            // Если нашли typo fix — отправляем результат и переходим к следующей задаче
-            if (typo_fix_found) {
-              finish_and_push(res, t0);
-              continue;
-            }
           }
-        }
-      }
 
           finish_and_push(res, t0);
         } catch (const std::exception &ex) {
@@ -547,8 +588,8 @@ private:
                 << ex.what() << "\n";
       latch_fatal();
     } catch (...) {
-      std::cerr
-          << "[punto] AnalysisWorkerPool: worker terminated by unknown exception\n";
+      std::cerr << "[punto] AnalysisWorkerPool: worker terminated by unknown "
+                   "exception\n";
       latch_fatal();
     }
   }
@@ -648,6 +689,7 @@ private:
   const Dictionary *dict_ = nullptr;
   std::function<void()> before_task_;
   std::function<void()> on_stop_wait_;
+  const std::size_t max_outstanding_tasks_;
 
   struct TaskState {
     std::uint64_t epoch = 0;

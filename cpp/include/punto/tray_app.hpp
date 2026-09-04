@@ -8,6 +8,9 @@
 
 #pragma once
 
+#include <functional>
+#include <memory>
+
 #include <gtk/gtk.h>
 
 // Поддержка как Ayatana (Ubuntu 22.04+), так и legacy AppIndicator
@@ -21,6 +24,8 @@
 
 namespace punto {
 
+struct TrayAppTestAccess;
+
 /**
  * @brief Класс tray-приложения
  *
@@ -33,8 +38,8 @@ public:
   ~TrayApp();
 
   // Запрет копирования
-  TrayApp(const TrayApp&) = delete;
-  TrayApp& operator=(const TrayApp&) = delete;
+  TrayApp(const TrayApp &) = delete;
+  TrayApp &operator=(const TrayApp &) = delete;
 
   /**
    * @brief Инициализирует приложение
@@ -49,15 +54,21 @@ public:
   int run();
 
 private:
+  friend struct TrayAppTestAccess;
+
+  struct StatusPollState;
+  struct StatusPollResult;
+
   // Callbacks для пунктов меню
-  static void on_auto_toggle_changed(GtkCheckMenuItem* item, gpointer user_data);
-  static void on_sound_toggle_changed(GtkCheckMenuItem* item, gpointer user_data);
-  static void on_settings_clicked(GtkMenuItem* item, gpointer user_data);
-  static void on_about_clicked(GtkMenuItem* item, gpointer user_data);
-  static void on_quit_clicked(GtkMenuItem* item, gpointer user_data);
+  static void on_settings_clicked(GtkMenuItem *item, gpointer user_data);
+  static void on_about_clicked(GtkMenuItem *item, gpointer user_data);
+  static void on_quit_clicked(GtkMenuItem *item, gpointer user_data);
 
   // Callback для периодического обновления статуса
   static gboolean on_status_update(gpointer user_data);
+  static gboolean on_status_result(gpointer user_data);
+
+  void request_status_update();
 
   /// Обновляет иконку в соответствии с текущим статусом
   void update_icon();
@@ -69,15 +80,13 @@ private:
   void update_sound_toggle_state();
 
   /// Создаёт контекстное меню
-  GtkWidget* create_menu();
+  GtkWidget *create_menu();
 
   // GTK компоненты
-  AppIndicator* indicator_ = nullptr;
-  GtkWidget* menu_ = nullptr;
-  GtkWidget* toggle_item_ = nullptr;
-  GtkWidget* sound_toggle_item_ = nullptr;
-
-  bool suppress_menu_signals_ = false;
+  AppIndicator *indicator_ = nullptr;
+  GtkWidget *menu_ = nullptr;
+  GtkWidget *toggle_item_ = nullptr;
+  GtkWidget *sound_toggle_item_ = nullptr;
 
   // Текущий статус
   ServiceStatus current_status_ = ServiceStatus::Unknown;
@@ -87,6 +96,9 @@ private:
 
   // ID таймера обновления статуса
   guint status_timer_id_ = 0;
+
+  std::shared_ptr<StatusPollState> status_poll_state_;
+  std::function<ServiceStatus()> status_provider_;
 };
 
 } // namespace punto

@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -18,32 +19,31 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
-#include <vector>
 
 #include "punto/analysis_worker_pool.hpp"
-#include "punto/clipboard_manager.hpp"
 #include "punto/config.hpp"
 #include "punto/control_plane_state.hpp"
 #include "punto/dictionary.hpp"
-#include "punto/history_manager.hpp"
 #include "punto/input_buffer.hpp"
 #include "punto/ipc_server.hpp"
-#include "punto/key_injector.hpp"
-#include "punto/layout_sync_sound.hpp"
 #include "punto/layout_analyzer.hpp"
-#include "punto/macro_lock.hpp"
+#include "punto/runtime_health.hpp"
 #include "punto/runtime_tuning.hpp"
 #include "punto/types.hpp"
-#include "punto/undo_detector.hpp"
 #include "punto/x11_session.hpp"
 
 namespace punto {
 
-class SoundManager;
+namespace event_loop_detail {
+[[nodiscard]] std::size_t count_running_punto_daemons(
+    const std::filesystem::path &proc_root = "/proc",
+    std::size_t max_numeric_candidates = 4096,
+    std::chrono::milliseconds time_budget = std::chrono::milliseconds{20});
+} // namespace event_loop_detail
 
 /**
  * @brief Главный класс приложения
@@ -53,11 +53,19 @@ class SoundManager;
  */
 class EventLoop {
 public:
+  using ConfigLoaderFunction = std::function<ConfigLoadOutcome(
+      const std::filesystem::path &,
+      const std::optional<std::filesystem::path> &, const std::string &)>;
+  using DictionaryLoaderFunction = std::function<DictionaryLoadOutcome()>;
+
   /**
    * @brief Конструктор
    * @param config Конфигурация приложения
+   * @param x11_probe Необязательный источник сессии для изолированных тестов
    */
-  explicit EventLoop(Config config);
+  explicit EventLoop(Config config, X11Session::ProbeFunction x11_probe = {},
+                     ConfigLoaderFunction config_loader = {},
+                     DictionaryLoaderFunction dictionary_loader = {});
 
   ~EventLoop();
 
@@ -66,7 +74,7 @@ public:
   EventLoop &operator=(const EventLoop &) = delete;
 
   /**
-   * @brief Инициализирует компоненты (X11 сессия, буфер обмена)
+   * @brief Инициализирует runtime-компоненты
    * @return true если инициализация успешна
    */
   bool initialize();
@@ -97,147 +105,11 @@ private:
   /// Обрабатывает входящее событие
   void handle_event(const input_event &ev);
 
-  /// Passthrough в stdout с трекингом состояния клавиш (key down/up).
+  /// Writes an input event to stdout, including partial-write handling.
   void emit_passthrough_event(const input_event &ev);
 
   /// Обновляет состояние модификаторов
   void update_modifier_state(ScanCode code, bool pressed);
-
-  /// Сбрасывает состояние всех модификаторов (после release_all_modifiers)
-  void reset_modifiers_state();
-
-  /// Определяет действие по горячей клавише
-  [[nodiscard]] HotkeyAction determine_hotkey_action(ScanCode code) const;
-
-  // =========================================================================
-  // Действия
-  // =========================================================================
-
-  /// Инвертирует раскладку последнего слова (ручной вызов по Pause)
-  void action_invert_layout_word();
-
-  /// Автоматическая инверсия текущего слова при нажатии пробела
-  /// @param word_to_invert Слово для инверсии (span)
-  /// @param space_code Код пробела/таба для ввода после инверсии
-  void action_auto_invert_word(std::span<const KeyEntry> word,
-                               ScanCode space_code);
-
-  /// Инвертирует раскладку выделенного текста
-  void action_invert_layout_selection();
-
-  /// Инвертирует регистр последнего слова
-  void action_invert_case_word();
-
-  /// Инвертирует регистр выделенного текста
-  void action_invert_case_selection();
-
-  /// Транслитерирует выделенный текст
-  void action_transliterate_selection();
-
-  /// Undo последнего исправления (авто/ручного). Возвращает true, если undo
-  /// выполнен и событие должно быть поглощено.
-  [[nodiscard]] bool action_undo_last_correction();
-
-  // =========================================================================
-  // Вспомогательные методы
-  // =========================================================================
-
-  /// Синхронизирует current_layout_ с ОС (best-effort, для использования
-  /// перед макросами). Возвращает текущую раскладку ОС или -1 при ошибке.
-  int sync_layout_from_os();
-
-  /// Проверяет, что punto по-прежнему владеет clipboard/primary после set_text.
-  /// Возвращает false если ownership был украден (другой экземпляр punto).
-  [[nodiscard]] bool verify_clipboard_ownership() const;
-
-  /// Переключает раскладку через системный hotkey (toggle).
-  /// Используется как fallback, если XKB недоступен.
-  void switch_layout(bool play_sound);
-
-  /// Устанавливает раскладку (0/1) через XKB (XkbLockGroup) с fallback на
-  /// hotkey.
-  /// @param target_layout 0 = EN, 1 = RU
-  /// @param play_sound Проигрывать ли звук (только для финального переключения)
-  /// @return true если удалось применить переключение
-  [[nodiscard]] bool set_layout(int target_layout, bool play_sound);
-
-  /// Перепечатывает слово после инверсии
-  void retype_word_inverted(std::span<const KeyEntry> word,
-                            std::span<const ScanCode> trailing);
-
-  /// Обрабатывает selection (копирование, трансформация, вставка)
-  bool process_selection(std::function<std::string(std::string_view)> transform,
-                         std::optional<int> restore_layout_for_undo);
-
-  /// Вставляет текст одной операцией через Clipboard + Paste.
-  ///
-  /// Best-effort: пытается сохранить/восстановить содержимое CLIPBOARD, чтобы
-  /// не ломать пользовательский буфер обмена.
-  [[nodiscard]] bool paste_text_oneshot(std::string_view text,
-                                        bool restore_clipboard = true);
-
-  /// Если paste делается через Ctrl+Shift+V, то в ряде терминалов хоткей
-  /// распознаётся по keysym и зависит от раскладки.
-  ///
-  /// Для устойчивости временно переключаемся на EN (layout=0) перед paste и
-  /// возвращаем прежнюю раскладку после.
-  [[nodiscard]] std::optional<int>
-  maybe_switch_layout_to_en_for_terminal_paste(bool is_terminal);
-
-  /// Удаляет `backspace_count` символов и вставляет `text` через oneshot paste.
-  ///
-  /// @param final_layout если задано (0/1) — стараемся установить раскладку
-  /// после вставки.
-  [[nodiscard]] bool replace_text_oneshot(std::size_t backspace_count,
-                                          std::string_view text,
-                                          std::optional<int> final_layout,
-                                          bool play_sound);
-
-  /// Запоминает последнюю коррекцию для Ctrl+Z undo.
-  void set_last_undo_record(std::string original_text,
-                            std::string_view inserted_text,
-                            std::optional<int> restore_layout,
-                            bool is_auto_correction);
-
-  /// Ожидает указанное время, буферизуя входящие события
-  void wait_and_buffer(std::chrono::microseconds us);
-
-  /// Ожидает указанное время или до выполнения условия, буферизуя ввод
-  void wait_and_buffer_until(std::chrono::microseconds us,
-                             const std::function<bool()> &stop_pred);
-
-  /// Обрабатывает все накопленные события
-  void drain_pending_events();
-
-  /// Восстанавливает буфер обмена, если есть отложенная операция
-  void flush_pending_clipboard_restore(bool force);
-
-  struct PendingClipboardRestore {
-    bool restore_clipboard = false;
-    bool restore_primary = false;
-
-    std::optional<std::string> clipboard;
-    std::optional<std::string> primary;
-
-    std::uint64_t clip_req_seq = 0;
-    std::uint64_t primary_req_seq = 0;
-
-    std::chrono::steady_clock::time_point deadline{};
-  };
-
-  void finalize_clipboard_restore(PendingClipboardRestore plan,
-                                  bool request_seen);
-
-  /// Во время макроса мы буферизуем ввод. Если макрос стартует очень быстро,
-  /// key-release (в т.ч. для SPACE/последней буквы) может оказаться в
-  /// pending_events_, и тогда инжектируемые нажатия этой же клавиши могут быть
-  /// проигнорированы, потому что для приложения клавиша всё ещё "зажата".
-  ///
-  /// Этот метод "пропускает" наружу только те фреймы (до SYN_REPORT),
-  /// которые НЕ содержат EV_KEY press/repeat (т.е. только release и служебные
-  /// события). Фреймы с press/repeat остаются в очереди и будут обработаны
-  /// после макроса.
-  void flush_pending_release_frames();
 
   /// Проверяет готовые результаты анализа и (при необходимости) применяет
   /// коррекции
@@ -246,77 +118,95 @@ private:
   /// Сбрасывает async state и выставляет новый barrier для task_id.
   void reset_async_state(bool bump_task_barrier = true);
 
-  void sync_current_layout_from_os(std::string_view reason);
-  void mark_layout_desynced(std::string_view reason);
-  [[nodiscard]] bool is_configured_layout_hotkey_press(ScanCode code,
-                                                       bool is_press) const;
-  [[nodiscard]] bool is_configured_layout_hotkey_release(ScanCode code,
-                                                         bool is_release) const;
-  void maybe_complete_external_layout_hotkey(ScanCode code, bool is_release);
-  void maybe_handle_injector_failure(std::string_view context);
+  void note_input_event_accepted(const input_event &event);
+  void note_input_event_committed(const input_event &event);
+  void fail_input_pipeline() noexcept;
+  void refresh_analysis_health_head();
+  void commit_analysis_terminal(std::uint64_t task_id);
   void maybe_promote_to_control_plane_primary();
+  [[nodiscard]] bool reconcile_control_plane_before_promotion();
   void sync_control_plane_from_shared_state(bool force);
   void publish_control_plane_state(bool bump_config_generation,
                                    bool bump_status_generation);
   [[nodiscard]] bool start_primary_ipc_server();
+  void service_ipc_commands() noexcept;
+  void cancel_ipc_commands_for_shutdown() noexcept;
+  [[nodiscard]] IpcResult execute_ipc_command(const IpcRequest &request);
+  void observe_ipc_fatal() noexcept;
+  [[nodiscard]] bool start_config_loader() noexcept;
+  void poll_config_load_completion();
+  void request_x11_config_reload();
+  void retry_pending_x11_config_reload();
+  [[nodiscard]] bool
+  stop_config_loader(std::chrono::milliseconds timeout) noexcept;
+  [[nodiscard]] bool start_dictionary_loader() noexcept;
+  void poll_dictionary_load_completion();
+  [[nodiscard]] bool
+  stop_dictionary_loader(std::chrono::milliseconds timeout) noexcept;
+  void shutdown_runtime() noexcept;
 
   [[nodiscard]] IpcResult stats_report() const;
-  [[nodiscard]] std::optional<std::filesystem::path>
-  validate_reload_path(const std::string &config_path) const;
 
-  struct PendingWordMeta {
-    std::uint64_t task_id = 0;
-    std::vector<KeyEntry> word;
-    std::size_t analysis_len = 0;
-    int layout_at_boundary = 0;
-    std::uint64_t start_pos = 0;
-    std::uint64_t end_pos = 0; // конец слова (перед разделителем)
-
-    std::chrono::steady_clock::time_point boundary_at{};
+  struct ConfigLoadTask {
+    std::uint64_t generation = 0;
+    std::filesystem::path system_root;
+    std::optional<std::filesystem::path> user_root;
+    std::optional<X11SessionInfo> session_authority;
+    std::optional<std::uint64_t> control_plane_generation;
+    std::optional<std::uint64_t> x11_config_generation;
+    std::string requested_path;
+    bool promotion_reconciliation = false;
   };
 
-  /// Применяет коррекцию раскладки (v2.6 логика)
-  void apply_correction(const PendingWordMeta &meta, int target_layout);
+  struct ConfigLoadCompletion {
+    ConfigLoadTask task;
+    ConfigLoadOutcome outcome;
+    bool used_promotion_fallback = false;
+  };
 
-  /// Применяет коррекцию только регистра БЕЗ смены раскладки (sticky shift fix)
-  /// Например: ПРивет -> Привет в той же раскладке
-  void apply_case_correction(const PendingWordMeta &meta,
-                             const std::vector<KeyEntry> &corrected_word);
+  struct ConfigLoaderState {
+    std::mutex mutex;
+    std::condition_variable condition;
+    ConfigLoaderFunction loader;
+    std::optional<ConfigLoadTask> request;
+    std::optional<ConfigLoadCompletion> completion;
+    bool stop_requested = false;
+    bool exited = false;
+  };
 
-  /// Применяет комбинированную коррекцию: смена раскладки + исправление
-  /// регистра Например: GHbdtn -> Привет (EN -> RU + case fix)
-  void apply_combined_correction(const PendingWordMeta &meta, int target_layout,
-                                 const std::vector<KeyEntry> &corrected_word);
+  enum class ConfigLoadStatus { None, Ok, Error };
+
+  struct DictionaryLoaderState {
+    std::mutex mutex;
+    std::condition_variable condition;
+    DictionaryLoaderFunction loader;
+    std::optional<DictionaryLoadOutcome> completion;
+    bool stop_requested = false;
+    bool exited = false;
+  };
 
   // =========================================================================
   // Состояние
   // =========================================================================
 
-  // Конфиг и зависящие от него компоненты обновляются через снапшоты,
-  // т.к. reload_config() вызывается из IPC-потока.
+  // Config snapshots are published on the event-loop thread.
   std::shared_ptr<const Config> config_;
-  std::shared_ptr<const LayoutAnalyzer> analyzer_;
-  std::shared_ptr<const KeyInjector> injector_;
 
   ModifierState modifiers_;
   InputBuffer buffer_;
-  Dictionary dict_;
 
-  // Async pipeline: история + пул анализа
-  HistoryManager history_{5};
-  AnalysisWorkerPool analysis_pool_{dict_};
+  // Read-only analysis pipeline.
+  std::shared_ptr<const Dictionary> dictionary_;
+  std::unique_ptr<AnalysisWorkerPool> analysis_pool_;
   bool analysis_pool_failed_ = false;
-
-  /// Детектор отмены коррекции — запоминает слова, которые пользователь отменил
-  UndoDetector undo_detector_;
 
   std::uint64_t next_task_id_ = 0;
   std::uint64_t next_apply_task_id_ = 0;
 
-  std::unordered_map<std::uint64_t, PendingWordMeta> pending_words_;
   std::unordered_map<std::uint64_t, WordResult> ready_results_;
-
-  std::vector<KeyEntry> tail_scratch_;
+  std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point>
+      analysis_accepted_at_;
+  StallHealthPolicy analysis_health_;
 
   struct Telemetry {
     std::chrono::steady_clock::time_point last_report_at{};
@@ -330,12 +220,6 @@ private:
     std::uint64_t queue_us_sum = 0;
     std::uint64_t queue_us_max = 0;
 
-    std::uint64_t corrections = 0;
-    std::uint64_t correction_us_sum = 0;
-    std::uint64_t correction_us_max = 0;
-
-    std::uint64_t tail_len_sum = 0;
-    std::uint64_t tail_len_max = 0;
   } telemetry_;
 
   struct LifetimeTelemetry {
@@ -343,99 +227,63 @@ private:
     std::atomic<std::uint64_t> need_switch_words{0};
     std::atomic<std::uint64_t> analysis_us_sum{0};
     std::atomic<std::uint64_t> queue_us_sum{0};
-    std::atomic<std::uint64_t> corrections{0};
-    std::atomic<std::uint64_t> correction_us_sum{0};
-    std::atomic<std::uint64_t> tail_len_sum{0};
-    std::atomic<std::size_t> pending_words{0};
     std::atomic<std::size_t> ready_results{0};
   } lifetime_telemetry_;
 
-  // Если прямое XKB-переключение не работает в текущем окружении,
-  // отключаем его и используем только hotkey-метод.
-  bool xkb_set_available_ = true;
-
-  /// Время, когда XKB set был отключён (для периодической ре-проверки)
-  std::chrono::steady_clock::time_point xkb_disabled_at_{};
-  bool layout_desynced_ = false;
-  ExternalLayoutSoundState external_layout_sound_{};
-
   std::unique_ptr<X11Session> x11_session_;
+  ExplicitHealthPolicy x11_health_{ComponentHealth::Degraded};
   bool x11_refresh_pending_{false}; // Флаг фонового refresh
+  bool x11_dependencies_ready_{false};
   bool wayland_warning_emitted_{false};
-  std::unique_ptr<ClipboardManager> clipboard_;
 
-  // Доступ только через std::atomic_load/std::atomic_store:
-  // main thread пересоздаёт SoundManager при смене X11-сессии, а
-  // reload_config() из IPC-потока обновляет флаг enabled.
-  std::shared_ptr<SoundManager> sound_manager_;
+  std::shared_ptr<ConfigLoaderState> config_loader_state_;
+  std::thread config_loader_thread_;
+  bool config_load_pending_ = false;
+  std::uint64_t config_load_generation_ = 0;
+  ConfigLoadStatus config_load_status_ = ConfigLoadStatus::None;
+  std::uint64_t x11_config_generation_ = 0;
+  std::optional<std::uint64_t> pending_x11_config_generation_;
 
-  std::optional<PendingClipboardRestore> pending_clip_restore_;
+  std::shared_ptr<DictionaryLoaderState> dictionary_loader_state_;
+  std::thread dictionary_loader_thread_;
+  bool dictionary_load_pending_ = false;
 
   bool initialized_ = false;
   AnalysisThreadBudget analysis_thread_budget_{};
 
-  /// Текущая раскладка: 0 = EN (первая), 1 = RU (вторая)
-  /// Обновляется при переключении раскладки
+  /// Последняя наблюдавшаяся раскладка: 0 = EN (первая), 1 = RU (вторая).
+  /// До первой успешной X11 snapshot-публикации используется 0.
   int current_layout_ = 0;
   int stop_signal_fd_ = -1;
   int exit_code_ = 0;
 
-  /// Очередь событий, накопленных во время выполнения макроса коррекции
-  std::deque<input_event> pending_events_;
+  // stdin is a byte stream: one input_event may arrive across several reads.
+  std::array<std::uint8_t, sizeof(input_event)> input_frame_bytes_{};
+  std::size_t input_frame_size_ = 0;
 
-  // Best-effort трекер «какие клавиши сейчас зажаты» с точки зрения приложения.
-  // Нужен, чтобы безопасно форвардить release-события во время макросов,
-  // даже если они пришли в одном SYN-фрейме вместе с press других клавиш.
-  std::array<std::uint8_t, KEY_CNT> key_down_{};
-
-  /// Флаг выполнения макроса (автокоррекции).
-  /// Атомарный для безопасности при взаимодействии с IPC callbacks.
-  std::atomic<bool> is_processing_macro_{false};
-
-  /// Флаг аварийного прерывания макроса при переполнении очереди событий.
-  /// Сбрасывается в drain_pending_events().
-  bool event_overflow_abort_requested_{false};
-
-  /// Если перехватили Ctrl+Z и НЕ пропустили press наружу, то все события Z
-  /// (repeat/release) до первого release нужно проглотить, иначе приложение
-  /// увидит "release без press".
-  bool swallow_z_until_release_ = false;
-
-  struct UndoRecord {
-    std::string original_text;
-    std::size_t inserted_len =
-        0; // сколько Backspace нужно для удаления вставки
-    std::optional<int> restore_layout; // 0/1, если нужно вернуть раскладку
-
-    bool is_auto_correction = false; // если true — можно писать в UndoDetector
-
-    std::chrono::steady_clock::time_point applied_at{};
-    std::uint64_t user_seq_at_apply = 0;
-  };
-
-  /// Последняя корректировка, которую можно откатить через Ctrl+Z.
-  std::optional<UndoRecord> last_undo_;
-
-  /// Монотонный счётчик "значимых" key-press (все кроме модификаторов).
-  /// Используется, чтобы Ctrl+Z не перехватывался, если после исправления
-  /// был другой ввод.
-  std::uint64_t user_seq_ = 0;
-
-  /// Время последнего замера раскладки
-  std::chrono::steady_clock::time_point last_sync_time_;
+  // Logical evdev frames are accepted at the first event and committed at the
+  // matching SYN_REPORT after all output/intentional-consumption work finishes.
+  std::deque<std::chrono::steady_clock::time_point> input_frame_accepts_;
+  bool input_read_frame_started_ = false;
+  StallHealthPolicy input_health_;
 
   // =========================================================================
   // IPC управление
   // =========================================================================
 
-  /// Атомарный флаг включения/выключения автопереключения
-  std::atomic<bool> ipc_enabled_{true};
-
   /// Атомарный флаг запроса остановки (от signal handler)
   std::atomic<bool> stop_requested_{false};
 
+  /// Bounded SPSC handoff: socket poller produces, EventLoop consumes.
+  /// Declaration order keeps the mailbox alive until after IpcServer teardown.
+  std::shared_ptr<IpcCommandMailbox> ipc_mailbox_{
+      std::make_shared<IpcCommandMailbox>()};
+
   /// IPC сервер для управления из tray-приложения
   std::unique_ptr<IpcServer> ipc_server_;
+  bool ipc_server_is_fallback_ = false;
+  bool ipc_fatal_reported_ = false;
+  bool runtime_shutdown_started_ = false;
   ControlPlaneLease control_plane_lease_{};
 
   /// Роль читается из IPC-потока (stats/reload), пишется main-потоком при
@@ -449,15 +297,15 @@ private:
   SharedControlPlaneState shared_control_plane_state_{};
   std::uint64_t applied_config_generation_ = 0;
   std::uint64_t applied_status_generation_ = 0;
+  std::optional<std::uint64_t> promotion_fallback_applied_generation_;
   std::chrono::steady_clock::time_point last_control_plane_poll_{};
 
-  /// Межпроцессная блокировка для сериализации макросов между экземплярами
-  /// punto-daemon (один на каждую клавиатуру в udevmon pipeline).
-  MacroLock macro_lock_;
-
-  /// Перезагружает конфигурацию (вызывается из IPC потока)
-  /// Если config_path не пуст, пытается загрузить именно этот файл.
-  IpcResult reload_config(const std::string &config_path = {});
+  /// Schedules a generation-fenced background configuration load.
+  IpcResult reload_config(
+      const std::string &config_path = {},
+      std::optional<std::uint64_t> control_plane_generation = std::nullopt,
+      std::optional<std::uint64_t> x11_config_generation = std::nullopt,
+      bool promotion_reconciliation = false);
 };
 
 } // namespace punto

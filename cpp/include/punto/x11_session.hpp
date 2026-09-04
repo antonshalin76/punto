@@ -1,166 +1,232 @@
 /**
  * @file x11_session.hpp
- * @brief Управление X11 сессией из root-контекста
- *
- * Решает проблему доступа к X11 от root (udevmon запускает процессы от root).
- * Находит активную GUI сессию и получает DISPLAY/XAUTHORITY.
+ * @brief Safe discovery and access for the active local X11 session.
  */
 
 #pragma once
 
+#include <xcb/xcb.h>
+
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
-#include <future>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
-
-#include <X11/Xlib.h>
-#include <sys/types.h>
+#include <string_view>
+#include <thread>
+#include <vector>
 
 namespace punto {
 
-/**
- * @brief Информация о GUI сессии пользователя
- */
-struct X11SessionInfo {
-  // Идентификатор логин-сессии systemd (loginctl), если доступен.
-  // Используется для детекта смены сессии после логина/логаута.
-  std::string session_id;
+class ClipboardManager;
 
+struct X11SessionInfo {
+  std::string session_id;
   std::string username;
   std::uint32_t uid = 0;
   std::uint32_t gid = 0;
-  std::string display;         // e.g., ":0"
-  std::string xauthority_path; // e.g., "/run/user/1000/gdm/Xauthority"
+  std::vector<std::uint32_t> supplementary_groups;
+  std::string display;
+  std::string xauthority_path;
   std::string home_dir;
-  std::string xdg_runtime_dir; // e.g., "/run/user/1000"
+  std::string xdg_runtime_dir;
   std::string xdg_config_home;
   std::string wayland_display;
+  int observed_keyboard_layout = -1;
 };
 
+namespace x11_detail {
+
+enum class ProbeStatus {
+  Healthy,
+  SessionAbsent,
+  Failed,
+};
+
+enum class XcbOperationResult {
+  Success,
+  TimedOut,
+  ConnectionFailed,
+  ProtocolError,
+};
+
+struct ProbeResult {
+  ProbeStatus status = ProbeStatus::Failed;
+  X11SessionInfo info;
+};
+
+inline constexpr std::size_t kMaxEnvironmentBytes = 64U * 1024U;
+inline constexpr std::size_t kMaxProcCandidates = 4096U;
+inline constexpr std::size_t kMaxPasswdBufferBytes = 1024U * 1024U;
+inline constexpr std::size_t kMaxXauthorityBytes = 1024U * 1024U;
+
+[[nodiscard]] bool is_valid_local_display(std::string_view value) noexcept;
+[[nodiscard]] bool is_valid_wayland_display(std::string_view value) noexcept;
+[[nodiscard]] std::optional<std::chrono::milliseconds>
+retry_delay_after_failure(std::size_t failure_count) noexcept;
+
+} // namespace x11_detail
+
 /**
- * @brief Менеджер X11 сессии
- *
- * Находит активную X11 сессию пользователя и предоставляет
- * необходимые переменные окружения для взаимодействия с X сервером.
+ * Owns one XCB connection and applies absolute deadlines to reply-bearing and
+ * checked-void requests. Any timeout, transport error, or protocol error
+ * closes the connection before returning.
  */
+class BoundedXcbConnection {
+public:
+  BoundedXcbConnection() noexcept = default;
+  ~BoundedXcbConnection();
+
+  BoundedXcbConnection(const BoundedXcbConnection &) = delete;
+  BoundedXcbConnection &operator=(const BoundedXcbConnection &) = delete;
+  BoundedXcbConnection(BoundedXcbConnection &&other) noexcept;
+  BoundedXcbConnection &operator=(BoundedXcbConnection &&other) noexcept;
+
+  [[nodiscard]] bool is_open() const noexcept;
+  [[nodiscard]] xcb_connection_t *get() const noexcept;
+  [[nodiscard]] int screen_number() const noexcept;
+
+  /** Caller owns the successful reply and must free it with std::free(). */
+  [[nodiscard]] void *
+  wait_for_reply(std::uint32_t sequence,
+                 std::chrono::steady_clock::time_point deadline,
+                 x11_detail::XcbOperationResult &result) noexcept;
+
+  [[nodiscard]] bool
+  check_request(xcb_void_cookie_t cookie,
+                std::chrono::steady_clock::time_point deadline,
+                x11_detail::XcbOperationResult &result) noexcept;
+
+  void close() noexcept;
+
+private:
+  friend class ClipboardManager;
+  friend class X11Session;
+  explicit BoundedXcbConnection(xcb_connection_t *connection,
+                                int screen_number) noexcept;
+  [[nodiscard]] void *poll_reply(
+      std::uint32_t sequence, std::chrono::steady_clock::time_point deadline,
+      bool allow_null_reply, x11_detail::XcbOperationResult &result) noexcept;
+
+  xcb_connection_t *connection_ = nullptr;
+  int screen_number_ = -1;
+};
+
 class X11Session {
+  struct WriteGate;
+
 public:
   enum class RefreshResult {
-    Unchanged,
-    Updated,
-    Invalidated,
+    HealthyUnchanged,
+    HealthyUpdated,
+    SessionAbsent,
+    Failed,
   };
 
-  /**
-   * @brief Инициализирует сессию, находя активного GUI пользователя
-   * @return true если сессия найдена и инициализирована
-   */
-  bool initialize();
+  using ProbeFunction = std::function<x11_detail::ProbeResult()>;
+  using RetryWaitFunction = std::function<bool(
+      std::chrono::milliseconds, const std::atomic<bool> &cancel_requested)>;
 
   /**
-   * @brief Переопределяет активную GUI-сессию и при необходимости переинициализирует
-   *
-   * Используется, чтобы не «прилипать» к greeter (gdm/lightdm) на этапе boot
-   * и корректно переживать logout/login.
-   *
-   * ВНИМАНИЕ: Блокирующий вызов! Может занять 2-3 секунды.
-   * Для неблокирующего варианта используйте start_background_refresh() + poll_refresh_result().
+   * Pins one committed session generation for an entire desktop write
+   * transaction. Revocation waits for all acquired leases before it commits.
    */
+  class WriteLease {
+  public:
+    WriteLease(WriteLease &&) noexcept = default;
+    WriteLease &operator=(WriteLease &&) noexcept = delete;
+    WriteLease(const WriteLease &) = delete;
+    WriteLease &operator=(const WriteLease &) = delete;
+
+    [[nodiscard]] bool valid() const noexcept;
+    [[nodiscard]] const X11SessionInfo &info() const noexcept;
+    [[nodiscard]] BoundedXcbConnection open_bounded_connection(
+        std::chrono::steady_clock::time_point deadline) const;
+    [[nodiscard]] BoundedXcbConnection open_bounded_connection(
+        std::chrono::milliseconds timeout = std::chrono::milliseconds{
+            250}) const;
+
+  private:
+    friend class X11Session;
+    WriteLease(std::shared_ptr<WriteGate> gate,
+               std::unique_lock<std::recursive_mutex> lock,
+               X11SessionInfo info) noexcept;
+
+    std::shared_ptr<WriteGate> gate_;
+    std::unique_lock<std::recursive_mutex> lock_;
+    X11SessionInfo info_;
+  };
+
+  explicit X11Session(ProbeFunction probe_function = {},
+                      RetryWaitFunction retry_wait_function = {});
+  ~X11Session();
+
+  X11Session(const X11Session &) = delete;
+  X11Session &operator=(const X11Session &) = delete;
+
+  [[nodiscard]] bool initialize();
   [[nodiscard]] RefreshResult refresh();
 
-  /**
-   * @brief Запускает refresh в фоновом потоке (неблокирующий)
-   *
-   * Если refresh уже запущен, ничего не делает.
-   */
   void start_background_refresh();
-
-  /**
-   * @brief Проверяет результат фонового refresh (неблокирующий)
-   * @return Результат если refresh завершен, nullopt если еще выполняется
-   */
   [[nodiscard]] std::optional<RefreshResult> poll_refresh_result();
 
   /**
-   * @brief Сбрасывает состояние (сессия считается невалидной)
+   * Requests cancellation and waits no longer than timeout. A stuck system
+   * discovery call is detached with shared-only state, so destruction remains
+   * bounded and cannot access this object afterwards.
    */
+  [[nodiscard]] bool shutdown_background_refresh(
+      std::chrono::milliseconds timeout = std::chrono::milliseconds{
+          3000}) noexcept;
+
   void reset() noexcept;
-
-  /**
-   * @brief Проверяет, инициализирована ли сессия
-   */
   [[nodiscard]] bool is_valid() const noexcept;
-
-  /**
-   * @brief Возвращает снапшот информации о сессии (thread-safe)
-   */
   [[nodiscard]] X11SessionInfo info() const;
-
   [[nodiscard]] bool is_wayland_session() const;
 
-  /**
-   * @brief Открывает X11 display для текущей сессии
-   *
-   * Важно: не меняет process credentials. Root-daemon работает через cookies
-   * пользователя, а открытие display сериализуется, чтобы не устраивать гонки
-   * на process-wide XAUTHORITY при многопоточном доступе.
-   */
-  [[nodiscard]] Display *open_display() const;
+  [[nodiscard]] std::optional<WriteLease> acquire_write_lease() const;
 
-  /**
-   * @brief Определяет текущую раскладку клавиатуры
-   * @return 0 = английская (первая), 1 = русская (вторая), -1 = ошибка
-   */
   [[nodiscard]] int get_current_keyboard_layout() const;
 
-  /**
-   * @brief Устанавливает текущую раскладку клавиатуры
-   * @param index 0 = первая (EN), 1 = вторая (RU)
-   * @return true если успешно
-   */
-  bool set_keyboard_layout(int index) const;
-
 private:
-  struct ActiveSession {
-    std::string session_id;
-    std::string username;
-    std::string leader_pid;
+  struct BackgroundState {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::atomic<bool> cancel_requested{false};
+    bool done = false;
+    std::uint64_t generation = 0;
+    x11_detail::ProbeResult probe;
+    ProbeFunction probe_function;
+    RetryWaitFunction retry_wait_function;
+    std::shared_ptr<WriteGate> write_gate;
+    std::shared_ptr<std::atomic<std::uint64_t>> generation_clock;
   };
 
-  /**
-   * @brief Находит активную user-сессию на seat0 через loginctl
-   */
-  std::optional<ActiveSession> find_active_session_loginctl();
-
-  /**
-   * @brief Fallback: находит пользователя (who/tty1)
-   */
-  std::optional<std::string> find_active_user_fallback();
-
-  /**
-   * @brief Находит DISPLAY/XAUTHORITY из /proc/<pid>/environ
-   */
-  bool find_session_env_by_pid(const std::string &pid, X11SessionInfo &out);
-
-  /**
-   * @brief Fallback: ищем env по процессам пользователя
-   */
-  bool find_session_env_by_user(const std::string &username, X11SessionInfo &out);
-
-  /**
-   * @brief Проверяет доступ к X серверу (минимальный healthcheck)
-   */
-  [[nodiscard]] bool verify_x11_access() const;
+  [[nodiscard]] static x11_detail::ProbeResult probe_once();
+  [[nodiscard]] static BoundedXcbConnection open_bounded_connection_for(
+      const X11SessionInfo &info,
+      std::chrono::steady_clock::time_point deadline) noexcept;
+  static void
+  run_background_probe(const std::shared_ptr<BackgroundState> &state) noexcept;
+  [[nodiscard]] RefreshResult commit_probe(std::uint64_t generation,
+                                           x11_detail::ProbeResult probe);
 
   mutable std::mutex mu_;
   X11SessionInfo info_;
   std::atomic<bool> initialized_{false};
 
-  // Фоновый refresh
   mutable std::mutex refresh_mutex_;
-  std::future<RefreshResult> pending_refresh_;
+  std::shared_ptr<BackgroundState> pending_refresh_;
+  std::thread refresh_thread_;
+  std::shared_ptr<std::atomic<std::uint64_t>> generation_clock_;
+  ProbeFunction probe_function_;
+  RetryWaitFunction retry_wait_function_;
+  std::shared_ptr<WriteGate> write_gate_;
 };
 
 } // namespace punto

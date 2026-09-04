@@ -13,8 +13,8 @@ namespace punto {
 ///
 /// @param res_name  WM_CLASS instance (XClassHint::res_name)
 /// @param res_class WM_CLASS class    (XClassHint::res_class)
-/// @return true если строка содержит известные токены терминалов (case-insensitive)
+/// @return true при component-boundary совпадении известного имени терминала
 [[nodiscard]] bool is_terminal_wm_class(std::string_view res_name,
-                                       std::string_view res_class) noexcept;
+                                        std::string_view res_class) noexcept;
 
 } // namespace punto

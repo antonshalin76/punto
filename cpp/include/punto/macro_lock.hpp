@@ -15,6 +15,11 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <mutex>
+#include <string>
+#include <thread>
 
 namespace punto {
 
@@ -26,7 +31,7 @@ namespace punto {
  */
 class MacroLock {
 public:
-  MacroLock();
+  explicit MacroLock(std::string path = "/var/run/punto-macro.lock");
   ~MacroLock();
 
   MacroLock(const MacroLock &) = delete;
@@ -37,8 +42,8 @@ public:
    * @param timeout Максимальное время ожидания
    * @return true если блокировка успешно захвачена
    */
-  [[nodiscard]] bool try_lock(
-      std::chrono::milliseconds timeout = std::chrono::milliseconds{2000});
+  [[nodiscard]] bool
+  try_lock(std::chrono::milliseconds timeout = std::chrono::milliseconds{2000});
 
   /**
    * @brief Освобождает блокировку.
@@ -50,15 +55,17 @@ public:
   /**
    * @brief Проверяет, захвачена ли блокировка текущим процессом.
    */
-  [[nodiscard]] bool is_locked() const noexcept { return locked_; }
+  [[nodiscard]] bool is_locked() const noexcept;
 
 private:
   bool ensure_fd();
 
+  mutable std::mutex mutex_;
+  std::condition_variable released_;
   int fd_ = -1;
-  bool locked_ = false;
-
-  static constexpr const char *kLockPath = "/var/run/punto-macro.lock";
+  std::thread::id owner_{};
+  std::size_t recursion_depth_ = 0;
+  std::string path_;
 };
 
 /**
@@ -69,9 +76,8 @@ private:
  */
 class MacroLockGuard {
 public:
-  explicit MacroLockGuard(
-      MacroLock &lock,
-      std::chrono::milliseconds timeout = std::chrono::milliseconds{2000})
+  explicit MacroLockGuard(MacroLock &lock, std::chrono::milliseconds timeout =
+                                               std::chrono::milliseconds{2000})
       : lock_(lock), owns_(lock.try_lock(timeout)) {}
 
   ~MacroLockGuard() {

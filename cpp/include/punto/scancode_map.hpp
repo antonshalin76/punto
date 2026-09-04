@@ -270,4 +270,15 @@ key_name_to_code(std::string_view name) noexcept {
   return std::nullopt;
 }
 
+/// Canonical name used by config serialization and settings persistence.
+[[nodiscard]] constexpr std::optional<std::string_view>
+key_code_to_name(std::uint16_t code) noexcept {
+  for (const auto &mapping : kKeyNames) {
+    if (mapping.code == code) {
+      return mapping.name;
+    }
+  }
+  return std::nullopt;
+}
+
 } // namespace punto

@@ -29,7 +29,8 @@ inline constexpr std::size_t kMaxWordLen = 256;
 inline constexpr std::string_view kConfigPath = "/etc/punto/config.yaml";
 
 /// Путь к пользовательскому конфигу (относительно $HOME)
-inline constexpr std::string_view kUserConfigRelPath = ".config/punto/config.yaml";
+inline constexpr std::string_view kUserConfigRelPath =
+    ".config/punto/config.yaml";
 
 // ===========================================================================
 // Типы для работы с событиями ввода
@@ -116,7 +117,7 @@ struct KeyEntry {
 // ===========================================================================
 
 /// Результат парсинга конфигурации
-enum class ConfigResult { Ok, FileNotFound, ParseError, InvalidValue };
+enum class ConfigResult { Ok, FileNotFound, IoError, ParseError, InvalidValue };
 
 /// Результат операции с буфером обмена
 enum class ClipboardResult {

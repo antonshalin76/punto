@@ -1,91 +1,87 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
-# Создание директорий
-mkdir -p /etc/punto
-mkdir -p /etc/interception
+PKG_VERSION="@PUNTO_VERSION@"
+: "$PKG_VERSION"
 
-# IPC и runtime-файлы демона доступны только root и группе punto.
-if ! getent group punto >/dev/null 2>&1; then
-    groupadd --system punto || true
-fi
+case "${1:-}" in
+    configure)
+        if ! getent group punto >/dev/null 2>&1; then
+            if ! command -v groupadd >/dev/null 2>&1; then
+                echo "punto-switcher: groupadd is unavailable" >&2
+                exit 1
+            fi
+            groupadd --system punto
+        fi
+        punto_group=$(getent group punto) || {
+            echo "punto-switcher: cannot resolve punto group" >&2
+            exit 1
+        }
+        punto_gid=$(printf '%s\n' "$punto_group" | cut -d: -f3)
+        case "$punto_gid" in
+            ''|*[!0-9]*)
+                echo "punto-switcher: cannot resolve numeric punto group" >&2
+                exit 1
+                ;;
+        esac
 
-ADDED_GROUP_USER=""
-if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
-    if id -u "${SUDO_USER}" >/dev/null 2>&1; then
-        if ! id -nG "${SUDO_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx "punto"; then
-            usermod -aG punto "${SUDO_USER}" || true
-            if id -nG "${SUDO_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx "punto"; then
-                ADDED_GROUP_USER="${SUDO_USER}"
+        if [ ! -d /etc/punto ] || [ -L /etc/punto ]; then
+            echo "punto-switcher: /etc/punto is not a trusted directory" >&2
+            exit 1
+        fi
+        punto_dir_state=$(stat -c '%u:%g:%a' /etc/punto 2>/dev/null || true)
+        punto_dir_owner=${punto_dir_state%%:*}
+        punto_dir_remainder=${punto_dir_state#*:}
+        punto_dir_group=${punto_dir_remainder%%:*}
+        punto_dir_mode=${punto_dir_remainder#*:}
+        case "$punto_dir_mode" in
+            ''|*[!0-7]*)
+                echo "punto-switcher: /etc/punto has invalid metadata" >&2
+                exit 1
+                ;;
+        esac
+        if [ "$punto_dir_owner" != 0 ] || [ "$punto_dir_group" != 0 ] ||
+           [ $((0$punto_dir_mode & 0022)) -ne 0 ]; then
+            echo "punto-switcher: /etc/punto is not root-owned and protected" >&2
+            exit 1
+        fi
+        runtime_gid=/etc/punto/runtime-gid
+        runtime_gid_current=false
+        if [ -f "$runtime_gid" ] && [ ! -L "$runtime_gid" ]; then
+            runtime_gid_state=$(stat -c '%u:%g:%a:%h:%s' "$runtime_gid" 2>/dev/null || true)
+            runtime_gid_size=$((${#punto_gid} + 1))
+            if [ "$runtime_gid_state" = "0:0:644:1:$runtime_gid_size" ]; then
+                runtime_gid_value=$(cat "$runtime_gid" 2>/dev/null || true)
+                if [ "$runtime_gid_value" = "$punto_gid" ]; then
+                    runtime_gid_current=true
+                fi
             fi
         fi
-    fi
-fi
+        if [ "$runtime_gid_current" != true ]; then
+            umask 077
+            runtime_gid_tmp=$(mktemp /etc/punto/.runtime-gid.XXXXXX) || exit 1
+            trap 'rm -f -- "${runtime_gid_tmp:-}"' 0 HUP INT TERM
+            printf '%s\n' "$punto_gid" >"$runtime_gid_tmp"
+            chown root:root "$runtime_gid_tmp"
+            chmod 0644 "$runtime_gid_tmp"
+            if ! mv -fT -- "$runtime_gid_tmp" "$runtime_gid"; then
+                echo "punto-switcher: cannot publish runtime group id" >&2
+                exit 1
+            fi
+            runtime_gid_tmp=
+            trap - 0 HUP INT TERM
+        fi
 
-# Определяем версию пакета
-PKG_VERSION="2.8.5"
-CONFIG_FILE="/etc/punto/config.yaml"
-NEW_CONFIG="/usr/share/punto-switcher/config.yaml"
+        # Static user units are started by XDG autostart, not globally from a
+        # root maintainer script. A daemon-only replacement must still stop a
+        # tray left running by an earlier full package.
+        if [ ! -x /usr/bin/punto-tray ]; then
+            deb-systemd-invoke --user stop punto-tray.service \
+                >/dev/null 2>&1 || true
+        fi
+        deb-systemd-invoke --user daemon-reload >/dev/null 2>&1 || true
 
-# Функция для получения версии из конфига
-get_config_version() {
-    if [ -f "$1" ]; then
-        # Ищем строку вида "# Config version: X.X.X" в первых 10 строках
-        grep -m1 "# Config version:" "$1" 2>/dev/null | sed 's/.*: //' || echo "0.0.0"
-    else
-        echo "0.0.0"
-    fi
-}
+        ;;
+esac
 
-# Проверяем нужно ли обновить конфиг
-if [ -f "$CONFIG_FILE" ]; then
-    CURRENT_VERSION=$(get_config_version "$CONFIG_FILE")
-    NEW_VERSION=$(get_config_version "$NEW_CONFIG")
-    
-    echo "Текущая версия конфига: $CURRENT_VERSION"
-    echo "Новая версия конфига: $NEW_VERSION"
-    
-    # Если конфиг старый или версии нет - обновляем
-    if [ "$CURRENT_VERSION" != "$NEW_VERSION" ] || [ "$CURRENT_VERSION" = "0.0.0" ]; then
-        BACKUP_FILE="/etc/punto/config.yaml.backup-$(date +%Y%m%d-%H%M%S)"
-        echo "Обновление конфигурации..."
-        echo "  Backup: $BACKUP_FILE"
-        cp "$CONFIG_FILE" "$BACKUP_FILE"
-        cp "$NEW_CONFIG" "$CONFIG_FILE"
-        echo "  ✓ Конфиг обновлён (старый сохранён в backup)"
-    else
-        echo "  Конфиг актуальный, обновление не требуется"
-    fi
-else
-    # Первая установка
-    echo "Установка начального конфига..."
-    cp "$NEW_CONFIG" "$CONFIG_FILE"
-fi
-
-# Установка конфигурации udevmon
-# Всегда обновляем, так как список клавиш может меняться
-cp /usr/share/punto-switcher/udevmon.yaml /etc/interception/udevmon.yaml
-
-# Включение и запуск сервиса
-systemctl daemon-reload
-systemctl enable udevmon || true
-systemctl restart udevmon || true
-
-if [ -e /var/run/punto.sock ]; then
-    chown root:punto /var/run/punto.sock 2>/dev/null || true
-    chmod 0660 /var/run/punto.sock 2>/dev/null || true
-fi
-
-if [ -e /var/run/punto-macro.lock ]; then
-    chown root:punto /var/run/punto-macro.lock 2>/dev/null || true
-    chmod 0660 /var/run/punto-macro.lock 2>/dev/null || true
-fi
-
-echo "Punto Switcher for Ubuntu установлен успешно!"
-echo "Author Anton Shalin <anton.shalin@gmail.com>"
-echo "Используйте Pause для инверсии слова, Shift+Pause для инверсии выделенного текста, Ctrl+Z для отмены последнего исправления."
-echo "Пользователи tray/IPC должны состоять в группе punto."
-if [ -n "$ADDED_GROUP_USER" ]; then
-    echo "Пользователь ${ADDED_GROUP_USER} добавлен в группу punto."
-    echo "Новая группа будет применена после relogin; до этого punto start использует sg punto для tray."
-fi
+exit 0

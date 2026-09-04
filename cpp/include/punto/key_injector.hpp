@@ -15,6 +15,21 @@
 
 namespace punto {
 
+enum class InjectionResult {
+  Completed,
+  CancelledBeforeAction,
+  CancelledAfterAction,
+  OutputFailedBeforeAction,
+  OutputFailedAfterAction,
+};
+
+[[nodiscard]] constexpr bool
+injection_action_dispatched(InjectionResult result) noexcept {
+  return result == InjectionResult::Completed ||
+         result == InjectionResult::CancelledAfterAction ||
+         result == InjectionResult::OutputFailedAfterAction;
+}
+
 /**
  * @brief Класс для эмуляции ввода через uinput
  *
@@ -49,7 +64,7 @@ public:
   void send_key(ScanCode code, KeyState state) const;
 
   /// Тип функции ожидания (для интеграции с Input Guard)
-  using WaitFunc = std::function<void(std::chrono::microseconds)>;
+  using WaitFunc = std::function<bool(std::chrono::microseconds)>;
 
   /**
    * @brief Устанавливает функцию ожидания
@@ -63,8 +78,8 @@ public:
    * @param with_shift Нужно ли зажимать Shift
    * @param turbo Использовать ли ускоренные задержки
    */
-  void tap_key(ScanCode code, bool with_shift = false,
-               bool turbo = false) const;
+  [[nodiscard]] InjectionResult tap_key(ScanCode code, bool with_shift = false,
+                                        bool turbo = false) const;
 
   // =========================================================================
   // Высокоуровневые макросы
@@ -98,7 +113,8 @@ public:
    * @param modifier Модификатор
    * @param key Клавиша
    */
-  void send_layout_hotkey(ScanCode modifier, ScanCode key) const;
+  [[nodiscard]] InjectionResult send_layout_hotkey(ScanCode modifier,
+                                                   ScanCode key) const;
 
   /**
    * @brief Вставка текста из буфера обмена
@@ -106,7 +122,13 @@ public:
    * - is_terminal=true: Ctrl+Shift+V
    * - is_terminal=false: Shift+Insert
    */
-  void send_paste(bool is_terminal) const;
+  [[nodiscard]] InjectionResult send_paste(bool is_terminal) const;
+
+  /** Sends Ctrl+V, which requests the CLIPBOARD selection in GUI apps. */
+  [[nodiscard]] InjectionResult send_clipboard_paste() const;
+
+  /** Sends Ctrl+C and releases every pressed key if a wait is cancelled. */
+  [[nodiscard]] InjectionResult send_clipboard_copy() const;
 
   /**
    * @brief Отпускает все модификаторы
@@ -114,7 +136,7 @@ public:
   void release_all_modifiers() const;
 
   /// Задержка (использует wait_func_ если установлена, иначе usleep)
-  void delay(std::chrono::microseconds us) const noexcept;
+  [[nodiscard]] bool delay(std::chrono::microseconds us) const noexcept;
 
   [[nodiscard]] bool has_fatal_io_error() const noexcept;
   [[nodiscard]] int fatal_io_errno() const noexcept;
@@ -125,14 +147,21 @@ public:
   // =========================================================================
 
   // Централизованные задержки для операций замены текста
-  static constexpr std::chrono::microseconds kPostLayoutSwitchWait{110000};  // После переключения раскладки
-  static constexpr std::chrono::microseconds kAfterBackspaceWaitTerminal{60000};  // После Backspace (терминал)
-  static constexpr std::chrono::microseconds kAfterBackspaceWaitGUI{25000};  // После Backspace (GUI)
-  static constexpr std::chrono::microseconds kPrePasteWaitTerminal{150000};  // До Paste (терминал)
-  static constexpr std::chrono::microseconds kPrePasteWaitGUI{100000};  // До Paste (GUI)
+  static constexpr std::chrono::microseconds kPostLayoutSwitchWait{
+      110000}; // После переключения раскладки
+  static constexpr std::chrono::microseconds kAfterBackspaceWaitTerminal{
+      60000}; // После Backspace (терминал)
+  static constexpr std::chrono::microseconds kAfterBackspaceWaitGUI{
+      25000}; // После Backspace (GUI)
+  static constexpr std::chrono::microseconds kPrePasteWaitTerminal{
+      150000}; // До Paste (терминал)
+  static constexpr std::chrono::microseconds kPrePasteWaitGUI{
+      100000}; // До Paste (GUI)
 
 private:
   void write_all(int fd, const void *data, std::size_t bytes) const;
+  void latch_io_error(int error, int fd, std::size_t bytes,
+                      std::size_t remaining) const;
 
   // Встроенные задержки (в микросекундах).
   // Значения соответствуют прежним рекомендуемым параметрам из config.yaml.
@@ -145,6 +174,7 @@ private:
   static constexpr std::chrono::microseconds kModifierHold{15000};
   static constexpr std::chrono::microseconds kModifierRelease{8000};
   static constexpr std::chrono::microseconds kBackspaceHold{18000};
+  static constexpr std::chrono::milliseconds kOutputWriteTimeout{2000};
 
   WaitFunc wait_func_;
   mutable std::atomic<bool> fatal_io_error_{false};

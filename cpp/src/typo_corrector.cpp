@@ -5,11 +5,11 @@
 
 #include "punto/typo_corrector.hpp"
 #include "punto/scancode_map.hpp"
+#include "punto/text_processor.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <iostream>
 #include <string_view>
 #include <vector>
 
@@ -18,16 +18,17 @@ namespace punto {
 namespace {
 
 constexpr std::array<std::string_view, 22> kKnownAbbreviations{
-    "api",  "url",  "uuid", "json", "yaml", "http", "https", "ssh",
-    "dns",  "sql",  "cpu",  "gpu",  "ram",  "sdk",  "cli",   "gui",
-    "rest", "grpc", "jwt",  "oauth","tls",  "ssl"};
+    "api",  "url",  "uuid", "json",  "yaml", "http", "https", "ssh",
+    "dns",  "sql",  "cpu",  "gpu",   "ram",  "sdk",  "cli",   "gui",
+    "rest", "grpc", "jwt",  "oauth", "tls",  "ssl"};
 
 [[nodiscard]] std::string to_ascii_lower(std::span<const KeyEntry> word) {
   std::string ascii;
   ascii.reserve(word.size());
 
   for (const auto &entry : word) {
-    if (!is_typeable_letter(entry.code) || entry.code >= kScancodeToChar.size()) {
+    if (!is_typeable_letter(entry.code) ||
+        entry.code >= kScancodeToChar.size()) {
       return {};
     }
 
@@ -50,37 +51,77 @@ is_likely_abbreviation(std::span<const KeyEntry> word) noexcept {
     return false;
   }
 
-  std::size_t letter_count = 0;
-  std::size_t consecutive_upper = 0;
-  std::size_t max_consecutive_upper = 0;
-
   for (const auto &entry : word) {
-    if (is_typeable_letter(entry.code)) {
-      ++letter_count;
-      if (entry.shifted) {
-        ++consecutive_upper;
-        max_consecutive_upper =
-            std::max(max_consecutive_upper, consecutive_upper);
-      } else {
-        consecutive_upper = 0;
-      }
+    if (!is_typeable_letter(entry.code) || !entry.shifted) {
+      return false;
     }
-  }
-
-  if (letter_count < 2) {
-    return false;
   }
 
   const std::string ascii = to_ascii_lower(word);
-  if (!ascii.empty()) {
-    for (std::string_view known : kKnownAbbreviations) {
-      if (ascii == known) {
-        return true;
-      }
+  for (std::string_view known : kKnownAbbreviations) {
+    if (ascii == known) {
+      return true;
     }
   }
+  return false;
+}
 
-  return max_consecutive_upper >= 3;
+[[nodiscard]] std::vector<std::string_view> utf8_units(std::string_view value) {
+  std::vector<std::string_view> units;
+  units.reserve(value.size());
+  for (std::size_t i = 0; i < value.size();) {
+    std::size_t len = utf8_char_len(static_cast<unsigned char>(value[i]));
+    if (len == 0 || i + len > value.size()) {
+      len = 1;
+    } else {
+      for (std::size_t offset = 1; offset < len; ++offset) {
+        const auto byte = static_cast<unsigned char>(value[i + offset]);
+        if ((byte & 0xC0U) != 0x80U) {
+          len = 1;
+          break;
+        }
+      }
+    }
+    units.push_back(value.substr(i, len));
+    i += len;
+  }
+  return units;
+}
+
+template <typename Left, typename Right>
+[[nodiscard]] std::size_t damerau_distance(const Left &left,
+                                           const Right &right) {
+  const std::size_t len1 = left.size();
+  const std::size_t len2 = right.size();
+  if (len1 == 0) {
+    return len2;
+  }
+  if (len2 == 0) {
+    return len1;
+  }
+
+  std::vector<std::size_t> previous_previous(len2 + 1U);
+  std::vector<std::size_t> previous(len2 + 1U);
+  std::vector<std::size_t> current(len2 + 1U);
+  for (std::size_t j = 0; j <= len2; ++j) {
+    previous[j] = j;
+  }
+
+  for (std::size_t i = 1; i <= len1; ++i) {
+    current[0] = i;
+    for (std::size_t j = 1; j <= len2; ++j) {
+      const std::size_t cost = (left[i - 1] == right[j - 1]) ? 0U : 1U;
+      current[j] = std::min(
+          {previous[j] + 1U, current[j - 1] + 1U, previous[j - 1] + cost});
+      if (i > 1 && j > 1 && left[i - 1] == right[j - 2] &&
+          left[i - 2] == right[j - 1]) {
+        current[j] = std::min(current[j], previous_previous[j - 2] + cost);
+      }
+    }
+    previous_previous.swap(previous);
+    previous.swap(current);
+  }
+  return previous[len2];
 }
 
 } // namespace
@@ -133,12 +174,6 @@ CasePattern detect_case_pattern(std::span<const KeyEntry> word) {
   if (total == 0) {
     return CasePattern::Unknown;
   }
-
-  // Диагностика
-  std::cerr << "[punto] detect_case_pattern: upper=" << upper_count
-            << " lower=" << lower_count << " first_upper=" << first_upper_pos
-            << " last_upper=" << last_upper_pos
-            << " first_lower=" << first_lower_pos << std::endl;
 
   // Все строчные
   if (upper_count == 0) {
@@ -322,62 +357,22 @@ detect_sticky_shift_with_layout(std::span<const KeyEntry> word,
 
 std::size_t damerau_levenshtein_distance(std::string_view s1,
                                          std::string_view s2) {
-  const std::size_t len1 = s1.size();
-  const std::size_t len2 = s2.size();
-
-  // Оптимизация для пустых строк
-  if (len1 == 0)
-    return len2;
-  if (len2 == 0)
-    return len1;
-
-  // Оптимизация для одинаковых строк
-  if (s1 == s2)
-    return 0;
-
-  // Создаём матрицу расстояний
-  // Используем 2D вектор для простоты (O(n*m) память)
-  std::vector<std::vector<std::size_t>> d(len1 + 1,
-                                          std::vector<std::size_t>(len2 + 1));
-
-  // Инициализация первой строки и столбца
-  for (std::size_t i = 0; i <= len1; ++i) {
-    d[i][0] = i;
-  }
-  for (std::size_t j = 0; j <= len2; ++j) {
-    d[0][j] = j;
-  }
-
-  // Заполнение матрицы
-  for (std::size_t i = 1; i <= len1; ++i) {
-    for (std::size_t j = 1; j <= len2; ++j) {
-      const std::size_t cost = (s1[i - 1] == s2[j - 1]) ? 0 : 1;
-
-      // Минимум из: удаление, вставка, замена
-      d[i][j] = std::min({
-          d[i - 1][j] + 1,       // Удаление
-          d[i][j - 1] + 1,       // Вставка
-          d[i - 1][j - 1] + cost // Замена
-      });
-
-      // Транспозиция (перестановка соседних символов)
-      if (i > 1 && j > 1 && s1[i - 1] == s2[j - 2] && s1[i - 2] == s2[j - 1]) {
-        d[i][j] = std::min(d[i][j], d[i - 2][j - 2] + cost);
-      }
-    }
-  }
-
-  return d[len1][len2];
+  const auto left = utf8_units(s1);
+  const auto right = utf8_units(s2);
+  return damerau_distance(left, right);
 }
 
 std::size_t damerau_levenshtein_distance(std::span<const KeyEntry> word1,
                                          std::span<const KeyEntry> word2) {
 
-  // Конвертируем в строки для сравнения (без учёта регистра)
-  std::string s1 = keys_to_ascii(word1);
-  std::string s2 = keys_to_ascii(word2);
-
-  return damerau_levenshtein_distance(s1, s2);
+  struct CodeView {
+    std::span<const KeyEntry> entries;
+    [[nodiscard]] std::size_t size() const noexcept { return entries.size(); }
+    [[nodiscard]] ScanCode operator[](std::size_t index) const noexcept {
+      return entries[index].code;
+    }
+  };
+  return damerau_distance(CodeView{word1}, CodeView{word2});
 }
 
 // ===========================================================================
@@ -480,11 +475,14 @@ std::vector<KeyEntry> ascii_to_keys(std::string_view ascii, bool preserve_case,
     bool shifted = false;
 
     // Определяем регистр
+    const bool source_upper = c >= 'A' && c <= 'Z';
+    if (source_upper) {
+      c = static_cast<char>(c + 32); // К нижнему регистру для поиска scancode
+    }
     if (preserve_case && i < original_word.size()) {
       shifted = original_word[i].shifted;
-    } else if (c >= 'A' && c <= 'Z') {
+    } else if (source_upper) {
       shifted = true;
-      c = static_cast<char>(c + 32); // К нижнему регистру для поиска scancode
     }
 
     // Ищем scancode для символа
@@ -496,9 +494,10 @@ std::vector<KeyEntry> ascii_to_keys(std::string_view ascii, bool preserve_case,
       }
     }
 
-    if (code != 0) {
-      result.emplace_back(code, shifted);
+    if (code == 0) {
+      return {};
     }
+    result.emplace_back(code, shifted);
   }
 
   return result;
@@ -555,12 +554,12 @@ std::string keys_to_utf8(std::span<const KeyEntry> word, bool is_english) {
 
   for (const auto &entry : word) {
     if (entry.code >= kScancodeToChar.size()) {
-      continue;
+      return {};
     }
 
     char c = kScancodeToChar[entry.code];
     if (c == '\0') {
-      continue;
+      return {};
     }
 
     // Приводим к нижнему регистру
@@ -572,6 +571,8 @@ std::string keys_to_utf8(std::span<const KeyEntry> word, bool is_english) {
       // Для английского — просто ASCII
       if ((c >= 'a' && c <= 'z')) {
         result += c;
+      } else {
+        return {};
       }
     } else {
       // Для русского — конвертируем в кириллицу
@@ -583,8 +584,9 @@ std::string keys_to_utf8(std::span<const KeyEntry> word, bool is_english) {
           break;
         }
       }
-      // Если не нашли в таблице — пропускаем
-      (void)found;
+      if (!found) {
+        return {};
+      }
     }
   }
 
@@ -654,14 +656,17 @@ std::vector<KeyEntry> utf8_to_keys(std::string_view utf8, bool is_english,
         }
       }
 
-      if (code != 0) {
-        bool shifted = false;
-        if (preserve_case && key_idx < original_word.size()) {
-          shifted = original_word[key_idx].shifted;
-        }
-        result.emplace_back(code, shifted);
-        ++key_idx;
+      if (code == 0) {
+        return {};
       }
+      bool shifted = false;
+      if (preserve_case && key_idx < original_word.size()) {
+        shifted = original_word[key_idx].shifted;
+      }
+      result.emplace_back(code, shifted);
+      ++key_idx;
+    } else {
+      return {};
     }
 
     i += char_len;

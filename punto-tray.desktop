@@ -2,9 +2,10 @@
 Type=Application
 Name=Punto Switcher Tray
 Name[ru]=Punto Switcher Трей
-Comment=System tray application for Punto Switcher control
-Comment[ru]=Приложение в трее для управления Punto Switcher
-Exec=/usr/local/bin/punto-tray
+Comment=System tray status and analysis settings for Punto Switcher
+Comment[ru]=Статус и настройки анализа Punto Switcher в системном трее
+TryExec=/usr/bin/punto-tray
+Exec=/usr/bin/systemctl --user start --no-block -- punto-tray.service
 Icon=input-keyboard
 Terminal=false
 Categories=Utility;

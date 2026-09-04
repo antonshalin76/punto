@@ -1,28 +1,70 @@
 /**
  * @file sound_manager.hpp
- * @brief Звуковая индикация переключения раскладки
- *
- * Реализация построена так, чтобы не блокировать критический путь ввода
- * и не использовать fork()+exec в многопоточном контексте небезопасным образом.
- *
- * Подход:
- * - подготовка аргументов/окружения в родителе
- * - double-fork: родитель ждёт только промежуточного процесса (быстро),
- *   финальный плеер становится сиротой и не оставляет zombie
+ * @brief Non-blocking, privilege-separated layout sound playback.
  */
 
 #pragma once
 
-#include <atomic>
+#include <memory>
+
+#ifdef PUNTO_TESTING
+#include <chrono>
+#include <functional>
+#include <optional>
+#include <stop_token>
 #include <string>
 #include <vector>
 
 #include <sys/types.h>
+#endif
 
 namespace punto {
 
 class X11Session;
+struct X11SessionInfo;
 struct SoundConfig;
+
+#ifdef PUNTO_TESTING
+enum class SoundLaunchResult {
+  Completed,
+  SpawnFailed,
+  ExitedFailure,
+  TimedOut,
+  Stopped,
+};
+
+struct SoundManagerResolvedUser {
+  std::string username;
+  std::string home_dir;
+  uid_t uid = 0;
+  gid_t gid = 0;
+  std::vector<gid_t> groups;
+};
+
+struct SoundLaunchRequest {
+  uid_t uid = 0;
+  gid_t gid = 0;
+  std::vector<gid_t> groups;
+  bool drop_privileges = true;
+  std::string player_path;
+  std::string sound_path;
+  std::vector<std::string> environment;
+};
+
+struct SoundManagerTestOptions {
+  bool session_valid = true;
+  std::string player_path;
+  std::optional<SoundManagerResolvedUser> resolved_user;
+  bool drop_privileges = true;
+  std::chrono::milliseconds minimum_launch_interval{100};
+  std::chrono::milliseconds shutdown_wait{2500};
+  std::function<std::optional<SoundManagerResolvedUser>(const X11SessionInfo &,
+                                                        std::stop_token)>
+      resolve_user;
+  std::function<SoundLaunchResult(const SoundLaunchRequest &, std::stop_token)>
+      launch;
+};
+#endif
 
 class SoundManager {
 public:
@@ -31,34 +73,29 @@ public:
 
   SoundManager(const SoundManager &) = delete;
   SoundManager &operator=(const SoundManager &) = delete;
+  SoundManager(SoundManager &&) = delete;
+  SoundManager &operator=(SoundManager &&) = delete;
 
   void set_enabled(bool enabled) noexcept;
 
-  /// @param new_layout 0 = EN, 1 = RU
-  void play_for_layout(int new_layout);
+  /// @param new_layout 0 = EN, 1 = RU; other values are ignored.
+  void play_for_layout(int new_layout) noexcept;
+
+#ifdef PUNTO_TESTING
+  SoundManager(const X11SessionInfo &session, const SoundConfig &config,
+               SoundManagerTestOptions options);
+
+  [[nodiscard]] static std::optional<SoundManagerResolvedUser>
+  resolve_user_for_test(const X11SessionInfo &session);
+
+  [[nodiscard]] static SoundLaunchResult run_process_for_test(
+      const SoundLaunchRequest &request, const std::string &helper_path,
+      std::chrono::milliseconds maximum_runtime, std::stop_token stop);
+#endif
 
 private:
-  void play_file(const char *wav_path);
-
-  const X11Session &x11_session_;
-  std::atomic<bool> enabled_{true};
-
-  // Определяется один раз при старте (paplay -> aplay).
-  std::string player_path_;
-
-  // UID/GID активного пользователя (берём из X11Session на старте)
-  uid_t user_uid_ = 0;
-  gid_t user_gid_ = 0;
-
-  // Группы пользователя (для aplay/ALSA может быть важно)
-  std::vector<gid_t> user_groups_;
-
-  // Подготовленное окружение для execve (валидно, пока жив объект)
-  std::vector<std::string> env_;
-  std::vector<char *> envp_;
-
-  // /dev/null для перенаправления stdin/stdout/stderr дочернему процессу
-  int devnull_fd_ = -1;
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 } // namespace punto

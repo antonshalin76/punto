@@ -1,8 +1,15 @@
-#!/bin/bash
+#!/bin/sh
 set -e
 
-# Остановка сервиса перед удалением
-systemctl stop udevmon || true
+# The host input service is foreign and may contain unrelated pipelines. Only
+# the package-owned user unit is stopped on final removal. Normal upgrades do
+# not interrupt active desktop sessions; daemon-only replacement is handled by
+# the new package's postinst after its tray payload is absent.
+case "${1:-}" in
+    remove|deconfigure)
+        deb-systemd-invoke --user stop punto-tray.service \
+            >/dev/null 2>&1 || true
+        ;;
+esac
 
-echo "Punto Switcher будет удален."
-echo "Конфигурационные файлы сохранены в /etc/punto/"
+exit 0

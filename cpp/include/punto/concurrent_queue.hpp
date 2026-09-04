@@ -1,6 +1,7 @@
 /**
  * @file concurrent_queue.hpp
- * @brief Простейшая потокобезопасная очередь для обмена сообщениями между потоками
+ * @brief Простейшая потокобезопасная очередь для обмена сообщениями между
+ * потоками
  */
 
 #pragma once
@@ -77,7 +78,7 @@ public:
     std::vector<T> extracted;
     std::lock_guard<std::mutex> lock(mu_);
     for (auto it = q_.begin(); it != q_.end();) {
-      if (std::forward<Predicate>(predicate)(*it)) {
+      if (predicate(*it)) {
         extracted.push_back(std::move(*it));
         it = q_.erase(it);
       } else {

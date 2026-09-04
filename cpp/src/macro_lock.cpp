@@ -4,46 +4,28 @@
  */
 
 #include "punto/macro_lock.hpp"
+#include "punto/runtime_file.hpp"
 
-#include <grp.h>
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
 #include <sys/file.h>
-#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 
 namespace punto {
 
-namespace {
-
-void apply_runtime_permissions(int fd) {
-  if (fd < 0) {
-    return;
-  }
-
-  if (::fchmod(fd, 0660) != 0) {
-    std::cerr << "[punto] MacroLock: failed to chmod lock file: "
-              << std::strerror(errno) << "\n";
-  }
-
-  if (group *grp = ::getgrnam("punto"); grp != nullptr) {
-    if (::fchown(fd, 0, grp->gr_gid) != 0) {
-      std::cerr << "[punto] MacroLock: failed to chown lock file: "
-                << std::strerror(errno) << "\n";
-    }
-  }
-}
-
-} // namespace
-
-MacroLock::MacroLock() = default;
+MacroLock::MacroLock(std::string path) : path_{std::move(path)} {}
 
 MacroLock::~MacroLock() {
-  if (locked_) {
-    unlock();
+  std::lock_guard<std::mutex> lock{mutex_};
+  if (recursion_depth_ > 0 && fd_ >= 0) {
+    (void)::flock(fd_, LOCK_UN);
+    recursion_depth_ = 0;
+    owner_ = {};
   }
   if (fd_ >= 0) {
     ::close(fd_);
@@ -56,39 +38,59 @@ bool MacroLock::ensure_fd() {
     return true;
   }
 
-  // O_CREAT | O_RDWR: создаём файл если не существует.
-  // Файл НЕ удаляется — stale lock файлы безопасны для flock().
-  fd_ = ::open(kLockPath, O_CREAT | O_RDWR, 0660);
+  const RuntimeFileSecurity security = default_runtime_file_security();
+  do {
+    fd_ = ::open(path_.c_str(),
+                 O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
+                 security.mode);
+  } while (fd_ < 0 && errno == EINTR);
   if (fd_ < 0) {
     const int err = errno;
-    std::cerr << "[punto] MacroLock: failed to open " << kLockPath << ": "
+    std::cerr << "[punto] MacroLock: failed to open " << path_ << ": "
               << std::strerror(err) << "\n";
     return false;
   }
 
-  apply_runtime_permissions(fd_);
+  if (!apply_runtime_file_security(fd_, security)) {
+    std::cerr << "[punto] MacroLock: unsafe runtime file " << path_ << "\n";
+    (void)::close(fd_);
+    fd_ = -1;
+    return false;
+  }
   return true;
 }
 
 bool MacroLock::try_lock(std::chrono::milliseconds timeout) {
-  if (locked_) {
-    // Уже захвачена (реентрантно в рамках одного процесса).
+  timeout = std::max(timeout, std::chrono::milliseconds::zero());
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  std::unique_lock<std::mutex> guard{mutex_};
+  const std::thread::id caller = std::this_thread::get_id();
+  if (recursion_depth_ > 0 && owner_ == caller) {
+    ++recursion_depth_;
     return true;
+  }
+  while (recursion_depth_ > 0) {
+    if (released_.wait_until(guard, deadline) == std::cv_status::timeout) {
+      return false;
+    }
   }
 
   if (!ensure_fd()) {
     return false;
   }
 
-  const auto start = std::chrono::steady_clock::now();
-
   // Сначала пробуем неблокирующий захват.
-  if (::flock(fd_, LOCK_EX | LOCK_NB) == 0) {
-    locked_ = true;
+  int lock_rc = -1;
+  do {
+    lock_rc = ::flock(fd_, LOCK_EX | LOCK_NB);
+  } while (lock_rc != 0 && errno == EINTR);
+  if (lock_rc == 0) {
+    owner_ = caller;
+    recursion_depth_ = 1;
     return true;
   }
 
-  if (errno != EWOULDBLOCK) {
+  if (errno != EWOULDBLOCK && errno != EAGAIN) {
     std::cerr << "[punto] MacroLock: flock failed: " << std::strerror(errno)
               << "\n";
     return false;
@@ -99,23 +101,27 @@ bool MacroLock::try_lock(std::chrono::milliseconds timeout) {
 
   while (true) {
     const auto now = std::chrono::steady_clock::now();
-    if (now - start >= timeout) {
-      std::cerr << "[punto] MacroLock: timeout after "
-                << std::chrono::duration_cast<std::chrono::milliseconds>(now -
-                                                                        start)
-                       .count()
+    if (now >= deadline) {
+      std::cerr << "[punto] MacroLock: timeout after " << timeout.count()
                 << "ms\n";
       return false;
     }
 
-    std::this_thread::sleep_for(kRetryInterval);
+    const auto retry_interval =
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            kRetryInterval);
+    std::this_thread::sleep_for(std::min(retry_interval, deadline - now));
 
-    if (::flock(fd_, LOCK_EX | LOCK_NB) == 0) {
-      locked_ = true;
+    do {
+      lock_rc = ::flock(fd_, LOCK_EX | LOCK_NB);
+    } while (lock_rc != 0 && errno == EINTR);
+    if (lock_rc == 0) {
+      owner_ = caller;
+      recursion_depth_ = 1;
       return true;
     }
 
-    if (errno != EWOULDBLOCK) {
+    if (errno != EWOULDBLOCK && errno != EAGAIN) {
       std::cerr << "[punto] MacroLock: flock retry failed: "
                 << std::strerror(errno) << "\n";
       return false;
@@ -124,15 +130,37 @@ bool MacroLock::try_lock(std::chrono::milliseconds timeout) {
 }
 
 void MacroLock::unlock() {
-  if (!locked_ || fd_ < 0) {
+  std::unique_lock<std::mutex> guard{mutex_};
+  if (recursion_depth_ == 0 || fd_ < 0) {
+    return;
+  }
+  if (owner_ != std::this_thread::get_id()) {
+    std::cerr << "[punto] MacroLock: unlock attempted by non-owner thread\n";
+    return;
+  }
+  --recursion_depth_;
+  if (recursion_depth_ > 0) {
     return;
   }
 
-  if (::flock(fd_, LOCK_UN) != 0) {
+  int rc = -1;
+  do {
+    rc = ::flock(fd_, LOCK_UN);
+  } while (rc != 0 && errno == EINTR);
+  if (rc != 0) {
     std::cerr << "[punto] MacroLock: unlock failed: " << std::strerror(errno)
               << "\n";
+    recursion_depth_ = 1;
+    return;
   }
-  locked_ = false;
+  owner_ = {};
+  guard.unlock();
+  released_.notify_all();
+}
+
+bool MacroLock::is_locked() const noexcept {
+  std::lock_guard<std::mutex> lock{mutex_};
+  return recursion_depth_ > 0;
 }
 
 } // namespace punto

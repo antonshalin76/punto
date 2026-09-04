@@ -1,16 +1,13 @@
 /**
  * @file config.hpp
- * @brief Конфигурация Punto Switcher
- *
- * Типобезопасная конфигурация с YAML парсингом.
- * Все значения имеют разумные дефолты.
+ * @brief Типобезопасная конфигурация Punto Switcher
  */
 
 #pragma once
 
 #include <linux/input.h>
 
-#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -21,57 +18,43 @@
 
 namespace punto {
 
-// ===========================================================================
-// Структура конфигурации
-// ===========================================================================
+namespace config_limits {
 
-/// Настройки горячей клавиши переключения раскладки
+inline constexpr double kThresholdMin = 0.5;
+inline constexpr double kThresholdMax = 10.0;
+inline constexpr std::size_t kMinWordLengthMin = 1;
+inline constexpr std::size_t kMinWordLengthMax = 10;
+inline constexpr double kMinScoreMin = 0.0;
+inline constexpr double kMinScoreMax = 20.0;
+inline constexpr std::size_t kRollbackWordsMin = 1;
+inline constexpr std::size_t kRollbackWordsMax = 50;
+inline constexpr std::size_t kTypoDiffMin = 1;
+inline constexpr std::size_t kTypoDiffMax = 2;
+inline constexpr std::size_t kAnalysisThreadsMax = 128;
+inline constexpr std::size_t kMaxAnalysisThreadsPerDaemonMin = 1;
+inline constexpr std::size_t kMaxAnalysisThreadsPerDaemonMax = 128;
+inline constexpr std::size_t kConfigFileMaxBytes = 64U * 1024U;
+
+} // namespace config_limits
+
 struct HotkeyConfig {
   std::uint16_t modifier = KEY_LEFTCTRL;
   std::uint16_t key = KEY_GRAVE;
 };
 
-/// Настройки автоматического переключения раскладки
 struct AutoSwitchConfig {
-  /// Включено ли автопереключение
   bool enabled = true;
+  double threshold = 3.5;
+  std::size_t min_word_len = 2;
+  double min_score = 5.0;
 
-  /// Порог срабатывания: отношение Score(Other) / Score(Current)
-  /// Например, 2.0 означает, что другая раскладка должна быть в 2 раза
-  /// вероятнее
-  double threshold = 2.5;
-
-  /// Минимальная длина слова для анализа (чтобы не переключать "a", "i", "y")
-  std::size_t min_word_len = 3;
-
-  /// Минимальный скор для принятия решения (защита от случайных данных)
-  double min_score = 10.0;
-
-  /// Максимальная глубина отката (сколько последних слов можно перепечатать
-  /// при позднем срабатывании анализа).
-  ///
-  /// Важно: чем больше значение, тем больше будет макрос коррекции (backspace +
-  /// replay) при очень быстром наборе.
+  // Maximum number of recent words that a late correction may replay.
   std::size_t max_rollback_words = 5;
-
-  // =========================================================================
-  // Исправление опечаток (v2.7+)
-  // =========================================================================
-
-  /// Включено ли исправление опечаток (перестановки, замены, пропуски, дубли)
-  bool typo_correction_enabled = true;
-
-  /// Максимальное расстояние редактирования (для пропусков/дублей букв).
-  /// 1 = исправляем только одну пропущенную/лишнюю букву в слове.
-  /// 2 = до двух ошибок на слово (более агрессивно).
-  std::size_t max_typo_diff = 1;
-
-  /// Включено ли исправление залипшего Shift (ПРивет -> Привет, кОЛБАСА ->
-  /// Колбаса)
+  bool typo_correction_enabled = false;
+  std::size_t max_typo_diff = 2;
   bool sticky_shift_correction_enabled = true;
 };
 
-/// Настройки звуковой индикации переключения раскладки
 struct SoundConfig {
   bool enabled = true;
 };
@@ -88,14 +71,11 @@ struct LoggingConfig {
 };
 
 struct RuntimeConfig {
-  // 0 = auto-budget на основе числа CPU и количества punto-daemon.
+  // Zero selects the automatic per-daemon CPU budget.
   std::size_t analysis_threads = 0;
-
-  // Верхняя граница для auto-budget на один daemon.
   std::size_t max_analysis_threads_per_daemon = 4;
 };
 
-/// Полная конфигурация приложения
 struct Config {
   HotkeyConfig hotkey;
   AutoSwitchConfig auto_switch;
@@ -105,15 +85,7 @@ struct Config {
   std::filesystem::path config_path{"/etc/punto/config.yaml"};
 };
 
-// ===========================================================================
-// Загрузчик конфигурации
-// ===========================================================================
-
-/// Результат загрузки конфигурации из файла.
-///
-/// В отличие от `load_config()`, это API НЕ делает скрытых фолбэков и
-/// позволяет вызывающему коду принять решение (fail-fast / fallback /
-/// UI-ошибка).
+/** Strict load: never falls back and returns a complete safe snapshot. */
 struct ConfigLoadOutcome {
   Config config;
   ConfigResult result = ConfigResult::Ok;
@@ -122,29 +94,33 @@ struct ConfigLoadOutcome {
 };
 
 /**
- * @brief Загружает конфигурацию из конкретного файла
- *
- * @param path Абсолютный или относительный путь к конфигу
- * @return ConfigLoadOutcome с кодом результата и сообщением ошибки
+ * Result of opening a config relative to a pinned allowed directory.
+ * `path_allowed` is false when the requested path escapes the root or any
+ * component is a symlink. The file is parsed from the verified descriptor.
  */
+struct RestrictedConfigLoadOutcome {
+  bool path_allowed = false;
+  ConfigLoadOutcome load;
+};
+
 [[nodiscard]] ConfigLoadOutcome load_config_checked(std::filesystem::path path);
 
-/**
- * @brief Загружает конфигурацию из YAML файла (best-effort)
- *
- * @param path Путь к конфигурационному файлу
- * @return Config с загруженными или дефолтными значениями
- *
- * Best-effort поведение: при ошибках чтения/валидации возвращает дефолты.
+[[nodiscard]] RestrictedConfigLoadOutcome
+load_config_beneath_checked(std::filesystem::path allowed_root,
+                            std::filesystem::path requested_path);
+
+/** Strict effective load: user config wins; only absence falls back to system.
+ */
+[[nodiscard]] ConfigLoadOutcome
+load_effective_config_checked(std::filesystem::path system_path = kConfigPath);
+
+/** Best-effort load; invalid or unreadable input produces documented defaults.
  */
 [[nodiscard]] Config load_config(std::string_view path = kConfigPath);
 
-/**
- * @brief Валидирует конфигурацию
- *
- * @param config Конфигурация для проверки
- * @return true если все значения в допустимых пределах
- */
+/** Serializes all settings; config_path remains load metadata. */
+[[nodiscard]] std::optional<std::string> serialize_config(const Config &config);
+
 [[nodiscard]] bool validate_config(const Config &config);
 
 } // namespace punto

@@ -214,4 +214,7 @@ jobs:
       - name: Build package
         run: ./build-deb.sh --non-interactive --skip-runtime-installs
       - name: Lint package
-        run: lintian ./*.deb
+        run: |
+          version=$(tr -d '\n' < VERSION)
+          architecture=$(dpkg --print-architecture)
+          lintian "./punto-switcher_${version}_${architecture}.deb"

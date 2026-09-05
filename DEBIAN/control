@@ -8,7 +8,7 @@ Depends: @PUNTO_DEPENDS@
 Maintainer: Anton Shalin <anton.shalin@gmail.com>
 Description: keyboard layout analysis and safe passthrough for Linux
  Punto Switcher monitors keyboard input through interception-tools and analyzes
- text typed with the wrong keyboard layout. Release 2.8.7 runs in a fail-closed
+ text typed with the wrong keyboard layout. Release 2.8.8 runs in a fail-closed
  safety mode that does not dispatch automatic or manual text mutations. The
  package includes a command-line control client. The default artifact includes
  a GTK system-tray client; the explicit daemon-only flavor does not.

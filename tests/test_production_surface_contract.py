@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guard the v2.8.7 production daemon's no-mutation link boundary."""
+"""Guard the v2.8.8 production daemon's no-mutation link boundary."""
 
 from __future__ import annotations
 

@@ -257,7 +257,7 @@ class MaintainerScriptContract(unittest.TestCase):
         result = self.harness.run(
             POSTINST,
             "configure",
-            previous_version="2.8.6",
+            previous_version="2.8.7",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.harness.calls.read_text(encoding="utf-8").splitlines()
@@ -284,7 +284,7 @@ class MaintainerScriptContract(unittest.TestCase):
             POSTINST,
             "configure",
             service_mode="fail",
-            previous_version="2.8.6",
+            previous_version="2.8.7",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.harness.calls.read_text(encoding="utf-8").splitlines()
@@ -304,7 +304,7 @@ class MaintainerScriptContract(unittest.TestCase):
             POSTINST,
             "configure",
             service_mode="hang",
-            previous_version="2.8.6",
+            previous_version="2.8.7",
         )
         elapsed = time.monotonic() - started
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -316,7 +316,7 @@ class MaintainerScriptContract(unittest.TestCase):
             POSTINST,
             "configure",
             policy_mode="hang",
-            previous_version="2.8.6",
+            previous_version="2.8.7",
         )
         elapsed = time.monotonic() - started
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -328,7 +328,7 @@ class MaintainerScriptContract(unittest.TestCase):
             POSTINST,
             "configure",
             service_mode="hang-helper",
-            previous_version="2.8.6",
+            previous_version="2.8.7",
         )
         elapsed = time.monotonic() - started
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -355,7 +355,7 @@ class MaintainerScriptContract(unittest.TestCase):
             POSTINST,
             "configure",
             policy_mode="deny",
-            previous_version="2.8.6",
+            previous_version="2.8.7",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.harness.calls.read_text(encoding="utf-8").splitlines()
@@ -368,7 +368,7 @@ class MaintainerScriptContract(unittest.TestCase):
             POSTINST,
             "configure",
             policy_mode="error",
-            previous_version="2.8.6",
+            previous_version="2.8.7",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(

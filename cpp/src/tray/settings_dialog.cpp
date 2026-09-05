@@ -293,7 +293,7 @@ bool SettingsDialog::save_settings(const SettingsData &settings) {
   return contents && write_config_atomically(config_path, *contents);
 }
 
-bool SettingsDialog::show(GtkWidget *parent) {
+bool SettingsDialog::show(GtkWidget *parent, Section section) {
   static GtkWidget *s_dialog_instance = nullptr;
   if (s_dialog_instance) {
     gtk_window_present(GTK_WINDOW(s_dialog_instance));
@@ -305,9 +305,10 @@ bool SettingsDialog::show(GtkWidget *parent) {
 
   // Создаём диалог
   GtkWidget *dialog = gtk_dialog_new_with_buttons(
-      "Настройки Punto Switcher", parent ? GTK_WINDOW(parent) : nullptr,
-      GTK_DIALOG_MODAL, "_Отмена", GTK_RESPONSE_CANCEL, "_Сохранить",
-      GTK_RESPONSE_ACCEPT, nullptr);
+      section == Section::Sound ? "Звук исправлений Punto Switcher"
+                                : "Настройки Punto Switcher",
+      parent ? GTK_WINDOW(parent) : nullptr, GTK_DIALOG_MODAL, "_Отмена",
+      GTK_RESPONSE_CANCEL, "_Сохранить", GTK_RESPONSE_ACCEPT, nullptr);
 
   s_dialog_instance = dialog;
 
@@ -323,10 +324,6 @@ bool SettingsDialog::show(GtkWidget *parent) {
   GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
   gtk_container_set_border_width(GTK_CONTAINER(content), 12);
 
-  // Notebook для вкладок
-  GtkWidget *notebook = gtk_notebook_new();
-  gtk_box_pack_start(GTK_BOX(content), notebook, TRUE, TRUE, 0);
-
   SettingsDialogUiContext ui_ctx;
   ui_ctx.initial = initial_settings;
   ui_ctx.save_button = save_button;
@@ -335,140 +332,149 @@ bool SettingsDialog::show(GtkWidget *parent) {
   GtkWidget *auto_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
   gtk_container_set_border_width(GTK_CONTAINER(auto_box), 12);
 
-  GtkWidget *auto_note = make_dim_label(
-      "Исправление слов и выделенного текста работает в X11. "
-      "Автоматический режим и ручные команды независимы; "
-      "возможности зависят от версии запущенного сервиса.");
-  gtk_box_pack_start(GTK_BOX(auto_box), auto_note, FALSE, FALSE, 0);
+  if (section == Section::General) {
+    GtkWidget *notebook = gtk_notebook_new();
+    gtk_box_pack_start(GTK_BOX(content), notebook, TRUE, TRUE, 0);
 
-  // Grid для параметров
-  GtkWidget *auto_grid = gtk_grid_new();
-  gtk_grid_set_row_spacing(GTK_GRID(auto_grid), 4);
-  gtk_grid_set_column_spacing(GTK_GRID(auto_grid), 12);
-  gtk_box_pack_start(GTK_BOX(auto_box), auto_grid, FALSE, FALSE, 8);
+    GtkWidget *auto_note =
+        make_dim_label("Исправление слов и выделенного текста работает в X11. "
+                       "Автоматический режим и ручные команды независимы; "
+                       "возможности зависят от версии запущенного сервиса.");
+    gtk_box_pack_start(GTK_BOX(auto_box), auto_note, FALSE, FALSE, 0);
 
-  // Threshold
-  GtkWidget *threshold_lbl = make_left_label("Порог срабатывания:");
-  gtk_grid_attach(GTK_GRID(auto_grid), threshold_lbl, 0, 0, 1, 1);
-  GtkWidget *threshold_spin = gtk_spin_button_new_with_range(0.5, 10.0, 0.1);
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(threshold_spin), 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(threshold_spin),
-                            initial_settings.threshold);
-  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(threshold_spin), 0.1, 0.1);
-  gtk_spin_button_set_snap_to_ticks(GTK_SPIN_BUTTON(threshold_spin), FALSE);
-  gtk_grid_attach(GTK_GRID(auto_grid), threshold_spin, 1, 0, 1, 1);
-  GtkWidget *threshold_desc =
-      make_dim_label("Диапазон: 0.5–10.0. Чем выше значение — тем реже "
-                     "анализ предлагает переключение.");
-  gtk_grid_attach(GTK_GRID(auto_grid), threshold_desc, 0, 1, 2, 1);
+    // Grid для параметров
+    GtkWidget *auto_grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(auto_grid), 4);
+    gtk_grid_set_column_spacing(GTK_GRID(auto_grid), 12);
+    gtk_box_pack_start(GTK_BOX(auto_box), auto_grid, FALSE, FALSE, 8);
 
-  // Min word len
-  GtkWidget *min_word_lbl = make_left_label("Мин. длина слова:");
-  gtk_grid_attach(GTK_GRID(auto_grid), min_word_lbl, 0, 2, 1, 1);
-  GtkWidget *min_word_spin = gtk_spin_button_new_with_range(1, 10, 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(min_word_spin),
-                            initial_settings.min_word_len);
-  gtk_grid_attach(GTK_GRID(auto_grid), min_word_spin, 1, 2, 1, 1);
-  GtkWidget *min_word_desc = make_dim_label(
-      "Диапазон: 1–10. Слова короче этого значения не анализируются.");
-  gtk_grid_attach(GTK_GRID(auto_grid), min_word_desc, 0, 3, 2, 1);
+    // Threshold
+    GtkWidget *threshold_lbl = make_left_label("Порог срабатывания:");
+    gtk_grid_attach(GTK_GRID(auto_grid), threshold_lbl, 0, 0, 1, 1);
+    GtkWidget *threshold_spin = gtk_spin_button_new_with_range(0.5, 10.0, 0.1);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(threshold_spin), 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(threshold_spin),
+                              initial_settings.threshold);
+    gtk_spin_button_set_increments(GTK_SPIN_BUTTON(threshold_spin), 0.1, 0.1);
+    gtk_spin_button_set_snap_to_ticks(GTK_SPIN_BUTTON(threshold_spin), FALSE);
+    gtk_grid_attach(GTK_GRID(auto_grid), threshold_spin, 1, 0, 1, 1);
+    GtkWidget *threshold_desc =
+        make_dim_label("Диапазон: 0.5–10.0. Чем выше значение — тем реже "
+                       "анализ предлагает переключение.");
+    gtk_grid_attach(GTK_GRID(auto_grid), threshold_desc, 0, 1, 2, 1);
 
-  // Min score
-  GtkWidget *min_score_lbl = make_left_label("Мин. уверенность:");
-  gtk_grid_attach(GTK_GRID(auto_grid), min_score_lbl, 0, 4, 1, 1);
-  GtkWidget *min_score_spin = gtk_spin_button_new_with_range(0.0, 20.0, 0.1);
-  gtk_spin_button_set_digits(GTK_SPIN_BUTTON(min_score_spin), 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(min_score_spin),
-                            initial_settings.min_score);
-  gtk_spin_button_set_increments(GTK_SPIN_BUTTON(min_score_spin), 0.1, 0.1);
-  gtk_spin_button_set_snap_to_ticks(GTK_SPIN_BUTTON(min_score_spin), FALSE);
-  gtk_grid_attach(GTK_GRID(auto_grid), min_score_spin, 1, 4, 1, 1);
-  GtkWidget *min_score_desc =
-      make_dim_label("Диапазон: 0.0–20.0. Чем выше значение — тем осторожнее "
-                     "диагностическое решение анализа.");
-  gtk_grid_attach(GTK_GRID(auto_grid), min_score_desc, 0, 5, 2, 1);
+    // Min word len
+    GtkWidget *min_word_lbl = make_left_label("Мин. длина слова:");
+    gtk_grid_attach(GTK_GRID(auto_grid), min_word_lbl, 0, 2, 1, 1);
+    GtkWidget *min_word_spin = gtk_spin_button_new_with_range(1, 10, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(min_word_spin),
+                              initial_settings.min_word_len);
+    gtk_grid_attach(GTK_GRID(auto_grid), min_word_spin, 1, 2, 1, 1);
+    GtkWidget *min_word_desc = make_dim_label(
+        "Диапазон: 1–10. Слова короче этого значения не анализируются.");
+    gtk_grid_attach(GTK_GRID(auto_grid), min_word_desc, 0, 3, 2, 1);
 
-  // Max rollback words
-  GtkWidget *rollback_lbl = make_left_label("Макс. откат слов:");
-  gtk_grid_attach(GTK_GRID(auto_grid), rollback_lbl, 0, 6, 1, 1);
-  GtkWidget *rollback_spin = gtk_spin_button_new_with_range(1, 50, 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(rollback_spin),
-                            initial_settings.max_rollback_words);
-  gtk_grid_attach(GTK_GRID(auto_grid), rollback_spin, 1, 6, 1, 1);
-  GtkWidget *rollback_desc = make_dim_label(
-      "Диапазон: 1–50. Сколько последних слов можно повторно ввести "
-      "при запоздавшем исправлении.");
-  gtk_grid_attach(GTK_GRID(auto_grid), rollback_desc, 0, 7, 2, 1);
+    // Min score
+    GtkWidget *min_score_lbl = make_left_label("Мин. уверенность:");
+    gtk_grid_attach(GTK_GRID(auto_grid), min_score_lbl, 0, 4, 1, 1);
+    GtkWidget *min_score_spin = gtk_spin_button_new_with_range(0.0, 20.0, 0.1);
+    gtk_spin_button_set_digits(GTK_SPIN_BUTTON(min_score_spin), 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(min_score_spin),
+                              initial_settings.min_score);
+    gtk_spin_button_set_increments(GTK_SPIN_BUTTON(min_score_spin), 0.1, 0.1);
+    gtk_spin_button_set_snap_to_ticks(GTK_SPIN_BUTTON(min_score_spin), FALSE);
+    gtk_grid_attach(GTK_GRID(auto_grid), min_score_spin, 1, 4, 1, 1);
+    GtkWidget *min_score_desc =
+        make_dim_label("Диапазон: 0.0–20.0. Чем выше значение — тем осторожнее "
+                       "диагностическое решение анализа.");
+    gtk_grid_attach(GTK_GRID(auto_grid), min_score_desc, 0, 5, 2, 1);
 
-  // ===== Секция исправления опечаток =====
-  gtk_box_pack_start(GTK_BOX(auto_box),
-                     gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE,
-                     FALSE, 6);
-  gtk_box_pack_start(GTK_BOX(auto_box), make_left_label("Анализ ошибок:"),
-                     FALSE, FALSE, 0);
+    // Max rollback words
+    GtkWidget *rollback_lbl = make_left_label("Макс. откат слов:");
+    gtk_grid_attach(GTK_GRID(auto_grid), rollback_lbl, 0, 6, 1, 1);
+    GtkWidget *rollback_spin = gtk_spin_button_new_with_range(1, 50, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(rollback_spin),
+                              initial_settings.max_rollback_words);
+    gtk_grid_attach(GTK_GRID(auto_grid), rollback_spin, 1, 6, 1, 1);
+    GtkWidget *rollback_desc = make_dim_label(
+        "Диапазон: 1–50. Сколько последних слов можно повторно ввести "
+        "при запоздавшем исправлении.");
+    gtk_grid_attach(GTK_GRID(auto_grid), rollback_desc, 0, 7, 2, 1);
 
-  GtkWidget *typo_grid = gtk_grid_new();
-  gtk_grid_set_row_spacing(GTK_GRID(typo_grid), 4);
-  gtk_grid_set_column_spacing(GTK_GRID(typo_grid), 12);
-  gtk_box_pack_start(GTK_BOX(auto_box), typo_grid, FALSE, FALSE, 4);
+    // ===== Секция исправления опечаток =====
+    gtk_box_pack_start(GTK_BOX(auto_box),
+                       gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE,
+                       FALSE, 6);
+    gtk_box_pack_start(GTK_BOX(auto_box), make_left_label("Анализ ошибок:"),
+                       FALSE, FALSE, 0);
 
-  // Sticky shift correction
-  GtkWidget *sticky_check = gtk_check_button_new_with_label(
-      "Исправлять залипший Shift в поддерживаемых редакторах");
-  gtk_toggle_button_set_active(
-      GTK_TOGGLE_BUTTON(sticky_check),
-      initial_settings.sticky_shift_correction_enabled);
-  gtk_grid_attach(GTK_GRID(typo_grid), sticky_check, 0, 0, 2, 1);
+    GtkWidget *typo_grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(typo_grid), 4);
+    gtk_grid_set_column_spacing(GTK_GRID(typo_grid), 12);
+    gtk_box_pack_start(GTK_BOX(auto_box), typo_grid, FALSE, FALSE, 4);
 
-  // Typo correction
-  GtkWidget *typo_check = gtk_check_button_new_with_label(
-      "Исправлять опечатки в поддерживаемых редакторах (beta)");
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(typo_check),
-                               initial_settings.typo_correction_enabled);
-  gtk_grid_attach(GTK_GRID(typo_grid), typo_check, 0, 1, 2, 1);
+    // Sticky shift correction
+    GtkWidget *sticky_check = gtk_check_button_new_with_label(
+        "Исправлять залипший Shift в поддерживаемых редакторах");
+    gtk_toggle_button_set_active(
+        GTK_TOGGLE_BUTTON(sticky_check),
+        initial_settings.sticky_shift_correction_enabled);
+    gtk_grid_attach(GTK_GRID(typo_grid), sticky_check, 0, 0, 2, 1);
 
-  // Max typo diff
-  GtkWidget *typo_diff_lbl = make_left_label("Макс. расстояние:");
-  gtk_grid_attach(GTK_GRID(typo_grid), typo_diff_lbl, 0, 2, 1, 1);
-  GtkWidget *typo_diff_spin = gtk_spin_button_new_with_range(1, 2, 1);
-  gtk_spin_button_set_value(GTK_SPIN_BUTTON(typo_diff_spin),
-                            initial_settings.max_typo_diff);
-  gtk_grid_attach(GTK_GRID(typo_grid), typo_diff_spin, 1, 2, 1, 1);
-  GtkWidget *typo_diff_desc = make_dim_label(
-      "1 = только однобуквенные ошибки, 2 = включая двухбуквенные.");
-  gtk_grid_attach(GTK_GRID(typo_grid), typo_diff_desc, 0, 3, 2, 1);
+    // Typo correction
+    GtkWidget *typo_check = gtk_check_button_new_with_label(
+        "Исправлять опечатки в поддерживаемых редакторах (beta)");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(typo_check),
+                                 initial_settings.typo_correction_enabled);
+    gtk_grid_attach(GTK_GRID(typo_grid), typo_check, 0, 1, 2, 1);
 
-  GtkWidget *sound_check = gtk_check_button_new_with_label("Звук при смене раскладки");
-  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sound_check), initial_settings.sound_enabled);
+    // Max typo diff
+    GtkWidget *typo_diff_lbl = make_left_label("Макс. расстояние:");
+    gtk_grid_attach(GTK_GRID(typo_grid), typo_diff_lbl, 0, 2, 1, 1);
+    GtkWidget *typo_diff_spin = gtk_spin_button_new_with_range(1, 2, 1);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(typo_diff_spin),
+                              initial_settings.max_typo_diff);
+    gtk_grid_attach(GTK_GRID(typo_grid), typo_diff_spin, 1, 2, 1, 1);
+    GtkWidget *typo_diff_desc = make_dim_label(
+        "1 = только однобуквенные ошибки, 2 = включая двухбуквенные.");
+    gtk_grid_attach(GTK_GRID(typo_grid), typo_diff_desc, 0, 3, 2, 1);
+
+    ui_ctx.threshold_spin = GTK_SPIN_BUTTON(threshold_spin);
+    ui_ctx.min_word_spin = GTK_SPIN_BUTTON(min_word_spin);
+    ui_ctx.min_score_spin = GTK_SPIN_BUTTON(min_score_spin);
+    ui_ctx.max_rollback_words_spin = GTK_SPIN_BUTTON(rollback_spin);
+    ui_ctx.sticky_shift_check = GTK_TOGGLE_BUTTON(sticky_check);
+    ui_ctx.typo_correction_check = GTK_TOGGLE_BUTTON(typo_check);
+    ui_ctx.max_typo_diff_spin = GTK_SPIN_BUTTON(typo_diff_spin);
+    g_signal_connect(threshold_spin, "value-changed",
+                     G_CALLBACK(on_any_setting_changed), &ui_ctx);
+    g_signal_connect(min_word_spin, "value-changed",
+                     G_CALLBACK(on_any_setting_changed), &ui_ctx);
+    g_signal_connect(min_score_spin, "value-changed",
+                     G_CALLBACK(on_any_setting_changed), &ui_ctx);
+    g_signal_connect(rollback_spin, "value-changed",
+                     G_CALLBACK(on_any_setting_changed), &ui_ctx);
+    g_signal_connect(sticky_check, "toggled",
+                     G_CALLBACK(on_any_setting_changed), &ui_ctx);
+    g_signal_connect(typo_check, "toggled", G_CALLBACK(on_any_setting_changed),
+                     &ui_ctx);
+    g_signal_connect(typo_diff_spin, "value-changed",
+                     G_CALLBACK(on_any_setting_changed), &ui_ctx);
+
+    gtk_notebook_append_page(GTK_NOTEBOOK(notebook), auto_box,
+                             gtk_label_new("Автопереключение"));
+  } else {
+    gtk_box_pack_start(GTK_BOX(content), auto_box, TRUE, TRUE, 0);
+  }
+
+  GtkWidget *sound_check =
+      gtk_check_button_new_with_label("Звук при смене раскладки");
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sound_check),
+                               initial_settings.sound_enabled);
   gtk_box_pack_start(GTK_BOX(auto_box), sound_check, FALSE, FALSE, 8);
-
-  ui_ctx.threshold_spin = GTK_SPIN_BUTTON(threshold_spin);
-  ui_ctx.min_word_spin = GTK_SPIN_BUTTON(min_word_spin);
-  ui_ctx.min_score_spin = GTK_SPIN_BUTTON(min_score_spin);
-  ui_ctx.max_rollback_words_spin = GTK_SPIN_BUTTON(rollback_spin);
-  ui_ctx.sticky_shift_check = GTK_TOGGLE_BUTTON(sticky_check);
-  ui_ctx.typo_correction_check = GTK_TOGGLE_BUTTON(typo_check);
-  ui_ctx.max_typo_diff_spin = GTK_SPIN_BUTTON(typo_diff_spin);
   ui_ctx.sound_check = GTK_TOGGLE_BUTTON(sound_check);
-  g_signal_connect(sound_check, "toggled", G_CALLBACK(on_any_setting_changed), &ui_ctx);
-
-  g_signal_connect(threshold_spin, "value-changed",
-                   G_CALLBACK(on_any_setting_changed), &ui_ctx);
-  g_signal_connect(min_word_spin, "value-changed",
-                   G_CALLBACK(on_any_setting_changed), &ui_ctx);
-  g_signal_connect(min_score_spin, "value-changed",
-                   G_CALLBACK(on_any_setting_changed), &ui_ctx);
-  g_signal_connect(rollback_spin, "value-changed",
-                   G_CALLBACK(on_any_setting_changed), &ui_ctx);
-  g_signal_connect(sticky_check, "toggled", G_CALLBACK(on_any_setting_changed),
+  g_signal_connect(sound_check, "toggled", G_CALLBACK(on_any_setting_changed),
                    &ui_ctx);
-  g_signal_connect(typo_check, "toggled", G_CALLBACK(on_any_setting_changed),
-                   &ui_ctx);
-  g_signal_connect(typo_diff_spin, "value-changed",
-                   G_CALLBACK(on_any_setting_changed), &ui_ctx);
-
-  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), auto_box,
-                           gtk_label_new("Автопереключение"));
 
   // Первичное состояние кнопки "Сохранить".
   update_settings_dialog_state(&ui_ctx);

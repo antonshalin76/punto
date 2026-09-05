@@ -471,6 +471,12 @@ struct WordEditor::PendingPaste {
   PasteReceiptToken receipt;
 };
 
+struct WordEditor::RetainedWordSelection {
+  SelectionRead selection;
+  xcb_window_t focus_window = XCB_WINDOW_NONE;
+  std::uint64_t session_generation = 0;
+};
+
 WordEditor::WordEditor(X11Session &session, WaitFunction wait)
     : session_(session), wait_(std::move(wait)) {}
 
@@ -486,6 +492,7 @@ void WordEditor::pump() {
   if (!lease || lease->generation() != clipboard_session_) {
     clipboard_.reset();
     pending_.reset();
+    retained_word_selection_.reset();
     clipboard_session_ = 0;
     return;
   }
@@ -511,6 +518,7 @@ void WordEditor::reset() {
   // A status/config reset cannot revoke a payload already requested by an app.
   // Session loss and foreign ownership are handled by the same pump authority.
   pump();
+  retained_word_selection_.reset();
 }
 
 WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
@@ -532,6 +540,7 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     return outcome;
   }
   pump();
+  auto previous_selection = std::move(retained_word_selection_);
   if (busy() && !native_undo) {
     return outcome;
   }
@@ -623,10 +632,23 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
       xcb_get_selection_owner(connection.get(), XCB_ATOM_PRIMARY).sequence,
       deadline);
   if (!active_client || !owner ||
-      client_of(*initial_focus) != *active_client ||
-      (owner->owner != XCB_WINDOW_NONE &&
-       client_of(owner->owner) == *active_client && word)) {
+      client_of(*initial_focus) != *active_client) {
     return outcome;
+  }
+  if (word && owner->owner != XCB_WINDOW_NONE &&
+      client_of(owner->owner) == *active_client) {
+    // Chromium retains PRIMARY after our temporary selection has collapsed.
+    // Only our exact prior receipt can admit it; a new user selection cannot.
+    if (kind != ActiveWindowKind::Gui || !previous_selection ||
+        previous_selection->focus_window != *initial_focus ||
+        previous_selection->session_generation != lease->generation() ||
+        !clipboard_time()) {
+      return outcome;
+    }
+    const auto current = clipboard_->get_text_with_owner(Selection::Primary);
+    if (!current || !same_selection(previous_selection->selection, *current)) {
+      return outcome;
+    }
   }
   auto pointer = reply<xcb_query_pointer_reply_t>(
       connection, xcb_query_pointer(connection.get(), *initial_focus).sequence,
@@ -812,6 +834,7 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     }
   }
   xcb_window_t prepared_owner = XCB_WINDOW_NONE;
+  std::unique_ptr<RetainedWordSelection> prepared_receipt;
   if (!terminal) {
     std::optional<SelectionRead> observed;
     std::optional<SelectionRead> prepared_selection;
@@ -846,6 +869,8 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
       return outcome;
     }
     prepared_owner = observed->owner;
+    prepared_receipt = std::make_unique<RetainedWordSelection>(
+        RetainedWordSelection{*observed, *initial_focus, lease->generation()});
   }
 
   for (const auto &stroke : *replacement) {
@@ -866,6 +891,7 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   }
   if (finish_layout()) {
     outcome.status = WordEditStatus::Dispatched;
+    retained_word_selection_ = std::move(prepared_receipt);
     // Server acceptance can precede the client's processing of the replacement.
     // Let our prepared selection settle before another word macro's preflight.
     while (prepared_owner != XCB_WINDOW_NONE && context_matches()) {

@@ -56,6 +56,20 @@ struct TrayAppTestAccess {
     return app.sound_settings_item_;
   }
 
+  static GtkWidget *settings_item(TrayApp &app) {
+    GList *items = gtk_container_get_children(GTK_CONTAINER(app.menu_));
+    GtkWidget *found = nullptr;
+    for (GList *item = items; item; item = item->next) {
+      const char *label = gtk_menu_item_get_label(GTK_MENU_ITEM(item->data));
+      if (label && std::string_view{label} == "Настройки...") {
+        found = GTK_WIDGET(item->data);
+        break;
+      }
+    }
+    g_list_free(items);
+    return found;
+  }
+
   static void set_config_reloader(TrayApp &app,
                                   std::function<bool(const std::string &)> reload) {
     app.config_reloader_ = std::move(reload);
@@ -105,6 +119,17 @@ GtkWidget *find_sound_checkbox(GtkWidget *widget) {
   return found;
 }
 
+unsigned int count_widgets(GtkWidget *widget, GType type) {
+  unsigned int count = G_TYPE_CHECK_INSTANCE_TYPE(widget, type) ? 1U : 0U;
+  if (!GTK_IS_CONTAINER(widget)) return count;
+  GList *children = gtk_container_get_children(GTK_CONTAINER(widget));
+  for (GList *child = children; child; child = child->next) {
+    count += count_widgets(GTK_WIDGET(child->data), type);
+  }
+  g_list_free(children);
+  return count;
+}
+
 struct PrivateSoundConfig {
   std::filesystem::path root;
   std::filesystem::path path;
@@ -134,12 +159,18 @@ struct SoundDialogAction {
   bool initial_enabled = false;
   bool save_enabled = false;
   bool error_seen = false;
+  bool sound_only = true;
+  bool correct_view = false;
+  GtkWidget *reenter_item = nullptr;
+  bool reentry_preserved = false;
   std::filesystem::path fail_path;
   std::string error;
 };
 
 void exercise_sound_menu(punto::TrayApp &app, SoundDialogAction &action) {
-  GtkWidget *item = punto::TrayAppTestAccess::sound_item(app);
+  GtkWidget *item = action.sound_only ? punto::TrayAppTestAccess::sound_item(app)
+                                    : punto::TrayAppTestAccess::settings_item(app);
+  expect(item != nullptr, "requested preferences item exists");
   expect(gtk_widget_get_sensitive(item), "sound preferences are available from tray");
   const guint error_closer = g_timeout_add(5, [](gpointer data) -> gboolean {
     auto &state = *static_cast<SoundDialogAction *>(data);
@@ -164,8 +195,7 @@ void exercise_sound_menu(punto::TrayApp &app, SoundDialogAction &action) {
     GList *windows = gtk_window_list_toplevels();
     GtkWidget *dialog = nullptr;
     for (GList *window = windows; window; window = window->next) {
-      const char *title = gtk_window_get_title(GTK_WINDOW(window->data));
-      if (title && std::string_view{title} == "Настройки Punto Switcher") {
+      if (GTK_IS_DIALOG(window->data) && !GTK_IS_MESSAGE_DIALOG(window->data)) {
         dialog = GTK_WIDGET(window->data);
         break;
       }
@@ -173,12 +203,35 @@ void exercise_sound_menu(punto::TrayApp &app, SoundDialogAction &action) {
     g_list_free(windows);
     if (!dialog) return G_SOURCE_CONTINUE;
     try {
+      const char *title = gtk_window_get_title(GTK_WINDOW(dialog));
+      const unsigned int checks = count_widgets(dialog, GTK_TYPE_CHECK_BUTTON);
+      const unsigned int spins = count_widgets(dialog, GTK_TYPE_SPIN_BUTTON);
+      const unsigned int notebooks = count_widgets(dialog, GTK_TYPE_NOTEBOOK);
+      state.correct_view = title && (state.sound_only
+          ? std::string_view{title} == "Звук исправлений Punto Switcher" &&
+                checks == 1 && spins == 0 && notebooks == 0
+          : std::string_view{title} == "Настройки Punto Switcher" &&
+                checks == 3 && spins == 5 && notebooks == 1);
       GtkWidget *sound = find_sound_checkbox(dialog);
       state.found = sound != nullptr;
       if (sound) {
         state.initial_enabled = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(sound));
         if (state.toggle) {
           gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sound), !state.initial_enabled);
+        }
+        if (state.reenter_item) {
+          const std::string original_title = title ? title : "";
+          gtk_menu_item_activate(GTK_MENU_ITEM(state.reenter_item));
+          GList *open_windows = gtk_window_list_toplevels();
+          unsigned int dialogs = 0;
+          for (GList *window = open_windows; window; window = window->next) {
+            if (GTK_IS_DIALOG(window->data)) ++dialogs;
+          }
+          g_list_free(open_windows);
+          state.reentry_preserved = dialogs == 1 &&
+              original_title == gtk_window_get_title(GTK_WINDOW(dialog)) &&
+              (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(sound)) != FALSE) ==
+                  (state.toggle ? !state.initial_enabled : state.initial_enabled);
         }
         state.save_enabled = gtk_widget_get_sensitive(
             gtk_dialog_get_widget_for_response(GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT));
@@ -200,6 +253,11 @@ void exercise_sound_menu(punto::TrayApp &app, SoundDialogAction &action) {
   g_source_remove(error_closer);
   expect(action.error.empty(), action.error);
   expect(action.found, "sound action opens real settings with sound checkbox");
+  expect(action.correct_view, action.sound_only
+      ? "sound menu opens dedicated sound-only controls, not general Settings"
+      : "Settings menu retains general correction controls");
+  expect(!action.reenter_item || action.reentry_preserved,
+         "reentrant preference route retains one dialog and unsaved edits");
 }
 
 void test_sound_menu_uses_settings_persistence_and_failure_readback() {
@@ -237,6 +295,7 @@ void test_sound_menu_uses_settings_persistence_and_failure_readback() {
          "successful save requests exactly one reload of the private config");
   SoundDialogAction cancel;
   cancel.toggle = true;
+  cancel.reenter_item = punto::TrayAppTestAccess::settings_item(app);
   exercise_sound_menu(app, cancel);
   expect(!cancel.initial_enabled && reloads == 1 && !cancel.error_seen,
          "Cancel has no reload, error, or optimistic state");
@@ -251,6 +310,18 @@ void test_sound_menu_uses_settings_persistence_and_failure_readback() {
   exercise_sound_menu(app, reopen);
   expect(!reopen.initial_enabled && !reopen.save_enabled && reloads == 1 && !reopen.error_seen,
          "reopening reads persisted sound after failed save");
+  SoundDialogAction unchanged;
+  unchanged.accept = true;
+  exercise_sound_menu(app, unchanged);
+  expect(!unchanged.save_enabled && reloads == 1,
+         "accepting unchanged sound preferences does not save or reload");
+  SoundDialogAction general;
+  general.sound_only = false;
+  general.toggle = true;
+  general.reenter_item = punto::TrayAppTestAccess::sound_item(app);
+  exercise_sound_menu(app, general);
+  expect(!general.initial_enabled && general.save_enabled && reloads == 1,
+         "general settings retain sound editing and Cancel without reload");
   loaded = punto::load_config_checked(fixture.path);
   expect(punto::serialize_config(loaded.config) == punto::serialize_config(expected),
          "Cancel and failure preserve persisted config fields");

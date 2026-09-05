@@ -39,12 +39,14 @@ struct SettingsData {
  */
 class SettingsDialog {
 public:
+  enum class Section { General, Sound };
+
   /**
    * @brief Показывает диалог настроек
    * @param parent Родительское окно (может быть nullptr)
    * @return true если настройки были сохранены
    */
-  static bool show(GtkWidget *parent = nullptr);
+  static bool show(GtkWidget *parent = nullptr, Section section = Section::General);
 
   /// Загружает настройки из файла (используется также tray меню)
   static SettingsData load_settings();

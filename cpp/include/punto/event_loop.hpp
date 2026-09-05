@@ -132,7 +132,8 @@ private:
   [[nodiscard]] HotkeyAction determine_hotkey_action() const;
 
   /// Сбрасывает async state и выставляет новый barrier для task_id.
-  void reset_async_state(bool bump_task_barrier = true);
+  void reset_async_state(bool bump_task_barrier = true,
+                         bool preserve_completed_selection = false);
 
   void note_input_event_accepted(const input_event &event);
   void note_input_event_committed(const input_event &event);

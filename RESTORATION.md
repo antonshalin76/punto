@@ -1,8 +1,69 @@
 # Product restoration
 
-This document records the source restoration for 2.8.9. Source tests, package
+This document records the source restoration through 2.8.10. Source tests, package
 validation, publication and machine installation are separate evidence gates;
 runtime health alone is not proof of an editor correction.
+
+## Sound routing and retained Chromium PRIMARY (2026-09-06, 2.8.10)
+
+The sound menu incorrectly called the general settings route, and its old test
+expected that wrong title. SettingsDialog now presents a typed Sound section
+with the existing checkbox and shared save/error handling. General settings
+remain unchanged; a visible modal retains its unsaved draft on re-entry.
+
+Native Chromium exposed a gap hidden by GTK fixtures: after replacing Punto's
+temporary selection, Chromium keeps PRIMARY while the DOM caret is collapsed.
+The first correction passed and subsequent manual/automatic corrections were
+rejected. WordEditor now retains the verified prepared selection only after a
+dispatched edit. A later word edit can admit that exact receipt after checking
+owner, text, timestamp, ownership generation, focus and X11 session. New user
+selections and runtime resets invalidate permission. EventLoop preserves this
+completed receipt only when replacing a pending manual request; it does not own
+selection-admission policy. ClipboardManager remains the evidence provider.
+
+| Scenario | Acceptance criterion and actual seam |
+| --- | --- |
+| S1 | Actual tray activation opens only Sound controls with its dedicated title; General still opens the full dialog |
+| S2 | Sound save changes the sound preference through existing Config persistence; the full unrelated-settings oracle is unchanged |
+| S3 | Cancel, unchanged acceptance and persistence failure preserve the appropriate file/UI state |
+| S4 | Modal re-entry and reopen preserve draft/saved state according to the existing singleton contract |
+| C1 | Two native Chromium Pause operations toggle the exact DOM text twice |
+| C2 | Two consecutive automatic corrections update exact DOM text and leave the expected keyboard layout |
+| C3 | A new real same-client, same-text selection is rejected without changing DOM selection/text or native key count |
+| C4 | Actual IPC status reset invalidates a retained receipt and rejection leaves the DOM unchanged |
+
+Independent BDD critic, separate BDD auditor, pre-RED SRP, actual RED critic and
+final combined source/SRP reviews passed. The old code fails C1/C2 while C3/C4
+already pass; the sound RED fails on the dialog title. No further refactor was
+needed after GREEN. One test-only file was added and none removed. Runtime
+changes add 44 net lines for the new behavior (+192/-148); test changes add
+244 net lines. CMake/CI add 15 lines. No new production module or library is
+needed. No parallel persistence, UI-state or selection-policy owner was added;
+broker/proxy decisions are N/A for these changes.
+
+| Focused gate | Result and evidence |
+| --- | --- |
+| Sound RED | `/tmp/punto-sound-route-red.log` |
+| Sound Release / sanitized Debug | PASS, `/tmp/punto-sound-route-green.log`, `/tmp/punto-sound-route-debug.log` |
+| Chromium RED on old driver | C1/C2 fail, C3/C4 pass, `/tmp/punto-browser-probe-PO9CKA/chromium-red-final.log` |
+| Chromium Release / Debug | 4/4 each, `/tmp/punto-browser-probe-PO9CKA/chromium-green-release.log`, `/tmp/punto-retained-primary-chromium-debug.log` |
+| GTK/VTE Release / Debug | 86/86 each, `/tmp/punto-retained-primary-gtk-release.log`, `/tmp/punto-retained-primary-gtk-debug.log` |
+
+The browser tests use a fresh native Chrome/Chromium profile in a private
+networkless Bubblewrap/Xvfb session. They exercise EventLoop and the real editor
+through the existing XTest relay, not the host's kernel interception pipeline.
+No host editor buffers, clipboard or browser profile are used. CI requires the
+browser suite; an absent browser is a failure there, not a successful skip.
+
+This fixes repeated corrections after Punto's own retained selection, not
+arbitrary stale same-client PRIMARY originating in another field. The latter
+still fails closed. Host device-specific logs show rejected edit dispatches;
+the user's particular VSCode failure is not yet proven to have this cause.
+STATS counters belong to each daemon, not an aggregate over all keyboards.
+The existing full-snapshot settings save can still overwrite a concurrent
+external configuration edit; this release does not change that contract.
+Exact-commit CI, final artifact checks and installed read-back are recorded
+separately in the release delivery report.
 
 ## Host-upgrade compatibility checkpoint (2026-09-05, 2.8.9)
 

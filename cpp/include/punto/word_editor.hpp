@@ -64,10 +64,12 @@ public:
 
 private:
   struct PendingPaste;
+  struct RetainedWordSelection;
   X11Session &session_;
   WaitFunction wait_;
   std::unique_ptr<ClipboardManager> clipboard_;
   std::unique_ptr<PendingPaste> pending_;
+  std::unique_ptr<RetainedWordSelection> retained_word_selection_;
   std::uint64_t clipboard_session_ = 0;
 };
 

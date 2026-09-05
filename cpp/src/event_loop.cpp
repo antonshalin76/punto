@@ -1290,12 +1290,15 @@ void EventLoop::update_modifier_state(ScanCode code, bool pressed) {
   }
 }
 
-void EventLoop::reset_async_state(bool bump_task_barrier) {
+void EventLoop::reset_async_state(bool bump_task_barrier,
+                                 bool preserve_completed_selection) {
   pending_word_edit_.reset();
   pending_is_undo_ = false;
   undo_request_.reset();
   if (undo_detector_) undo_detector_->on_key_typed();
-  if (word_editor_ && !macro_active_) word_editor_->reset();
+  if (word_editor_ && !macro_active_ && !preserve_completed_selection) {
+    word_editor_->reset();
+  }
   if (analysis_pool_) {
     analysis_pool_->begin_new_epoch();
   }
@@ -1884,7 +1887,9 @@ void EventLoop::queue_manual_word_edit(HotkeyAction action) {
   if (buffer_.current_word().empty() && !word_history_.empty()) {
     visible = word_history_.back().visible;
   }
-  reset_async_state();
+  // Queue replacement cancels pending analysis, not the completed editor edit.
+  reset_async_state(/*bump_task_barrier=*/true,
+                    /*preserve_completed_selection=*/true);
   const Kind kind = action == HotkeyAction::InvertLayoutSelection ? Kind::SelectionLayout
                     : action == HotkeyAction::InvertCaseSelection ? Kind::SelectionCase
                     : action == HotkeyAction::TranslitSelection ? Kind::SelectionTranslit

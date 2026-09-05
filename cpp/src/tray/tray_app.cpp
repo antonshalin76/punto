@@ -241,11 +241,13 @@ void TrayApp::on_auto_toggled(GtkCheckMenuItem *item, gpointer user_data) {
 }
 
 void TrayApp::on_settings_clicked(GtkMenuItem *item, gpointer user_data) {
-  (void)item;
   auto *app = static_cast<TrayApp *>(user_data);
 
   // Показываем диалог настроек
-  bool saved = SettingsDialog::show(nullptr);
+  const auto section = GTK_WIDGET(item) == app->sound_settings_item_
+                           ? SettingsDialog::Section::Sound
+                           : SettingsDialog::Section::General;
+  bool saved = SettingsDialog::show(nullptr, section);
 
   if (saved) {
     // Автоматически применяем настройки после сохранения

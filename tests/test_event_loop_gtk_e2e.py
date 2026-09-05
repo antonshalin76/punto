@@ -1019,7 +1019,21 @@ class EventLoopGtkE2E(unittest.TestCase):
         self.assertEqual(parts[0], "OK")
         return response, dict(part.split("=", 1) for part in parts[1:])
 
+    def wait_analysis_ready(self) -> None:
+        def diagnostic_analysis_ready() -> bool:
+            _, fields = self.stats_fields()
+            return (
+                fields["config_pending"] == "0"
+                and fields["config_result"] == "ok"
+                and fields["analysis_health"] == "ready"
+                and fields["worker_threads"] == "1"
+                and fields["x11_health"] == "ready"
+            )
+
+        self.pump_until(diagnostic_analysis_ready, "initialized diagnostic analysis")
+
     def test_auto_candidate_delimiter_bypasses_unresponsive_x11(self) -> None:
+        self.wait_analysis_ready()
         clipboard_before = "auto clipboard sentinel"
         primary_before = "auto primary sentinel"
         self.set_selection(Gdk.SELECTION_CLIPBOARD, clipboard_before)
@@ -1538,17 +1552,7 @@ class EventLoopGtkE2E(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 0.5)
 
     def test_ru_layout_snapshot_drives_analysis_without_input_x11(self) -> None:
-        def diagnostic_analysis_ready() -> bool:
-            _, fields = self.stats_fields()
-            return (
-                fields["config_pending"] == "0"
-                and fields["config_result"] == "ok"
-                and fields["analysis_health"] == "ready"
-                and fields["worker_threads"] == "1"
-                and fields["x11_health"] == "ready"
-            )
-
-        self.pump_until(diagnostic_analysis_ready, "initialized RU diagnostic analysis")
+        self.wait_analysis_ready()
         self.harness.type_word("hello")
         self.pump_until(
             lambda: self.entry.get_text() == "hello", "RU-layout physical word"

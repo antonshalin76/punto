@@ -2198,8 +2198,13 @@ void EventLoop::process_pending_word_edit() {
       buffer_.reset_all();
     }
   }
-  std::cerr << "[punto] Word edit dispatch status=" << static_cast<int>(outcome.status)
-            << '\n';
+  std::string dispatch_log = "[punto] Word edit dispatch status=" +
+                             std::to_string(static_cast<int>(outcome.status));
+  if (outcome.status == WordEditStatus::Rejected) {
+    dispatch_log += " rejection_stage=";
+    dispatch_log += outcome.rejection_stage;
+  }
+  std::cerr << dispatch_log + '\n';
   drain_pending_events();
 }
 

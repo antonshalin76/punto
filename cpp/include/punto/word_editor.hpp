@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <string_view>
 #include <cstdint>
 #include <chrono>
 #include <functional>
@@ -47,6 +48,8 @@ struct WordEditOutcome {
   std::uint64_t session_generation = 0;
   std::uint32_t focused_window = 0;
   bool terminal_insert = false;
+  // Static check-group label only; never editor or clipboard content.
+  std::string_view rejection_stage = "invalid_request";
 };
 
 // Bounded X11 executor. Dispatched means the server accepted the

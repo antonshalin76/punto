@@ -541,25 +541,30 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   }
   pump();
   auto previous_selection = std::move(retained_word_selection_);
+  outcome.rejection_stage = "busy";
   if (busy() && !native_undo) {
     return outcome;
   }
   const auto deadline = Clock::now() + std::chrono::milliseconds{300};
+  outcome.rejection_stage = "macro_lock";
   MacroLock lock;
   MacroLockGuard guard{lock, std::chrono::milliseconds{0}};
   if (!guard.owns_lock()) {
     return outcome;
   }
+  outcome.rejection_stage = "session";
   auto lease = session_.acquire_write_lease();
   if (!lease || !lease->valid() || !lease->info().wayland_display.empty() ||
       lease->generation() != request.session_generation) {
     return outcome;
   }
+  outcome.rejection_stage = "connection";
   auto connection = lease->open_bounded_connection(deadline);
   if (!connection.is_open()) {
     return outcome;
   }
   // Generated extension requests otherwise perform a blocking first lookup.
+  outcome.rejection_stage = "xtest";
   xcb_prefetch_extension_data(connection.get(), &xcb_test_id);
   auto extension_barrier = reply<xcb_get_input_focus_reply_t>(
       connection, xcb_get_input_focus(connection.get()).sequence, deadline);
@@ -570,16 +575,19 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   if (xtest == nullptr || xtest->present == 0) {
     return outcome;
   }
+  outcome.rejection_stage = "xkb";
   auto extension = reply<xcb_xkb_use_extension_reply_t>(
       connection, xcb_xkb_use_extension(connection.get(), 1, 0).sequence,
       deadline);
   if (!extension || !extension->supported) {
     return outcome;
   }
+  outcome.rejection_stage = "keymap";
   const auto keyboard = make_keyboard_plan(connection, deadline);
   if (!keyboard) {
     return outcome;
   }
+  outcome.rejection_stage = "context";
   const auto allowed_locks = static_cast<std::uint8_t>(
       keyboard->num_lock_mask | keyboard->caps_lock_mask);
   const auto initial_state =
@@ -592,6 +600,7 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
        request.source_locked_mods != initial_state->locked_mods)) {
     return outcome;
   }
+  outcome.rejection_stage = "text_plan";
   auto expected = word ? plan_text(request.expected, keyboard->alphabet)
                        : std::optional<std::vector<Stroke>>{std::vector<Stroke>{}};
   auto replacement = word && !request.replacement.empty()
@@ -604,6 +613,7 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     return outcome;
   }
 
+  outcome.rejection_stage = "clipboard_init";
   const auto clipboard_time = [&] {
     return Clock::now() + kClipboardBudget < deadline;
   };
@@ -614,6 +624,7 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   if (!clipboard_time() || !clipboard_->open(deadline) || !clipboard_time()) {
     return outcome;
   }
+  outcome.rejection_stage = "active_window";
   const auto kind = clipboard_->active_window_kind();
   if (kind == ActiveWindowKind::Unknown ||
       (word && kind == ActiveWindowKind::Terminal && !request.allow_terminal) ||
@@ -622,6 +633,7 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
       (word && kind == ActiveWindowKind::Gui && replacement->empty())) {
     return outcome;
   }
+  outcome.rejection_stage = "active_client";
   const auto active_client = clipboard_->active_client_id();
   const auto resource_mask = xcb_get_setup(connection.get())->resource_id_mask;
   const auto client_of = [&](xcb_window_t window) {
@@ -637,6 +649,7 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   }
   if (word && owner->owner != XCB_WINDOW_NONE &&
       client_of(owner->owner) == *active_client) {
+    outcome.rejection_stage = "retained_selection_context";
     // Chromium retains PRIMARY after our temporary selection has collapsed.
     // Only our exact prior receipt can admit it; a new user selection cannot.
     if (kind != ActiveWindowKind::Gui || !previous_selection ||
@@ -645,11 +658,13 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
         !clipboard_time()) {
       return outcome;
     }
+    outcome.rejection_stage = "retained_selection_read";
     const auto current = clipboard_->get_text_with_owner(Selection::Primary);
     if (!current || !same_selection(previous_selection->selection, *current)) {
       return outcome;
     }
   }
+  outcome.rejection_stage = "pointer";
   auto pointer = reply<xcb_query_pointer_reply_t>(
       connection, xcb_query_pointer(connection.get(), *initial_focus).sequence,
       deadline);
@@ -697,12 +712,14 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
            current->root_y == pointer->root_y &&
            (current->mask & buttons) == (pointer->mask & buttons);
   };
+  outcome.rejection_stage = "context_changed";
   if (!context_matches()) {
     return outcome;
   }
 
   std::optional<SelectionRead> previous_clipboard;
   if (selection || paste_word) {
+    outcome.rejection_stage = "clipboard_snapshot";
     previous_clipboard = clipboard_->get_text_with_owner(Selection::Clipboard);
     if (!previous_clipboard || !clipboard_time() ||
         clipboard_->has_only_text_targets(Selection::Clipboard,
@@ -743,12 +760,14 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     return true;
   };
   const auto paste_selection = [&](const SelectionRead &source, bool terminal) {
+    outcome.rejection_stage = "selection_confirmation";
     auto confirmed = clipboard_->get_text_with_owner(Selection::Primary);
     if (!confirmed || !same_selection(source, *confirmed) || !context_matches()) {
       return;
     }
     auto pending = std::make_unique<PendingPaste>();
     pending->previous = previous_clipboard->text;
+    outcome.rejection_stage = "clipboard_ownership";
     const bool owned = previous_clipboard->owner == XCB_WINDOW_NONE
                            ? clipboard_->set_text(Selection::Clipboard,
                                                   outcome.replacement) == ClipboardResult::Ok
@@ -789,11 +808,13 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   }
 
   if (selection) {
+    outcome.rejection_stage = "selection_source";
     auto source = clipboard_->get_text_with_owner(Selection::Primary);
     if (!source || source->text.empty() || source->text.size() > 4096 ||
         client_of(source->owner) != *active_client || !context_matches()) {
       return outcome;
     }
+    outcome.rejection_stage = "selection_transform";
     switch (request.operation) {
     case WordEditOperation::SelectionLayout:
       outcome.replacement = invert_layout(source->text);
@@ -822,6 +843,7 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
 
   outcome.original = request.expected;
   outcome.replacement = request.replacement;
+  outcome.rejection_stage = "selection_prepare";
   const bool terminal = kind == ActiveWindowKind::Terminal;
   for (std::size_t i = 0; i < expected->size(); ++i) {
     if (!context_matches()) {

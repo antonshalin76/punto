@@ -1698,6 +1698,10 @@ class EventLoopGtkE2E(unittest.TestCase):
         self.harness.hotkey(KEY_LEFTALT, repeat=True)
         self.pump_until(lambda: "Word edit dispatch status=0" in self.harness.diagnostic(),
                         "unsupported single-layout selection rejection")
+        diagnostic = self.harness.stderr.decode("utf-8", errors="replace")
+        self.assertIn("Word edit dispatch status=0 rejection_stage=keymap", diagnostic)
+        for private_text in (original, "sEleCt", "plain clipboard sentinel"):
+            self.assertNotIn(private_text, diagnostic)
 
         self.assertEqual(self.entry.get_text(), original)
         self.assertEqual(self.entry.get_selection_bounds(), (start, start + 6))
@@ -2113,11 +2117,18 @@ class EventLoopGtkE2E(unittest.TestCase):
             lambda: "Word edit dispatch status=0" in self.harness.diagnostic(),
             "changed source group rejected",
         )
+        self.assertIn("Word edit dispatch status=0 rejection_stage=context",
+                      self.harness.diagnostic())
         self.assert_no_word_mutation("hello")
         self.lock_keyboard_group(0)
         self.harness.send_key(KEY_PAUSE)
         self.pump_until(lambda: self.entry.get_text() == "руддщ", "fresh request recovery")
         self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+        diagnostic = self.harness.stderr.decode("utf-8", errors="replace")
+        self.assertIn("[punto] Word edit dispatch status=2\n", diagnostic)
+        self.assertNotIn("status=2 rejection_stage=", diagnostic)
+        for private_text in ("hello", "руддщ", "startup clipboard baseline"):
+            self.assertNotIn(private_text, diagnostic)
 
     def test_new_input_invalidates_delayed_keyboard_observation(self) -> None:
         self.prepare_word_editor()

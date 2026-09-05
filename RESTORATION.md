@@ -58,12 +58,52 @@ browser suite; an absent browser is a failure there, not a successful skip.
 This fixes repeated corrections after Punto's own retained selection, not
 arbitrary stale same-client PRIMARY originating in another field. The latter
 still fails closed. Host device-specific logs show rejected edit dispatches;
-the user's particular VSCode failure is not yet proven to have this cause.
+the user's particular editor failure is not yet proven to have this cause.
 STATS counters belong to each daemon, not an aggregate over all keyboards.
 The existing full-snapshot settings save can still overwrite a concurrent
 external configuration edit; this release does not change that contract.
 Exact-commit CI, final artifact checks and installed read-back are recorded
 separately in the release delivery report.
+
+### Browser lifecycle and rejection diagnostics checkpoint
+
+Hosted CI then exposed a test cleanup defect: Chrome's parent could exit while
+descendants still wrote its private profile. The fixture now owns a separate
+process group, drains live members with bounded TERM/KILL, and deletes the
+profile only after successful shutdown. Zombie-only groups cannot write and do
+not block cleanup. A failed stop retains the profile. Existing correction
+assertions and C2-first ordering remain unchanged.
+
+Lifecycle scenarios cover an orphan writer ignoring TERM, survival of an
+unrelated group, exited/failed startup, repeated cleanup, and profile preservation
+on stop failure. The actual old cleanup fails the live-writer assertion in
+`/tmp/punto-browser-cleanup-red.log`. Final focused tests pass 4/4 in
+`/tmp/punto-browser-cleanup-final-green.log`; Release and Debug aggregates pass
+8/8 in `/tmp/punto-browser-cleanup-release8.log` and
+`/tmp/punto-browser-cleanup-debug8.log`. The fixture owns child/profile lifecycle;
+private proc inspection and signaling are mechanical helpers. Production state,
+persistence, UI and broker policy are N/A. One test file adds 145/removes 13 lines.
+
+The remaining intermittent automatic rejection was opaque (`status=0`).
+WordEditor now classifies rejected operations with static `rejection_stage`
+labels; EventLoop only projects the label in its existing status line. Labels
+identify a check group, not a proven individual predicate or user-editor cause.
+No text, clipboard content or window identifiers are logged. Admission conditions,
+execution ordering, deadlines and retry behavior are unchanged.
+
+R1 maps existing real keymap/context rejection cases to exact stage assertions
+and unchanged no-mutation checks. R2 checks successful recovery without a stage
+field. R3 checks private sentinels against full captured stderr. Both old-driver
+tests fail solely on missing stage metadata in `/tmp/punto-rejection-stage-red.log`;
+both pass in `/tmp/punto-rejection-stage-green.log`. WordEditor owns diagnostic
+classification, EventLoop transports it; other service slices are unchanged/N/A.
+All stage values are literals. There is no duplicate policy or new abstraction.
+This diagnostic capability adds 32/removes 2 runtime lines in three existing
+files, plus 11 test lines; no production file is added or removed.
+
+For both changes, independent BDD critic, separate BDD auditor, pre-RED SRP,
+actual RED critic and final source/SRP reviews passed. No additional refactor
+was needed. Broader final-source CI and package evidence remain separate gates.
 
 ### Initialization deadline checkpoint
 

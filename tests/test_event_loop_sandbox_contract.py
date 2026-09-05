@@ -4,6 +4,7 @@
 import importlib.util
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,16 @@ def run_fixture(driver: pathlib.Path) -> int:
 
 
 class SandboxContract(unittest.TestCase):
+    def test_missing_xprop_is_reported_before_gui_start(self) -> None:
+        result = subprocess.run([
+            "bwrap", "--unshare-all", "--die-with-parent", "--ro-bind", "/", "/",
+            "--tmpfs", "/tmp",
+            "--ro-bind", "/dev/null", "/usr/bin/xprop", "--setenv", "PATH", "/usr/bin:/bin",
+            sys.executable, str(pathlib.Path(__file__).resolve()), "--missing-xprop",
+        ], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("xprop", result.stdout.splitlines())
+
     def assert_host_layout(self, existing_punto: bool) -> None:
         with tempfile.TemporaryDirectory(prefix="punto-sandbox-contract-") as temporary:
             fixture = pathlib.Path(temporary)
@@ -80,7 +91,10 @@ class SandboxContract(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if os.environ.get("PUNTO_EVENT_LOOP_E2E_INNER") == "1":
+    if sys.argv[1:] == ["--missing-xprop"]:
+        assert shutil.which("xprop") is None
+        print("\n".join(load_runner().missing_runtime()))
+    elif os.environ.get("PUNTO_EVENT_LOOP_E2E_INNER") == "1":
         check_inner_mounts()
     elif len(sys.argv) == 3 and sys.argv[1] == "--outer":
         raise SystemExit(run_fixture(pathlib.Path(sys.argv[2])))

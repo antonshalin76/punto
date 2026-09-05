@@ -100,7 +100,7 @@ class XkbState(ctypes.Structure):
 def missing_runtime() -> list[str]:
     missing = [
         name
-        for name in ("bwrap", "Xvfb", "xdotool", "xclip", "setxkbmap", "xkbcomp", "xmodmap")
+        for name in ("bwrap", "Xvfb", "xdotool", "xclip", "setxkbmap", "xkbcomp", "xmodmap", "xprop")
         if shutil.which(name) is None
     ]
     if ctypes.util.find_library("X11") is None:
@@ -3115,7 +3115,7 @@ class EventLoopGtkE2E(unittest.TestCase):
         Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY).clear()
         return terminal, received
 
-    def select_vte_source_word(self, terminal, source: str, recent_click: bool = False) -> None:
+    def select_vte_source_word(self, terminal, source: str, recent_clicks: int = 0) -> None:
         pointer_events = []
 
         def record_pointer(_widget, event):
@@ -3144,7 +3144,7 @@ class EventLoopGtkE2E(unittest.TestCase):
             self.pump_until(predicate, description, timeout=max(0.0, deadline - time.monotonic()))
 
         try:
-            if recent_click:
+            for _ in range(recent_clicks):
                 try:
                     self.xdo("mousemove", "--window", xid, str(x), str(y), "mousedown", "1")
                     wait_receipt(lambda: any(event[0] == Gdk.EventType.BUTTON_PRESS and event[5] == 1
@@ -3155,9 +3155,11 @@ class EventLoopGtkE2E(unittest.TestCase):
                                          for event in pointer_events), "VTE received prior click release")
                 pointer_events.clear()
             click_interval = terminal.get_settings().get_property("gtk-double-click-time") / 1000.0
-            single_click_at = time.monotonic() + click_interval + 0.001
+            # GTK3 also recognizes triple clicks across twice this interval:
+            # https://github.com/GNOME/gtk/blob/3.24.41/gdk/gdkevents.c#L2079
+            single_click_at = time.monotonic() + 2 * click_interval + 0.001
             wait_receipt(lambda: time.monotonic() >= single_click_at,
-                         "GTK double-click recognition window elapsed")
+                         "GTK double/triple-click recognition window elapsed")
             try:
                 self.xdo("mousemove", "--window", xid, str(x), str(y), "mousedown", "1")
                 wait_receipt(lambda: any(event[0] == Gdk.EventType.BUTTON_PRESS and event[5] == 1
@@ -3207,12 +3209,12 @@ class EventLoopGtkE2E(unittest.TestCase):
         self.assertEqual(self.selection_text(Gdk.SELECTION_CLIPBOARD), "startup clipboard baseline")
 
     def assert_vte_selection_inserts(self, source: str, transformed: str,
-                                     modifiers: tuple[int, ...], recent_click: bool = False) -> None:
+                                     modifiers: tuple[int, ...], recent_clicks: int = 0) -> None:
         terminal, received = self.prepare_vte_line_editor(source)
         self.harness.type_word("prefix")
         self.pump_until(lambda: "prefix" in terminal.get_text_format(Vte.Format.TEXT),
                         "nonempty live terminal input")
-        self.select_vte_source_word(terminal, source, recent_click)
+        self.select_vte_source_word(terminal, source, recent_clicks)
         self.assertEqual(self.selection_text(Gdk.SELECTION_PRIMARY), source)
         self.send_chord(modifiers)
         self.pump_until(lambda: "prefix" + transformed in terminal.get_text_format(Vte.Format.TEXT),
@@ -3230,10 +3232,10 @@ class EventLoopGtkE2E(unittest.TestCase):
         self.assert_vte_selection_inserts("AbC", "aBc", (KEY_LEFTALT,))
 
     def test_vte_selection_layout_inserts_without_deleting_scrollback(self) -> None:
-        self.assert_vte_selection_inserts("ghbdtn", "привет", (KEY_LEFTSHIFT,))
+        self.assert_vte_selection_inserts("ghbdtn", "привет", (KEY_LEFTSHIFT,), recent_clicks=1)
 
     def test_vte_selection_layout_after_recent_click_preserves_exact_selection(self) -> None:
-        self.assert_vte_selection_inserts("ghbdtn", "привет", (KEY_LEFTSHIFT,), recent_click=True)
+        self.assert_vte_selection_inserts("ghbdtn", "привет", (KEY_LEFTSHIFT,), recent_clicks=2)
 
     def test_vte_selection_translit_has_full_modifier_priority(self) -> None:
         self.assert_vte_selection_inserts("привет", "privet", (KEY_LEFTCTRL, KEY_LEFTALT, KEY_LEFTSHIFT))

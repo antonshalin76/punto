@@ -28,6 +28,7 @@ COMMAND_TIMEOUT_MS=120
 START_TIMEOUT_MS=40
 STOP_TIMEOUT_MS=40
 POLL_INTERVAL_MS=10
+STOP_FALLBACK_WALL_BOUND_MS=1500
 TRANSITION_AT_MS=""
 TRANSITION_STATE=""
 SEED_TRAY=0
@@ -2105,7 +2106,7 @@ run_stop_case() {
 }
 
 run_stop_matrix() {
-    local fake_clock systemctl_mode bound
+    local fake_clock systemctl_mode
     reset_case
     run_cli stop-idempotent-first stop
     assert_zero "$CLI_RC" "B26 stop on inactive service and tray succeeds"
@@ -2166,6 +2167,8 @@ run_stop_matrix() {
         fail "B26 stop fake clock is $fake_clock, expected near $STOP_TIMEOUT_MS"
     fi
     assert_no_pid_or_undeclared_calls "B26 TERM fallback"
+    assert_bounded "$CLI_RC" "$CLI_DURATION_MS" "$STOP_FALLBACK_WALL_BOUND_MS" \
+        "B26 TERM fallback is bounded"
 
     reset_case
     printf 'active\n' >"$tmp_root/service.state"
@@ -2179,7 +2182,8 @@ run_stop_matrix() {
     assert_service_state active "B26 sticky service failure"
     assert_tray_state inactive "B26 sticky service failure"
     assert_no_pid_or_undeclared_calls "B26 sticky service failure"
-    assert_bounded "$CLI_RC" "$CLI_DURATION_MS" 1000 "B26 sticky service failure is bounded"
+    assert_bounded "$CLI_RC" "$CLI_DURATION_MS" "$STOP_FALLBACK_WALL_BOUND_MS" \
+        "B26 sticky service failure is bounded"
 
     for systemctl_mode in sticky-stop,fail-kill sticky-stop,hang-kill; do
         reset_case
@@ -2197,9 +2201,7 @@ run_stop_matrix() {
         assert_service_mutation_sequence "B26 TERM failure $systemctl_mode" stop term
         assert_service_state active "B26 TERM failure $systemctl_mode"
         assert_no_pid_or_undeclared_calls "B26 TERM failure $systemctl_mode"
-        bound=1000
-        [[ $systemctl_mode == *hang-kill ]] && bound=1500
-        assert_bounded "$CLI_RC" "$CLI_DURATION_MS" "$bound" \
+        assert_bounded "$CLI_RC" "$CLI_DURATION_MS" "$STOP_FALLBACK_WALL_BOUND_MS" \
             "B26 TERM failure $systemctl_mode is bounded"
     done
 

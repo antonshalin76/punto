@@ -159,7 +159,7 @@ def run_in_sandbox(driver: pathlib.Path) -> int:
         "--tmpfs",
         "/tmp",
         "--tmpfs",
-        "/etc/punto",
+        "/etc",
         "--ro-bind",
         str(driver.resolve()),
         "/tmp/punto-event-loop-e2e-driver",
@@ -191,6 +191,16 @@ def run_in_sandbox(driver: pathlib.Path) -> int:
         "PUNTO_RUNTIME_GID",
         "0",
     ]
+    # Build the private mount point even on hosts without Punto installed.
+    for entry in sorted(pathlib.Path("/etc").iterdir()):
+        if entry.name == "punto":
+            continue
+        if entry.is_symlink():
+            command.extend(("--symlink", os.readlink(entry), str(entry)))
+        else:
+            command.extend(("--ro-bind", str(entry), str(entry)))
+    command.extend(("--dir", "/etc/punto", "--remount-ro", "/etc",
+                    "--tmpfs", "/etc/punto"))
     for variable in (
         "ASAN_OPTIONS",
         "UBSAN_OPTIONS",
@@ -1160,10 +1170,13 @@ class EventLoopGtkE2E(unittest.TestCase):
             "initial config diagnostic delivered",
         )
         config_loads = self.harness.diagnostic().count("Configuration reloaded:")
+        refresh_prefix = "X11 observation refreshed, layout:"
+        refreshes = self.harness.diagnostic().count(refresh_prefix)
         self.lock_keyboard_group(1)
         pathlib.Path("/run/punto-e2e-layout-ru").touch()
         self.pump_until(
-            lambda: "X11 observation refreshed, layout: RU" in self.harness.diagnostic(),
+            lambda: self.harness.diagnostic().count(refresh_prefix) > refreshes
+            and self.stats_fields()[1]["x11_health"] == "ready",
             "changed layout observed by session refresh",
         )
         self.pump_until(
@@ -1504,7 +1517,7 @@ class EventLoopGtkE2E(unittest.TestCase):
                 and fields["config_result"] == "ok"
                 and fields["analysis_health"] == "ready"
                 and fields["worker_threads"] == "1"
-                and "X11 observation refreshed, layout: RU" in self.harness.diagnostic()
+                and fields["x11_health"] == "ready"
             )
 
         self.pump_until(diagnostic_analysis_ready, "initialized RU diagnostic analysis")
@@ -2699,20 +2712,29 @@ class EventLoopGtkE2E(unittest.TestCase):
         self.pump_until(lambda: self.entry.get_text() == "helllo world ", "undo restores original lengths and tail")
 
     def test_automatic_undo_learns_exclusion_and_survives_restart(self) -> None:
+        self.assert_automatic_undo_learning("ghbdtn", "привет")
+
+    def test_automatic_undo_learns_punctuation_key_and_survives_restart(self) -> None:
+        from unittest.mock import patch
+
+        with patch.dict(LETTER_CODES, {";": 39}):
+            self.assert_automatic_undo_learning(";tcn", "жест")
+
+    def assert_automatic_undo_learning(self, source: str, corrected: str) -> None:
         self.prepare_word_editor()
-        self.send_text_batch("ghbdtn ")
-        self.pump_until(lambda: self.entry.get_text() == "привет ", "automatic correction before learning")
+        self.send_text_batch(source + " ")
+        self.pump_until(lambda: self.entry.get_text() == corrected + " ", "automatic correction before learning")
         self.send_chord((KEY_LEFTCTRL,), KEY_Z)
-        self.pump_until(lambda: self.entry.get_text() == "ghbdtn ", "undo restores automatic correction")
-        self.send_text_batch("ghbdtn ")
+        self.pump_until(lambda: self.entry.get_text() == source + " ", "undo restores automatic correction")
+        self.send_text_batch(source + " ")
         self.pump_until(lambda: self.stats_fields()[1]["analyzed"] == "2", "repeated word analyzed")
         self.pump_for(0.1)
-        self.assertEqual(self.entry.get_text(), "ghbdtn ghbdtn ")
+        self.assertEqual(self.entry.get_text(), source + " " + source + " ")
         exclusions = pathlib.Path("/etc/punto/undo_exclusions.txt")
-        self.pump_until(lambda: exclusions.exists() and "ghbdtn\n" in exclusions.read_text(),
+        self.pump_until(lambda: exclusions.exists() and source + "\n" in exclusions.read_text(),
                         "learned exclusion persisted")
         self.harness.send_key(KEY_PAUSE)
-        self.pump_until(lambda: self.entry.get_text() == "ghbdtn привет ", "manual correction remains available for learned exclusion")
+        self.pump_until(lambda: self.entry.get_text() == source + " " + corrected + " ", "manual correction remains available for learned exclusion")
         self.harness.stop()
         self.entry.set_text("")
         self.lock_keyboard_group(0)
@@ -2721,10 +2743,10 @@ class EventLoopGtkE2E(unittest.TestCase):
         self.addCleanup(self.harness.stop)
         self.harness.wait_ready(self.pump_once)
         self.prepare_word_editor()
-        self.send_text_batch("ghbdtn ")
+        self.send_text_batch(source + " ")
         self.pump_until(lambda: self.stats_fields()[1]["analyzed"] == "1", "word analyzed after restart")
         self.pump_for(0.1)
-        self.assertEqual(self.entry.get_text(), "ghbdtn ")
+        self.assertEqual(self.entry.get_text(), source + " ")
         self.assertEqual(self.stats_fields()[1]["word_dispatches"], "0")
 
     def assert_backspace_learning(self, intervening_key: bool) -> None:
@@ -3093,7 +3115,7 @@ class EventLoopGtkE2E(unittest.TestCase):
         Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY).clear()
         return terminal, received
 
-    def select_vte_source_word(self, terminal, source: str) -> None:
+    def select_vte_source_word(self, terminal, source: str, recent_click: bool = False) -> None:
         pointer_events = []
 
         def record_pointer(_widget, event):
@@ -3122,8 +3144,22 @@ class EventLoopGtkE2E(unittest.TestCase):
             self.pump_until(predicate, description, timeout=max(0.0, deadline - time.monotonic()))
 
         try:
+            if recent_click:
+                try:
+                    self.xdo("mousemove", "--window", xid, str(x), str(y), "mousedown", "1")
+                    wait_receipt(lambda: any(event[0] == Gdk.EventType.BUTTON_PRESS and event[5] == 1
+                                             for event in pointer_events), "VTE received prior click press")
+                finally:
+                    self.xdo("mouseup", "1")
+                wait_receipt(lambda: any(event[0] == Gdk.EventType.BUTTON_RELEASE and event[5] == 1
+                                         for event in pointer_events), "VTE received prior click release")
+                pointer_events.clear()
+            click_interval = terminal.get_settings().get_property("gtk-double-click-time") / 1000.0
+            single_click_at = time.monotonic() + click_interval + 0.001
+            wait_receipt(lambda: time.monotonic() >= single_click_at,
+                         "GTK double-click recognition window elapsed")
             try:
-                self.xdo("mousemove", "--sync", "--window", xid, str(x), str(y), "mousedown", "1")
+                self.xdo("mousemove", "--window", xid, str(x), str(y), "mousedown", "1")
                 wait_receipt(lambda: any(event[0] == Gdk.EventType.BUTTON_PRESS and event[5] == 1
                                          for event in pointer_events), "VTE received gesture button press")
                 after_press = len(pointer_events)
@@ -3140,6 +3176,9 @@ class EventLoopGtkE2E(unittest.TestCase):
                 self.xdo("mouseup", "1")
             wait_receipt(lambda: any(event[0] == Gdk.EventType.BUTTON_RELEASE and event[5] == 1
                                      for event in pointer_events[after_motion:]), "VTE received gesture release")
+            self.assertFalse(any(event[0] in (Gdk.EventType.DOUBLE_BUTTON_PRESS,
+                                              Gdk.EventType.TRIPLE_BUTTON_PRESS)
+                                 for event in pointer_events), "drag must begin with a single click")
             wait_receipt(lambda: terminal.get_has_selection()
                          and self.selection_text(Gdk.SELECTION_PRIMARY) == source,
                          "real VTE drag selects exactly the source word")
@@ -3168,12 +3207,12 @@ class EventLoopGtkE2E(unittest.TestCase):
         self.assertEqual(self.selection_text(Gdk.SELECTION_CLIPBOARD), "startup clipboard baseline")
 
     def assert_vte_selection_inserts(self, source: str, transformed: str,
-                                     modifiers: tuple[int, ...]) -> None:
+                                     modifiers: tuple[int, ...], recent_click: bool = False) -> None:
         terminal, received = self.prepare_vte_line_editor(source)
         self.harness.type_word("prefix")
         self.pump_until(lambda: "prefix" in terminal.get_text_format(Vte.Format.TEXT),
                         "nonempty live terminal input")
-        self.select_vte_source_word(terminal, source)
+        self.select_vte_source_word(terminal, source, recent_click)
         self.assertEqual(self.selection_text(Gdk.SELECTION_PRIMARY), source)
         self.send_chord(modifiers)
         self.pump_until(lambda: "prefix" + transformed in terminal.get_text_format(Vte.Format.TEXT),
@@ -3192,6 +3231,9 @@ class EventLoopGtkE2E(unittest.TestCase):
 
     def test_vte_selection_layout_inserts_without_deleting_scrollback(self) -> None:
         self.assert_vte_selection_inserts("ghbdtn", "привет", (KEY_LEFTSHIFT,))
+
+    def test_vte_selection_layout_after_recent_click_preserves_exact_selection(self) -> None:
+        self.assert_vte_selection_inserts("ghbdtn", "привет", (KEY_LEFTSHIFT,), recent_click=True)
 
     def test_vte_selection_translit_has_full_modifier_priority(self) -> None:
         self.assert_vte_selection_inserts("привет", "privet", (KEY_LEFTCTRL, KEY_LEFTALT, KEY_LEFTSHIFT))

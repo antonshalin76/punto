@@ -1,4 +1,5 @@
 #include "punto/undo_detector.hpp"
+#include "punto/control_plane_state.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -70,6 +72,31 @@ void wait_saved(punto::UndoDetector &detector) {
     std::this_thread::yield();
   expect(!detector.pending() && !detector.persistence_failed(),
          "accepted storage mutation is durable");
+}
+
+void test_read_bounded_preserves_default_and_small_limits() {
+  TempDir dir;
+  const auto path = dir.path() / "bounded.txt";
+  const auto read = [&](const std::string &payload,
+                        std::optional<std::size_t> limit) {
+    {
+      std::ofstream output(path, std::ios::binary);
+      output << payload;
+    }
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    expect(fd >= 0, "open bounded read fixture");
+    const auto result = limit ? punto::detail::read_bounded(fd, *limit)
+                              : punto::detail::read_bounded(fd);
+    expect(::close(fd) == 0, "close bounded read fixture");
+    return result;
+  };
+  expect(read("a", 1) == std::optional<std::string>{"a"}, "exact one-byte budget accepted");
+  expect(!read("ab", 1), "small budget cannot underflow when chunk is larger");
+  expect(!read("a", 0) && read("", 0).has_value(), "zero budget admits only empty input");
+  expect(read(std::string(8192, 'a'), std::nullopt).has_value(),
+         "default control-plane read limit remains 8192 bytes");
+  expect(!read(std::string(8193, 'a'), std::nullopt),
+         "default control-plane read still rejects over 8192 bytes");
 }
 
 void test_initial_io_does_not_block_constructor() {
@@ -318,13 +345,21 @@ void test_atomic_private_round_trip() {
 
 void test_invalid_words_and_capacity_are_bounded() {
   TempDir dir;
-  punto::UndoDetector detector{(dir.path() / "undo.txt").string()};
-  wait_ready(detector);
-  detector.add_exclusion("UPPER");
-  detector.add_exclusion("line\nbreak");
-  detector.add_exclusion(
-      std::string(punto::UndoDetector::maximum_word_bytes() + 1U, 'a'));
-  expect(detector.exclusion_count() == 0, "invalid entries are rejected");
+  const auto path = dir.path() / "undo.txt";
+  {
+    punto::UndoDetector detector{path.string()};
+    wait_ready(detector);
+    detector.add_exclusion("UPPER");
+    detector.add_exclusion("#hidden");
+    detector.add_exclusion("white space");
+    detector.add_exclusion(std::string{"nul\0byte", 8});
+    detector.add_exclusion("tab\tbyte");
+    detector.add_exclusion("line\nbreak");
+    detector.add_exclusion(
+        std::string(punto::UndoDetector::maximum_word_bytes() + 1U, 'a'));
+    expect(detector.exclusion_count() == 0, "invalid entries are rejected");
+  }
+  std::vector<std::string> words;
   for (std::size_t index = 0;
        index < punto::UndoDetector::maximum_entries() + 10U; ++index) {
     std::string word;
@@ -333,18 +368,75 @@ void test_invalid_words_and_capacity_are_bounded() {
       word.push_back(static_cast<char>('a' + (value % 26U)));
       value /= 26U;
     } while (value != 0U);
-    detector.add_exclusion("w" + word);
+    words.push_back("w" + word);
   }
+  const auto seeded = punto::UndoDetector::maximum_entries() - 10U;
+  {
+    std::ofstream output(path);
+    for (std::size_t index = 0; index < seeded; ++index)
+      output << words[index] << '\n';
+  }
+  expect(::chmod(path.c_str(), 0600) == 0, "secure near-capacity fixture");
+  punto::UndoDetector detector{path.string()};
+  wait_ready(detector);
+  expect(detector.exclusion_count() == seeded, "near-capacity fixture loads");
+  for (std::size_t index = seeded; index < words.size(); ++index)
+    detector.add_exclusion(words[index]);
   expect(detector.exclusion_count() == punto::UndoDetector::maximum_entries(),
          "entry count is capped");
   wait_saved(detector);
+  for (std::size_t index = 0; index < punto::UndoDetector::maximum_entries(); ++index)
+    expect(detector.is_excluded(words[index]), "every admitted entry remains cached at capacity");
 }
 
 std::string maximum_word(std::size_t index) {
   std::string word(63, 'a');
-  word[61] = static_cast<char>('a' + index / 26);
-  word[62] = static_cast<char>('a' + index % 26);
+  for (std::size_t offset = 0; offset < 3; ++offset) {
+    word[word.size() - 1 - offset] = static_cast<char>('a' + index % 26);
+    index /= 26;
+  }
   return word;
+}
+
+void test_legacy_exclusions_survive_learning_and_restart() {
+  TempDir dir;
+  const auto path = dir.path() / "undo.txt";
+  std::vector<std::string> legacy;
+  for (std::size_t index = 0; index < 199; ++index)
+    legacy.push_back("old" + maximum_word(index).substr(60));
+  for (std::size_t index = 0; index < 49; ++index)
+    legacy.push_back("Old'" + std::to_string(index) + "[]");
+  std::string payload = "# Punto Switcher Undo Exclusions\n";
+  const std::string learned = "new'word42+*";
+  for (const auto &word : legacy)
+    payload += word + '\n';
+  {
+    std::ofstream output(path);
+    output << payload;
+  }
+  expect(::chmod(path.c_str(), 0600) == 0, "secure migrated legacy fixture");
+  {
+    punto::UndoDetector detector{path.string()};
+    wait_ready(detector);
+    expect(!detector.persistence_failed() && detector.exclusion_count() == 248,
+           "all 248 legacy exclusions load without truncation");
+    for (const auto &word : legacy)
+      expect(detector.is_excluded(word), "legacy token spelling is preserved");
+    expect(read_file(path) == payload, "loading legacy exclusions never rewrites them");
+    detector.add_exclusion(learned);
+    expect(detector.is_excluded(learned), "physical punctuation and digits can be learned");
+    wait_saved(detector);
+  }
+  punto::UndoDetector restarted{path.string()};
+  wait_ready(restarted);
+  expect(restarted.exclusion_count() == legacy.size() + 1,
+         "learning preserves the complete legacy set across restart");
+  for (const auto &word : legacy)
+    expect(restarted.is_excluded(word), "no legacy token is lost on publication");
+  expect(restarted.is_excluded(learned), "new printable exclusion survives restart");
+  struct stat metadata {};
+  expect(::lstat(path.c_str(), &metadata) == 0 && (metadata.st_mode & 0777) == 0600,
+         "legacy rewrite retains private file mode");
 }
 
 void test_full_capacity_long_words_round_trip() {
@@ -352,24 +444,45 @@ void test_full_capacity_long_words_round_trip() {
   const auto path = dir.path() / "undo.txt";
   {
     std::ofstream output(path);
-    for (std::size_t index = 0; index < 127; ++index)
+    for (std::size_t index = 0; index < 1023; ++index)
       output << maximum_word(index) << '\n';
   }
   expect(::chmod(path.c_str(), 0600) == 0, "secure maximum word fixture");
   punto::UndoDetector detector{path.string()};
   wait_ready(detector);
-  expect(detector.exclusion_count() == 127, "127 maximum length words load");
-  detector.add_exclusion(maximum_word(127));
-  expect(detector.is_excluded(maximum_word(127)),
-         "128th maximum word is accepted");
+  expect(detector.exclusion_count() == 1023, "1023 maximum length words load");
+  detector.add_exclusion(maximum_word(1023));
+  expect(detector.is_excluded(maximum_word(1023)),
+         "1024th maximum word is accepted");
   wait_saved(detector);
-  expect(read_file(path).size() == 8192,
+  expect(read_file(path).size() == 65536,
          "full valid exclusion set fits storage bound");
   punto::UndoDetector restarted{path.string()};
   wait_ready(restarted);
-  for (std::size_t index = 0; index < 128; ++index)
+  for (std::size_t index = 0; index < 1024; ++index)
     expect(restarted.is_excluded(maximum_word(index)),
            "every maximum word survives restart");
+}
+
+void test_duplicate_at_capacity_preserves_all_entries() {
+  TempDir dir;
+  const auto path = dir.path() / "undo.txt";
+  std::string payload;
+  for (std::size_t index = 0; index < punto::UndoDetector::maximum_entries(); ++index)
+    payload += maximum_word(index).substr(60) + '\n';
+  payload += maximum_word(0).substr(60) + '\n';
+  {
+    std::ofstream output(path);
+    output << payload;
+  }
+  expect(::chmod(path.c_str(), 0600) == 0, "secure duplicate-at-capacity fixture");
+  punto::UndoDetector detector{path.string()};
+  wait_ready(detector);
+  expect(!detector.persistence_failed() && detector.exclusion_count() == punto::UndoDetector::maximum_entries(),
+         "duplicate row at capacity does not reject existing distinct entries");
+  for (std::size_t index = 0; index < punto::UndoDetector::maximum_entries(); ++index)
+    expect(detector.is_excluded(maximum_word(index).substr(60)), "every distinct entry remains available");
+  expect(read_file(path) == payload, "duplicate row load leaves source unchanged");
 }
 
 void test_full_refresh_preserves_accepted_local_additions(
@@ -403,8 +516,8 @@ void test_full_refresh_preserves_accepted_local_additions(
   }
   std::vector<std::string> local_words{"localone"};
   if (completed_add) {
-    for (std::size_t index = 0; index < 127; ++index)
-      local_words.push_back("pending" + maximum_word(index).substr(61));
+    for (std::size_t index = 0; index < punto::UndoDetector::maximum_entries() - 1; ++index)
+      local_words.push_back("pending" + maximum_word(index).substr(60));
   } else
     local_words.push_back("localtwo");
   for (const auto &word : local_words)
@@ -416,7 +529,7 @@ void test_full_refresh_preserves_accepted_local_additions(
   };
   const bool accepted = all_local_cached();
   std::string external = completed_add ? "localone\n" : "";
-  for (std::size_t index = 0; index < (completed_add ? 127U : 128U); ++index) {
+  for (std::size_t index = 0; index < punto::UndoDetector::maximum_entries() - (completed_add ? 1U : 0U); ++index) {
     auto word = maximum_word(index);
     if (completed_add)
       word[0] = 'z';
@@ -443,7 +556,7 @@ void test_full_refresh_preserves_accepted_local_additions(
          "full persistent store reports pending failure");
   expect(all_local_cached(),
          "full older operation cannot drop accepted local additions");
-  expect(detector.exclusion_count() <= 128, "local overlay stays bounded");
+  expect(detector.exclusion_count() <= punto::UndoDetector::maximum_entries(), "local overlay stays bounded");
   expect(read_file(path) == external,
          "capacity failure leaves external snapshot intact");
 }
@@ -464,14 +577,20 @@ void test_unsafe_and_oversized_files_fail_closed() {
   expect(read_file(victim) == "secret\n", "symlink target is untouched");
 
   const auto oversized = dir.path() / "oversized.txt";
+  std::string oversized_payload;
+  for (std::size_t index = 0; index <= punto::UndoDetector::maximum_file_bytes() / 2; ++index)
+    oversized_payload += "a\n";
   {
     std::ofstream output(oversized, std::ios::binary);
-    output << std::string(9000U, 'a') << '\n';
+    output << oversized_payload;
   }
   expect(::chmod(oversized.c_str(), 0600) == 0, "chmod oversized fixture");
   punto::UndoDetector rejected{oversized.string()};
   wait_ready(rejected);
-  expect(rejected.exclusion_count() == 0, "oversized file is rejected");
+  expect(rejected.exclusion_count() == 0 && rejected.persistence_failed(), "oversized file is rejected");
+  rejected.add_exclusion("newword");
+  expect(read_file(oversized) == oversized_payload,
+         "oversized file remains unchanged after rejected learning");
 }
 
 void test_published_mutation_is_not_replayed(bool clear) {
@@ -692,6 +811,22 @@ void test_live_instances_converge_after_background_refresh() {
 } // namespace
 
 int main(int argc, char **argv) {
+  if (argc == 2 && std::string_view{argv[1]} == "legacy") {
+    test_legacy_exclusions_survive_learning_and_restart();
+    return 0;
+  }
+  if (argc == 2 && std::string_view{argv[1]} == "capacity") {
+    test_full_capacity_long_words_round_trip();
+    return 0;
+  }
+  if (argc == 2 && std::string_view{argv[1]} == "invalid-capacity") {
+    test_invalid_words_and_capacity_are_bounded();
+    return 0;
+  }
+  if (argc == 2 && std::string_view{argv[1]} == "duplicate") {
+    test_duplicate_at_capacity_preserves_all_entries();
+    return 0;
+  }
   if (argc == 2 && (std::string_view{argv[1]} == "published-clear" ||
                     std::string_view{argv[1]} == "published-add")) {
     test_published_mutation_is_not_replayed(std::string_view{argv[1]} ==
@@ -708,7 +843,10 @@ int main(int argc, char **argv) {
   }
   if (argc != 1)
     return 2;
+  test_read_bounded_preserves_default_and_small_limits();
+  test_legacy_exclusions_survive_learning_and_restart();
   test_full_capacity_long_words_round_trip();
+  test_duplicate_at_capacity_preserves_all_entries();
   test_published_mutation_is_not_replayed(true);
   test_published_mutation_is_not_replayed(false);
   test_full_refresh_preserves_accepted_local_additions();

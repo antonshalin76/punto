@@ -328,7 +328,7 @@ punto::DictionaryLoadOutcome deterministic_dictionary_loader() {
   const ScopedFixturePath affix{"/tmp/punto-e2e" + suffix + ".aff"};
   punto::DictionaryLoadOutcome outcome;
   if (!write_fixture(english.path, "2\nhello\nworld\n") ||
-      !write_fixture(russian.path, "1\nпривет\n") ||
+      !write_fixture(russian.path, "2\nпривет\nжест\n") ||
       !write_fixture(affix.path, "SET UTF-8\nTRY esiarntolcdugmphbyfvkwzxjq\n")) {
     return outcome;
   }

@@ -258,14 +258,14 @@ missing_test_tools=""
 if [[ -n ${PUNTO_CONTRACT_LIFECYCLE_ONLY_ARTIFACT:-} ]]; then
     prerequisite_tools=(
         bash bwrap dpkg dpkg-query dpkg-deb realpath timeout python3 busybox ldd
-        awk mkdir chmod cp dirname ln sed rm sha256sum grep chroot mktemp
+        awk mkdir chmod cp dirname ln sed rm sha256sum grep chroot mktemp mkfifo find sort
     )
 else
     prerequisite_tools=(
         bash bwrap strace cmake dpkg dpkg-query dpkg-deb dpkg-shlibdeps file readelf
         strip strings tar realpath readlink sha256sum timeout python3 busybox ldd
         gzip pkg-config awk cmp stat find chmod cp sed grep wc mkdir mktemp rm sort
-        tr cut head ln chroot basename dirname date du install mv nproc
+        tr cut head ln chroot basename dirname date du install mv nproc mkfifo
     )
 fi
 for required in "${prerequisite_tools[@]}"; do
@@ -2097,15 +2097,21 @@ LIFECYCLE_RC=0
 LIFECYCLE_GROUP_MODE=ok
 LIFECYCLE_SERVICE_MODE=ok
 LIFECYCLE_POLICY_MODE=allow
+LIFECYCLE_EXCLUSION_SOURCE=""
 
 run_lifecycle_command() {
     local root=$1 name=$2
     local output="$tmp_root/lifecycle-$name.log"
+    local -a exclusion_bind=()
+    if [[ -n $LIFECYCLE_EXCLUSION_SOURCE ]]; then
+        exclusion_bind=(--ro-bind "$LIFECYCLE_EXCLUSION_SOURCE" "$root/etc/punto/undo_exclusions.txt")
+    fi
     shift 2
     set +e
     timeout --signal=KILL 45s bwrap \
         --ro-bind / / --bind "$tmp_root" "$tmp_root" \
         --dev-bind /dev/null "$root/dev/null" --proc /proc --dev /dev \
+        "${exclusion_bind[@]}" \
         --unshare-net --unshare-pid --unshare-user --uid 0 --gid 0 \
         --cap-add CAP_SYS_CHROOT \
         --die-with-parent --new-session --clearenv \
@@ -2173,7 +2179,7 @@ run_package_lifecycle_gate() {
     local upgrade_tree="$tmp_root/lifecycle-upgrade-tree"
     local upgrade_artifact="$tmp_root/punto-switcher-lifecycle-upgrade.deb"
     local upgrade_version="${EXPECTED_VERSION}+contract1"
-    local before_repeat after_repeat local_hash calls postinst
+    local before_repeat after_repeat local_hash calls postinst legacy_hash legacy_inode
     local before_punto_rc after_punto_rc
     local expected_service_calls
 
@@ -2254,6 +2260,10 @@ run_package_lifecycle_gate() {
 
     printf '\n# contract-local-edit: preserve-me\n' >>"$root/etc/punto/config.yaml"
     local_hash=$(sha256sum "$root/etc/punto/config.yaml" | awk '{print $1}')
+    printf 'legacy\nlegacy;key\n' >"$root/etc/punto/undo_exclusions.txt"
+    chmod 0644 "$root/etc/punto/undo_exclusions.txt"
+    legacy_hash=$(sha256sum "$root/etc/punto/undo_exclusions.txt" | awk '{print $1}')
+    legacy_inode=$(stat -c '%i' "$root/etc/punto/undo_exclusions.txt")
     if ! prepare_upgrade_artifact "$artifact" "$upgrade_artifact" "$upgrade_tree" \
         "$upgrade_version"; then
         return
@@ -2269,6 +2279,12 @@ run_package_lifecycle_gate() {
     assert_lifecycle_service_log "$root" "$expected_service_calls" \
         "B14 lifecycle upgrade"
     assert_package_status "$root" 'ii ' "B14 lifecycle upgrade"
+    if [[ $(stat -c '%a:%h:%i' "$root/etc/punto/undo_exclusions.txt") == "600:1:$legacy_inode" &&
+          $(sha256sum "$root/etc/punto/undo_exclusions.txt" | awk '{print $1}') == "$legacy_hash" ]]; then
+        pass "B14 upgrade secures legacy exclusions without changing bytes or inode"
+    else
+        fail "B14 upgrade does not preserve and secure legacy exclusions"
+    fi
     if [[ -f $root/etc/punto/config.yaml ]]; then
         assert_contains "$(<"$root/etc/punto/config.yaml")" '# contract-local-edit: preserve-me' \
             "B14 lifecycle upgrade preserves the local conffile edit"
@@ -2328,6 +2344,104 @@ run_package_lifecycle_gate() {
     run_package_setup_failure "$artifact"
     run_package_service_failure "$artifact"
     run_package_policy_denial "$artifact"
+    run_legacy_exclusion_migration_gate "$artifact"
+}
+
+run_legacy_exclusion_migration_gate() {
+    local artifact=$1 root="$tmp_root/lifecycle-legacy-exclusions/root"
+    local fixture before after fixture_path before_payload after_payload before_links after_links
+    prepare_lifecycle_root "$root"
+    run_lifecycle_command "$root" legacy-install /usr/bin/dpkg --root="$root" \
+        --log="$root/var/log/dpkg.log" --force-depends --force-confdef \
+        --force-confold -i "$artifact"
+    assert_zero "$LIFECYCLE_RC" "B14 legacy migration fixture installs"
+    if [[ ! -e $root/etc/punto/undo_exclusions.txt ]]; then
+        pass "B14 fresh install does not invent learned exclusions"
+    else
+        fail "B14 fresh install creates exclusions"
+    fi
+    for fixture in secure legacy symlink dangling hardlink writable directory fifo; do
+        fixture_path="$root/contract-state/$fixture"
+        mkdir -p "$fixture_path"
+        printf 'legacy\nlegacy;key\n' >"$fixture_path/undo_exclusions.txt"
+        chmod 0644 "$fixture_path/undo_exclusions.txt"
+        case $fixture in
+            secure) chmod 0600 "$fixture_path/undo_exclusions.txt" ;;
+            symlink|dangling)
+                mv "$fixture_path/undo_exclusions.txt" "$fixture_path/target"
+                ln -s "/contract-state/$fixture/target" "$fixture_path/undo_exclusions.txt"
+                [[ $fixture != dangling ]] || mv "$fixture_path/target" "$fixture_path/preserved"
+                ;;
+            hardlink) ln "$fixture_path/undo_exclusions.txt" "$fixture_path/peer" ;;
+            writable) chmod 0666 "$fixture_path/undo_exclusions.txt" ;;
+            directory|fifo)
+                mv "$fixture_path/undo_exclusions.txt" "$fixture_path/preserved"
+                if [[ $fixture == directory ]]; then
+                    mkdir "$fixture_path/undo_exclusions.txt"
+                else
+                    mkfifo "$fixture_path/undo_exclusions.txt"
+                fi
+                ;;
+        esac
+        before_payload=$(find "$fixture_path" -type f -exec sha256sum {} + | sort)
+        before_links=$(find "$fixture_path" -type f -printf '%m:%U:%G:%n:%i:%p\n' | sort)
+        mv "$fixture_path/undo_exclusions.txt" "$root/etc/punto/undo_exclusions.txt"
+        before=$(stat -c '%F:%u:%g:%a:%h:%i' "$root/etc/punto/undo_exclusions.txt")
+        run_lifecycle_command "$root" "legacy-$fixture" /usr/sbin/chroot "$root" \
+            /var/lib/dpkg/info/punto-switcher.postinst configure "$EXPECTED_VERSION"
+        assert_zero "$LIFECYCLE_RC" "B14 legacy $fixture configure is bounded"
+        after=$(stat -c '%F:%u:%g:%a:%h:%i' "$root/etc/punto/undo_exclusions.txt")
+        if [[ $fixture == legacy ]]; then
+            if [[ $after == "${before/:644:/:600:}" ]]; then
+                pass "B14 legacy migration changes only permissions"
+            else
+                fail "B14 legacy migration did not secure exact admitted file"
+            fi
+        elif [[ $before == "$after" ]]; then
+            pass "B14 legacy $fixture metadata is preserved"
+        else
+            fail "B14 legacy $fixture metadata was changed"
+        fi
+        if [[ $fixture != legacy && $fixture != secure ]]; then
+            assert_contains "$(<"$tmp_root/lifecycle-legacy-$fixture.log")" \
+                'unsafe legacy exclusions left unchanged' "B14 legacy $fixture has explicit diagnostic"
+        fi
+        mv "$root/etc/punto/undo_exclusions.txt" "$fixture_path/undo_exclusions.txt"
+        after_payload=$(find "$fixture_path" -type f -exec sha256sum {} + | sort)
+        after_links=$(find "$fixture_path" -type f -printf '%m:%U:%G:%n:%i:%p\n' | sort)
+        if [[ $fixture != legacy ]]; then
+            if [[ $before_links == "$after_links" ]]; then
+                pass "B14 legacy $fixture linked metadata is unchanged"
+            else
+                fail "B14 legacy $fixture altered linked metadata"
+            fi
+        fi
+        if [[ $before_payload == "$after_payload" ]]; then
+            pass "B14 legacy $fixture all payloads are retained"
+        else
+            fail "B14 legacy $fixture altered source or linked payload"
+        fi
+    done
+    # A real root-owned public file is an unmapped foreign owner in this user
+    # namespace. Its read-only bind makes a mistaken chmod safe but detectable.
+    before_payload=$(sha256sum /etc/debian_version)
+    before=$(stat -c '%u:%g:%a:%h:%i' /etc/debian_version)
+    : >"$root/etc/punto/undo_exclusions.txt"
+    LIFECYCLE_EXCLUSION_SOURCE=/etc/debian_version
+    # shellcheck disable=SC2016 # Expansion must use metadata inside the namespace.
+    run_lifecycle_command "$root" legacy-foreign /usr/sbin/chroot "$root" /bin/sh -c \
+        '[ "$(stat -c %u /etc/punto/undo_exclusions.txt)" != 0 ] && exec /var/lib/dpkg/info/punto-switcher.postinst configure "$1"' \
+        legacy-owner "$EXPECTED_VERSION"
+    LIFECYCLE_EXCLUSION_SOURCE=""
+    assert_zero "$LIFECYCLE_RC" "B14 foreign-owner exclusions are left untouched"
+    assert_contains "$(<"$tmp_root/lifecycle-legacy-foreign.log")" \
+        'unsafe legacy exclusions left unchanged' "B14 foreign-owner exclusions diagnostic"
+    if [[ $(sha256sum /etc/debian_version) == "$before_payload" &&
+          $(stat -c '%u:%g:%a:%h:%i' /etc/debian_version) == "$before" ]]; then
+        pass "B14 foreign-owner source bytes and metadata are unchanged"
+    else
+        fail "B14 foreign-owner source was changed"
+    fi
 }
 
 run_package_setup_failure() {

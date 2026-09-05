@@ -4,7 +4,74 @@ This document records the source restoration for 2.8.9. Source tests, package
 validation, publication and machine installation are separate evidence gates;
 runtime health alone is not proof of an editor correction.
 
-## Current functional checkpoint (2026-09-05, release candidate 2.8.9)
+## Host-upgrade compatibility checkpoint (2026-09-05, 2.8.9)
+
+The first candidate was installed for host validation but not published. That
+check exposed an upgrade regression: a legacy root-owned 0644 exclusion file
+with 248 printable ASCII tokens could not satisfy the new 0600, 128-entry,
+alphabetic-only contract. The original file was backed up without changing its
+bytes. No historical words were copied into tests or logs.
+
+UndoDetector remains the only format, admission and persistence owner. It now
+preserves legacy printable ASCII tokens and admits learned physical-key tokens
+through the existing scancode map. Its bound is 1024 entries of 63 bytes, at
+most 65536 bytes; the shared control-plane reader retains its 8192-byte default.
+EventLoop uses the same physical-key mapping when looking up learned exclusions.
+The installer only changes a trusted single-link root:root 0644 inode to 0600,
+after checking its parent. It does not rewrite words or repair unsafe files.
+
+| Scenario | Owner and proof |
+| --- | --- |
+| 248 legacy tokens survive read, learning and restart | UndoDetector synthetic full-set equality contract |
+| 1024 maximum-size tokens fit; overflow and duplicates are bounded | UndoDetector capacity, file-size and small-read-limit contracts |
+| Pending learning survives refresh and failed durability | Existing background-worker/concurrent-writer contracts at the new bound |
+| Upgrade changes permissions without losing bytes or inode | Actual package lifecycle; links, FIFO and foreign owners remain unchanged |
+| Wrong-layout punctuation learns after undo and restart | Real GTK `;tcn` correction, native key events, disk and editor-text oracles |
+| Clean hosts run the same e2e without host configuration writes | Actual sandbox helper with absent and existing read-only host policy |
+
+BDD critic, separate scenario auditor, pre-SRP and actual RED reviews passed.
+The focused package lifecycle passed 87/87, and GTK learning passed both
+alphabetic and punctuation cases. The sandbox contract passed both host layouts.
+No new state machine, data-copy fallback, parser owner or broker was introduced.
+The test gap was upgrade and clean-host coverage: the initial source suites used
+fresh private files on a host where `/etc/punto` already existed.
+
+RED evidence: `/tmp/punto-undo-legacy-red.log`,
+`/tmp/punto-undo-duplicate-red.log`, `/tmp/punto-legacy-mode-red.log`,
+`/tmp/punto-learning-punctuation-red.log`, `/tmp/punto-sandbox-missing-etc-red.log`.
+Focused GREEN: `/tmp/punto-undo-legacy-final-green.log`,
+`/tmp/punto-legacy-mode-green.log`, `/tmp/punto-learning-punctuation-green.log`,
+`/tmp/punto-sandbox-cmake-green.log`. Two later fixture defects were reproduced:
+interleaved diagnostic lines broke a readiness substring, and GTK's click
+history turned a new drag into a double-click. Structured readiness retains a
+wrong-layout negative control; the VTE fixture waits the actual GTK click
+interval within its original deadline and asserts a single drag. Neither fix
+changes production code, retries a correction or weakens PRIMARY/PTY checks.
+
+Final source/SRP audits passed for all compatibility owners. Runtime C++ grows
+by 6 net lines (+17/-11 in three files; EventLoop's guard is a net-zero change).
+The installer adds 22 lines for the permission migration. There is one new
+test-only sandbox contract and no new production file or service boundary.
+
+| Final local gate | Result and evidence |
+| --- | --- |
+| Release | 24/24 covered: aggregate `/tmp/punto-compat-release-ctest.log`; final 86-case GTK/VTE rerun `/tmp/punto-compat-release-gtk-final.log`, PASS 55.54 s |
+| Debug ASan/UBSan/LSan | 24/24 covered excluding GTK clipboard: aggregate `/tmp/punto-compat-debug-ctest.log`, with the sole failing fixture target superseded by `/tmp/punto-compat-debug-gtk-settled.log`, 86 cases PASS 58.85 s |
+| Separate GTK clipboard | Existing unchanged-target ASan/UBSan proof `/tmp/punto-restored-debug-clipboard.log` reused; total Debug coverage 25/25 |
+| CLI | 4483 checks reused for unchanged CLI/protocol source |
+| clang-tidy and ShellCheck | Changed/dependent translation units PASS `/tmp/punto-compat-tidy.log`; unchanged translation units reuse the previous full check; all shell scripts PASS |
+| Package migration | Actual postinst lifecycle 87/87 PASS `/tmp/punto-legacy-mode-green.log` |
+
+Frozen EventLoop SHA256:
+`d66c166699fc974c166e1398a3164eb1a18118b3c4d6b12651ed72caaf1205d3`.
+Frozen UndoDetector SHA256:
+`dcd8d32fe6b659ccead03b75e634c4d82edd4b2bafae7b04695750ac60f41b54`.
+Final publication requires green CI for the exact release commit, including the
+full packaging/reproducibility matrix, plus lifecycle checks on the final local
+artifact. Release notes and the delivery report carry the published checksum
+and host read-back; source health alone is not installation proof.
+
+## Previous functional checkpoint (edbce08, first candidate 2.8.9)
 
 The restored Release executor passes actual GTK selection layout/case/translit,
 repeated word correction, immediate/native undo, CapsLock and CapsLock+NumLock,

@@ -44,7 +44,7 @@ std::string word_exclusion_key(std::span<const KeyEntry> word) {
   for (const auto &entry : word) {
     if (entry.code >= kScancodeToChar.size()) return {};
     const char character = kScancodeToChar[entry.code];
-    if (character < 'a' || character > 'z') return {};
+    if (character == '\0') return {};
     key += character;
   }
   return key;

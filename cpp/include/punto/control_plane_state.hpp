@@ -169,7 +169,8 @@ inline bool write_all(int fd, std::string_view payload) noexcept {
   return true;
 }
 
-inline std::optional<std::string> read_bounded(int fd) {
+inline std::optional<std::string>
+read_bounded(int fd, std::size_t maximum_bytes = kMaxControlPlaneStateBytes) {
   std::string payload;
   payload.reserve(512U);
   char chunk[1024];
@@ -177,7 +178,7 @@ inline std::optional<std::string> read_bounded(int fd) {
     const ssize_t count = ::read(fd, chunk, sizeof(chunk));
     if (count > 0) {
       const std::size_t size = static_cast<std::size_t>(count);
-      if (payload.size() > kMaxControlPlaneStateBytes - size) {
+      if (size > maximum_bytes - payload.size()) {
         return std::nullopt;
       }
       payload.append(chunk, size);

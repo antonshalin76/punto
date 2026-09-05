@@ -710,9 +710,19 @@ if(BUILD_TESTING)
                 SKIP_RETURN_CODE 77
                 RUN_SERIAL TRUE
         )
+        add_test(
+            NAME punto-event-loop-sandbox-contract
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_event_loop_sandbox_contract.py
+                    $<TARGET_FILE:punto-event-loop-e2e-driver>
+        )
+        set_tests_properties(
+            punto-event-loop-sandbox-contract
+            PROPERTIES TIMEOUT 70 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+        )
         if(DEFINED ENV{CI} AND NOT "$ENV{CI}" STREQUAL "")
             set_property(
-                TEST punto-event-loop-gtk-e2e
+                TEST punto-event-loop-gtk-e2e punto-event-loop-sandbox-contract
                 APPEND PROPERTY ENVIRONMENT
                     "PUNTO_REQUIRE_EVENT_LOOP_E2E=1"
             )

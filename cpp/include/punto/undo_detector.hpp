@@ -54,8 +54,11 @@ public:
   void load_from_file();
   void add_exclusion(const std::string &word);
 
-  static constexpr std::size_t maximum_entries() noexcept { return 128U; }
+  static constexpr std::size_t maximum_entries() noexcept { return 1024U; }
   static constexpr std::size_t maximum_word_bytes() noexcept { return 63U; }
+  static constexpr std::size_t maximum_file_bytes() noexcept {
+    return maximum_entries() * (maximum_word_bytes() + 1U);
+  }
 
 private:
   enum class PersistenceMutation { Add, Clear, Refresh, SyncDirectory };

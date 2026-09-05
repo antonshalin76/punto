@@ -1,6 +1,7 @@
 #include "punto/undo_detector.hpp"
 
 #include "punto/control_plane_state.hpp"
+#include "punto/scancode_map.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -49,9 +50,10 @@ parse_exclusions(std::string_view payload) {
     const bool valid =
         word.size() <= UndoDetector::maximum_word_bytes() &&
         std::all_of(word.begin(), word.end(), [](char character) {
-          return character >= 'a' && character <= 'z';
+          return character >= '!' && character <= '~';
         });
-    if (!valid || parsed.size() >= UndoDetector::maximum_entries()) {
+    if (!valid || (!parsed.contains(word) &&
+                   parsed.size() >= UndoDetector::maximum_entries())) {
       return std::nullopt;
     }
     parsed.insert(word);
@@ -78,7 +80,7 @@ read_exclusions_at(int directory_fd, std::string_view name,
     (void)::close(fd);
     return std::nullopt;
   }
-  const auto payload = detail::read_bounded(fd);
+  const auto payload = detail::read_bounded(fd, UndoDetector::maximum_file_bytes());
   const bool closed = ::close(fd) == 0;
   if (!payload || !closed) {
     return std::nullopt;
@@ -357,11 +359,11 @@ bool UndoDetector::persistence_failed() const noexcept {
 }
 
 bool UndoDetector::valid_word(const std::string &word) noexcept {
-  return !word.empty() && word.size() <= maximum_word_bytes() &&
+  return !word.empty() && word.front() != '#' && word.size() <= maximum_word_bytes() &&
          std::all_of(word.begin(), word.end(), [](char character) {
-           const auto byte = static_cast<unsigned char>(character);
-           return byte >= static_cast<unsigned char>('a') &&
-                  byte <= static_cast<unsigned char>('z');
+           return character != '\0' &&
+                  std::find(kScancodeToChar.begin(), kScancodeToChar.end(), character) !=
+                      kScancodeToChar.end();
          });
 }
 
@@ -450,7 +452,7 @@ Publication UndoDetector::Store::persist(PersistenceMutation mutation,
     payload += word;
     payload.push_back('\n');
   }
-  if (payload.size() > detail::kMaxControlPlaneStateBytes) {
+  if (payload.size() > maximum_file_bytes()) {
     (void)::close(lock_fd);
     (void)::close(directory_fd);
     return Publication::NotPublished;

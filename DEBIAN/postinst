@@ -108,6 +108,28 @@ case "${1:-}" in
             echo "punto-switcher: /etc/punto is not root-owned and protected" >&2
             exit 1
         fi
+
+        # Older releases created learned exclusions with the default 0644
+        # mode. Only secure this exact trusted inode; never rewrite its words
+        # or follow links. The validated parent cannot be replaced by users.
+        punto_exclusions=/etc/punto/undo_exclusions.txt
+        if [ -e "$punto_exclusions" ] || [ -L "$punto_exclusions" ]; then
+            punto_exclusions_state=unsafe
+            if [ -f "$punto_exclusions" ] && [ ! -L "$punto_exclusions" ]; then
+                punto_exclusions_state=$(stat -c '%u:%g:%a:%h' "$punto_exclusions" 2>/dev/null || true)
+            fi
+            case "$punto_exclusions_state" in
+                0:0:644:1)
+                    if ! chmod 0600 "$punto_exclusions" ||
+                       [ "$(stat -c '%u:%g:%a:%h' "$punto_exclusions" 2>/dev/null || true)" != 0:0:600:1 ]; then
+                        echo "punto-switcher: cannot secure legacy exclusions" >&2
+                        exit 1
+                    fi
+                    ;;
+                0:0:600:1) ;;
+                *) echo "punto-switcher: unsafe legacy exclusions left unchanged" >&2 ;;
+            esac
+        fi
         runtime_gid=/etc/punto/runtime-gid
         runtime_gid_current=false
         if [ -f "$runtime_gid" ] && [ ! -L "$runtime_gid" ]; then

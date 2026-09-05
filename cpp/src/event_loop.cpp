@@ -2211,7 +2211,7 @@ void EventLoop::process_pending_word_edit() {
 bool EventLoop::wait_and_buffer(std::chrono::steady_clock::time_point deadline) {
   while (std::chrono::steady_clock::now() < deadline) {
     if (stop_requested_.load(std::memory_order_relaxed) ||
-        (ipc_mailbox_ && ipc_mailbox_->size() != 0) ||
+        (ipc_mailbox_ && ipc_mailbox_->has_pending_mutation()) ||
         pending_events_.size() >= kMacroEventCapacity || macro_input_eof_) return false;
     std::array<pollfd, 2> descriptors{{{STDIN_FILENO, POLLIN, 0},
                                       {stop_signal_fd_, POLLIN, 0}}};
@@ -2248,7 +2248,7 @@ bool EventLoop::wait_and_buffer(std::chrono::steady_clock::time_point deadline) 
   }
   return !stop_requested_.load(std::memory_order_relaxed) && !macro_input_eof_ &&
          pending_events_.size() < kMacroEventCapacity &&
-         (!ipc_mailbox_ || ipc_mailbox_->size() == 0);
+         (!ipc_mailbox_ || !ipc_mailbox_->has_pending_mutation());
 }
 
 void EventLoop::drain_pending_events() {

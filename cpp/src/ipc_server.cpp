@@ -43,6 +43,7 @@ using namespace std::chrono_literals;
 
 #if defined(PUNTO_IPC_MAILBOX_TESTING)
 std::atomic<IpcMailboxProducerTestHook> g_mailbox_producer_test_hook{nullptr};
+std::atomic<IpcMailboxProducerTestHook> g_mailbox_admitted_test_hook{nullptr};
 #endif
 
 constexpr std::size_t kMaximumPayloadBytes = 254;
@@ -63,6 +64,10 @@ std::string format_response(const IpcResult &result) {
   return response;
 }
 
+bool is_read_only(IpcVerb verb) noexcept {
+  return verb == IpcVerb::GetStatus || verb == IpcVerb::Stats;
+}
+
 IpcCommandSink
 make_mailbox_sink(const std::shared_ptr<IpcCommandMailbox> &mailbox,
                   IpcEndpointMode endpoint_mode) {
@@ -72,7 +77,7 @@ make_mailbox_sink(const std::shared_ptr<IpcCommandMailbox> &mailbox,
       return IpcEnqueueResult::Failed;
     }
     if (endpoint_mode == IpcEndpointMode::DiagnosticReadOnly &&
-        request.verb != IpcVerb::GetStatus && request.verb != IpcVerb::Stats) {
+        !is_read_only(request.verb)) {
       try {
         complete({false, "Read-only diagnostic endpoint"});
         return IpcEnqueueResult::Accepted;
@@ -763,6 +768,12 @@ IpcCommandMailbox::try_enqueue(IpcRequest request,
     return IpcEnqueueResult::Failed;
   }
   impl_->write_position.store(next, std::memory_order_release);
+#if defined(PUNTO_IPC_MAILBOX_TESTING)
+  if (const auto hook = g_mailbox_admitted_test_hook.load(std::memory_order_acquire);
+      hook != nullptr) {
+    hook();
+  }
+#endif
   return IpcEnqueueResult::Accepted;
 }
 
@@ -804,6 +815,10 @@ void set_ipc_mailbox_producer_test_hook(
     IpcMailboxProducerTestHook hook) noexcept {
   g_mailbox_producer_test_hook.store(hook, std::memory_order_release);
 }
+void set_ipc_mailbox_admitted_test_hook(
+    IpcMailboxProducerTestHook hook) noexcept {
+  g_mailbox_admitted_test_hook.store(hook, std::memory_order_release);
+}
 #endif
 
 bool IpcCommandMailbox::is_open() const noexcept {
@@ -825,6 +840,19 @@ std::size_t IpcCommandMailbox::size() const noexcept {
 
 std::size_t IpcCommandMailbox::capacity() const noexcept {
   return impl_ ? impl_->usable_capacity : 0;
+}
+
+bool IpcCommandMailbox::has_pending_mutation() const noexcept {
+  if (!impl_) return false;
+  if (impl_->consumer_busy.test_and_set(std::memory_order_acquire)) return true;
+  Impl::BusyGuard consumer_guard{impl_->consumer_busy};
+  const auto write = impl_->write_position.load(std::memory_order_acquire);
+  for (auto read = impl_->read_position.load(std::memory_order_relaxed);
+       read != write; read = (read + 1U) % impl_->slots.size()) {
+    const auto &slot = impl_->slots[read];
+    if (!slot || !is_read_only(slot->request.verb)) return true;
+  }
+  return false;
 }
 
 IpcFramePolicy::IpcFramePolicy(Clock::time_point accepted_at)

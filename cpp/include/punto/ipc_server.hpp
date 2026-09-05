@@ -90,6 +90,8 @@ public:
 
   [[nodiscard]] bool is_open() const noexcept;
   [[nodiscard]] std::size_t size() const noexcept;
+  // Owner-side observation only; never drains or completes queued requests.
+  [[nodiscard]] bool has_pending_mutation() const noexcept;
   [[nodiscard]] std::size_t capacity() const noexcept;
 
 private:
@@ -100,6 +102,8 @@ private:
 #if defined(PUNTO_IPC_MAILBOX_TESTING)
 using IpcMailboxProducerTestHook = void (*)() noexcept;
 void set_ipc_mailbox_producer_test_hook(
+    IpcMailboxProducerTestHook hook) noexcept;
+void set_ipc_mailbox_admitted_test_hook(
     IpcMailboxProducerTestHook hook) noexcept;
 #endif
 

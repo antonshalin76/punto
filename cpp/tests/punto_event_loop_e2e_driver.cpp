@@ -1,4 +1,5 @@
 #include "punto/event_loop.hpp"
+#include "punto/ipc_server.hpp"
 
 #include <fcntl.h>
 #include <grp.h>
@@ -7,6 +8,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -47,6 +49,22 @@ bool consume_private_fault_marker(const char *path) {
 
 std::mutex keyboard_query_mutex;
 std::optional<std::pair<xcb_connection_t *, unsigned int>> keyboard_query;
+std::atomic<bool> macro_ipc_hold{false};
+std::atomic<bool> macro_ipc_admitted{false};
+
+void mark_private_macro_event(const char *path) noexcept {
+  const int marker = ::open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (marker >= 0) {
+    (void)::close(marker);
+  }
+}
+
+void observe_admitted_macro_ipc() noexcept {
+  if (macro_ipc_hold.load(std::memory_order_acquire)) {
+    mark_private_macro_event("/run/punto-e2e-macro-ipc-admitted");
+    macro_ipc_admitted.store(true, std::memory_order_release);
+  }
+}
 } // namespace
 
 extern "C" decltype(xcb_intern_atom) __real_xcb_intern_atom;
@@ -58,6 +76,21 @@ extern "C" xcb_intern_atom_cookie_t __wrap_xcb_intern_atom(
     // A test-only scheduling delay, not proof of interruptible I/O expiry.
     std::cerr << "[fixture] Clipboard initialization delay reached\n";
     std::this_thread::sleep_for(std::chrono::milliseconds{20});
+  }
+  if (std::string_view{name, length} == "CLIPBOARD" &&
+      consume_private_fault_marker("/run/punto-e2e-hold-macro-ipc")) {
+    macro_ipc_admitted.store(false, std::memory_order_relaxed);
+    macro_ipc_hold.store(true, std::memory_order_release);
+    mark_private_macro_event("/run/punto-e2e-macro-ipc-held");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{150};
+    while (std::chrono::steady_clock::now() < deadline &&
+           !macro_ipc_admitted.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    if (!macro_ipc_admitted.load(std::memory_order_acquire)) {
+      mark_private_macro_event("/run/punto-e2e-macro-ipc-expired");
+    }
+    macro_ipc_hold.store(false, std::memory_order_release);
   }
   return __real_xcb_intern_atom(connection, only_if_exists, length, name);
 }
@@ -394,6 +427,7 @@ punto::DictionaryLoadOutcome blocking_dictionary_loader() {
 } // namespace
 
 int main() {
+  punto::set_ipc_mailbox_admitted_test_hook(observe_admitted_macro_ipc);
   int stop_pipe[2] = {-1, -1};
   if (::pipe2(stop_pipe, O_CLOEXEC | O_NONBLOCK) != 0) {
     std::cerr << "failed to create stop pipe\n";

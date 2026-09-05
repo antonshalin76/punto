@@ -2186,6 +2186,82 @@ class EventLoopGtkE2E(unittest.TestCase):
     def test_reload_invalidates_delayed_keyboard_observation(self) -> None:
         self.assert_control_invalidates_observation(b"RELOAD\n")
 
+    def assert_queued_ipc_during_macro(self, command: bytes, changes_context: bool) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn", "native source word")
+        paths = {name: pathlib.Path("/run", name) for name in (
+            "punto-e2e-hold-macro-ipc", "punto-e2e-macro-ipc-held",
+            "punto-e2e-macro-ipc-admitted", "punto-e2e-macro-ipc-expired",
+        )}
+        for path in paths.values():
+            path.unlink(missing_ok=True)
+            self.addCleanup(path.unlink, missing_ok=True)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(EVENT_TIMEOUT)
+            client.connect("/run/punto.sock")
+            paths["punto-e2e-hold-macro-ipc"].touch(mode=0o600)
+            self.harness.send_key(KEY_PAUSE)
+            self.pump_until(paths["punto-e2e-macro-ipc-held"].exists,
+                            "macro held before context check")
+            sent_at = time.monotonic()
+            client.sendall(command)
+            client.setblocking(False)
+            response = bytearray()
+
+            def receive_reply():
+                try:
+                    chunk = client.recv(8192)
+                except BlockingIOError:
+                    return False
+                self.assertTrue(chunk, "IPC connection closed before response")
+                response.extend(chunk)
+                return b"\n" in response
+
+            self.pump_until(receive_reply, "queued command completed after macro")
+            self.assertLess(time.monotonic() - sent_at, 3.0,
+                            "queued IPC response remains bounded through macro execution")
+        self.assertTrue(paths["punto-e2e-macro-ipc-admitted"].exists(),
+                        "IPC request was published into the mailbox while macro was held")
+        self.assertFalse(paths["punto-e2e-macro-ipc-expired"].exists(),
+                         "macro resumed on admitted request, not hold timeout")
+        self.assertFalse(paths["punto-e2e-hold-macro-ipc"].exists())
+        if command == b"STATS\n":
+            self.assertTrue(response.startswith(b"OK "), bytes(response))
+            self.assertIn(b"word_dispatches=1", response)
+        else:
+            self.assertEqual(bytes(response), {
+                b"GET_STATUS\n": b"OK ENABLED\n",
+                b"SET_STATUS 0\n": b"OK DISABLED\n",
+                b"RELOAD\n": b"OK Scheduled\n",
+                b"SHUTDOWN\n": b"ERROR Shutdown not allowed via IPC\n",
+            }[command])
+        if changes_context:
+            self.pump_until(lambda: "Word edit dispatch status=0" in self.harness.diagnostic(),
+                            "queued write cancels macro before mutation")
+            self.assert_no_word_mutation("ghbdtn")
+        else:
+            self.pump_until(lambda: self.entry.get_text() == "привет",
+                            "read-only IPC preserves exact GTK correction")
+            self.assertEqual(self.entry.get_selection_bounds(), ())
+            self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+        self.assertIsNone(self.harness.process.poll(), "IPC command did not terminate daemon")
+
+    def test_queued_get_status_does_not_cancel_macro(self) -> None:
+        self.assert_queued_ipc_during_macro(b"GET_STATUS\n", False)
+
+    def test_queued_stats_does_not_cancel_macro(self) -> None:
+        self.assert_queued_ipc_during_macro(b"STATS\n", False)
+
+    def test_queued_status_change_cancels_macro(self) -> None:
+        self.assert_queued_ipc_during_macro(b"SET_STATUS 0\n", True)
+
+    def test_queued_reload_cancels_macro(self) -> None:
+        self.assert_queued_ipc_during_macro(b"RELOAD\n", True)
+
+    def test_queued_shutdown_cancels_macro_without_shutdown_authority(self) -> None:
+        self.assert_queued_ipc_during_macro(b"SHUTDOWN\n", True)
+
     def test_keyboard_observation_stall_keeps_input_live_and_recovers(self) -> None:
         self.prepare_word_editor()
         self.harness.type_word("ghbdtn")

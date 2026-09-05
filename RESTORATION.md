@@ -65,7 +65,51 @@ external configuration edit; this release does not change that contract.
 Exact-commit CI, final artifact checks and installed read-back are recorded
 separately in the release delivery report.
 
-### Browser lifecycle and rejection diagnostics checkpoint
+### Read-only IPC and macro cancellation checkpoint
+
+The tray polls STATS every two seconds. Both STATS and GET_STATUS are queued
+for EventLoop, but wait_and_buffer previously cancelled a macro for any queued
+command. A real Unix request admitted during a held clipboard initialization
+reproduces this: both read commands reject at context_changed and leave the
+source word unchanged. This is a separate source-proven product defect, not
+an asserted explanation of the earlier tray-free hosted Chromium failure.
+
+The IPC layer now shares one read-only verb classifier between diagnostic
+admission and an owner-side pending-mutation query. The query holds the existing
+consumer guard and scans one acquire-loaded published ring interval without
+draining, changing counters or executing callbacks. Unknown verbs, missing slots
+and consumer contention are conservative. EventLoop still owns cancellation;
+both wait checks now cancel for pending mutations, not read requests. Stop,
+input bounds, FIFO order and the existing macro deadline are unchanged.
+
+R1 covers GET_STATUS/STATS preserving exact GTK text correction and real replies.
+R2 covers SET_STATUS, RELOAD and denied SHUTDOWN retaining cancellation and no
+editor mutation. R3 covers all verbs, unknown verbs, writes behind reads,
+wraparound, capacity, FIFO/completions, close with pending writes and an
+unpublished stalled producer. R4 measures full replies below three seconds.
+Consumer contention is source-reviewed, not deterministically forced in tests.
+Test-only synchronization acknowledges enqueue after publication and expires
+after 150 ms; tests reject expiry, so socket-send timing cannot create a false
+pass. No hook is compiled into production.
+
+Actual old-runtime RED: `/tmp/punto-ipc-macro-red.log` (two read failures, three
+control negatives passing). The missing-API compilation failure in
+`/tmp/punto-readonly-ipc-api-red.log` is secondary evidence only. Final focused
+Release/Debug pass 5/5 in `/tmp/punto-ipc-macro-release-green.log` and
+`/tmp/punto-ipc-macro-debug-green.log`; IPC contracts pass in
+`/tmp/punto-readonly-ipc-unit-release.log` and
+`/tmp/punto-readonly-ipc-unit-debug.log`.
+
+Independent BDD critic, separate auditor, pre-RED SRP, RED critic and final
+source/SRP reviews passed. IPC owns classification and queue observation;
+EventLoop owns macro policy, and test adapters supply evidence only. Persistence,
+UI state and broker routing are unchanged/N/A. No further refactor was needed.
+Seven existing implementation/test/build files add 195/remove 4 lines. Excluding
+test-only hooks, production changes add 22/remove 3 lines (net 19), buying the
+non-interference property. No file, queue implementation or parallel state owner
+is added. Final source CI and package/install evidence remain separate gates.
+
+### Browser lifecycle and rejection diagnostics evidence
 
 Hosted CI then exposed a test cleanup defect: Chrome's parent could exit while
 descendants still wrote its private profile. The fixture now owns a separate

@@ -410,6 +410,50 @@ void test_typed_mailbox_is_bounded_fifo_and_owner_drained() {
          "closed mailbox accepted a new command");
 }
 
+void test_mailbox_pending_mutations_preserve_fifo_and_wraparound() {
+  using punto::IpcVerb;
+  punto::IpcCommandMailbox mailbox{3};
+  int completions = 0;
+  const auto complete = [&completions](punto::IpcResult) { ++completions; };
+  const std::array verbs{IpcVerb::GetStatus, IpcVerb::Stats, IpcVerb::SetStatus,
+                         IpcVerb::Reload, IpcVerb::Shutdown,
+                         static_cast<IpcVerb>(999)};
+  for (const auto verb : verbs) {
+    const bool mutating = verb != IpcVerb::GetStatus && verb != IpcVerb::Stats;
+    expect(!mailbox.has_pending_mutation(), "empty mailbox cancelled a macro");
+    for (const auto queued : {IpcVerb::GetStatus, IpcVerb::Stats, verb}) {
+      expect(mailbox.try_enqueue({queued, {}}, complete) ==
+                 punto::IpcEnqueueResult::Accepted, "matrix enqueue failed");
+    }
+    expect(mailbox.try_enqueue({IpcVerb::Reload, {}}, complete) ==
+               punto::IpcEnqueueResult::Failed, "matrix exceeded capacity");
+    const auto completed_before = completions;
+    for (int repeat = 0; repeat < 10; ++repeat) {
+      expect(mailbox.has_pending_mutation() == mutating,
+             "published write behind reads was misclassified");
+      expect(mailbox.size() == 3 && completions == completed_before,
+             "observational scan drained or completed a command");
+    }
+    for (const auto expected : {IpcVerb::GetStatus, IpcVerb::Stats, verb}) {
+      expect(mailbox.has_pending_mutation() == mutating,
+             "mutation visibility changed before its dequeue");
+      auto pending = mailbox.try_dequeue();
+      expect(pending && pending->request.verb == expected,
+             "scan disturbed wrapped FIFO order");
+      pending->complete({true, {}});
+    }
+    expect(!mailbox.has_pending_mutation() && mailbox.size() == 0,
+           "drained mutation remained visible");
+    expect(completions == completed_before + 3, "completion ownership changed");
+  }
+  expect(mailbox.try_enqueue({IpcVerb::Reload, {}}, complete) ==
+             punto::IpcEnqueueResult::Accepted, "close fixture enqueue failed");
+  expect(mailbox.close() && mailbox.has_pending_mutation(),
+         "closing admission hid an already admitted mutation");
+  expect(mailbox.try_dequeue().has_value() && !mailbox.has_pending_mutation(),
+         "closed mailbox did not retain owner drain semantics");
+}
+
 void test_mailbox_close_is_a_linearized_admission_barrier() {
   constexpr std::size_t capacity = 32'768;
   punto::IpcCommandMailbox mailbox{capacity};
@@ -460,7 +504,7 @@ void test_mailbox_close_is_bounded_when_a_producer_stalls() {
 
   punto::IpcEnqueueResult producer_result = punto::IpcEnqueueResult::Failed;
   std::thread producer{[&] {
-    producer_result = mailbox.try_enqueue({punto::IpcVerb::Stats, {}},
+    producer_result = mailbox.try_enqueue({punto::IpcVerb::Reload, {}},
                                           [](punto::IpcResult) {});
   }};
 
@@ -470,6 +514,7 @@ void test_mailbox_close_is_bounded_when_a_producer_stalls() {
     std::this_thread::yield();
   }
   const bool entered = g_mailbox_hook_entered.load(std::memory_order_acquire);
+  const bool unpublished_mutation = mailbox.has_pending_mutation();
   const auto started = Clock::now();
   const bool closed = mailbox.close(20ms);
   const auto elapsed = Clock::now() - started;
@@ -479,6 +524,7 @@ void test_mailbox_close_is_bounded_when_a_producer_stalls() {
   punto::set_ipc_mailbox_producer_test_hook(nullptr);
 
   expect(entered, "mailbox producer test hook was not reached");
+  expect(!unpublished_mutation, "scan observed an unpublished producer slot");
   expect(!closed, "stalled mailbox producer bypassed the close deadline");
   expect(elapsed >= 20ms && elapsed < 250ms,
          "mailbox close did not honor its bounded wait window");
@@ -3574,6 +3620,7 @@ int main() {
       {"LF irreversible", test_lf_is_irreversible_across_recv_segmentation},
       {"typed owner-drained mailbox",
        test_typed_mailbox_is_bounded_fifo_and_owner_drained},
+      {"mailbox mutation visibility", test_mailbox_pending_mutations_preserve_fifo_and_wraparound},
       {"linearized mailbox close",
        test_mailbox_close_is_a_linearized_admission_barrier},
       {"bounded mailbox close",

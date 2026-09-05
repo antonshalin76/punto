@@ -75,6 +75,8 @@ public:
   ClipboardManager &operator=(const ClipboardManager &) = delete;
 
   [[nodiscard]] bool open();
+  /** Uses the caller's initialization deadline without changing request timeouts. */
+  [[nodiscard]] bool open(std::chrono::steady_clock::time_point deadline);
   void close() noexcept;
   [[nodiscard]] bool is_open() const noexcept;
 

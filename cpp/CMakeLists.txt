@@ -695,6 +695,7 @@ if(BUILD_TESTING)
         target_link_options(punto-event-loop-e2e-driver PRIVATE
             -Wl,--wrap=fsync -Wl,--wrap=xcb_xkb_get_map
             -Wl,--wrap=xcb_xkb_get_state -Wl,--wrap=xcb_poll_for_reply
+            -Wl,--wrap=xcb_intern_atom
             -Wl,--wrap=xcb_disconnect)
 
         add_test(

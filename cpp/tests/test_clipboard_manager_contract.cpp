@@ -34,6 +34,9 @@ bool disconnected = false;
 bool used_after_disconnect = false;
 
 void suspend(xcb_connection_t *candidate, Stage candidate_stage) {
+  if (stage != Stage::None && stage == candidate_stage && connection == nullptr) {
+    connection = candidate;
+  }
   if (candidate == connection && stage == candidate_stage && !stopped) {
     stopped = ::kill(server, SIGSTOP) == 0;
   }
@@ -1224,6 +1227,7 @@ struct NestedXServer {
 
   ~NestedXServer() {
     if (pid > 0) {
+      (void)::kill(pid, SIGCONT);
       (void)::kill(pid, SIGTERM);
       (void)::waitpid(pid, nullptr, 0);
     }
@@ -1380,6 +1384,114 @@ void test_initialization_stall(initialization_fault::Stage stage) {
          "initialization timeout closes its connection");
 }
 
+void test_caller_initialization_deadline() {
+  using namespace std::chrono_literals;
+  using Clock = std::chrono::steady_clock;
+  NestedXServer server = start_nested_xvfb();
+  struct PrivateAuthority {
+    char path[48] = "/tmp/punto-clipboard-deadline-XXXXXX";
+    ~PrivateAuthority() { (void)::unlink(path); }
+  } authority;
+  const int descriptor = ::mkstemp(authority.path);
+  expect(descriptor >= 0, "create private empty Xauthority for nested server");
+  expect(::close(descriptor) == 0, "close private Xauthority");
+  punto::X11Session session{[&] {
+    punto::X11SessionInfo info;
+    info.uid = static_cast<std::uint32_t>(::geteuid());
+    info.gid = static_cast<std::uint32_t>(::getegid());
+    info.display = server.display;
+    info.xauthority_path = authority.path;
+    return punto::x11_detail::ProbeResult{
+        punto::x11_detail::ProbeStatus::Healthy, std::move(info)};
+  }};
+  expect(session.initialize(), "publish only the private nested X11 session");
+
+  const auto open_with_pause = [&](initialization_fault::Stage stage,
+                                   bool caller_budget) {
+    auto manager = std::make_unique<punto::ClipboardManager>(session, 10ms);
+    initialization_fault::stage = stage;
+    initialization_fault::connection = nullptr;
+    initialization_fault::server = server.pid;
+    initialization_fault::stopped = false;
+    initialization_fault::disconnected = false;
+    initialization_fault::used_after_disconnect = false;
+    std::jthread resume_server{[pid = server.pid](std::stop_token stop) {
+      while (!initialization_fault::stopped.load() && !stop.stop_requested()) {
+        std::this_thread::sleep_for(1ms);
+      }
+      if (!stop.stop_requested()) {
+        std::this_thread::sleep_for(20ms);
+        (void)::kill(pid, SIGCONT);
+      }
+    }};
+    const auto started = Clock::now();
+    const bool opened = caller_budget ? manager->open(started + 100ms)
+                                      : manager->open();
+    const auto elapsed = Clock::now() - started;
+    (void)::kill(server.pid, SIGCONT);
+    resume_server.request_stop();
+    resume_server.join();
+    const bool stopped = initialization_fault::stopped;
+    const bool used_after_disconnect = initialization_fault::used_after_disconnect;
+    initialization_fault::stage = initialization_fault::Stage::None;
+    initialization_fault::connection = nullptr;
+    expect(stopped, "public open reaches the requested initialization boundary");
+    expect(!used_after_disconnect, "deadline initialization never uses revoked XCB");
+    expect(opened == caller_budget && manager->is_open() == caller_budget,
+           "caller deadline admits initialization beyond unchanged 10ms request budget");
+    expect(elapsed < 100ms, "initialization never receives a fresh caller budget");
+    return manager;
+  };
+
+  for (const auto stage : {initialization_fault::Stage::Atom,
+                           initialization_fault::Stage::Extension}) {
+    auto manager = open_with_pause(stage, true);
+    expect(manager->set_text(punto::Selection::Clipboard, "deadline-test") ==
+               punto::ClipboardResult::Ok,
+           "own payload before idempotency and request deadline checks");
+    const auto generation = manager->selection_generation(punto::Selection::Clipboard);
+    expect(manager->open(Clock::now() - 1ms) && manager->open() &&
+               manager->locally_owns_generation(punto::Selection::Clipboard, generation),
+           "already-open calls preserve ownership even with expired initialization deadline");
+    expect(::kill(server.pid, SIGSTOP) == 0, "stop private server with owned payload");
+    std::jthread rescue{[pid = server.pid] {
+      std::this_thread::sleep_for(100ms);
+      (void)::kill(pid, SIGCONT);
+    }};
+    const auto started = Clock::now();
+    const bool owned = manager->verify_ownership();
+    const auto elapsed = Clock::now() - started;
+    (void)::kill(server.pid, SIGCONT);
+    expect(!owned && !manager->is_open() && elapsed < 50ms,
+           "generous initialization does not replace the 10ms request timeout");
+  }
+  (void)open_with_pause(initialization_fault::Stage::Atom, false);
+
+  punto::ClipboardManager short_budget{session, 100ms};
+  initialization_fault::stage = initialization_fault::Stage::Atom;
+  initialization_fault::connection = nullptr;
+  initialization_fault::stopped = false;
+  const bool expired_opened = short_budget.open(Clock::now() - 1ms);
+  const bool expired_initialized = initialization_fault::stopped ||
+                                   initialization_fault::connection != nullptr;
+  (void)::kill(server.pid, SIGCONT);
+  initialization_fault::stage = initialization_fault::Stage::None;
+  initialization_fault::connection = nullptr;
+  expect(!expired_opened && !short_budget.is_open() && !expired_initialized,
+         "expired caller deadline fails closed before initialization");
+  expect(::kill(server.pid, SIGSTOP) == 0, "stop private server before short deadline");
+  std::jthread rescue{[pid = server.pid] {
+    std::this_thread::sleep_for(100ms);
+    (void)::kill(pid, SIGCONT);
+  }};
+  const auto started = Clock::now();
+  const bool opened = short_budget.open(started + 5ms);
+  const auto elapsed = Clock::now() - started;
+  (void)::kill(server.pid, SIGCONT);
+  expect(!opened && !short_budget.is_open() && elapsed < 50ms,
+         "short caller deadline is not replaced by the 100ms request timeout");
+}
+
 void test_stopped_server_large_payload_send_is_bounded() {
   NestedXServer server = start_nested_xvfb();
   Connection owner = connect_to(server.display.c_str());
@@ -1440,6 +1552,8 @@ int main(int argc, char **argv) {
         test_initialization_stall(initialization_fault::Stage::Atom);
       } else if (selected == "initialization-extension") {
         test_initialization_stall(initialization_fault::Stage::Extension);
+      } else if (selected == "initialization-deadline") {
+        test_caller_initialization_deadline();
       } else {
         throw std::runtime_error{"unknown focused test"};
       }
@@ -1447,6 +1561,7 @@ int main(int argc, char **argv) {
       return 0;
     }
     run("cold-initialization", test_cold_initialization);
+    run("initialization-deadline", test_caller_initialization_deadline);
     run("initialization-atom",
         [] { test_initialization_stall(initialization_fault::Stage::Atom); });
     run("initialization-extension", [] {

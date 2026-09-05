@@ -118,6 +118,12 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
                         "second native browser correction with retained PRIMARY")
         self.pump_until(lambda: self.dispatches() == 2, "second dispatch receipt")
 
+    def test_delayed_clipboard_initialization_uses_remaining_macro_budget(self):
+        marker = pathlib.Path("/run/punto-e2e-slow-clipboard-init")
+        marker.touch(mode=0o600)
+        self.first_manual_conversion()
+        self.assertFalse(marker.exists(), "clipboard initialization fault was not reached")
+
     def test_consecutive_automatic_corrections(self):
         self.assertEqual(gtk.ipc_request(b"SET_STATUS 1\n"), b"OK ENABLED\n")
         self.harness.type_word("ghbdtn")

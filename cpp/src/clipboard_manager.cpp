@@ -89,11 +89,15 @@ ClipboardManager::ClipboardManager(xcb_connection_t *connection,
 ClipboardManager::~ClipboardManager() { close(); }
 
 bool ClipboardManager::open() {
+  return open(std::chrono::steady_clock::now() + timeout_);
+}
+
+bool ClipboardManager::open(std::chrono::steady_clock::time_point deadline) {
   if (is_open()) {
     return true;
   }
   close();
-  if (session_ == nullptr) {
+  if (session_ == nullptr || std::chrono::steady_clock::now() >= deadline) {
     return false;
   }
 
@@ -101,7 +105,6 @@ bool ClipboardManager::open() {
   if (!lease) {
     return false;
   }
-  const auto deadline = std::chrono::steady_clock::now() + timeout_;
   return initialize_connection(lease->open_bounded_connection(deadline),
                                deadline);
 }

@@ -611,7 +611,7 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     clipboard_ = std::make_unique<ClipboardManager>(session_, kClipboardBudget);
     clipboard_session_ = lease->generation();
   }
-  if (!clipboard_time() || !clipboard_->open() || !clipboard_time()) {
+  if (!clipboard_time() || !clipboard_->open(deadline) || !clipboard_time()) {
     return outcome;
   }
   const auto kind = clipboard_->active_window_kind();

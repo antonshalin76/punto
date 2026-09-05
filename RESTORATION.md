@@ -65,6 +65,65 @@ external configuration edit; this release does not change that contract.
 Exact-commit CI, final artifact checks and installed read-back are recorded
 separately in the release delivery report.
 
+### Initialization deadline checkpoint
+
+The first hosted run failed the initial browser startup at the fixture's
+15-second deadline; subsequent browser cases passed. The fixture now allows
+45 seconds within the existing sandbox/CTest bounds. A real browser delayed
+16 seconds fails the old readiness check and passes the new one; exited and
+no-window children still fail and are reaped. Production deadlines are unchanged.
+
+A subsequent hosted Release run rejected the first automatic edit before text
+preparation; sanitized Debug passed. Local diagnostic trials did not reproduce
+that exact rejection, so its cause is not asserted. Inspection did expose a
+separate budget coupling: ClipboardManager initialization shared the 10 ms
+per-request timeout across connection setup, atom requests, extension setup and
+selection baselines. A controlled 20 ms initialization delay reproduced rejection
+of a valid native-browser correction before any text change.
+
+WordEditor now passes its existing absolute 300 ms macro deadline to
+ClipboardManager::open(deadline). ClipboardManager remains the initialization
+owner; default open() and ordinary request timeouts retain their previous budget.
+The overload neither starts a fresh macro budget nor changes selection policy.
+Already-open reuse preserves ownership, even if a new initialization deadline
+has expired. Unopened expired calls fail before initialization.
+
+| Scenario | Proof at the owning boundary |
+| --- | --- |
+| C5: valid cold initialization can exceed 10 ms | Native Chrome, one-shot 20 ms initialization delay, exact word/caret/dispatch/PRIMARY oracles |
+| Caller budget, not request budget, bounds initialization | Public open(deadline), real private X11Session, 20 ms stopped-Xvfb atom and extension stages, 100 ms caller budget and 10 ms requests |
+| Expired/short budget is not restarted | Expired call emits no initialization; stopped Xvfb with 5 ms remaining fails before a 100 ms rescue |
+| Default open and request timeouts remain unchanged | Default 10 ms initialization fails on the 20 ms stall; an owned clipboard verification against stopped Xvfb still fails on the 10 ms request budget |
+| Reuse is idempotent | Repeated open preserves the existing owned generation |
+
+Independent BDD critic, separate BDD auditor, pre-RED SRP, actual RED critic and
+final combined source/SRP reviews passed. The request-timeout test first owns
+CLIPBOARD, because verify_ownership otherwise performs no server I/O. The browser
+delay is only a scheduling probe; actual stopped-server checks prove bounded I/O.
+RED: /tmp/punto-init-deadline-browser-red-final.log (delay reached, edit rejected),
+plus /tmp/punto-init-deadline-api-red-build.log (new overload absent).
+GREEN: /tmp/punto-init-deadline-browser-green.log and
+/tmp/punto-init-deadline-clipboard-focused-green.log;
+full clipboard contract: /tmp/punto-init-deadline-clipboard-green.log.
+The API compilation failure alone is not behavioral proof.
+
+Runtime grows by five net lines in three existing files. Test-only fault
+injection uses the existing private marker and linker-wrap mechanism; it is not
+compiled into the production daemon. No new production module, persistence
+owner, fallback or retry was added. UI and broker/proxy decisions are unchanged
+or N/A. No further refactor was needed. This runtime change invalidates the
+earlier package checksum and requires fresh source, artifact and installed gates.
+
+Final local source coverage: Release 25/25 (24 remaining CTest targets in
+/tmp/punto-init-deadline-release-ctest.log plus the unchanged final clipboard
+contract result above); Debug 26/26 (25 in
+/tmp/punto-init-deadline-debug-ctest.log plus the separate GTK clipboard check in
+/tmp/punto-init-deadline-debug-gtk-clipboard.log). Both builds include all 86
+GTK/VTE cases and all five Chromium cases. The original automatic Chromium
+scenario remains first, before the added initialization scenario, so the new
+case does not prewarm that path on a fresh CI host. Package and exact-commit CI
+are separate gates; these results do not certify the user's particular editor.
+
 ## Host-upgrade compatibility checkpoint (2026-09-05, 2.8.9)
 
 The first candidate was installed for host validation but not published. That

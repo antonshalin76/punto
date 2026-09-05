@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 #include <xcb/xcbext.h>
@@ -47,6 +48,19 @@ bool consume_private_fault_marker(const char *path) {
 std::mutex keyboard_query_mutex;
 std::optional<std::pair<xcb_connection_t *, unsigned int>> keyboard_query;
 } // namespace
+
+extern "C" decltype(xcb_intern_atom) __real_xcb_intern_atom;
+extern "C" xcb_intern_atom_cookie_t __wrap_xcb_intern_atom(
+    xcb_connection_t *connection, std::uint8_t only_if_exists,
+    std::uint16_t length, const char *name) {
+  if (std::string_view{name, length} == "CLIPBOARD" &&
+      consume_private_fault_marker("/run/punto-e2e-slow-clipboard-init")) {
+    // A test-only scheduling delay, not proof of interruptible I/O expiry.
+    std::cerr << "[fixture] Clipboard initialization delay reached\n";
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+  }
+  return __real_xcb_intern_atom(connection, only_if_exists, length, name);
+}
 
 extern "C" decltype(xcb_xkb_get_state) __real_xcb_xkb_get_state;
 extern "C" xcb_xkb_get_state_cookie_t __wrap_xcb_xkb_get_state(

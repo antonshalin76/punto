@@ -65,8 +65,17 @@ inline constexpr std::size_t kMaxProcCandidates = 4096U;
 inline constexpr std::size_t kMaxPasswdBufferBytes = 1024U * 1024U;
 inline constexpr std::size_t kMaxXauthorityBytes = 1024U * 1024U;
 
+struct XauthorityMetadata {
+  std::uint32_t owner_uid = 0;
+  std::uint32_t mode = 0;
+  std::int64_t size = -1;
+};
+
 [[nodiscard]] bool is_valid_local_display(std::string_view value) noexcept;
 [[nodiscard]] bool is_valid_wayland_display(std::string_view value) noexcept;
+[[nodiscard]] bool xauthority_metadata_is_trusted(
+    const XauthorityMetadata &metadata,
+    std::uint32_t expected_uid) noexcept;
 [[nodiscard]] std::optional<std::chrono::milliseconds>
 retry_delay_after_failure(std::size_t failure_count) noexcept;
 

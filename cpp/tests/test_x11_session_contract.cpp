@@ -1,5 +1,7 @@
 #include "punto/x11_session.hpp"
 
+#include <X11/Xauth.h>
+
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -7,9 +9,11 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <iostream>
 #include <memory>
 #include <poll.h>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
@@ -23,10 +27,10 @@
 namespace {
 
 using namespace std::chrono_literals;
+constexpr unsigned short kFamilyInternet = 0;
 
 [[noreturn]] void fail(std::string_view message) {
-  std::cerr << "FAIL: " << message << '\n';
-  std::exit(1);
+  throw std::runtime_error{std::string{message}};
 }
 
 void expect(bool condition, std::string_view message) {
@@ -196,7 +200,32 @@ void test_shutdown_is_bounded_for_uncooperative_probe() {
 }
 
 struct TempAuthority {
+  struct Record {
+    unsigned short family = FamilyLocal;
+    std::string address;
+    std::string number;
+    std::string protocol = "MIT-MAGIC-COOKIE-1";
+    std::string cookie;
+  };
+
   std::string path;
+
+  struct ReplacementCleanup {
+    std::string path;
+    ~ReplacementCleanup() {
+      if (!path.empty()) {
+        (void)::unlink(path.c_str());
+      }
+    }
+  };
+
+  struct StreamCloser {
+    void operator()(FILE *file) const noexcept {
+      if (file != nullptr) {
+        (void)::fclose(file);
+      }
+    }
+  };
 
   TempAuthority() {
     path = "/tmp/punto-x11-authority-XXXXXX";
@@ -207,6 +236,50 @@ struct TempAuthority {
   }
 
   ~TempAuthority() { (void)::unlink(path.c_str()); }
+
+  void replace(const std::vector<Record> &records,
+               std::string_view trailing_bytes = {}) const {
+    std::string replacement = path + ".replacement-XXXXXX";
+    const int descriptor = ::mkstemp(replacement.data());
+    expect(descriptor >= 0, "create replacement Xauthority");
+    ReplacementCleanup cleanup{replacement};
+    if (::fchmod(descriptor, 0600) != 0) {
+      (void)::close(descriptor);
+      fail("protect replacement Xauthority");
+    }
+    FILE *raw_file = ::fdopen(descriptor, "wb");
+    if (raw_file == nullptr) {
+      (void)::close(descriptor);
+      fail("open replacement Xauthority stream");
+    }
+    std::unique_ptr<FILE, StreamCloser> file{raw_file};
+    for (const auto &record : records) {
+      Xauth auth{};
+      auth.family = record.family;
+      auth.address_length =
+          static_cast<unsigned short>(record.address.size());
+      auth.address = const_cast<char *>(record.address.data());
+      auth.number_length = static_cast<unsigned short>(record.number.size());
+      auth.number = const_cast<char *>(record.number.data());
+      auth.name_length = static_cast<unsigned short>(record.protocol.size());
+      auth.name = const_cast<char *>(record.protocol.data());
+      auth.data_length = static_cast<unsigned short>(record.cookie.size());
+      auth.data = const_cast<char *>(record.cookie.data());
+      expect(::XauWriteAuth(file.get(), &auth) == 1,
+             "write Xauthority record");
+    }
+    expect(trailing_bytes.empty() ||
+               std::fwrite(trailing_bytes.data(), trailing_bytes.size(), 1,
+                           file.get()) == 1,
+           "write truncated Xauthority tail");
+    expect(std::fflush(file.get()) == 0, "flush replacement Xauthority");
+    expect(::fsync(::fileno(file.get())) == 0, "sync replacement Xauthority");
+    expect(std::fclose(file.release()) == 0,
+           "close replacement Xauthority");
+    expect(::rename(replacement.c_str(), path.c_str()) == 0,
+           "atomically replace Xauthority");
+    cleanup.path.clear();
+  }
 };
 
 struct NestedXServer {
@@ -273,6 +346,348 @@ NestedXServer start_nested_xvfb(bool disable_xfixes = false) {
   }
   expect(!number.empty(), "nested Xvfb display is empty");
   return NestedXServer{pid, ":" + number, false};
+}
+
+std::string local_hostname() {
+  std::array<char, 256> hostname{};
+  expect(::gethostname(hostname.data(), hostname.size() - 1U) == 0,
+         "read local hostname");
+  return hostname.data();
+}
+
+std::string find_unused_display_number() {
+  const unsigned int base =
+      20000U + static_cast<unsigned int>(::getpid()) % 10000U;
+  for (unsigned int offset = 0; offset < 1000U; ++offset) {
+    const std::string number = std::to_string(base + offset);
+    const std::string socket = "/tmp/.X11-unix/X" + number;
+    struct stat metadata {};
+    if (::lstat(socket.c_str(), &metadata) != 0 && errno == ENOENT) {
+      return number;
+    }
+  }
+  fail("find unused authenticated X display");
+}
+
+NestedXServer start_authenticated_xvfb(const TempAuthority &server_authority) {
+  const std::string number = find_unused_display_number();
+  const std::string display = ":" + number;
+  const pid_t pid = ::fork();
+  expect(pid >= 0, "fork authenticated Xvfb");
+  if (pid == 0) {
+    const int null_descriptor = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (null_descriptor >= 0) {
+      (void)::dup2(null_descriptor, STDOUT_FILENO);
+      (void)::dup2(null_descriptor, STDERR_FILENO);
+      (void)::close(null_descriptor);
+    }
+    ::execl("/usr/bin/Xvfb", "Xvfb", display.c_str(), "-auth",
+            server_authority.path.c_str(), "-nolisten", "tcp",
+            static_cast<char *>(nullptr));
+    _exit(127);
+  }
+
+  const std::string socket = "/tmp/.X11-unix/X" + number;
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    int status = 0;
+    if (::waitpid(pid, &status, WNOHANG) == pid) {
+      fail("authenticated Xvfb exited during startup");
+    }
+    struct stat metadata {};
+    if (::lstat(socket.c_str(), &metadata) == 0 && S_ISSOCK(metadata.st_mode)) {
+      return NestedXServer{pid, display, false};
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  (void)::kill(pid, SIGTERM);
+  (void)::waitpid(pid, nullptr, 0);
+  fail("authenticated Xvfb startup timeout");
+}
+
+punto::X11SessionInfo real_candidate(const NestedXServer &server,
+                                     const TempAuthority &authority) {
+  punto::X11SessionInfo candidate = fake_info(server.display);
+  candidate.uid = static_cast<std::uint32_t>(::geteuid());
+  candidate.gid = static_cast<std::uint32_t>(::getegid());
+  candidate.xauthority_path = authority.path;
+  return candidate;
+}
+
+bool xkb_connection_succeeds(const punto::X11SessionInfo &candidate) {
+  const auto started = std::chrono::steady_clock::now();
+  punto::X11Session session{[candidate] {
+    return punto::x11_detail::ProbeResult{
+        punto::x11_detail::ProbeStatus::Healthy, candidate};
+  }};
+  if (!session.initialize()) {
+    return false;
+  }
+  auto lease = session.acquire_write_lease();
+  if (!lease) {
+    return false;
+  }
+  auto connection = lease->open_bounded_connection(1s);
+  if (!connection.is_open()) {
+    return false;
+  }
+  const int group = session.get_current_keyboard_layout();
+  return (group == 0 || group == 1) &&
+         std::chrono::steady_clock::now() - started < 1500ms;
+}
+
+std::string display_number(const NestedXServer &server) {
+  expect(server.display.starts_with(":"), "authenticated display is local");
+  return server.display.substr(1);
+}
+
+TempAuthority::Record authority_record(unsigned short family,
+                                       std::string address,
+                                       std::string number,
+                                       std::string cookie) {
+  return TempAuthority::Record{family, std::move(address), std::move(number),
+                               "MIT-MAGIC-COOKIE-1", std::move(cookie)};
+}
+
+void test_xauthority_metadata_policy_and_production_bridge() {
+  using punto::x11_detail::XauthorityMetadata;
+  using punto::x11_detail::xauthority_metadata_is_trusted;
+  const std::uint32_t uid = static_cast<std::uint32_t>(::geteuid());
+  expect(xauthority_metadata_is_trusted(
+             XauthorityMetadata{uid, S_IFREG | 0600U, 16}, uid),
+         "protected regular authority owned by the session is trusted");
+  expect(!xauthority_metadata_is_trusted(
+             XauthorityMetadata{uid + 1U, S_IFREG | 0600U, 16}, uid),
+         "authority with the wrong owner is rejected");
+  expect(!xauthority_metadata_is_trusted(
+             XauthorityMetadata{uid, S_IFREG | 0620U, 16}, uid),
+         "group-writable authority is rejected");
+  expect(!xauthority_metadata_is_trusted(
+             XauthorityMetadata{uid, S_IFREG | 0602U, 16}, uid),
+         "world-writable authority is rejected");
+  expect(!xauthority_metadata_is_trusted(
+             XauthorityMetadata{uid, S_IFIFO | 0600U, 16}, uid),
+         "non-regular authority is rejected");
+  expect(!xauthority_metadata_is_trusted(
+             XauthorityMetadata{uid, S_IFREG | 0600U, -1}, uid),
+         "negative authority size is rejected");
+  expect(!xauthority_metadata_is_trusted(
+             XauthorityMetadata{
+                 uid, S_IFREG | 0600U,
+                 static_cast<std::int64_t>(
+                     punto::x11_detail::kMaxXauthorityBytes) +
+                     1},
+             uid),
+         "oversized authority is rejected");
+
+  const std::string cookie(16, '\x31');
+  TempAuthority server_authority;
+  server_authority.replace(
+      {authority_record(FamilyWild, "", "", cookie)});
+  NestedXServer server = start_authenticated_xvfb(server_authority);
+  TempAuthority client_authority;
+  client_authority.replace({authority_record(
+      FamilyLocal, local_hostname(), display_number(server), cookie)});
+  expect(::chmod(client_authority.path.c_str(), 0620) == 0,
+         "make client authority group-writable");
+  expect(!xkb_connection_succeeds(real_candidate(server, client_authority)),
+         "production connector applies the metadata policy");
+  expect(::chmod(client_authority.path.c_str(), 0600) == 0,
+         "restore protected client authority");
+  expect(xkb_connection_succeeds(real_candidate(server, client_authority)),
+         "same server accepts the protected authority control");
+}
+
+void test_authenticated_xauthority_empty_number_and_precedence() {
+  const std::string cookie_a(16, '\x41');
+  const std::string cookie_b(16, '\x42');
+  TempAuthority server_authority;
+  server_authority.replace(
+      {authority_record(FamilyWild, "", "", cookie_a)});
+  NestedXServer server = start_authenticated_xvfb(server_authority);
+  const std::string number = display_number(server);
+  const std::string hostname = local_hostname();
+  TempAuthority client_authority;
+  const auto candidate = [&] {
+    return real_candidate(server, client_authority);
+  };
+
+  client_authority.replace({});
+  expect(!xkb_connection_succeeds(candidate()),
+         "authenticated Xvfb rejects a client without a cookie");
+  client_authority.replace(
+      {authority_record(FamilyLocal, hostname, "", cookie_a)});
+  expect(xkb_connection_succeeds(candidate()),
+         "GDM-style empty display number authorizes the production connector");
+
+  const auto empty_wrong =
+      authority_record(FamilyLocal, hostname, "", cookie_b);
+  const auto exact_correct =
+      authority_record(FamilyWild, "", number, cookie_a);
+  const auto empty_correct =
+      authority_record(FamilyLocal, hostname, "", cookie_a);
+  const auto exact_wrong =
+      authority_record(FamilyWild, "", number, cookie_b);
+  for (const bool exact_first : {false, true}) {
+    client_authority.replace(exact_first
+                                 ? std::vector{exact_correct, empty_wrong}
+                                 : std::vector{empty_wrong, exact_correct});
+    expect(xkb_connection_succeeds(candidate()),
+           "exact display number outranks a higher-family empty fallback");
+    client_authority.replace(exact_first
+                                 ? std::vector{exact_wrong, empty_correct}
+                                 : std::vector{empty_correct, exact_wrong});
+    expect(!xkb_connection_succeeds(candidate()),
+           "rejected exact cookie is not retried with the empty fallback");
+  }
+}
+
+void test_xauthority_family_precedence() {
+  const std::string cookie_a(16, '\x51');
+  const std::string cookie_b(16, '\x52');
+  TempAuthority server_authority;
+  server_authority.replace(
+      {authority_record(FamilyWild, "", "", cookie_a)});
+  NestedXServer server = start_authenticated_xvfb(server_authority);
+  const std::string hostname = local_hostname();
+  const std::string exact = display_number(server);
+  TempAuthority client_authority;
+
+  const auto expect_family_priority =
+      [&](const TempAuthority::Record &higher_family,
+          const TempAuthority::Record &lower_family,
+          std::string_view rejection_message,
+          std::string_view success_message) {
+        for (const bool higher_first : {false, true}) {
+          auto higher_wrong = higher_family;
+          higher_wrong.cookie = cookie_b;
+          auto lower_correct = lower_family;
+          lower_correct.cookie = cookie_a;
+          client_authority.replace(
+              higher_first ? std::vector{higher_wrong, lower_correct}
+                           : std::vector{lower_correct, higher_wrong});
+          expect(!xkb_connection_succeeds(
+                     real_candidate(server, client_authority)),
+                 rejection_message);
+
+          auto higher_correct = higher_family;
+          higher_correct.cookie = cookie_a;
+          auto lower_wrong = lower_family;
+          lower_wrong.cookie = cookie_b;
+          client_authority.replace(
+              higher_first ? std::vector{higher_correct, lower_wrong}
+                           : std::vector{lower_wrong, higher_correct});
+          expect(xkb_connection_succeeds(
+                     real_candidate(server, client_authority)),
+                 success_message);
+        }
+      };
+  for (const std::string &number : {std::string{}, exact}) {
+    expect_family_priority(
+        authority_record(FamilyLocal, hostname, number, cookie_a),
+        authority_record(FamilyLocalHost, hostname, number, cookie_a),
+        "FamilyLocal outranks FamilyLocalHost regardless of record order",
+        "valid FamilyLocal wins over FamilyLocalHost");
+    expect_family_priority(
+        authority_record(FamilyLocalHost, hostname, number, cookie_a),
+        authority_record(FamilyWild, "", number, cookie_a),
+        "FamilyLocalHost outranks FamilyWild regardless of record order",
+        "valid FamilyLocalHost wins over FamilyWild");
+  }
+}
+
+void test_xauthority_invalid_records_and_truncated_tail_fail_closed() {
+  const std::string cookie_a(16, '\x61');
+  TempAuthority server_authority;
+  server_authority.replace(
+      {authority_record(FamilyWild, "", "", cookie_a)});
+  NestedXServer server = start_authenticated_xvfb(server_authority);
+  const std::string hostname = local_hostname();
+  const std::string exact = display_number(server);
+  TempAuthority client_authority;
+
+  auto invalid_protocol =
+      authority_record(FamilyLocal, hostname, exact, cookie_a);
+  invalid_protocol.protocol = "XDM-AUTHORIZATION-1";
+  auto invalid_cookie = authority_record(FamilyLocal, hostname, exact,
+                                         std::string(15, '\x61'));
+  auto invalid_address =
+      authority_record(FamilyLocal, "not-this-host", exact, cookie_a);
+  auto invalid_family =
+      authority_record(kFamilyInternet, hostname, exact, cookie_a);
+  for (const auto &invalid : {invalid_protocol, invalid_cookie,
+                              invalid_address, invalid_family}) {
+    const auto fallback =
+        authority_record(FamilyWild, "", "", cookie_a);
+    for (const bool invalid_first : {false, true}) {
+      client_authority.replace(
+          invalid_first ? std::vector{invalid, fallback}
+                        : std::vector{fallback, invalid});
+      expect(xkb_connection_succeeds(real_candidate(server, client_authority)),
+             "invalid exact record cannot suppress a valid empty fallback");
+    }
+  }
+
+  client_authority.replace({invalid_family});
+  expect(!xkb_connection_succeeds(real_candidate(server, client_authority)),
+         "unsupported FamilyInternet is never selected");
+
+  client_authority.replace(
+      {authority_record(FamilyWild, "", "", cookie_a)},
+      std::string_view{"\0\1\0", 3});
+  expect(!xkb_connection_succeeds(real_candidate(server, client_authority)),
+         "truncated record after a valid cookie rejects the whole snapshot");
+}
+
+void test_xauthority_atomic_replacement_recovers_same_session() {
+  const std::string cookie(16, '\x71');
+  TempAuthority server_authority;
+  server_authority.replace(
+      {authority_record(FamilyWild, "", "", cookie)});
+  NestedXServer server = start_authenticated_xvfb(server_authority);
+  TempAuthority client_authority;
+  client_authority.replace(
+      {authority_record(FamilyWild, "", "99999", cookie)});
+  const punto::X11SessionInfo candidate =
+      real_candidate(server, client_authority);
+  const char *authority_before_raw = std::getenv("XAUTHORITY");
+  const std::optional<std::string> authority_before =
+      authority_before_raw == nullptr
+          ? std::nullopt
+          : std::optional<std::string>{authority_before_raw};
+
+  punto::X11Session session{[candidate] {
+    return punto::x11_detail::ProbeResult{
+        punto::x11_detail::ProbeStatus::Healthy, candidate};
+  }};
+  expect(session.initialize(), "recovery X11 snapshot commits");
+  auto lease = session.acquire_write_lease();
+  expect(lease.has_value(), "recovery snapshot grants one stable lease");
+  auto rejected = lease->open_bounded_connection(1s);
+  expect(!rejected.is_open(), "mismatched display record is rejected");
+  const char *authority_after_failure_raw = std::getenv("XAUTHORITY");
+  const std::optional<std::string> authority_after_failure =
+      authority_after_failure_raw == nullptr
+          ? std::nullopt
+          : std::optional<std::string>{authority_after_failure_raw};
+  expect(authority_after_failure == authority_before,
+         "failed auth never mutates process-global XAUTHORITY");
+
+  client_authority.replace(
+      {authority_record(FamilyWild, "", "", cookie)});
+  auto recovered = lease->open_bounded_connection(1s);
+  expect(recovered.is_open(),
+         "same X11 session recovers after atomic Xauthority replacement");
+  const int group = session.get_current_keyboard_layout();
+  expect(group == 0 || group == 1,
+         "recovered connection reads the XKB layout");
+  const char *authority_after_recovery_raw = std::getenv("XAUTHORITY");
+  const std::optional<std::string> authority_after_recovery =
+      authority_after_recovery_raw == nullptr
+          ? std::nullopt
+          : std::optional<std::string>{authority_after_recovery_raw};
+  expect(authority_after_recovery == authority_before,
+         "successful auth never mutates process-global XAUTHORITY");
 }
 
 void test_xkb_readiness_does_not_require_xfixes() {
@@ -537,15 +952,25 @@ void test_bounded_transport_and_linearizable_write_gate() {
 } // namespace
 
 int main() {
-  test_display_and_wayland_grammar();
-  test_retry_schedule_is_exact_and_bounded();
-  test_retry_wait_seam_is_deterministic();
-  test_prepare_commit_and_failure_revoke_write();
-  test_session_absence_is_distinct_from_failure();
-  test_stale_generation_cannot_commit();
-  test_shutdown_is_bounded_for_uncooperative_probe();
-  test_xkb_readiness_does_not_require_xfixes();
-  test_unresponsive_handshake_is_cancelled_and_next_connect_recovers();
-  test_bounded_transport_and_linearizable_write_gate();
-  std::cout << "punto-x11-session-contract: OK\n";
+  try {
+    test_display_and_wayland_grammar();
+    test_retry_schedule_is_exact_and_bounded();
+    test_retry_wait_seam_is_deterministic();
+    test_prepare_commit_and_failure_revoke_write();
+    test_session_absence_is_distinct_from_failure();
+    test_stale_generation_cannot_commit();
+    test_shutdown_is_bounded_for_uncooperative_probe();
+    test_xauthority_metadata_policy_and_production_bridge();
+    test_authenticated_xauthority_empty_number_and_precedence();
+    test_xauthority_family_precedence();
+    test_xauthority_invalid_records_and_truncated_tail_fail_closed();
+    test_xauthority_atomic_replacement_recovers_same_session();
+    test_xkb_readiness_does_not_require_xfixes();
+    test_unresponsive_handshake_is_cancelled_and_next_connect_recovers();
+    test_bounded_transport_and_linearizable_write_gate();
+    std::cout << "punto-x11-session-contract: OK\n";
+  } catch (const std::exception &error) {
+    std::cerr << "FAIL: " << error.what() << '\n';
+    return 1;
+  }
 }

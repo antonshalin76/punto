@@ -164,11 +164,13 @@ private:
   }
 
   struct stat metadata {};
-  if (::fstat(descriptor, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
-      metadata.st_uid != static_cast<uid_t>(info.uid) ||
-      (metadata.st_mode & 0022) != 0 || metadata.st_size < 0 ||
-      static_cast<std::uintmax_t>(metadata.st_size) >
-          x11_detail::kMaxXauthorityBytes) {
+  if (::fstat(descriptor, &metadata) != 0 ||
+      !x11_detail::xauthority_metadata_is_trusted(
+          x11_detail::XauthorityMetadata{
+              static_cast<std::uint32_t>(metadata.st_uid),
+              static_cast<std::uint32_t>(metadata.st_mode),
+              static_cast<std::int64_t>(metadata.st_size)},
+          info.uid)) {
     (void)::close(descriptor);
     return -1;
   }
@@ -281,29 +283,49 @@ read_xauthority(int descriptor, std::string_view display_number) noexcept {
           const std::string_view address{auth.address, auth.address_length};
           return address == hostname || address == short_hostname;
         };
-    while (Xauth *raw_auth = ::XauReadAuth(file.get())) {
+    while (true) {
+      const long record_offset = std::ftell(file.get());
+      if (record_offset < 0 ||
+          static_cast<std::size_t>(record_offset) > snapshot.size()) {
+        return std::nullopt;
+      }
+      if (static_cast<std::size_t>(record_offset) == snapshot.size()) {
+        break;
+      }
+      Xauth *raw_auth = ::XauReadAuth(file.get());
+      if (raw_auth == nullptr) {
+        return std::nullopt;
+      }
       std::unique_ptr<Xauth, decltype(&::XauDisposeAuth)> auth{
           raw_auth, &::XauDisposeAuth};
       constexpr std::string_view kMitCookie{"MIT-MAGIC-COOKIE-1"};
-      const bool number_matches =
-          auth->number_length == display_number.size() &&
+      int number_priority = -1;
+      if (auth->number_length == display_number.size() &&
           (display_number.empty() ||
            std::memcmp(auth->number, display_number.data(),
-                       display_number.size()) == 0);
+                       display_number.size()) == 0)) {
+        number_priority = 1;
+      } else if (auth->number_length == 0) {
+        number_priority = 0;
+      }
       const bool protocol_matches =
           auth->name_length == kMitCookie.size() &&
           std::memcmp(auth->name, kMitCookie.data(), kMitCookie.size()) == 0 &&
           auth->data_length == 16U;
-      int priority = -1;
+      int family_priority = -1;
       if (auth->family == FamilyLocal && local_address_matches(*auth)) {
-        priority = 2;
+        family_priority = 2;
       } else if (auth->family == FamilyLocalHost &&
                  (auth->address_length == 0 || local_address_matches(*auth))) {
-        priority = 1;
+        family_priority = 1;
       } else if (auth->family == FamilyWild) {
-        priority = 0;
+        family_priority = 0;
       }
-      if (!number_matches || !protocol_matches || priority <= best_priority) {
+      if (number_priority < 0 || !protocol_matches || family_priority < 0) {
+        continue;
+      }
+      const int priority = number_priority * 3 + family_priority;
+      if (priority <= best_priority) {
         continue;
       }
       best.name.assign(auth->name, auth->name + auth->name_length);
@@ -1119,6 +1141,15 @@ bool x11_detail::is_valid_local_display(std::string_view value) noexcept {
     return false;
   }
   return dot == std::string_view::npos || is_decimal(value.substr(dot + 1));
+}
+
+bool x11_detail::xauthority_metadata_is_trusted(
+    const XauthorityMetadata &metadata,
+    const std::uint32_t expected_uid) noexcept {
+  return (metadata.mode & S_IFMT) == S_IFREG &&
+         metadata.owner_uid == expected_uid && (metadata.mode & 0022U) == 0 &&
+         metadata.size >= 0 &&
+         static_cast<std::uint64_t>(metadata.size) <= kMaxXauthorityBytes;
 }
 
 bool x11_detail::is_valid_wayland_display(std::string_view value) noexcept {

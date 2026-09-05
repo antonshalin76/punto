@@ -312,9 +312,106 @@ struct NestedXServer {
   }
 };
 
+struct ScopedFd {
+  explicit ScopedFd(int descriptor) : descriptor(descriptor) {}
+  ScopedFd(const ScopedFd &) = delete;
+  ScopedFd &operator=(const ScopedFd &) = delete;
+  ~ScopedFd() { close(); }
+
+  [[nodiscard]] int get() const noexcept { return descriptor; }
+
+  void close() noexcept {
+    if (descriptor >= 0) {
+      (void)::close(descriptor);
+      descriptor = -1;
+    }
+  }
+
+private:
+  int descriptor = -1;
+};
+
+struct ChildGuard {
+  explicit ChildGuard(pid_t child_pid) : pid(child_pid) {}
+  ChildGuard(const ChildGuard &) = delete;
+  ChildGuard &operator=(const ChildGuard &) = delete;
+  ~ChildGuard() {
+    if (pid <= 0) {
+      return;
+    }
+    (void)::kill(pid, SIGKILL);
+    while (::waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
+    }
+  }
+
+  [[nodiscard]] pid_t release() noexcept {
+    const pid_t released = pid;
+    pid = -1;
+    return released;
+  }
+
+private:
+  pid_t pid = -1;
+};
+
+constexpr auto kXvfbStartupTimeout = 10s;
+
+std::string wait_for_xvfb_display(int descriptor, std::string_view label) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + kXvfbStartupTimeout;
+  pollfd poll_descriptor{descriptor, POLLIN, 0};
+  while (true) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      fail(std::string{label} + " Xvfb startup timeout");
+    }
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    const int timeout_ms =
+        remaining.count() > 0 ? static_cast<int>(remaining.count()) : 1;
+    poll_descriptor.revents = 0;
+    const int poll_result = ::poll(&poll_descriptor, 1, timeout_ms);
+    if (poll_result < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      fail(std::string{label} + " Xvfb display pipe poll failed");
+    }
+    if (poll_result == 0) {
+      continue;
+    }
+    if ((poll_descriptor.revents & (POLLERR | POLLNVAL)) != 0) {
+      fail(std::string{label} + " Xvfb display pipe failed");
+    }
+    if ((poll_descriptor.revents & (POLLIN | POLLHUP)) != 0) {
+      break;
+    }
+    fail(std::string{label} + " Xvfb display pipe returned an invalid event");
+  }
+
+  char buffer[32]{};
+  ssize_t count = -1;
+  do {
+    count = ::read(descriptor, buffer, sizeof(buffer) - 1U);
+  } while (count < 0 && errno == EINTR);
+  if (count <= 1) {
+    fail(std::string{label} + " Xvfb did not publish display");
+  }
+  std::string number{buffer, static_cast<std::size_t>(count)};
+  while (!number.empty() && (number.back() == '\n' || number.back() == '\r')) {
+    number.pop_back();
+  }
+  if (number.empty()) {
+    fail(std::string{label} + " Xvfb display is empty");
+  }
+  return number;
+}
+
 NestedXServer start_nested_xvfb(bool disable_xfixes = false) {
   int descriptors[2]{};
   expect(::pipe(descriptors) == 0, "create Xvfb display pipe");
+  ScopedFd output_pipe{descriptors[0]};
+  ScopedFd input_pipe{descriptors[1]};
   const pid_t pid = ::fork();
   expect(pid >= 0, "fork nested Xvfb");
   if (pid == 0) {
@@ -333,19 +430,12 @@ NestedXServer start_nested_xvfb(bool disable_xfixes = false) {
     _exit(127);
   }
 
-  (void)::close(descriptors[1]);
-  pollfd descriptor{descriptors[0], POLLIN, 0};
-  expect(::poll(&descriptor, 1, 5000) == 1, "nested Xvfb startup timeout");
-  char buffer[32]{};
-  const ssize_t count = ::read(descriptors[0], buffer, sizeof(buffer) - 1U);
-  (void)::close(descriptors[0]);
-  expect(count > 1, "nested Xvfb did not publish display");
-  std::string number{buffer, static_cast<std::size_t>(count)};
-  while (!number.empty() && (number.back() == '\n' || number.back() == '\r')) {
-    number.pop_back();
-  }
-  expect(!number.empty(), "nested Xvfb display is empty");
-  return NestedXServer{pid, ":" + number, false};
+  input_pipe.close();
+  ChildGuard child{pid};
+  const std::string number =
+      wait_for_xvfb_display(output_pipe.get(), "nested");
+  std::string display = ":" + number;
+  return NestedXServer{child.release(), std::move(display), false};
 }
 
 std::string local_hostname() {
@@ -359,6 +449,8 @@ NestedXServer start_authenticated_xvfb(const TempAuthority &server_authority) {
   int descriptors[2]{};
   expect(::pipe(descriptors) == 0,
          "create authenticated Xvfb display pipe");
+  ScopedFd output_pipe{descriptors[0]};
+  ScopedFd input_pipe{descriptors[1]};
   const pid_t pid = ::fork();
   expect(pid >= 0, "fork authenticated Xvfb");
   if (pid == 0) {
@@ -378,33 +470,12 @@ NestedXServer start_authenticated_xvfb(const TempAuthority &server_authority) {
     _exit(127);
   }
 
-  (void)::close(descriptors[1]);
-  pollfd descriptor{descriptors[0], POLLIN, 0};
-  if (::poll(&descriptor, 1, 5000) != 1) {
-    (void)::close(descriptors[0]);
-    (void)::kill(pid, SIGTERM);
-    (void)::waitpid(pid, nullptr, 0);
-    fail("authenticated Xvfb startup timeout");
-  }
-  char buffer[32]{};
-  const ssize_t count =
-      ::read(descriptors[0], buffer, sizeof(buffer) - 1U);
-  (void)::close(descriptors[0]);
-  if (count <= 1) {
-    (void)::kill(pid, SIGTERM);
-    (void)::waitpid(pid, nullptr, 0);
-    fail("authenticated Xvfb did not publish display");
-  }
-  std::string number{buffer, static_cast<std::size_t>(count)};
-  while (!number.empty() && (number.back() == '\n' || number.back() == '\r')) {
-    number.pop_back();
-  }
-  if (number.empty()) {
-    (void)::kill(pid, SIGTERM);
-    (void)::waitpid(pid, nullptr, 0);
-    fail("authenticated Xvfb display is empty");
-  }
-  return NestedXServer{pid, ":" + number, false};
+  input_pipe.close();
+  ChildGuard child{pid};
+  const std::string number =
+      wait_for_xvfb_display(output_pipe.get(), "authenticated");
+  std::string display = ":" + number;
+  return NestedXServer{child.release(), std::move(display), false};
 }
 
 punto::X11SessionInfo real_candidate(const NestedXServer &server,

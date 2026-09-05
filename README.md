@@ -578,8 +578,9 @@ sudo rm -rf /etc/punto
 - GitHub-hosted Ubuntu получает узкий AppArmor-профиль только для
   `/usr/bin/bwrap`; сетевые E2E остаются в отдельном namespace и проверяют
   отсутствие внешних интерфейсов и IPv4-маршрутов.
-- Xvfb сообщает готовность через `-displayfd`. Тайминги Xvfb, ELF-inspection и
-  traced CLI fixture учитывают нагрузку hosted runner, не изменяя
+- Xvfb сообщает готовность через `-displayfd`; failure path закрывает pipe и
+  завершает только принадлежащий fixture child. Тайминги Xvfb, ELF-inspection
+  и traced CLI fixture учитывают нагрузку hosted runner, не изменяя
   production-дедлайны и fail-closed проверки X11, CLI и ELF-поверхности.
 - Packaging contract вызывает только заявленные Debian tools из `/usr/bin`, а
   CI передаёт `lintian` единственный пакет текущих `VERSION` и архитектуры.

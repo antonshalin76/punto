@@ -65,7 +65,47 @@ external configuration edit; this release does not change that contract.
 Exact-commit CI, final artifact checks and installed read-back are recorded
 separately in the release delivery report.
 
-### Read-only IPC and macro cancellation checkpoint
+### Original key release checkpoint
+
+After the IPC fix removed observer interference, a private 25 ms Space-release
+delay still produced Dispatched with a permanently missing trailing space.
+Four seconds of fresh DOM snapshots ruled out early observation. A separate
+XQueryKeymap probe showed Space becoming UP before the relay delivered its
+original release: the macro pressed an already-held key (ignored by XTEST),
+then released it. Evidence: `/tmp/punto-relay-space-after-ipc-fix.log` and
+`/tmp/punto-keymap-space-causality.log`.
+
+WordEditor now checks actual server key state before its first editor action,
+waiting through its existing input-buffer/cancellation callback and absolute
+300 ms deadline. Captured focus, group, locks, pointer and session are checked
+on every iteration. Timeout/context change rejects before preparation; no user
+key release is synthesized. All word, terminal, selection and native-undo paths
+cross this initial fence. There is no new wait after a verified PRIMARY snapshot.
+
+K1 delays real Space release 25 ms and asserts exact corrected DOM/caret/dispatch.
+K2 holds Space beyond the macro budget, verifies rejection while the server still
+reports the key DOWN and source/clipboard are unchanged, then releases the actual
+queued event and proves Pause recovery. K3/K4 change focus or disable while a
+test-only real query receipt and server key state prove entry into the wait.
+Existing C2 covers already-released consecutive automatic edits unchanged.
+Faults belong to a per-instance private relay; only held-key negative cases
+disable Space autorepeat on their private Xvfb and restore it during cleanup.
+
+Actual old-runtime K1/K2 RED: `/tmp/punto-key-release-red-final.log`. Final focused
+Release/Debug pass 5/5 in `/tmp/punto-key-release-release-green.log` and
+`/tmp/punto-key-release-debug-green.log`. Independent BDD critic, separate auditor,
+pre-RED SRP, actual RED critic and final source/SRP reviews passed. WordEditor
+owns admission/deadline, existing XCB helpers own bounded transport, and fixture
+adapters supply evidence only; persistence/UI/broker policy are unchanged/N/A.
+No further refactor was needed. Five existing files add 160 lines, of which 13
+are production runtime; no file or parallel state owner is added.
+
+This addresses ordinary keys already visible as held at initial preflight.
+Held modifiers can still be rejected earlier by idle_layout; this is not a new
+modifier-release recovery feature. Arbitrary external keydown after the fence
+remains outside this fix. Source gates, final package and CI are separate below.
+
+### Read-only IPC and macro cancellation evidence
 
 The tray polls STATS every two seconds. Both STATS and GET_STATUS are queued
 for EventLoop, but wait_and_buffer previously cancelled a macro for any queued

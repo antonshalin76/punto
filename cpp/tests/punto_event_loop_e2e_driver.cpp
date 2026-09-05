@@ -96,6 +96,14 @@ extern "C" xcb_intern_atom_cookie_t __wrap_xcb_intern_atom(
 }
 
 extern "C" decltype(xcb_xkb_get_state) __real_xcb_xkb_get_state;
+extern "C" decltype(xcb_query_keymap) __real_xcb_query_keymap;
+extern "C" xcb_query_keymap_cookie_t __wrap_xcb_query_keymap(xcb_connection_t *connection) {
+  if (consume_private_fault_marker("/run/punto-e2e-arm-key-release-check")) {
+    mark_private_macro_event("/run/punto-e2e-key-release-checked");
+  }
+  return __real_xcb_query_keymap(connection);
+}
+
 extern "C" xcb_xkb_get_state_cookie_t __wrap_xcb_xkb_get_state(
     xcb_connection_t *connection, xcb_xkb_device_spec_t device) {
   const auto cookie = __real_xcb_xkb_get_state(connection, device);

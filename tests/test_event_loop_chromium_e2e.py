@@ -113,6 +113,67 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
     def dispatches(self):
         return int(self.stats_fields()[1]["word_dispatches"])
 
+    def key_is_down(self, code):
+        x11 = gtk.ctypes.CDLL(gtk.ctypes.util.find_library("X11"))
+        x11.XOpenDisplay.argtypes = [gtk.ctypes.c_char_p]
+        x11.XOpenDisplay.restype = gtk.ctypes.c_void_p
+        x11.XQueryKeymap.argtypes = [gtk.ctypes.c_void_p, gtk.ctypes.c_void_p]
+        x11.XCloseDisplay.argtypes = [gtk.ctypes.c_void_p]
+        connection = x11.XOpenDisplay(self.x11.display.encode("ascii"))
+        self.assertTrue(connection, "key observation opens only the private Xvfb")
+        try:
+            keys = (gtk.ctypes.c_ubyte * 32)()
+            self.assertNotEqual(x11.XQueryKeymap(connection, keys), 0)
+            keycode = code + 8
+            return bool(keys[keycode // 8] & (1 << (keycode % 8)))
+        finally:
+            x11.XCloseDisplay(connection)
+
+    def arm_held_space(self):
+        # Only this private server's Space repeat is disabled for held-key tests.
+        repeat_command = ["xset", "-display", self.x11.display]
+        subprocess.run([*repeat_command, "-r", str(gtk.KEY_SPACE + 8)],
+                       check=True, timeout=3)
+        self.addCleanup(subprocess.run,
+                        [*repeat_command, "r", str(gtk.KEY_SPACE + 8)],
+                        check=True, timeout=3)
+        self.harness.relay.arm_delayed_key_release(gtk.KEY_SPACE)
+        self.addCleanup(self.harness.relay.permit_key_release.set)
+        marker = pathlib.Path("/run/punto-e2e-arm-key-release-check")
+        checked = pathlib.Path("/run/punto-e2e-key-release-checked")
+        checked.unlink(missing_ok=True)
+        marker.touch(mode=0o600)
+        self.addCleanup(marker.unlink, missing_ok=True)
+        self.addCleanup(checked.unlink, missing_ok=True)
+        self.assertEqual(gtk.ipc_request(b"SET_STATUS 1\n"), b"OK ENABLED\n")
+        self.harness.type_word("ghbdtn")
+        self.harness.send_key(gtk.KEY_SPACE)
+        self.pump_until(self.harness.relay.key_release_blocked.is_set,
+                        "Space release held in the private relay")
+        self.assertTrue(self.key_is_down(gtk.KEY_SPACE))
+        return checked
+
+    def assert_held_space_rejected(self):
+        self.pump_until(lambda: "Word edit dispatch status=0" in self.harness.diagnostic(),
+                        "held Space rejected before any edit", timeout=1)
+        self.assertTrue(self.key_is_down(gtk.KEY_SPACE), "Punto must not force keyup")
+        self.assertFalse(self.harness.relay.key_release_delivered.is_set())
+        self.assertEqual(self.dispatches(), 0)
+        self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD),
+                         "startup clipboard baseline")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn ", 7, 7],
+                        "source text and caret preserved while Space remains down")
+
+    def release_held_space(self):
+        self.harness.relay.permit_key_release.set()
+        self.pump_until(self.harness.relay.key_release_delivered.is_set,
+                        "actual queued Space release delivered")
+        self.pump_until(lambda: not self.key_is_down(gtk.KEY_SPACE), "Space is up")
+        serial = self.browser_state()[-1]
+        self.pump_until(lambda: self.browser_state()[-1] > serial,
+                        "fresh DOM after actual Space release")
+        self.assertEqual(self.browser_state()[:3], ["ghbdtn ", 7, 7])
+
     def first_manual_conversion(self):
         self.harness.type_word("ghbdtn")
         self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
@@ -176,6 +237,55 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
                         "genuine same-text browser selection")
         self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_PRIMARY), "ghbdtn")
         self.assert_pause_rejected()
+
+    def test_delayed_space_release_preserves_delimiter(self):
+        self.assertEqual(gtk.ipc_request(b"SET_STATUS 1\n"), b"OK ENABLED\n")
+        relay = self.harness.relay
+        relay.arm_delayed_key_release(gtk.KEY_SPACE, .025)
+        self.harness.type_word("ghbdtn")
+        self.harness.send_key(gtk.KEY_SPACE)
+        self.pump_until(relay.key_release_delivered.is_set, "25ms delayed Space release")
+        self.assertGreaterEqual(relay.key_release_delivered_at - relay.key_release_blocked_at,
+                                .025)
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет ", 7, 7],
+                        "automatic correction preserves Space and caret after delayed keyup")
+        self.assertEqual(self.dispatches(), 1)
+
+    def test_held_space_expires_without_edit_or_forced_keyup(self):
+        checked = self.arm_held_space()
+        self.assert_held_space_rejected()
+        self.assertTrue(checked.exists(), "rejection reached the real key-release check")
+        self.pump_for(max(0, self.harness.relay.key_release_blocked_at + .350
+                          - time.monotonic()))
+        self.assertTrue(self.key_is_down(gtk.KEY_SPACE))
+        self.release_held_space()
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет ", 7, 7],
+                        "manual correction recovers after held-key rejection")
+        self.assertEqual(self.dispatches(), 1)
+
+    def test_held_space_wait_cancels_when_disabled(self):
+        checked = self.arm_held_space()
+        self.pump_until(checked.exists, "real key-release wait reached")
+        self.assertTrue(self.key_is_down(gtk.KEY_SPACE))
+        self.assertNotIn("Word edit dispatch status=", self.harness.diagnostic())
+        started = time.monotonic()
+        self.assertEqual(gtk.ipc_request(b"SET_STATUS 0\n"), b"OK DISABLED\n")
+        self.assertLess(time.monotonic() - started, 3)
+        self.assert_held_space_rejected()
+        self.release_held_space()
+
+    def test_held_space_wait_cancels_when_focus_changes(self):
+        checked = self.arm_held_space()
+        self.pump_until(checked.exists, "real key-release wait reached")
+        self.assertTrue(self.key_is_down(gtk.KEY_SPACE))
+        self.assertNotIn("Word edit dispatch status=", self.harness.diagnostic())
+        xid = self.window.get_window().get_xid()
+        self.xdo("windowfocus", "--sync", str(xid))
+        self.publish_active_window(xid)
+        self.assert_held_space_rejected()
+        self.release_held_space()
+        self.assertEqual(self.entry.get_text(), "")
 
     def test_runtime_reset_invalidates_retained_receipt(self):
         self.first_manual_conversion()

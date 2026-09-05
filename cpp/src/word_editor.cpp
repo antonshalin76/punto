@@ -712,6 +712,19 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
            current->root_y == pointer->root_y &&
            (current->mask & buttons) == (pointer->mask & buttons);
   };
+  // Forwarded input can reach X after our local key-up bookkeeping. XTEST
+  // ignores a press of an already-held key, then releases that user's key.
+  outcome.rejection_stage = "key_release";
+  for (;;) {
+    if (!context_matches()) return outcome;
+    const auto keys = reply<xcb_query_keymap_reply_t>(
+        connection, xcb_query_keymap(connection.get()).sequence, deadline);
+    if (!keys) return outcome;
+    if (std::ranges::all_of(keys->keys, [](auto byte) { return byte == 0; })) {
+      break;
+    }
+    if (!wait(Clock::now() + std::chrono::milliseconds{1})) return outcome;
+  }
   outcome.rejection_stage = "context_changed";
   if (!context_matches()) {
     return outcome;

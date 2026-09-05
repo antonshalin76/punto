@@ -695,6 +695,7 @@ if(BUILD_TESTING)
         target_compile_definitions(punto-event-loop-e2e-driver
             PRIVATE PUNTO_IPC_MAILBOX_TESTING=1)
         target_link_options(punto-event-loop-e2e-driver PRIVATE
+            "-Wl,--wrap=xcb_query_keymap"
             -Wl,--wrap=fsync -Wl,--wrap=xcb_xkb_get_map
             -Wl,--wrap=xcb_xkb_get_state -Wl,--wrap=xcb_poll_for_reply
             -Wl,--wrap=xcb_intern_atom

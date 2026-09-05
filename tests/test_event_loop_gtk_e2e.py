@@ -383,6 +383,12 @@ class XTestRelay:
         self.paste_blocked = threading.Event()
         self.permit_paste = threading.Event()
         self.blocked_at = 0.0
+        self.delayed_key_release: tuple[int, float | None] | None = None
+        self.key_release_blocked = threading.Event()
+        self.permit_key_release = threading.Event()
+        self.key_release_delivered = threading.Event()
+        self.key_release_blocked_at = 0.0
+        self.key_release_delivered_at = 0.0
         self.error: BaseException | None = None
         self.stopped = False
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -401,6 +407,12 @@ class XTestRelay:
     def snapshot(self) -> list[tuple[float, int, int, int]]:
         with self.events_lock:
             return list(self.events)
+
+    def arm_delayed_key_release(self, code: int, delay: float | None = None) -> None:
+        self.key_release_blocked.clear()
+        self.permit_key_release.clear()
+        self.key_release_delivered.clear()
+        self.delayed_key_release = (code, delay)
 
     def _read_exact(self, size: int) -> bytes | None:
         data = bytearray()
@@ -477,6 +489,17 @@ class XTestRelay:
                         raise RuntimeError("delayed Ctrl+V was never released")
 
                 pressed = value != 0
+                delayed_release = (value == 0 and self.delayed_key_release is not None
+                                   and self.delayed_key_release[0] == code)
+                if delayed_release:
+                    _, delay = self.delayed_key_release
+                    self.delayed_key_release = None
+                    self.key_release_blocked_at = time.monotonic()
+                    self.key_release_blocked.set()
+                    permitted = self.permit_key_release.wait(
+                        timeout=EVENT_TIMEOUT if delay is None else delay)
+                    if delay is None and not permitted:
+                        raise RuntimeError("delayed key release was never permitted")
                 # XTest ignores a second press of an already held key. Evdev
                 # repeat is a delivered keystroke, represented by X11's pair.
                 if value == 2 and code in keys_down:
@@ -485,6 +508,9 @@ class XTestRelay:
                 if xtst.XTestFakeKeyEvent(connection, code + 8, pressed, 0) == 0:
                     raise RuntimeError(f"XTest rejected evdev code {code}")
                 x11.XFlush(connection)
+                if delayed_release:
+                    self.key_release_delivered_at = time.monotonic()
+                    self.key_release_delivered.set()
                 if pressed:
                     keys_down.add(code)
                 else:
@@ -508,6 +534,7 @@ class XTestRelay:
         self.stopped = True
         self.stop_requested.set()
         self.permit_paste.set()
+        self.permit_key_release.set()
         self.reader.join(timeout=1)
         if break_pipe and not self.stream.closed:
             self.stream.close()
@@ -635,6 +662,7 @@ class EventLoopHarness:
             return
         self.stopped = True
         self.relay.permit_paste.set()
+        self.relay.permit_key_release.set()
         if self.process.stdin is not None and not self.process.stdin.closed:
             self.process.stdin.close()
         try:

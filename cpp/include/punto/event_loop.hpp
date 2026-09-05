@@ -10,6 +10,7 @@
 
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -35,8 +36,12 @@
 #include "punto/runtime_tuning.hpp"
 #include "punto/types.hpp"
 #include "punto/x11_session.hpp"
+#include "punto/word_editor.hpp"
 
 namespace punto {
+
+class SoundManager;
+class UndoDetector;
 
 namespace event_loop_detail {
 [[nodiscard]] std::size_t count_running_punto_daemons(
@@ -114,6 +119,17 @@ private:
   /// Проверяет готовые результаты анализа и (при необходимости) применяет
   /// коррекции
   void process_ready_results();
+  void queue_manual_word_edit(HotkeyAction action);
+  void queue_auto_word_edit(const WordResult &result);
+  void finish_word_candidate(
+      const X11Session::KeyboardObservation *observation = nullptr);
+  void process_word_observation(bool input_idle = false);
+  void process_pending_word_edit();
+  bool wait_and_buffer(std::chrono::steady_clock::time_point deadline);
+  void drain_pending_events();
+  void clear_word_history();
+  void finalize_queued_words();
+  [[nodiscard]] HotkeyAction determine_hotkey_action() const;
 
   /// Сбрасывает async state и выставляет новый barrier для task_id.
   void reset_async_state(bool bump_task_barrier = true);
@@ -126,8 +142,10 @@ private:
   void maybe_promote_to_control_plane_primary();
   [[nodiscard]] bool reconcile_control_plane_before_promotion();
   void sync_control_plane_from_shared_state(bool force);
-  void publish_control_plane_state(bool bump_config_generation,
-                                   bool bump_status_generation);
+  ControlPlanePublicationResult
+  publish_control_plane_state(bool bump_config_generation,
+                              bool bump_status_generation, const Config &config,
+                              bool auto_enabled);
   [[nodiscard]] bool start_primary_ipc_server();
   void service_ipc_commands() noexcept;
   void cancel_ipc_commands_for_shutdown() noexcept;
@@ -149,6 +167,7 @@ private:
 
   struct ConfigLoadTask {
     std::uint64_t generation = 0;
+    std::uint64_t status_generation_at_admission = 0;
     std::filesystem::path system_root;
     std::optional<std::filesystem::path> user_root;
     std::optional<X11SessionInfo> session_authority;
@@ -191,9 +210,67 @@ private:
 
   // Config snapshots are published on the event-loop thread.
   std::shared_ptr<const Config> config_;
+  bool runtime_auto_enabled_ = true;
+  bool runtime_status_established_ = false;
 
   ModifierState modifiers_;
+  std::bitset<KEY_CNT> held_keys_;
   InputBuffer buffer_;
+  struct RawWordCandidate {
+    enum class Kind { Automatic, ManualLayout, ManualCase, SelectionLayout,
+                      SelectionCase, SelectionTranslit, Undo, Tail };
+    Kind kind;
+    std::uint64_t request_id;
+    std::vector<KeyEntry> word;
+    std::string trailing;
+    std::size_t analysis_len;
+    int diagnostic_layout;
+    std::shared_ptr<const Config> config;
+    bool observing = false;
+    std::uint64_t word_id = 0;
+    std::optional<std::string> visible = std::nullopt;
+    std::uint64_t input_sequence = 0;
+    bool analyze = true;
+    bool allow_correction = true;
+  };
+  std::optional<RawWordCandidate> raw_word_candidate_;
+  std::deque<RawWordCandidate> queued_word_candidates_;
+  std::uint64_t next_word_observation_id_ = 0;
+  struct TrackedWord {
+    std::uint64_t id;
+    std::vector<KeyEntry> word;
+    std::string trailing;
+    std::optional<std::string> visible = std::nullopt;
+    std::optional<std::uint64_t> task_id = std::nullopt;
+    std::optional<std::string> correction = std::nullopt;
+    int target_layout = -1;
+    int source_layout = -1;
+    std::uint64_t session_generation = 0;
+    std::uint32_t focus_window = 0;
+    bool eligible = true;
+    bool allow_terminal = true;
+  };
+  std::deque<TrackedWord> word_history_;
+  std::uint64_t next_word_id_ = 0;
+  std::optional<std::string> active_word_visible_;
+  bool active_word_manually_edited_ = false;
+  std::optional<X11Session::KeyboardObservation> keyboard_observation_;
+  std::optional<WordEditRequest> pending_word_edit_;
+  bool pending_is_undo_ = false;
+  std::optional<WordEditRequest> undo_request_;
+  std::chrono::steady_clock::time_point undo_applied_at_{};
+  std::uint64_t user_input_sequence_ = 0;
+  std::uint64_t undo_input_sequence_ = 0;
+  bool swallow_z_until_release_ = false;
+  std::unique_ptr<WordEditor> word_editor_;
+  std::unique_ptr<SoundManager> sound_manager_;
+  std::unique_ptr<UndoDetector> undo_detector_;
+  std::deque<input_event> pending_events_;
+  bool macro_active_ = false;
+  bool macro_input_eof_ = false;
+  std::chrono::steady_clock::time_point last_key_event_at_{};
+  std::uint64_t word_dispatches_ = 0;
+  bool pause_down_ = false;
 
   // Read-only analysis pipeline.
   std::shared_ptr<const Dictionary> dictionary_;

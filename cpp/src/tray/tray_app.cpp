@@ -64,13 +64,16 @@ struct TrayApp::StatusPollState {
 
 struct TrayApp::StatusPollResult {
   std::shared_ptr<StatusPollState> state;
-  ServiceStatus status = ServiceStatus::Unknown;
+  IpcClientResult snapshot;
+  std::optional<bool> command_failed;
   std::uint64_t generation = 0;
 };
 
 TrayApp::TrayApp()
     : status_poll_state_{std::make_shared<StatusPollState>()},
-      status_provider_{[] { return IpcClient::get_status(); }} {
+      status_provider_{[] { return IpcClient::get_runtime_snapshot(); }},
+      status_setter_{[](bool enabled) { return IpcClient::set_auto_enabled(enabled); }},
+      config_reloader_{[](const std::string &path) { return IpcClient::reload_config(path); }} {
   status_poll_state_->owner.store(this, std::memory_order_release);
 }
 
@@ -115,10 +118,6 @@ bool TrayApp::initialize() {
   update_icon();
   update_auto_toggle_state();
 
-  // Загружаем текущую настройку звука из user config
-  sound_enabled_ = SettingsDialog::load_settings().sound_enabled;
-  update_sound_toggle_state();
-
   // Запускаем периодическое обновление статуса
   status_timer_id_ =
       g_timeout_add(kStatusUpdateIntervalMs, on_status_update, this);
@@ -134,17 +133,15 @@ int TrayApp::run() {
 GtkWidget *TrayApp::create_menu() {
   GtkWidget *menu = gtk_menu_new();
 
-  // Report the effective capability, not the configured analysis intent.
   toggle_item_ =
-      gtk_check_menu_item_new_with_label("Изменение текста отключено (v" PUNTO_VERSION ")");
+      gtk_check_menu_item_new_with_label("Автокоррекция: состояние неизвестно");
   gtk_widget_set_sensitive(toggle_item_, FALSE);
+  g_signal_connect(toggle_item_, "toggled", G_CALLBACK(on_auto_toggled), this);
   gtk_menu_shell_append(GTK_MENU_SHELL(menu), toggle_item_);
 
-  // Correction sound is inactive while text mutations are unavailable.
-  sound_toggle_item_ =
-      gtk_check_menu_item_new_with_label("Звук исправлений недоступен");
-  gtk_widget_set_sensitive(sound_toggle_item_, FALSE);
-  gtk_menu_shell_append(GTK_MENU_SHELL(menu), sound_toggle_item_);
+  sound_settings_item_ = gtk_menu_item_new_with_label("Звук исправлений...");
+  g_signal_connect(sound_settings_item_, "activate", G_CALLBACK(on_settings_clicked), this);
+  gtk_menu_shell_append(GTK_MENU_SHELL(menu), sound_settings_item_);
 
   // Разделитель
   GtkWidget *sep1 = gtk_separator_menu_item_new();
@@ -201,6 +198,22 @@ void TrayApp::update_auto_toggle_state() {
   }
 
   auto *item = GTK_CHECK_MENU_ITEM(toggle_item_);
+  updating_toggle_ = true;
+  const char *label = "Автокоррекция: состояние неизвестно";
+  if (current_capability_ == MutationCapability::Disabled) {
+    label = "Изменение текста отключено в сервисе";
+  } else if (current_capability_ == MutationCapability::X11) {
+    label = "Автокоррекция слов";
+  }
+  gtk_menu_item_set_label(GTK_MENU_ITEM(item), label);
+  gtk_widget_set_sensitive(
+      toggle_item_, current_capability_ == MutationCapability::X11 &&
+                        current_status_ != ServiceStatus::Unknown &&
+                        !status_poll_state_->in_flight.load(std::memory_order_acquire));
+  gtk_widget_set_tooltip_text(
+      toggle_item_, last_command_failed_
+                        ? "Команда не подтверждена. Показано прочитанное состояние сервиса."
+                        : "Только автоматические исправления в поддерживаемых X11-редакторах. Ручные команды независимы.");
 
   if (current_status_ == ServiceStatus::Unknown) {
     gtk_check_menu_item_set_inconsistent(item, TRUE);
@@ -210,16 +223,21 @@ void TrayApp::update_auto_toggle_state() {
     gtk_check_menu_item_set_active(item,
                                    current_status_ == ServiceStatus::Enabled);
   }
+  updating_toggle_ = false;
 }
 
-void TrayApp::update_sound_toggle_state() {
-  if (!sound_toggle_item_) {
+void TrayApp::on_auto_toggled(GtkCheckMenuItem *item, gpointer user_data) {
+  auto *app = static_cast<TrayApp *>(user_data);
+  if (app->updating_toggle_) {
     return;
   }
-
-  auto *item = GTK_CHECK_MENU_ITEM(sound_toggle_item_);
-  gtk_check_menu_item_set_inconsistent(item, FALSE);
-  gtk_check_menu_item_set_active(item, sound_enabled_);
+  if (app->current_capability_ != MutationCapability::X11 ||
+      app->current_status_ == ServiceStatus::Unknown ||
+      app->status_poll_state_->in_flight.load(std::memory_order_acquire)) {
+    app->update_auto_toggle_state();
+    return;
+  }
+  app->request_status_update(gtk_check_menu_item_get_active(item) != FALSE);
 }
 
 void TrayApp::on_settings_clicked(GtkMenuItem *item, gpointer user_data) {
@@ -232,14 +250,10 @@ void TrayApp::on_settings_clicked(GtkMenuItem *item, gpointer user_data) {
   if (saved) {
     // Автоматически применяем настройки после сохранения
     const std::string cfg_path = SettingsDialog::get_user_config_path();
-    bool success = IpcClient::reload_config(cfg_path);
+    bool success = app->config_reloader_(cfg_path);
     if (success) {
       app->request_status_update();
     }
-
-    // Обновляем статус звука из конфига (даже если сервис сейчас недоступен)
-    app->sound_enabled_ = SettingsDialog::load_settings().sound_enabled;
-    app->update_sound_toggle_state();
   }
 }
 
@@ -273,7 +287,7 @@ void TrayApp::on_about_clicked(GtkMenuItem *item, gpointer user_data) {
   const char *markup =
       "<b>Punto Switcher for Linux</b>\n"
       "Version " PUNTO_VERSION "\n"
-      "Безопасный режим: изменение текста отключено\n"
+      "Исправление слов и выделенного текста в X11\n"
       "Лицензия: Personal Use Only\n"
       "Автор: Anton Shalin\n"
       "email: <a "
@@ -312,18 +326,21 @@ gboolean TrayApp::on_status_result(gpointer user_data) {
   auto *result = static_cast<StatusPollResult *>(user_data);
   const auto state = result->state;
   TrayApp *app = state->owner.load(std::memory_order_acquire);
+  state->in_flight.store(false, std::memory_order_release);
   if (app != nullptr &&
-      state->generation.load(std::memory_order_acquire) == result->generation &&
-      result->status != app->current_status_) {
-    app->current_status_ = result->status;
+      state->generation.load(std::memory_order_acquire) == result->generation) {
+    app->current_status_ = result->snapshot.status;
+    app->current_capability_ = result->snapshot.capability;
+    if (result->command_failed) {
+      app->last_command_failed_ = *result->command_failed;
+    }
     app->update_icon();
     app->update_auto_toggle_state();
   }
-  state->in_flight.store(false, std::memory_order_release);
   return G_SOURCE_REMOVE;
 }
 
-void TrayApp::request_status_update() {
+void TrayApp::request_status_update(std::optional<bool> requested_enabled) {
   bool expected = false;
   if (!status_poll_state_->in_flight.compare_exchange_strong(
           expected, true, std::memory_order_acq_rel,
@@ -332,19 +349,34 @@ void TrayApp::request_status_update() {
   }
 
   const auto state = status_poll_state_;
-  const auto provider = status_provider_;
+  update_auto_toggle_state();
   const std::uint64_t generation =
       state->generation.fetch_add(1, std::memory_order_acq_rel) + 1;
   try {
-    std::thread{[state, provider, generation] {
-      ServiceStatus status = ServiceStatus::Unknown;
+    auto provider = status_provider_;
+    auto setter = status_setter_;
+    std::thread{[state, provider = std::move(provider), setter = std::move(setter),
+                 generation, requested_enabled] {
+      IpcClientResult snapshot;
+      std::optional<bool> command_failed;
+      if (requested_enabled) {
+        try {
+          command_failed = !setter(*requested_enabled);
+        } catch (...) {
+          command_failed = true;
+        }
+      }
       try {
-        status = provider();
+        snapshot = provider();
       } catch (...) {
-        status = ServiceStatus::Unknown;
+        snapshot = {};
+      }
+      if (!snapshot.ok()) {
+        snapshot.status = ServiceStatus::Unknown;
+        snapshot.capability = MutationCapability::Unknown;
       }
       auto *result =
-          new (std::nothrow) StatusPollResult{state, status, generation};
+          new (std::nothrow) StatusPollResult{state, std::move(snapshot), command_failed, generation};
       if (result == nullptr) {
         state->in_flight.store(false, std::memory_order_release);
         return;
@@ -355,6 +387,7 @@ void TrayApp::request_status_update() {
     }}.detach();
   } catch (...) {
     state->in_flight.store(false, std::memory_order_release);
+    update_auto_toggle_state();
   }
 }
 

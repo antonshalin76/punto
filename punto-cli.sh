@@ -92,19 +92,29 @@ valid_uint64() {
 }
 
 validate_stats_line() {
-    local line=$1 index name value
-    local -a parts names
+    local line=$1 index name value capability
+    local -a parts names dispatch_field=()
+
+    read -r -a parts <<<"$line"
+    case ${parts[10]:-} in
+        text_mutation=disabled) capability=disabled ;;
+        text_mutation=x11)
+            capability=x11
+            dispatch_field=(word_dispatches)
+            ;;
+        *) return 1 ;;
+    esac
 
     names=(
         x11_health analysis_health input_health x11_last_progress_ms
         analysis_last_progress_ms input_last_progress_ms analysis_outstanding
         input_in_flight log_dropped text_mutation enabled configured_enabled
-        config_pending config_generation config_result analyzed need_switch corrections pending_words
+        config_pending config_generation config_result analyzed need_switch corrections
+        "${dispatch_field[@]}" pending_words
         ready_results worker_threads daemon_peers analysis_mode control_plane
         queued_tasks avg_queue_us avg_analysis_us avg_macro_us avg_tail_len
     )
-    read -r -a parts <<<"$line"
-    [[ ${#parts[@]} -eq 30 && ${parts[0]} == OK ]] || return 1
+    [[ ${#parts[@]} -eq $((${#names[@]} + 1)) && ${parts[0]} == OK ]] || return 1
     [[ $line == "${parts[*]}" ]] || return 1
 
     for ((index = 0; index < ${#names[@]}; ++index)); do
@@ -119,10 +129,10 @@ validate_stats_line() {
                 [[ $value == 0 || $value == 1 ]] || return 1
                 ;;
             text_mutation)
-                [[ $value == disabled ]] || return 1
+                [[ $value == "$capability" ]] || return 1
                 ;;
             enabled)
-                [[ $value == 0 ]] || return 1
+                [[ $value == 0 || ( $capability == x11 && $value == 1 ) ]] || return 1
                 ;;
             config_result)
                 [[ $value == none || $value == ok || $value == error ]] || return 1
@@ -557,8 +567,8 @@ show_help() {
         '  help       Show this help' \
         '  --version  Print the installed version' \
         '' \
-        "Safety mode $version: analysis and passthrough are active; automatic" \
-        'and manual text mutations are disabled before key dispatch.'
+        'This build supports X11 word and selection corrections, including terminal line input.' \
+        'STATS separates backend capability from the runtime automatic-correction toggle.'
 }
 
 main() {

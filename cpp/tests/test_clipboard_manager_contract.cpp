@@ -2,6 +2,7 @@
 #include "punto/x11_session.hpp"
 
 #include <xcb/xcb.h>
+#include <xcb/xcbext.h>
 #include <xcb/xfixes.h>
 
 #include <array>
@@ -22,6 +23,62 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+
+namespace initialization_fault {
+enum class Stage { None, Atom, Extension };
+Stage stage = Stage::None;
+xcb_connection_t *connection = nullptr;
+pid_t server = -1;
+std::atomic<bool> stopped{false};
+bool disconnected = false;
+bool used_after_disconnect = false;
+
+void suspend(xcb_connection_t *candidate, Stage candidate_stage) {
+  if (candidate == connection && stage == candidate_stage && !stopped) {
+    stopped = ::kill(server, SIGSTOP) == 0;
+  }
+}
+} // namespace initialization_fault
+
+extern "C" {
+xcb_intern_atom_cookie_t __real_xcb_intern_atom(xcb_connection_t *, uint8_t,
+                                                uint16_t, const char *);
+xcb_intern_atom_cookie_t __wrap_xcb_intern_atom(xcb_connection_t *connection,
+                                                uint8_t only_if_exists,
+                                                uint16_t length,
+                                                const char *name) {
+  initialization_fault::suspend(connection, initialization_fault::Stage::Atom);
+  return __real_xcb_intern_atom(connection, only_if_exists, length, name);
+}
+void __real_xcb_prefetch_extension_data(xcb_connection_t *, xcb_extension_t *);
+void __wrap_xcb_prefetch_extension_data(xcb_connection_t *connection,
+                                        xcb_extension_t *extension) {
+  initialization_fault::suspend(connection,
+                                initialization_fault::Stage::Extension);
+  __real_xcb_prefetch_extension_data(connection, extension);
+}
+const xcb_query_extension_reply_t *
+__real_xcb_get_extension_data(xcb_connection_t *, xcb_extension_t *);
+const xcb_query_extension_reply_t *
+__wrap_xcb_get_extension_data(xcb_connection_t *connection,
+                              xcb_extension_t *extension) {
+  if (connection == initialization_fault::connection &&
+      initialization_fault::disconnected) {
+    initialization_fault::used_after_disconnect = true;
+    return nullptr;
+  }
+  initialization_fault::suspend(connection,
+                                initialization_fault::Stage::Extension);
+  return __real_xcb_get_extension_data(connection, extension);
+}
+void __real_xcb_disconnect(xcb_connection_t *);
+void __wrap_xcb_disconnect(xcb_connection_t *connection) {
+  if (connection == initialization_fault::connection) {
+    initialization_fault::disconnected = true;
+  }
+  __real_xcb_disconnect(connection);
+}
+}
 
 namespace punto {
 
@@ -1094,8 +1151,22 @@ void test_active_window_kind_is_tristate_and_boundary_safe() {
           XCB_ATOM_STRING, 8, static_cast<std::uint32_t>(unknown_class.size()),
           unknown_class.data())));
   expect(!property_error, "publish unknown active window");
-  expect(manager->active_window_kind() == punto::ActiveWindowKind::Unknown,
-         "nonempty unknown WM_CLASS is not assumed to be GUI-safe");
+  expect(manager->active_window_kind() == punto::ActiveWindowKind::Gui,
+         "well-formed nonterminal class uses guarded GUI execution");
+
+  for (const auto &malformed : {std::string{"postman"},
+                               std::string{"\0Postman\0", 9},
+                               std::string{"postman\0Postman", 15}}) {
+    property_error = xcb_ptr(xcb_request_check(
+        window_client.value,
+        xcb_change_property_checked(
+            window_client.value, XCB_PROP_MODE_REPLACE, window,
+            XCB_ATOM_WM_CLASS, XCB_ATOM_STRING, 8,
+            static_cast<std::uint32_t>(malformed.size()), malformed.data())));
+    expect(!property_error, "publish malformed class fixture");
+    expect(manager->active_window_kind() == punto::ActiveWindowKind::Unknown,
+           "malformed or empty class component stays unknown");
+  }
 
   const std::string gui_class{"gedit\0Gedit\0", 12};
   property_error = xcb_ptr(xcb_request_check(
@@ -1256,6 +1327,59 @@ void test_stopped_server_is_bounded_and_fail_closed() {
   expect(!manager->is_open(), "X timeout revokes clipboard connection");
 }
 
+void test_cold_initialization() {
+  NestedXServer server = start_nested_xvfb();
+  int screen = -1;
+  auto *connection = xcb_connect(server.display.c_str(), &screen);
+  expect(connection != nullptr && xcb_connection_has_error(connection) == 0,
+         "connect without prewarming XFixes");
+  auto manager = punto::ClipboardManagerTestAccess::make(connection, screen);
+  expect(manager->is_open(), "cold connection initializes successfully");
+}
+
+void test_initialization_stall(initialization_fault::Stage stage) {
+  NestedXServer server = start_nested_xvfb();
+  int screen = -1;
+  auto *connection = xcb_connect(server.display.c_str(), &screen);
+  expect(connection != nullptr && xcb_connection_has_error(connection) == 0,
+         "connect before initialization stall");
+  initialization_fault::stage = stage;
+  initialization_fault::connection = connection;
+  initialization_fault::server = server.pid;
+  initialization_fault::stopped = false;
+  initialization_fault::disconnected = false;
+  initialization_fault::used_after_disconnect = false;
+  // Rescue the old unbounded extension lookup so RED terminates on its own.
+  std::jthread resume_server{[pid = server.pid](std::stop_token stop) {
+    while (!initialization_fault::stopped.load() && !stop.stop_requested()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    if (stop.stop_requested()) {
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{350});
+    (void)::kill(pid, SIGCONT);
+  }};
+  const auto started = std::chrono::steady_clock::now();
+  auto manager = punto::ClipboardManagerTestAccess::make(
+      connection, screen, std::chrono::milliseconds{50});
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  (void)::kill(server.pid, SIGCONT);
+  const bool stopped = initialization_fault::stopped;
+  const bool disconnected = initialization_fault::disconnected;
+  const bool used_after_disconnect =
+      initialization_fault::used_after_disconnect;
+  initialization_fault::stage = initialization_fault::Stage::None;
+  initialization_fault::connection = nullptr;
+  expect(stopped, "fault reached the requested initialization boundary");
+  expect(!used_after_disconnect,
+         "initialization must not use a revoked XCB connection");
+  expect(elapsed < std::chrono::milliseconds{250},
+         "cold initialization obeys its deadline while X server stalls");
+  expect(disconnected && !manager->is_open(),
+         "initialization timeout closes its connection");
+}
+
 void test_stopped_server_large_payload_send_is_bounded() {
   NestedXServer server = start_nested_xvfb();
   Connection owner = connect_to(server.display.c_str());
@@ -1299,7 +1423,7 @@ void test_stopped_server_large_payload_send_is_bounded() {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
   try {
     expect(std::signal(SIGPIPE, SIG_IGN) != SIG_ERR,
            "ignore SIGPIPE like punto-daemon");
@@ -1310,6 +1434,24 @@ int main() {
         throw std::runtime_error{std::string{name} + ": " + error.what()};
       }
     };
+    if (argc == 2) {
+      const std::string_view selected{argv[1]};
+      if (selected == "initialization-atom") {
+        test_initialization_stall(initialization_fault::Stage::Atom);
+      } else if (selected == "initialization-extension") {
+        test_initialization_stall(initialization_fault::Stage::Extension);
+      } else {
+        throw std::runtime_error{"unknown focused test"};
+      }
+      std::cout << "PASS: " << selected << '\n';
+      return 0;
+    }
+    run("cold-initialization", test_cold_initialization);
+    run("initialization-atom",
+        [] { test_initialization_stall(initialization_fault::Stage::Atom); });
+    run("initialization-extension", [] {
+      test_initialization_stall(initialization_fault::Stage::Extension);
+    });
     run("delivery", test_delivery_receipts_and_targets);
     run("preexisting-baseline",
         test_preexisting_owner_has_timestamp_fenced_baseline);

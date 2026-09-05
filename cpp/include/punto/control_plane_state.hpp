@@ -37,6 +37,12 @@ struct SharedControlPlaneState {
   std::string config_path;
 };
 
+enum class ControlPlanePublicationResult {
+  NotPublished,
+  PublishedNotDurable,
+  Durable,
+};
+
 enum class ControlPlanePromotionAction {
   Ready,
   ReloadAuthoritativePath,
@@ -357,26 +363,26 @@ inline SharedControlPlaneState seed_control_plane_generations(
   return state;
 }
 
-inline bool write_shared_control_plane_state(
+inline ControlPlanePublicationResult publish_shared_control_plane_state(
     const SharedControlPlaneState &state,
     const std::string &path = std::string{kControlPlaneStatePath}) {
   if (!detail::valid_control_plane_path(state.config_path)) {
-    return false;
+    return ControlPlanePublicationResult::NotPublished;
   }
   const std::string payload = detail::serialize_control_plane_state(state);
   if (payload.size() > detail::kMaxControlPlaneStateBytes) {
-    return false;
+    return ControlPlanePublicationResult::NotPublished;
   }
 
   const RuntimeFileSecurity security = default_runtime_file_security();
   const auto runtime_path = detail::split_runtime_path(path);
   if (!runtime_path) {
-    return false;
+    return ControlPlanePublicationResult::NotPublished;
   }
   const int directory_fd =
       detail::open_runtime_directory(*runtime_path, security);
   if (directory_fd < 0) {
-    return false;
+    return ControlPlanePublicationResult::NotPublished;
   }
 
   int existing_fd = -1;
@@ -390,11 +396,11 @@ inline bool write_shared_control_plane_state(
     (void)::close(existing_fd);
     if (!existing_safe) {
       (void)::close(directory_fd);
-      return false;
+      return ControlPlanePublicationResult::NotPublished;
     }
   } else if (errno != ENOENT) {
     (void)::close(directory_fd);
-    return false;
+    return ControlPlanePublicationResult::NotPublished;
   }
 
   static std::atomic<std::uint64_t> sequence{0};
@@ -416,7 +422,7 @@ inline bool write_shared_control_plane_state(
   }
   if (temp_fd < 0) {
     (void)::close(directory_fd);
-    return false;
+    return ControlPlanePublicationResult::NotPublished;
   }
 
   bool ok = apply_runtime_file_security(temp_fd, security) &&
@@ -428,14 +434,23 @@ inline bool write_shared_control_plane_state(
     ok = ::renameat(directory_fd, temp_name.c_str(), directory_fd,
                     runtime_path->name.c_str()) == 0;
   }
+  auto result = ControlPlanePublicationResult::NotPublished;
   if (ok) {
-    ok = ::fsync(directory_fd) == 0;
-  }
-  if (!ok) {
+    result = ::fsync(directory_fd) == 0
+                 ? ControlPlanePublicationResult::Durable
+                 : ControlPlanePublicationResult::PublishedNotDurable;
+  } else {
     (void)::unlinkat(directory_fd, temp_name.c_str(), 0);
   }
   (void)::close(directory_fd);
-  return ok;
+  return result;
+}
+
+inline bool write_shared_control_plane_state(
+    const SharedControlPlaneState &state,
+    const std::string &path = std::string{kControlPlaneStatePath}) {
+  return publish_shared_control_plane_state(state, path) ==
+         ControlPlanePublicationResult::Durable;
 }
 
 } // namespace punto

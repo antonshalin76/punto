@@ -29,6 +29,42 @@
 #include <thread>
 #include <utility>
 
+namespace publication_fault {
+enum class Target { None, TemporaryFile, Directory };
+Target target = Target::None;
+std::string directory;
+dev_t directory_device = 0;
+ino_t directory_inode = 0;
+unsigned int injected = 0;
+} // namespace publication_fault
+
+extern "C" int __real_fsync(int fd);
+extern "C" int __wrap_fsync(int fd) {
+  using namespace publication_fault;
+  struct stat metadata {};
+  bool owned = false;
+  if (target != Target::None && ::fstat(fd, &metadata) == 0) {
+    if (target == Target::Directory) {
+      owned = S_ISDIR(metadata.st_mode) &&
+              metadata.st_dev == directory_device &&
+              metadata.st_ino == directory_inode;
+    } else if (S_ISREG(metadata.st_mode)) {
+      char path[PATH_MAX + 1]{};
+      const std::string descriptor = "/proc/self/fd/" + std::to_string(fd);
+      const ssize_t length = ::readlink(descriptor.c_str(), path, PATH_MAX);
+      owned = length > 0 &&
+              std::string_view{path, static_cast<std::size_t>(length)}
+                  .starts_with(directory + "/.control.state.tmp.");
+    }
+  }
+  if (owned) {
+    ++injected;
+    errno = EIO;
+    return -1;
+  }
+  return __real_fsync(fd);
+}
+
 using namespace punto;
 
 namespace {
@@ -623,6 +659,57 @@ void test_control_plane_generation_seeding() {
   expect(::rmdir(dir) == 0, "seed dir removed");
 }
 
+void test_control_plane_publication_outcomes() {
+  char dir_template[] = "/tmp/punto-publication-XXXXXX";
+  char *dir = ::mkdtemp(dir_template);
+  expect(dir != nullptr, "publication mkdtemp failed");
+  const std::string path = std::string{dir} + "/control.state";
+  struct stat metadata {};
+  expect(::stat(dir, &metadata) == 0, "publication directory identity");
+  publication_fault::directory = dir;
+  publication_fault::directory_device = metadata.st_dev;
+  publication_fault::directory_inode = metadata.st_ino;
+  const SharedControlPlaneState before{7, 9, false, "/etc/punto/config.yaml"};
+  const SharedControlPlaneState after{8, 10, true, "/etc/punto/new.yaml"};
+  const auto expect_visible = [&](const SharedControlPlaneState &expected) {
+    SharedControlPlaneState visible;
+    expect(read_shared_control_plane_state(visible, path),
+           "published state remains readable");
+    expect(visible.config_generation == expected.config_generation &&
+               visible.status_generation == expected.status_generation &&
+               visible.enabled == expected.enabled &&
+               visible.config_path == expected.config_path,
+           "publication readback matches exact authoritative state");
+  };
+  expect(publish_shared_control_plane_state(before, path) ==
+             ControlPlanePublicationResult::Durable,
+         "healthy publication is durable");
+  expect_visible(before);
+  publication_fault::target = publication_fault::Target::TemporaryFile;
+  publication_fault::injected = 0;
+  const auto unpublished = publish_shared_control_plane_state(after, path);
+  publication_fault::target = publication_fault::Target::None;
+  expect(publication_fault::injected == 1, "owned temporary fsync fault fired");
+  expect(unpublished == ControlPlanePublicationResult::NotPublished,
+         "temporary fsync failure does not publish");
+  expect_visible(before);
+  publication_fault::target = publication_fault::Target::Directory;
+  publication_fault::injected = 0;
+  const auto published = publish_shared_control_plane_state(after, path);
+  publication_fault::target = publication_fault::Target::None;
+  expect(publication_fault::injected == 1, "owned directory fsync fault fired");
+  expect_visible(after);
+  expect(published == ControlPlanePublicationResult::PublishedNotDurable,
+         "directory fsync failure reports visible nondurable publication");
+  expect(publish_shared_control_plane_state(after, path) ==
+             ControlPlanePublicationResult::Durable,
+         "publication retry confirms durability");
+  expect_visible(after);
+  expect(std::filesystem::remove(path), "publication state removed");
+  expect(::rmdir(dir) == 0, "publication leaves no temporary files");
+  publication_fault::directory.clear();
+}
+
 void test_control_plane_promotion_planning() {
   SharedControlPlaneState committed;
   committed.config_generation = 6;
@@ -713,6 +800,7 @@ int main() {
   test_runtime_thread_budget();
   test_control_plane_state_round_trip();
   test_control_plane_generation_seeding();
+  test_control_plane_publication_outcomes();
   test_control_plane_promotion_planning();
 
   std::cout << "punto-tests: OK\n";

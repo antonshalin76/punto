@@ -51,6 +51,7 @@ namespace punto {
 struct X11Session::WriteGate {
   mutable std::recursive_mutex mutex;
   bool enabled = false;
+  std::uint64_t generation = 0;
 };
 
 namespace {
@@ -607,7 +608,8 @@ enable_xkb(BoundedXcbConnection &connection,
 
 [[nodiscard]] int
 get_xkb_group(BoundedXcbConnection &connection,
-              std::chrono::steady_clock::time_point deadline) noexcept {
+              std::chrono::steady_clock::time_point deadline,
+              std::uint8_t *locked_mods = nullptr) noexcept {
   if (!enable_xkb(connection, deadline)) {
     return -1;
   }
@@ -620,6 +622,9 @@ get_xkb_group(BoundedXcbConnection &connection,
                             reply != nullptr && connection.is_open()
                         ? static_cast<int>(reply->group)
                         : -1;
+  if (group >= 0 && locked_mods != nullptr) {
+    *locked_mods = reply->lockedMods;
+  }
   std::free(reply);
   return group;
 }
@@ -963,8 +968,7 @@ pid_belongs_to_session(pid_t pid, std::string_view expected_session) noexcept {
          left.home_dir == right.home_dir &&
          left.xdg_runtime_dir == right.xdg_runtime_dir &&
          left.xdg_config_home == right.xdg_config_home &&
-         left.wayland_display == right.wayland_display &&
-         left.observed_keyboard_layout == right.observed_keyboard_layout;
+         left.wayland_display == right.wayland_display;
 }
 
 [[nodiscard]] OwnedCString take_sd_string(char *value) noexcept {
@@ -1313,6 +1317,40 @@ x11_detail::ProbeResult X11Session::probe_once() {
 
 void X11Session::run_background_probe(
     const std::shared_ptr<BackgroundState> &state) noexcept {
+  if (state->kind == BackgroundState::Kind::Keyboard) {
+    int group = -1;
+    std::uint8_t locked_mods = 0;
+    std::uint32_t focus_window = 0;
+    if (!state->cancel_requested.load(std::memory_order_acquire)) {
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds{250};
+      auto connection =
+          open_bounded_connection_for(state->keyboard_session, deadline);
+      if (connection.is_open()) {
+        group = get_xkb_group(connection, deadline, &locked_mods);
+        if (group >= 0) {
+          const auto cookie = ::xcb_get_input_focus(connection.get());
+          x11_detail::XcbOperationResult result{};
+          auto *reply = static_cast<xcb_get_input_focus_reply_t *>(
+              connection.wait_for_reply(cookie.sequence, deadline, result));
+          if (result == x11_detail::XcbOperationResult::Success &&
+              reply != nullptr && connection.is_open()) {
+            focus_window = reply->focus;
+          } else {
+            group = -1;
+          }
+          std::free(reply);
+        }
+      }
+    }
+    std::lock_guard<std::mutex> lock{state->mu};
+    state->keyboard.group = group;
+    state->keyboard.focus_window = focus_window;
+    state->keyboard.locked_mods = locked_mods;
+    state->done = true;
+    state->cv.notify_all();
+    return;
+  }
   std::size_t failures = 0;
   while (true) {
     x11_detail::ProbeResult result;
@@ -1341,7 +1379,10 @@ void X11Session::run_background_probe(
         state->cv.notify_all();
         return;
       }
-      state->write_gate->enabled = false;
+      if (state->write_gate->enabled) {
+        ++state->write_gate->generation;
+        state->write_gate->enabled = false;
+      }
     }
     ++failures;
     const auto delay = x11_detail::retry_delay_after_failure(failures);
@@ -1377,16 +1418,10 @@ void X11Session::run_background_probe(
   }
 }
 
-void X11Session::start_background_refresh() {
+bool X11Session::start_background_refresh() {
   std::lock_guard<std::mutex> lock{refresh_mutex_};
   if (pending_refresh_) {
-    std::lock_guard<std::mutex> state_lock{pending_refresh_->mu};
-    if (!pending_refresh_->done) {
-      return;
-    }
-  }
-  if (refresh_thread_.joinable()) {
-    refresh_thread_.join();
+    return false;
   }
 
   auto state = std::make_shared<BackgroundState>();
@@ -1399,11 +1434,70 @@ void X11Session::start_background_refresh() {
   pending_refresh_ = state;
   refresh_thread_ =
       std::thread{[state] { X11Session::run_background_probe(state); }};
+  return true;
+}
+
+bool X11Session::start_background_keyboard_observation(
+    std::uint64_t request_id) {
+  std::lock_guard<std::mutex> lock{refresh_mutex_};
+  if (pending_refresh_) {
+    return false;
+  }
+  auto lease = acquire_write_lease();
+  if (!lease || !lease->info().wayland_display.empty()) {
+    return false;
+  }
+  auto state = std::make_shared<BackgroundState>();
+  state->kind = BackgroundState::Kind::Keyboard;
+  state->generation =
+      generation_clock_->fetch_add(1, std::memory_order_acq_rel) + 1;
+  state->keyboard = KeyboardObservation{request_id, lease->generation(), -1};
+  state->keyboard_session = lease->info();
+  pending_refresh_ = state;
+  // The immutable snapshot travels to the worker; no desktop write lease is
+  // held during observation I/O, including a stalled connection handshake.
+  lease.reset();
+  refresh_thread_ =
+      std::thread{[state] { X11Session::run_background_probe(state); }};
+  return true;
+}
+
+std::optional<X11Session::KeyboardObservation>
+X11Session::poll_keyboard_observation() {
+  std::lock_guard<std::mutex> lock{refresh_mutex_};
+  if (!pending_refresh_ ||
+      pending_refresh_->kind != BackgroundState::Kind::Keyboard) {
+    return std::nullopt;
+  }
+  KeyboardObservation observation;
+  {
+    std::lock_guard<std::mutex> state_lock{pending_refresh_->mu};
+    if (!pending_refresh_->done) {
+      return std::nullopt;
+    }
+    observation = pending_refresh_->keyboard;
+  }
+  if (refresh_thread_.joinable()) {
+    refresh_thread_.join();
+  }
+  auto lease = acquire_write_lease();
+  if (!lease || lease->generation() != observation.session_generation ||
+      pending_refresh_->generation !=
+          generation_clock_->load(std::memory_order_acquire)) {
+    observation.group = -1;
+  }
+  if (observation.group >= 0) {
+    std::lock_guard<std::mutex> snapshot_lock{mu_};
+    info_.observed_keyboard_layout = observation.group;
+  }
+  pending_refresh_.reset();
+  return observation;
 }
 
 std::optional<X11Session::RefreshResult> X11Session::poll_refresh_result() {
   std::lock_guard<std::mutex> lock{refresh_mutex_};
-  if (!pending_refresh_) {
+  if (!pending_refresh_ ||
+      pending_refresh_->kind != BackgroundState::Kind::Discovery) {
     return std::nullopt;
   }
   x11_detail::ProbeResult probe;
@@ -1474,6 +1568,9 @@ X11Session::commit_probe(std::uint64_t generation,
       info_ = std::move(probe.info);
     }
     initialized_.store(true, std::memory_order_release);
+    if (changed) {
+      ++write_gate_->generation;
+    }
     write_gate_->enabled = true;
     return changed ? RefreshResult::HealthyUpdated
                    : RefreshResult::HealthyUnchanged;
@@ -1484,6 +1581,9 @@ X11Session::commit_probe(std::uint64_t generation,
     info_ = std::move(probe.info);
   }
   initialized_.store(false, std::memory_order_release);
+  if (write_gate_->enabled) {
+    ++write_gate_->generation;
+  }
   write_gate_->enabled = false;
   return probe.status == x11_detail::ProbeStatus::SessionAbsent
              ? RefreshResult::SessionAbsent
@@ -1493,6 +1593,7 @@ X11Session::commit_probe(std::uint64_t generation,
 void X11Session::reset() noexcept {
   std::unique_lock<std::recursive_mutex> write_lock{write_gate_->mutex};
   (void)generation_clock_->fetch_add(1, std::memory_order_acq_rel);
+  ++write_gate_->generation;
   initialized_.store(false, std::memory_order_release);
   write_gate_->enabled = false;
   std::lock_guard<std::mutex> lock{mu_};
@@ -1516,8 +1617,10 @@ bool X11Session::is_wayland_session() const {
 
 X11Session::WriteLease::WriteLease(std::shared_ptr<WriteGate> gate,
                                    std::unique_lock<std::recursive_mutex> lock,
-                                   X11SessionInfo info) noexcept
-    : gate_{std::move(gate)}, lock_{std::move(lock)}, info_{std::move(info)} {}
+                                   X11SessionInfo info,
+                                   std::uint64_t generation) noexcept
+    : gate_{std::move(gate)}, lock_{std::move(lock)}, info_{std::move(info)},
+      generation_{generation} {}
 
 bool X11Session::WriteLease::valid() const noexcept {
   return gate_ != nullptr && lock_.owns_lock();
@@ -1525,6 +1628,10 @@ bool X11Session::WriteLease::valid() const noexcept {
 
 const X11SessionInfo &X11Session::WriteLease::info() const noexcept {
   return info_;
+}
+
+std::uint64_t X11Session::WriteLease::generation() const noexcept {
+  return generation_;
 }
 
 BoundedXcbConnection X11Session::WriteLease::open_bounded_connection(
@@ -1553,7 +1660,8 @@ std::optional<X11Session::WriteLease> X11Session::acquire_write_lease() const {
     std::lock_guard<std::mutex> lock{mu_};
     snapshot = info_;
   }
-  return WriteLease{write_gate_, std::move(write_lock), std::move(snapshot)};
+  return WriteLease{write_gate_, std::move(write_lock), std::move(snapshot),
+                    write_gate_->generation};
 }
 
 BoundedXcbConnection X11Session::open_bounded_connection_for(

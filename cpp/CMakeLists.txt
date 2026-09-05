@@ -68,6 +68,9 @@ find_package(yaml-cpp REQUIRED)
 pkg_check_modules(SYSTEMD REQUIRED libsystemd)
 pkg_check_modules(XCB REQUIRED xcb)
 pkg_check_modules(XCB_XKB REQUIRED xcb-xkb)
+pkg_check_modules(XCB_XFIXES REQUIRED xcb-xfixes)
+pkg_check_modules(XCB_XTEST REQUIRED xcb-xtest)
+pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
 pkg_check_modules(XAU REQUIRED xau)
 
 # Hunspell для проверки орфографии с учётом словоформ (падежи, склонения, времена)
@@ -98,6 +101,12 @@ set(PUNTO_SOURCES
     src/ipc_server.cpp
     src/typo_corrector.cpp
     src/smart_bypass.cpp
+    src/word_editor.cpp
+    src/clipboard_manager.cpp
+    src/macro_lock.cpp
+    src/terminal_detection.cpp
+    src/sound_manager.cpp
+    src/undo_detector.cpp
 )
 
 set(PUNTO_HEADERS
@@ -122,6 +131,8 @@ set(PUNTO_HEADERS
     include/punto/runtime_tuning.hpp
     include/punto/runtime_file.hpp
     include/punto/runtime_health.hpp
+    include/punto/sound_manager.hpp
+    include/punto/undo_detector.hpp
 )
 
 # -----------------------------------------------------------------------------
@@ -138,6 +149,9 @@ function(configure_punto_daemon_target target_name)
         ${SYSTEMD_INCLUDE_DIRS}
         ${XCB_INCLUDE_DIRS}
         ${XCB_XKB_INCLUDE_DIRS}
+        ${XCB_XFIXES_INCLUDE_DIRS}
+        ${XCB_XTEST_INCLUDE_DIRS}
+        ${XKBCOMMON_INCLUDE_DIRS}
         ${XAU_INCLUDE_DIRS}
         ${HUNSPELL_INCLUDE_DIRS}
     )
@@ -147,6 +161,9 @@ function(configure_punto_daemon_target target_name)
         ${SYSTEMD_LIBRARIES}
         ${XCB_LIBRARIES}
         ${XCB_XKB_LIBRARIES}
+        ${XCB_XFIXES_LIBRARIES}
+        ${XCB_XTEST_LIBRARIES}
+        ${XKBCOMMON_LIBRARIES}
         ${XAU_LIBRARIES}
         ${HUNSPELL_LIBRARIES}
         Threads::Threads
@@ -157,16 +174,9 @@ endfunction()
 add_executable(punto ${PUNTO_SOURCES} ${PUNTO_HEADERS})
 configure_punto_daemon_target(punto)
 
-# Text mutation is intentionally disabled in the v2.8.8 production daemon.
-# Keep this boundary configure-time fatal; the inactive components remain
-# available only to the isolated contract-test targets below.
+# WordEditor owns bounded text execution; do not link the obsolete injector.
 set(PUNTO_FORBIDDEN_PRODUCTION_SOURCES
-    src/clipboard_manager.cpp
     src/key_injector.cpp
-    src/macro_lock.cpp
-    src/sound_manager.cpp
-    src/terminal_detection.cpp
-    src/undo_detector.cpp
 )
 foreach(forbidden_source IN LISTS PUNTO_FORBIDDEN_PRODUCTION_SOURCES)
     list(FIND PUNTO_SOURCES "${forbidden_source}" forbidden_index)
@@ -291,6 +301,7 @@ if(BUILD_TESTING)
             ${HUNSPELL_LIBRARIES}
             yaml-cpp::yaml-cpp
     )
+    target_link_options(punto-tests PRIVATE -Wl,--wrap=fsync)
 
     add_test(NAME punto-tests COMMAND punto-tests)
     set_tests_properties(punto-tests PROPERTIES TIMEOUT 30)
@@ -459,6 +470,7 @@ if(BUILD_TESTING)
 
     add_test(NAME punto-undo-detector-contract
              COMMAND punto-undo-detector-contract)
+    target_compile_definitions(punto-undo-detector-contract PRIVATE PUNTO_TESTING)
     set_tests_properties(punto-undo-detector-contract PROPERTIES TIMEOUT 15)
 
     add_executable(punto-sound-manager-contract
@@ -503,6 +515,7 @@ if(BUILD_TESTING)
     add_test(NAME punto-tray-ipc-contract COMMAND punto-tray-ipc-contract)
     set_tests_properties(punto-tray-ipc-contract PROPERTIES TIMEOUT 30)
 
+    find_program(XVFB_RUN_EXECUTABLE xvfb-run)
     if(GTK3_FOUND AND APPINDICATOR_FOUND)
         add_executable(punto-tray-app-contract
             tests/test_tray_app_contract.cpp
@@ -537,9 +550,33 @@ if(BUILD_TESTING)
             )
         endif()
 
-        add_test(NAME punto-tray-app-contract
-                 COMMAND punto-tray-app-contract)
-        set_tests_properties(punto-tray-app-contract PROPERTIES TIMEOUT 10)
+        if(XVFB_RUN_EXECUTABLE)
+            add_test(NAME punto-tray-app-contract
+                     COMMAND ${CMAKE_COMMAND} -E env
+                             --unset=DBUS_SESSION_BUS_ADDRESS
+                             --unset=SESSION_MANAGER NO_AT_BRIDGE=1
+                             ${XVFB_RUN_EXECUTABLE} -a
+                             $<TARGET_FILE:punto-tray-app-contract>)
+            set_tests_properties(punto-tray-app-contract PROPERTIES TIMEOUT 10)
+            # GTK/Pango worker retains Fontconfig's process-global FcInit cache.
+            # Keep LeakSanitizer active for every other allocation in this target.
+            set_tests_properties(punto-tray-app-contract PROPERTIES ENVIRONMENT
+                "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tray_fontconfig.lsan.supp")
+            if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND Python3_Interpreter_FOUND)
+                add_test(NAME punto-tray-lsan-negative-control
+                    COMMAND ${CMAKE_COMMAND} -E env
+                            --unset=DBUS_SESSION_BUS_ADDRESS
+                            --unset=SESSION_MANAGER NO_AT_BRIDGE=1
+                            ${XVFB_RUN_EXECUTABLE} -a ${Python3_EXECUTABLE}
+                            ${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_tray_lsan_negative_control.py
+                            $<TARGET_FILE:punto-tray-app-contract>)
+                set_tests_properties(punto-tray-lsan-negative-control PROPERTIES
+                    TIMEOUT 15
+                    ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tray_fontconfig.lsan.supp")
+            endif()
+        else()
+            message(WARNING "xvfb-run not found: tray app contract disabled")
+        endif()
     endif()
 
     add_executable(punto-x11-session-contract
@@ -575,6 +612,12 @@ if(BUILD_TESTING)
         src/terminal_detection.cpp
         src/x11_session.cpp
     )
+    target_link_options(punto-clipboard-contract PRIVATE
+        -Wl,--wrap=xcb_intern_atom
+        -Wl,--wrap=xcb_prefetch_extension_data
+        -Wl,--wrap=xcb_get_extension_data
+        -Wl,--wrap=xcb_disconnect
+    )
 
     target_include_directories(punto-clipboard-contract
         PRIVATE
@@ -596,7 +639,6 @@ if(BUILD_TESTING)
             ${XAU_LIBRARIES}
     )
 
-    find_program(XVFB_RUN_EXECUTABLE xvfb-run)
     if(XVFB_RUN_EXECUTABLE)
         add_test(NAME punto-clipboard-contract
                  COMMAND ${XVFB_RUN_EXECUTABLE} -a $<TARGET_FILE:punto-clipboard-contract>)
@@ -649,26 +691,11 @@ if(BUILD_TESTING)
             ${PUNTO_EVENT_LOOP_E2E_SOURCES}
         )
 
-        target_include_directories(punto-event-loop-e2e-driver
-            PRIVATE
-                ${CMAKE_CURRENT_SOURCE_DIR}/include
-                ${SYSTEMD_INCLUDE_DIRS}
-                ${XCB_INCLUDE_DIRS}
-                ${XCB_XKB_INCLUDE_DIRS}
-                ${XAU_INCLUDE_DIRS}
-                ${HUNSPELL_INCLUDE_DIRS}
-        )
-
-        target_link_libraries(punto-event-loop-e2e-driver
-            PRIVATE
-                ${SYSTEMD_LIBRARIES}
-                ${XCB_LIBRARIES}
-                ${XCB_XKB_LIBRARIES}
-                ${XAU_LIBRARIES}
-                ${HUNSPELL_LIBRARIES}
-                Threads::Threads
-                yaml-cpp::yaml-cpp
-        )
+        configure_punto_daemon_target(punto-event-loop-e2e-driver)
+        target_link_options(punto-event-loop-e2e-driver PRIVATE
+            -Wl,--wrap=fsync -Wl,--wrap=xcb_xkb_get_map
+            -Wl,--wrap=xcb_xkb_get_state -Wl,--wrap=xcb_poll_for_reply
+            -Wl,--wrap=xcb_disconnect)
 
         add_test(
             NAME punto-event-loop-gtk-e2e

@@ -38,6 +38,8 @@ jobs:
             libxcb1-dev \
             libxcb-xkb-dev \
             libxcb-xfixes0-dev \
+            libxcb-xtest0-dev \
+            libxkbcommon-dev \
             libxau-dev \
             libyaml-cpp-dev \
             libgtk-3-dev \
@@ -45,6 +47,8 @@ jobs:
             xauth \
             xclip \
             xdotool \
+            x11-xkb-utils \
+            x11-xserver-utils \
             xvfb
       - name: Allow Bubblewrap user namespaces on the hosted runner
         if: ${{ runner.environment == 'github-hosted' }}
@@ -91,6 +95,8 @@ jobs:
             libxcb1-dev \
             libxcb-xkb-dev \
             libxcb-xfixes0-dev \
+            libxcb-xtest0-dev \
+            libxkbcommon-dev \
             libxau-dev \
             libyaml-cpp-dev \
             libgtk-3-dev \
@@ -98,6 +104,8 @@ jobs:
             xauth \
             xclip \
             xdotool \
+            x11-xkb-utils \
+            x11-xserver-utils \
             xvfb
       - name: Allow Bubblewrap user namespaces on the hosted runner
         if: ${{ runner.environment == 'github-hosted' }}
@@ -145,6 +153,8 @@ jobs:
             libxcb1-dev \
             libxcb-xkb-dev \
             libxcb-xfixes0-dev \
+            libxcb-xtest0-dev \
+            libxkbcommon-dev \
             libxau-dev \
             libyaml-cpp-dev \
             libgtk-3-dev \
@@ -202,6 +212,9 @@ jobs:
             libsystemd-dev \
             libxcb1-dev \
             libxcb-xkb-dev \
+            libxcb-xfixes0-dev \
+            libxcb-xtest0-dev \
+            libxkbcommon-dev \
             libxau-dev \
             libyaml-cpp-dev \
             libgtk-3-dev \

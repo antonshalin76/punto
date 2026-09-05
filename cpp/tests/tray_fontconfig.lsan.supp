@@ -1,0 +1,6 @@
+# Tray widget fixture only; keep ASAN_OPTIONS=detect_leaks=1.
+# After releasing Pango's default map, Fontconfig 2.15.0 retains 320 bytes
+# in three XML initialization allocations whose stacks contain FcInit.
+# Evidence: pc_a84bd16ecea1. --lsan-negative-control must still report
+# inject_owned_leak_for_sanitizer_negative_control (73 bytes, one allocation).
+leak:FcInit

@@ -31,7 +31,6 @@ constexpr auto kPumpTimeBudget = std::chrono::milliseconds{2};
 // stopped X server cannot make libxcb enter its unbounded POLLOUT wait.
 constexpr std::size_t kMaxClipboardBytes = 4096U;
 constexpr std::size_t kMaxWmClassBytes = 4096;
-constexpr std::string_view kSafeGuiWmClass = "gedit";
 
 template <typename T> using XcbPtr = std::unique_ptr<T, decltype(&std::free)>;
 
@@ -46,25 +45,15 @@ template <typename T> XcbPtr<T> xcb_ptr(T *pointer) {
   return current + 1;
 }
 
-[[nodiscard]] bool
-equals_ascii_case_insensitive(std::string_view lhs,
-                              std::string_view rhs) noexcept {
-  return lhs.size() == rhs.size() &&
-         std::equal(lhs.begin(), lhs.end(), rhs.begin(),
-                    [](char left, char right) {
-                      const auto fold = [](char value) {
-                        return value >= 'A' && value <= 'Z'
-                                   ? static_cast<char>(value + ('a' - 'A'))
-                                   : value;
-                      };
-                      return fold(left) == fold(right);
-                    });
-}
-
 [[nodiscard]] bool is_safe_gui_wm_class(std::string_view instance,
                                         std::string_view klass) noexcept {
-  return equals_ascii_case_insensitive(instance, kSafeGuiWmClass) ||
-         equals_ascii_case_insensitive(klass, kSafeGuiWmClass);
+  const auto ordinary = [](std::string_view value) {
+    return !value.empty() && std::all_of(value.begin(), value.end(), [](char byte) {
+      const auto code = static_cast<unsigned char>(byte);
+      return code >= 0x20U && code != 0x7fU;
+    });
+  };
+  return ordinary(instance) && ordinary(klass);
 }
 
 [[nodiscard]] int
@@ -167,6 +156,32 @@ bool ClipboardManager::initialize_connection(
   atom_net_active_window_ = intern_atom("_NET_ACTIVE_WINDOW", deadline);
   atom_read_property_ = intern_atom("PUNTO_SELECTION_READ", deadline);
 
+  if (atom_clipboard_ == XCB_ATOM_NONE || atom_utf8_string_ == XCB_ATOM_NONE ||
+      atom_targets_ == XCB_ATOM_NONE || atom_text_plain_ == XCB_ATOM_NONE ||
+      atom_text_plain_utf8_ == XCB_ATOM_NONE || atom_incr_ == XCB_ATOM_NONE ||
+      atom_compound_text_ == XCB_ATOM_NONE || atom_text_ == XCB_ATOM_NONE ||
+      atom_timestamp_ == XCB_ATOM_NONE || atom_multiple_ == XCB_ATOM_NONE ||
+      atom_save_targets_ == XCB_ATOM_NONE ||
+      atom_read_property_ == XCB_ATOM_NONE || !connection_healthy()) {
+    fail_closed();
+    return false;
+  }
+
+  // Populate XCB's extension cache before generated XFixes requests can
+  // perform an unbounded first lookup. The core reply fences the query.
+  xcb_prefetch_extension_data(connection_, &xcb_xfixes_id);
+  const auto extension_barrier = xcb_get_input_focus(connection_);
+  void *raw_barrier = nullptr;
+  xcb_generic_error_t *raw_barrier_error = nullptr;
+  if (!wait_for_reply(extension_barrier.sequence, deadline, &raw_barrier,
+                      &raw_barrier_error)) {
+    fail_closed();
+    return false;
+  }
+  auto barrier =
+      xcb_ptr(static_cast<xcb_get_input_focus_reply_t *>(raw_barrier));
+  auto barrier_error = xcb_ptr(raw_barrier_error);
+
   const xcb_query_extension_reply_t *xfixes =
       xcb_get_extension_data(connection_, &xcb_xfixes_id);
   if (xfixes == nullptr || xfixes->present == 0) {
@@ -185,6 +200,10 @@ bool ClipboardManager::initialize_connection(
   auto version =
       xcb_ptr(static_cast<xcb_xfixes_query_version_reply_t *>(raw_version));
   auto version_error = xcb_ptr(raw_version_error);
+  if (!version || version_error) {
+    fail_closed();
+    return false;
+  }
   constexpr std::uint32_t owner_mask =
       XCB_XFIXES_SELECTION_EVENT_MASK_SET_SELECTION_OWNER |
       XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_WINDOW_DESTROY |
@@ -194,14 +213,7 @@ bool ClipboardManager::initialize_connection(
   const auto primary_watch = xcb_xfixes_select_selection_input_checked(
       connection_, window_, atom_primary_, owner_mask);
 
-  if (atom_clipboard_ == XCB_ATOM_NONE || atom_utf8_string_ == XCB_ATOM_NONE ||
-      atom_targets_ == XCB_ATOM_NONE || atom_text_plain_ == XCB_ATOM_NONE ||
-      atom_text_plain_utf8_ == XCB_ATOM_NONE || atom_incr_ == XCB_ATOM_NONE ||
-      atom_compound_text_ == XCB_ATOM_NONE || atom_text_ == XCB_ATOM_NONE ||
-      atom_timestamp_ == XCB_ATOM_NONE || atom_multiple_ == XCB_ATOM_NONE ||
-      atom_save_targets_ == XCB_ATOM_NONE ||
-      atom_read_property_ == XCB_ATOM_NONE || !version || version_error ||
-      !complete_checked_request(clipboard_watch, deadline) ||
+  if (!complete_checked_request(clipboard_watch, deadline) ||
       !complete_checked_request(primary_watch, deadline) ||
       !connection_healthy()) {
     fail_closed();
@@ -1563,15 +1575,18 @@ ActiveWindowKind ClipboardManager::active_window_kind() {
         const std::size_t first_end = value.find('\0');
         const std::string_view instance = value.substr(0, first_end);
         std::string_view klass;
+        bool valid_class = false;
         if (first_end != std::string_view::npos &&
             first_end + 1 < value.size()) {
           const std::size_t second_end = value.find('\0', first_end + 1);
           klass = value.substr(first_end + 1, second_end - first_end - 1);
+          valid_class = second_end != std::string_view::npos &&
+                        second_end + 1 == value.size();
         }
-        if (is_terminal_wm_class(instance, klass)) {
+        if (valid_class && is_terminal_wm_class(instance, klass)) {
           return ActiveWindowKind::Terminal;
         }
-        if (is_safe_gui_wm_class(instance, klass)) {
+        if (valid_class && is_safe_gui_wm_class(instance, klass)) {
           return ActiveWindowKind::Gui;
         }
       }

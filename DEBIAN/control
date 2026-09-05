@@ -6,9 +6,9 @@ Architecture: @PUNTO_ARCHITECTURE@
 Pre-Depends: dpkg (>= 1.20.6)
 Depends: @PUNTO_DEPENDS@
 Maintainer: Anton Shalin <anton.shalin@gmail.com>
-Description: keyboard layout analysis and safe passthrough for Linux
- Punto Switcher monitors keyboard input through interception-tools and analyzes
- text typed with the wrong keyboard layout. Release 2.8.8 runs in a fail-closed
- safety mode that does not dispatch automatic or manual text mutations. The
- package includes a command-line control client. The default artifact includes
+Description: automatic and manual EN/RU keyboard corrections for X11
+ Punto Switcher processes keyboard input through interception-tools and corrects
+ layout, case and spelling with guarded X11 operations. It supports selection
+ transformations, immediate undo, learned exclusions and optional layout sounds.
+ The package includes a command-line control client. The default artifact includes
  a GTK system-tray client; the explicit daemon-only flavor does not.

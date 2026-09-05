@@ -361,6 +361,80 @@ void test_status_is_exact() {
   }
 }
 
+void test_runtime_capability_schema_is_exact() {
+  const std::string legacy =
+      "OK x11_health=ready analysis_health=ready input_health=ready "
+      "x11_last_progress_ms=0 analysis_last_progress_ms=0 input_last_progress_ms=0 "
+      "analysis_outstanding=0 input_in_flight=0 log_dropped=0 text_mutation=disabled "
+      "enabled=0 configured_enabled=1 config_pending=0 config_generation=1 config_result=ok "
+      "analyzed=0 need_switch=0 corrections=0 pending_words=0 ready_results=0 worker_threads=1 "
+      "daemon_peers=1 analysis_mode=auto control_plane=primary queued_tasks=0 "
+      "avg_queue_us=0 avg_analysis_us=0 avg_macro_us=0 avg_tail_len=0";
+  const auto replace = [](std::string text, std::string_view from, std::string_view to) {
+    const auto offset = text.find(from);
+    require(offset != std::string::npos, "mutation fixture field exists");
+    text.replace(offset, from.size(), to);
+    return text;
+  };
+  const auto modern = replace(replace(legacy, "text_mutation=disabled",
+                                      "text_mutation=x11"),
+                              "corrections=0", "corrections=0 word_dispatches=7");
+  const auto exchange = [](const std::string &payload) {
+    OneShotServer server{[&](int fd) {
+      require(read_request(fd) == "STATS\n", "runtime snapshot requests exactly STATS");
+      send_all(fd, payload + "\n");
+    }};
+    auto result = punto::IpcClient::diagnose_runtime_socket(server.path());
+    server.verify();
+    return result;
+  };
+  auto result = exchange(legacy);
+  require(result.ok() && result.capability == punto::MutationCapability::Disabled &&
+              result.status == punto::ServiceStatus::Disabled, "legacy disabled snapshot is supported");
+  for (const bool enabled : {false, true}) {
+    result = exchange(enabled ? replace(modern, "enabled=0", "enabled=1") : modern);
+    require(result.ok() && result.capability == punto::MutationCapability::X11 &&
+                result.status == (enabled ? punto::ServiceStatus::Enabled : punto::ServiceStatus::Disabled),
+            "experimental capability is independent of runtime enabled");
+  }
+  for (const auto &payload : {
+           replace(modern, "text_mutation=x11", "text_mutation=unknown"),
+           replace(modern, "text_mutation=x11", "text_mutation=disabled"),
+           replace(modern, " word_dispatches=7", ""),
+           modern + " word_dispatches=7",
+           replace(modern, "word_dispatches=7", "word_dispatches=18446744073709551616"),
+           replace(modern, "word_dispatches=7", "word_dispatches=00"),
+           replace(modern, "enabled=0", "enabled=2"),
+           replace(legacy, "enabled=0", "enabled=1"),
+           replace(modern, "corrections=0 word_dispatches=7", "word_dispatches=7 corrections=0"),
+           modern + " "}) {
+    result = exchange(payload);
+    require(result.error == punto::IpcClientError::ProtocolError &&
+                result.status == punto::ServiceStatus::Unknown &&
+                result.capability == punto::MutationCapability::Unknown,
+            "malformed or hybrid schema fails closed without a usable status");
+  }
+}
+
+void test_auto_status_command_and_acknowledgement_are_exact() {
+  for (const bool enabled : {false, true}) {
+    const std::string expected = enabled ? "OK ENABLED\n" : "OK DISABLED\n";
+    const std::string opposite = enabled ? "OK DISABLED\n" : "OK ENABLED\n";
+    for (const auto &response : {expected, opposite, std::string{"OK unrelated\n"},
+                                 std::string{"ERROR State publication not durable\n"}}) {
+      OneShotServer server{[&](int fd) {
+        require(read_request(fd) == (enabled ? "SET_STATUS 1\n" : "SET_STATUS 0\n"),
+                "toggle submits the exact runtime status command");
+        send_all(fd, response);
+      }};
+      const bool accepted = punto::IpcClient::set_auto_enabled_for_test(enabled, server.path());
+      server.verify();
+      require(accepted == (response == expected),
+              "only exact matching status acknowledgement confirms the command");
+    }
+  }
+}
+
 void test_malformed_frames_are_rejected() {
   std::string with_nul{"OK ENABLED\0\n", 12U};
   std::string non_ascii{"OK ENABLED ", 11U};
@@ -519,6 +593,8 @@ int main() {
        test_client_descriptor_is_nonblocking_and_close_on_exec},
       {"typed success", test_typed_success_and_server_error},
       {"exact status", test_status_is_exact},
+      {"runtime capability schema", test_runtime_capability_schema_is_exact},
+      {"exact auto status command", test_auto_status_command_and_acknowledgement_are_exact},
       {"malformed frames", test_malformed_frames_are_rejected},
       {"oversized response", test_oversized_response_is_rejected},
       {"request validation", test_request_validation_precedes_connect},

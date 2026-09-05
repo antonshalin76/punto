@@ -1467,6 +1467,42 @@ run_protocol_rejection() {
     assert_bounded "$CLI_RC" "$CLI_DURATION_MS" 800 "B11 grammar: $label is bounded"
 }
 
+run_word_capability_matrix() {
+    local payload enabled command malformed
+    payload=${VALID_STATS/text_mutation=disabled/text_mutation=x11}
+    payload=${payload/corrections=2/corrections=0 word_dispatches=7}
+    for enabled in 0 1; do
+        for command in status start restart; do
+            reset_case
+            set_response_line "${payload/enabled=0/enabled=$enabled}"
+            start_fixture normal || continue
+            run_cli "word-mode-${command}-${enabled}" "$command"
+            if [[ $command == status ]]; then
+                assert_status_success "${payload/enabled=0/enabled=$enabled}" \
+                    "GUI word capability with runtime $enabled"
+            else
+                assert_zero "$CLI_RC" "GUI word $command with runtime $enabled"
+                assert_service_mutation_sequence "GUI word $command without rollback" "$command"
+                assert_service_state active "GUI word $command backend remains active"
+                assert_tray_state active "GUI word $command tray started"
+                assert_exact_stats_requests "GUI word $command readiness"
+            fi
+        done
+    done
+    for malformed in \
+        "${payload/text_mutation=x11/text_mutation=unknown}" \
+        "${payload/text_mutation=x11/text_mutation=disabled}" \
+        "${payload/ word_dispatches=7/}" \
+        "$payload word_dispatches=7" \
+        "${payload/word_dispatches=7/word_dispatches=-1}" \
+        "${payload/word_dispatches=7/word_dispatches=18446744073709551616}" \
+        "${payload/enabled=0/enabled=2}"; do
+        reset_case
+        set_response_line "$malformed"
+        run_protocol_rejection 'invalid GUI word capability snapshot'
+    done
+}
+
 run_stats_grammar_matrix() {
     local field value payload label token invalid_numeric index cursor
     local -a tokens=(
@@ -2821,8 +2857,8 @@ PY
         assert_matches "$CLI_OUTPUT" "(^|[[:space:]])$command([[:space:]]|$)" "B26 help documents $command"
     done
     assert_contains "$CLI_OUTPUT" '--version' "B26 help documents --version"
-    assert_contains "$CLI_OUTPUT" 'text mutations are disabled' \
-        "B26 help reports the 2.8.8 safety-mode capability"
+    assert_contains "$CLI_OUTPUT" 'X11 word and selection corrections' \
+        "B26 help describes the X11 correction capability"
     assert_no_control_calls "B26 --help"
     assert_bounded "$CLI_RC" "$CLI_DURATION_MS" 500 "B26 --help is bounded"
 
@@ -2859,6 +2895,7 @@ verify_fixture_permissions
 run_static_safety_gate
 run_basic_commands
 run_stats_grammar_matrix
+run_word_capability_matrix
 run_transport_error_matrix
 run_start_success_and_idempotency
 run_start_failure_matrix

@@ -18,6 +18,7 @@ tmp_root=""
 REQUIRED_PACKAGES=(
     build-essential cmake pkg-config libhunspell-dev libyaml-cpp-dev
     libsystemd-dev libxcb1-dev libxcb-xkb-dev libxau-dev
+    libxcb-xfixes0-dev libxcb-xtest0-dev libxkbcommon-dev
     dpkg-dev binutils file
 )
 REQUIRED_TOOLS=(
@@ -468,6 +469,7 @@ run_fake_build() {
     local name=$1 missing_packages=${2:-} missing_tool=${3:-} version_mode=${4:-preserve}
     local build_flavor=${5:-full}
     local source_epoch=${6:-}
+    local sound_fault=${7:-}
     local work="$tmp_root/fake-$name" spies bash_env output_file
     local -a build_options=(--non-interactive --skip-runtime-installs)
     local -a epoch_environment=()
@@ -483,6 +485,19 @@ run_fake_build() {
     mkdir -p "$work/home" "$FAKE_STAGE"
     : >"$FAKE_CALLS"
     copy_repo "$FAKE_REPO"
+    case $sound_fault in
+        missing-en_ru|missing-ru_en)
+            rm -- "$FAKE_REPO/cpp/src/sound/${sound_fault#missing-}.wav"
+            ;;
+        symlink-en_ru|symlink-ru_en)
+            mv -- "$FAKE_REPO/cpp/src/sound/${sound_fault#symlink-}.wav" \
+                "$work/sound-reference.wav"
+            ln -s "$work/sound-reference.wav" \
+                "$FAKE_REPO/cpp/src/sound/${sound_fault#symlink-}.wav"
+            ;;
+        '') ;;
+        *) fail "unknown sound fixture: $sound_fault" ;;
+    esac
     case $version_mode in
         preserve) ;;
         missing) rm -f -- "$FAKE_REPO/VERSION" ;;
@@ -1621,6 +1636,7 @@ assert_exact_derived_dependencies() {
     local -a elf_args=() derived_parts=() control_parts=()
     local -a explicit_parts=(
         interception-tools hunspell-en-us hunspell-ru netcat-openbsd passwd
+        'pulseaudio-utils | alsa-utils'
         'util-linux (>= 2.38)' 'systemd (>= 249.10)' \
         'init-system-helpers (>= 1.66)'
     )
@@ -1773,15 +1789,26 @@ inspect_artifact() {
     fi
     assert_file "$data/usr/share/punto-switcher/VERSION" "$label packages canonical VERSION"
     assert_file "$data/usr/share/doc/punto-switcher/README.md" "$label packages README"
+    assert_file "$data/usr/share/doc/punto-switcher/RESTORATION.md" \
+        "$label packages the restoration document linked by README"
     assert_file "$data/usr/share/doc/punto-switcher/copyright" "$label packages copyright"
     assert_file "$data/usr/share/doc/punto-switcher/changelog.Debian.gz" "$label packages changelog"
     assert_file "$data/usr/share/doc/punto-switcher/examples/udevmon.yaml" \
         "$label packages the udevmon example outside global configuration"
-    if [[ ! -e $data/usr/share/punto-switcher/sounds ]]; then
-        pass "$label omits inactive correction sound payloads"
-    else
-        fail "$label unexpectedly ships inactive correction sound payloads"
-    fi
+    local sound source_sound packaged_sound
+    for sound in en_ru ru_en; do
+        source_sound="$REPO_ROOT/cpp/src/sound/$sound.wav"
+        packaged_sound="$data/usr/share/punto-switcher/sounds/$sound.wav"
+        if [[ -f $packaged_sound && ! -L $packaged_sound ]] &&
+           cmp -s "$source_sound" "$packaged_sound" &&
+           [[ $(stat -c '%a' "$packaged_sound") == 644 ]]; then
+            pass "$label ships exact regular $sound WAV with mode 0644"
+        else
+            fail "$label lacks exact regular $sound WAV with mode 0644"
+        fi
+    done
+    assert_contains "$depends" 'pulseaudio-utils | alsa-utils' \
+        "$label declares an installed sound playback provider"
     if [[ ! -e $data/etc/interception/udevmon.yaml ]]; then
         pass "$label does not own the global interception configuration"
     else
@@ -2673,6 +2700,15 @@ if [[ -n ${PUNTO_CONTRACT_LIFECYCLE_ONLY_ARTIFACT:-} ]]; then
     [[ $failures -eq 0 ]]
     exit
 fi
+
+for sound_fault in missing-en_ru missing-ru_en symlink-en_ru symlink-ru_en; do
+    run_fake_build "sound-$sound_fault" '' '' preserve full '' "$sound_fault"
+    assert_nonzero "$FAKE_RC" "sound source preflight rejects $sound_fault"
+    assert_contains "$FAKE_OUTPUT" 'ERROR invalid-source-file: cpp/src/sound/' \
+        "sound source preflight reports $sound_fault"
+    assert_not_contains "$(<"$FAKE_CALLS")" 'CMAKE' \
+        "sound source preflight rejects $sound_fault before building"
+done
 
 run_version_source_gate
 run_default_source_epoch_gate

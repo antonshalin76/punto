@@ -137,6 +137,14 @@ public:
     Failed,
   };
 
+  struct KeyboardObservation {
+    std::uint64_t request_id = 0;
+    std::uint64_t session_generation = 0;
+    int group = -1;
+    std::uint32_t focus_window = 0;
+    std::uint8_t locked_mods = 0;
+  };
+
   using ProbeFunction = std::function<x11_detail::ProbeResult()>;
   using RetryWaitFunction = std::function<bool(
       std::chrono::milliseconds, const std::atomic<bool> &cancel_requested)>;
@@ -154,6 +162,7 @@ public:
 
     [[nodiscard]] bool valid() const noexcept;
     [[nodiscard]] const X11SessionInfo &info() const noexcept;
+    [[nodiscard]] std::uint64_t generation() const noexcept;
     [[nodiscard]] BoundedXcbConnection open_bounded_connection(
         std::chrono::steady_clock::time_point deadline) const;
     [[nodiscard]] BoundedXcbConnection open_bounded_connection(
@@ -164,11 +173,12 @@ public:
     friend class X11Session;
     WriteLease(std::shared_ptr<WriteGate> gate,
                std::unique_lock<std::recursive_mutex> lock,
-               X11SessionInfo info) noexcept;
+               X11SessionInfo info, std::uint64_t generation) noexcept;
 
     std::shared_ptr<WriteGate> gate_;
     std::unique_lock<std::recursive_mutex> lock_;
     X11SessionInfo info_;
+    std::uint64_t generation_ = 0;
   };
 
   explicit X11Session(ProbeFunction probe_function = {},
@@ -181,8 +191,11 @@ public:
   [[nodiscard]] bool initialize();
   [[nodiscard]] RefreshResult refresh();
 
-  void start_background_refresh();
+  bool start_background_refresh();
   [[nodiscard]] std::optional<RefreshResult> poll_refresh_result();
+  [[nodiscard]] bool
+  start_background_keyboard_observation(std::uint64_t request_id);
+  [[nodiscard]] std::optional<KeyboardObservation> poll_keyboard_observation();
 
   /**
    * Requests cancellation and waits no longer than timeout. A stuck system
@@ -204,12 +217,16 @@ public:
 
 private:
   struct BackgroundState {
+    enum class Kind { Discovery, Keyboard };
+    Kind kind = Kind::Discovery;
     std::mutex mu;
     std::condition_variable cv;
     std::atomic<bool> cancel_requested{false};
     bool done = false;
     std::uint64_t generation = 0;
     x11_detail::ProbeResult probe;
+    KeyboardObservation keyboard;
+    X11SessionInfo keyboard_session;
     ProbeFunction probe_function;
     RetryWaitFunction retry_wait_function;
     std::shared_ptr<WriteGate> write_gate;

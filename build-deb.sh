@@ -22,6 +22,7 @@ SKIP_RUNTIME_INSTALLS=false
 required_packages=(
     build-essential cmake pkg-config libsystemd-dev libxcb1-dev
     libxcb-xkb-dev libxau-dev libhunspell-dev libyaml-cpp-dev
+    libxcb-xfixes0-dev libxcb-xtest0-dev libxkbcommon-dev
     dpkg-dev binutils file
 )
 required_tools=(
@@ -142,7 +143,8 @@ for package in "${runtime_packages[@]}"; do
 done
 
 for input in \
-    punto-cli.sh config.yaml udevmon.yaml README.md LICENSE \
+    punto-cli.sh config.yaml udevmon.yaml README.md RESTORATION.md LICENSE \
+    cpp/src/sound/en_ru.wav cpp/src/sound/ru_en.wav \
     DEBIAN/control DEBIAN/postinst DEBIAN/prerm DEBIAN/postrm; do
     require_regular_input "$input"
 done
@@ -203,6 +205,7 @@ install -d -m 0755 \
     "$STAGE_DIR/etc/punto" \
     "$STAGE_DIR/usr/bin" \
     "$STAGE_DIR/usr/share/punto-switcher" \
+    "$STAGE_DIR/usr/share/punto-switcher/sounds" \
     "$STAGE_DIR/usr/share/doc/punto-switcher/examples" \
     "$STAGE_DIR/usr/share/doc/punto-switcher"
 
@@ -222,6 +225,8 @@ if [[ $BUILD_TRAY == true ]]; then
 fi
 
 install -m 0644 VERSION "$STAGE_DIR/usr/share/punto-switcher/VERSION"
+install -m 0644 cpp/src/sound/en_ru.wav cpp/src/sound/ru_en.wav \
+    "$STAGE_DIR/usr/share/punto-switcher/sounds/"
 install -m 0644 udevmon.yaml \
     "$STAGE_DIR/usr/share/doc/punto-switcher/examples/udevmon.yaml"
 install -m 0644 LICENSE "$STAGE_DIR/usr/share/doc/punto-switcher/copyright"
@@ -238,6 +243,7 @@ sed -E \
     -e "s|(punto-switcher_)[0-9]+([.][0-9]+){2}_[a-z0-9-]+([.]deb)|\\1${VERSION}_${ARCHITECTURE}\\3|" \
     README.md >"$STAGE_DIR/usr/share/doc/punto-switcher/README.md"
 chmod 0644 "$STAGE_DIR/usr/share/doc/punto-switcher/README.md"
+install -m 0644 RESTORATION.md "$STAGE_DIR/usr/share/doc/punto-switcher/RESTORATION.md"
 
 changelog_date=$(date -u -d "@$SOURCE_EPOCH" -R) || fail 'invalid-source-date-epoch'
 {
@@ -273,6 +279,7 @@ derived_dependencies=${derived_dependencies#shlibs:Depends=}
 
 explicit_dependencies=(
     interception-tools hunspell-en-us hunspell-ru netcat-openbsd passwd
+    'pulseaudio-utils | alsa-utils'
     'util-linux (>= 2.38)' 'systemd (>= 249.10)' \
     'init-system-helpers (>= 1.66)'
 )
@@ -288,7 +295,7 @@ done
 sed \
     -e "s|@PUNTO_VERSION@|$VERSION|g" \
     -e "s|@PUNTO_ARCHITECTURE@|$ARCHITECTURE|g" \
-    -e "s|@PUNTO_DEPENDS@|$depends|g" \
+    -e "s#@PUNTO_DEPENDS@#$depends#g" \
     DEBIAN/control >"$STAGE_DIR/DEBIAN/control"
 sed "s|@PUNTO_VERSION@|$VERSION|g" DEBIAN/postinst \
     >"$STAGE_DIR/DEBIAN/postinst"

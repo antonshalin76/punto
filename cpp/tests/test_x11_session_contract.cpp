@@ -1,6 +1,9 @@
 #include "punto/x11_session.hpp"
 
 #include <X11/Xauth.h>
+#define explicit explicit_
+#include <xcb/xkb.h>
+#undef explicit
 
 #include <array>
 #include <atomic>
@@ -286,19 +289,56 @@ struct NestedXServer {
   pid_t pid = -1;
   std::string display;
   bool stopped = false;
+  inline static unsigned int shutdown_failures = 0;
 
-  ~NestedXServer() { shutdown(); }
+  ~NestedXServer() {
+    if (!shutdown()) {
+      ++shutdown_failures;
+    }
+  }
 
-  void shutdown() {
-    if (pid > 0) {
-      if (stopped) {
-        (void)::kill(pid, SIGCONT);
+  [[nodiscard]] bool shutdown(int signal = SIGTERM) {
+    if (pid <= 0) {
+      return true;
+    }
+    int status = 0;
+    auto wait = [&](bool bounded) {
+      const auto deadline = std::chrono::steady_clock::now() + 5s;
+      pid_t result;
+      do {
+        result = ::waitpid(pid, &status, WNOHANG);
+        if (result > 0 || (result < 0 && errno != EINTR) ||
+            (!bounded && result == 0)) {
+          return result;
+        }
+        std::this_thread::sleep_for(1ms);
+      } while (std::chrono::steady_clock::now() < deadline);
+      errno = ETIMEDOUT;
+      return bounded ? pid_t{0} : pid_t{-1};
+    };
+    const pid_t previous = wait(false);
+    if (previous != 0) {
+      if (previous == pid || errno == ECHILD) {
+        pid = -1;
       }
-      (void)::kill(pid, SIGTERM);
-      (void)::waitpid(pid, nullptr, 0);
+      return false;
+    }
+    const bool resumed = !stopped || ::kill(pid, SIGCONT) == 0;
+    const bool signalled = ::kill(pid, signal) == 0;
+    pid_t result = wait(true);
+    const bool orderly = result == pid && resumed && signalled &&
+                         (signal == SIGTERM
+                              ? WIFEXITED(status) && WEXITSTATUS(status) == 0
+                              : WIFSIGNALED(status) && WTERMSIG(status) == signal);
+    if (result == 0) {
+      (void)::kill(pid, SIGKILL);
+      result = wait(true);
+    }
+    if (result == pid || (result < 0 && errno == ECHILD)) {
       pid = -1;
       stopped = false;
     }
+    return orderly;
   }
 
   void stop() {
@@ -779,9 +819,47 @@ void test_xkb_readiness_does_not_require_xfixes() {
   auto connection = lease->open_bounded_connection(1s);
   expect(connection.is_open(),
          "production X11 transport does not require XFixes");
+  const auto cookie = xcb_query_extension(connection.get(), 6, "XFIXES");
+  punto::x11_detail::XcbOperationResult result{};
+  auto *reply = static_cast<xcb_query_extension_reply_t *>(connection.wait_for_reply(
+      cookie.sequence, std::chrono::steady_clock::now() + 1s, result));
+  const bool xfixes_absent = reply != nullptr && reply->present == 0;
+  std::free(reply);
+  expect(xfixes_absent, "nested server actually has no XFIXES extension");
   const int group = session.get_current_keyboard_layout();
   expect(group == 0 || group == 1,
          "XKB layout observation works without XFixes");
+  // Xvfb 21.1.12 aborts on last XKB-client disconnect with XFIXES disabled.
+  // End this fixture while its retained connection is alive; reject prior death.
+  expect(server.shutdown(SIGKILL),
+         "XFIXES-disabled fixture ends only by its requested SIGKILL");
+}
+
+void test_nested_server_shutdown_rejects_early_exit() {
+  for (const bool signalled : {false, true}) {
+    const pid_t child = ::fork();
+    expect(child >= 0, "fork fixture early-exit control");
+    if (child == 0) {
+      if (signalled) {
+        (void)::raise(SIGKILL);
+      }
+      _exit(0);
+    }
+    NestedXServer server{child, {}, false};
+    siginfo_t info{};
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (info.si_pid == 0 && std::chrono::steady_clock::now() < deadline) {
+      expect(::waitid(P_PID, static_cast<id_t>(child), &info,
+                      WEXITED | WNOHANG | WNOWAIT) == 0,
+             "observe exited child without consuming its status");
+      std::this_thread::sleep_for(1ms);
+    }
+    expect(info.si_pid == child, "early-exit child reaches a terminal state");
+    expect(!server.shutdown(signalled ? SIGKILL : SIGTERM),
+           "shutdown rejects a child that exited before its requested signal");
+    expect(server.pid == -1 && server.shutdown(),
+           "rejected early-exit child is reaped once and cleanup is idempotent");
+  }
 }
 
 struct HangingLocalXServer {
@@ -911,7 +989,7 @@ void test_unresponsive_handshake_is_cancelled_and_next_connect_recovers() {
   const bool recovery_succeeded = recovered.is_open();
   recovered.close();
   hanging.shutdown();
-  healthy.shutdown();
+  expect(healthy.shutdown(), "healthy recovery server exits normally on SIGTERM");
 
   expect(timeout_is_bounded,
          "accepted X socket without handshake is cancelled by deadline");
@@ -1020,6 +1098,120 @@ void test_bounded_transport_and_linearizable_write_gate() {
          "single connector worker recovers after X resumes");
 }
 
+void test_keyboard_observation_ownership_and_authority_generation() {
+  NestedXServer server = start_nested_xvfb();
+  TempAuthority authority;
+  auto candidate = real_candidate(server, authority);
+  candidate.observed_keyboard_layout = 0;
+  unsigned int discovery_calls = 0;
+  punto::X11Session session{[&] {
+    ++discovery_calls;
+    return punto::x11_detail::ProbeResult{
+        punto::x11_detail::ProbeStatus::Healthy, candidate};
+  }};
+  expect(session.initialize(), "observation fixture session initializes");
+  auto fixture_lease = session.acquire_write_lease();
+  auto fixture_connection = fixture_lease->open_bounded_connection(1s);
+  fixture_lease.reset();
+  expect(fixture_connection.is_open(), "open observation fixture connection");
+  const auto screen = xcb_setup_roots_iterator(xcb_get_setup(fixture_connection.get()));
+  expect(screen.data != nullptr, "observation fixture has a screen");
+  const xcb_window_t observed_window = xcb_generate_id(fixture_connection.get());
+  punto::x11_detail::XcbOperationResult fixture_result{};
+  const auto check = [&](xcb_void_cookie_t cookie) {
+    return fixture_connection.check_request(cookie, std::chrono::steady_clock::now() + 1s,
+                                            fixture_result);
+  };
+  expect(check(xcb_create_window_checked(fixture_connection.get(), XCB_COPY_FROM_PARENT,
+      observed_window, screen.data->root, 0, 0, 80, 40, 0,
+      XCB_WINDOW_CLASS_INPUT_OUTPUT, XCB_COPY_FROM_PARENT, 0, nullptr)),
+      "create observation fixture window");
+  expect(check(xcb_map_window_checked(fixture_connection.get(), observed_window)),
+         "map observation fixture window");
+  expect(check(xcb_set_input_focus_checked(fixture_connection.get(), XCB_INPUT_FOCUS_PARENT,
+      observed_window, XCB_CURRENT_TIME)), "focus observation fixture window");
+  const auto generation = [&] {
+    const auto lease = session.acquire_write_lease();
+    expect(lease.has_value(), "valid authority grants a generation lease");
+    return lease->generation();
+  };
+  const auto collect = [&](std::uint64_t request_id) {
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    std::optional<punto::X11Session::KeyboardObservation> result;
+    while (!result && std::chrono::steady_clock::now() < deadline) {
+      expect(!session.start_background_keyboard_observation(999),
+             "busy observation lane cannot replace the original request");
+      expect(!session.start_background_refresh(),
+             "discovery cannot replace a pending keyboard job");
+      expect(!session.poll_refresh_result(),
+             "wrong-kind poll leaves keyboard completion owned by its caller");
+      result = session.poll_keyboard_observation();
+      std::this_thread::yield();
+    }
+    expect(result.has_value(), "keyboard observation completes within its bound");
+    expect(result->request_id == request_id,
+           "refused requests never overwrite the original completion id");
+    return *result;
+  };
+
+  const auto first_generation = generation();
+  expect(first_generation != 0, "initial authority has a nonzero generation");
+  expect(session.start_background_keyboard_observation(1),
+         "idle lane admits keyboard observation");
+  const auto first = collect(1);
+  expect(first.group == 0 && first.session_generation == first_generation,
+         "real Xvfb observation retains its exact authority and group");
+  expect(first.focus_window == observed_window && first.locked_mods == 0,
+         "keyboard observation captures the focused window and initial locks");
+  expect(discovery_calls == 1, "keyboard job never invokes session discovery");
+  const auto extension_cookie = xcb_xkb_use_extension(fixture_connection.get(), 1, 0);
+  auto *extension_reply = static_cast<xcb_xkb_use_extension_reply_t *>(
+      fixture_connection.wait_for_reply(extension_cookie.sequence,
+          std::chrono::steady_clock::now() + 1s, fixture_result));
+  const bool extension_ready = extension_reply != nullptr && extension_reply->supported;
+  std::free(extension_reply);
+  expect(extension_ready, "fixture connection enables XKB");
+  expect(check(xcb_xkb_latch_lock_state_checked(fixture_connection.get(), XCB_XKB_ID_USE_CORE_KBD,
+      XCB_MOD_MASK_LOCK, XCB_MOD_MASK_LOCK, 0, 0, 0, 0, 0)), "lock CapsLock in fixture");
+  expect(session.start_background_keyboard_observation(2),
+         "consuming the result frees the single-flight lane");
+  const auto second = collect(2);
+  expect(second.group == 0 && second.focus_window == observed_window &&
+             second.locked_mods == XCB_MOD_MASK_LOCK,
+         "next observation captures changed locks without a session refresh");
+
+  candidate.observed_keyboard_layout = 1;
+  expect(session.refresh() == punto::X11Session::RefreshResult::HealthyUnchanged,
+         "layout-only discovery does not change session identity");
+  expect(generation() == first_generation &&
+             session.info().observed_keyboard_layout == 1,
+         "layout diagnostics update without revoking the authority generation");
+  candidate.session_id += "-new";
+  expect(session.refresh() == punto::X11Session::RefreshResult::HealthyUpdated,
+         "actual session identity change publishes a new authority");
+  const auto changed_generation = generation();
+  expect(changed_generation != first_generation,
+         "new session identity cannot reuse the previous lease generation");
+
+  expect(session.start_background_keyboard_observation(3),
+         "observation starts before session revocation");
+  session.reset();
+  expect(!session.is_valid(), "reset revokes authority before completion drain");
+  const auto stale = collect(3);
+  expect(stale.group == -1 && stale.session_generation == changed_generation,
+         "late completion reports failure under its original authority");
+  expect(!session.is_valid(), "draining stale observation cannot restore writes");
+  expect(session.refresh() == punto::X11Session::RefreshResult::HealthyUpdated,
+         "healthy discovery restores authority after reset");
+  expect(generation() != changed_generation,
+         "recovered authority does not reuse a revoked generation");
+  expect(session.start_background_keyboard_observation(4),
+         "stale completion drain releases the observation lane");
+  const auto recovered = collect(4);
+  expect(recovered.group == 0 && recovered.session_generation == generation(),
+         "healthy retry observes real group under the recovered authority");
+}
+
 } // namespace
 
 int main() {
@@ -1036,9 +1228,13 @@ int main() {
     test_xauthority_family_precedence();
     test_xauthority_invalid_records_and_truncated_tail_fail_closed();
     test_xauthority_atomic_replacement_recovers_same_session();
+    test_nested_server_shutdown_rejects_early_exit();
     test_xkb_readiness_does_not_require_xfixes();
     test_unresponsive_handshake_is_cancelled_and_next_connect_recovers();
     test_bounded_transport_and_linearizable_write_gate();
+    test_keyboard_observation_ownership_and_authority_generation();
+    expect(NestedXServer::shutdown_failures == 0,
+           "all implicit nested server teardowns completed normally");
     std::cout << "punto-x11-session-contract: OK\n";
   } catch (const std::exception &error) {
     std::cerr << "FAIL: " << error.what() << '\n';

@@ -48,6 +48,7 @@ struct SettingsDialogUiContext {
   GtkToggleButton *typo_correction_check = nullptr;
   GtkSpinButton *max_typo_diff_spin = nullptr;
   GtkToggleButton *sticky_shift_check = nullptr;
+  GtkToggleButton *sound_check = nullptr;
 
   // UI
   GtkWidget *save_button = nullptr;
@@ -76,6 +77,8 @@ struct SettingsDialogUiContext {
   if (a.max_typo_diff != b.max_typo_diff)
     return true;
   if (a.sticky_shift_correction_enabled != b.sticky_shift_correction_enabled)
+    return true;
+  if (a.sound_enabled != b.sound_enabled)
     return true;
 
   return false;
@@ -111,6 +114,9 @@ read_non_hotkey_from_ui(const SettingsDialogUiContext &ctx) {
   if (ctx.sticky_shift_check) {
     out.sticky_shift_correction_enabled =
         gtk_toggle_button_get_active(ctx.sticky_shift_check);
+  }
+  if (ctx.sound_check) {
+    out.sound_enabled = gtk_toggle_button_get_active(ctx.sound_check);
   }
 
   return out;
@@ -330,9 +336,9 @@ bool SettingsDialog::show(GtkWidget *parent) {
   gtk_container_set_border_width(GTK_CONTAINER(auto_box), 12);
 
   GtkWidget *auto_note = make_dim_label(
-      "Безопасный режим v" PUNTO_VERSION
-      ": параметры ниже управляют только анализом. "
-      "Изменение текста и раскладки отключено до отправки клавиш.");
+      "Исправление слов и выделенного текста работает в X11. "
+      "Автоматический режим и ручные команды независимы; "
+      "возможности зависят от версии запущенного сервиса.");
   gtk_box_pack_start(GTK_BOX(auto_box), auto_note, FALSE, FALSE, 0);
 
   // Grid для параметров
@@ -390,8 +396,8 @@ bool SettingsDialog::show(GtkWidget *parent) {
                             initial_settings.max_rollback_words);
   gtk_grid_attach(GTK_GRID(auto_grid), rollback_spin, 1, 6, 1, 1);
   GtkWidget *rollback_desc = make_dim_label(
-      "Диапазон: 1–50. Сохраняется для совместимости конфигурации; "
-      "в v" PUNTO_VERSION " откат и повторный ввод не выполняются.");
+      "Диапазон: 1–50. Сколько последних слов можно повторно ввести "
+      "при запоздавшем исправлении.");
   gtk_grid_attach(GTK_GRID(auto_grid), rollback_desc, 0, 7, 2, 1);
 
   // ===== Секция исправления опечаток =====
@@ -408,7 +414,7 @@ bool SettingsDialog::show(GtkWidget *parent) {
 
   // Sticky shift correction
   GtkWidget *sticky_check = gtk_check_button_new_with_label(
-      "Распознавать залипший Shift (без изменения текста)");
+      "Исправлять залипший Shift в поддерживаемых редакторах");
   gtk_toggle_button_set_active(
       GTK_TOGGLE_BUTTON(sticky_check),
       initial_settings.sticky_shift_correction_enabled);
@@ -416,7 +422,7 @@ bool SettingsDialog::show(GtkWidget *parent) {
 
   // Typo correction
   GtkWidget *typo_check = gtk_check_button_new_with_label(
-      "Распознавать опечатки (без изменения текста) beta");
+      "Исправлять опечатки в поддерживаемых редакторах (beta)");
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(typo_check),
                                initial_settings.typo_correction_enabled);
   gtk_grid_attach(GTK_GRID(typo_grid), typo_check, 0, 1, 2, 1);
@@ -432,6 +438,10 @@ bool SettingsDialog::show(GtkWidget *parent) {
       "1 = только однобуквенные ошибки, 2 = включая двухбуквенные.");
   gtk_grid_attach(GTK_GRID(typo_grid), typo_diff_desc, 0, 3, 2, 1);
 
+  GtkWidget *sound_check = gtk_check_button_new_with_label("Звук при смене раскладки");
+  gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(sound_check), initial_settings.sound_enabled);
+  gtk_box_pack_start(GTK_BOX(auto_box), sound_check, FALSE, FALSE, 8);
+
   ui_ctx.threshold_spin = GTK_SPIN_BUTTON(threshold_spin);
   ui_ctx.min_word_spin = GTK_SPIN_BUTTON(min_word_spin);
   ui_ctx.min_score_spin = GTK_SPIN_BUTTON(min_score_spin);
@@ -439,6 +449,8 @@ bool SettingsDialog::show(GtkWidget *parent) {
   ui_ctx.sticky_shift_check = GTK_TOGGLE_BUTTON(sticky_check);
   ui_ctx.typo_correction_check = GTK_TOGGLE_BUTTON(typo_check);
   ui_ctx.max_typo_diff_spin = GTK_SPIN_BUTTON(typo_diff_spin);
+  ui_ctx.sound_check = GTK_TOGGLE_BUTTON(sound_check);
+  g_signal_connect(sound_check, "toggled", G_CALLBACK(on_any_setting_changed), &ui_ctx);
 
   g_signal_connect(threshold_spin, "value-changed",
                    G_CALLBACK(on_any_setting_changed), &ui_ctx);
@@ -468,30 +480,22 @@ bool SettingsDialog::show(GtkWidget *parent) {
 
   bool saved = false;
   if (response == GTK_RESPONSE_ACCEPT) {
-    SettingsData new_settings = initial_settings;
-
-    // Читаем значения из виджетов (без "Звук" и без enable-флага
-    // авто-переключения).
-    new_settings.threshold =
-        gtk_spin_button_get_value(GTK_SPIN_BUTTON(threshold_spin));
-    new_settings.min_word_len =
-        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(min_word_spin));
-    new_settings.min_score =
-        gtk_spin_button_get_value(GTK_SPIN_BUTTON(min_score_spin));
-    new_settings.max_rollback_words =
-        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(rollback_spin));
-
-    // Typo correction
-    new_settings.sticky_shift_correction_enabled =
-        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(sticky_check));
-    new_settings.typo_correction_enabled =
-        gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(typo_check));
-    new_settings.max_typo_diff =
-        gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(typo_diff_spin));
+    const SettingsData new_settings = read_non_hotkey_from_ui(ui_ctx);
 
     const bool dirty = non_hotkey_changed(new_settings, initial_settings);
     if (dirty) {
       saved = save_settings(new_settings);
+      if (!saved) {
+        GtkWidget *error = gtk_message_dialog_new(
+            GTK_WINDOW(dialog), GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR,
+            GTK_BUTTONS_CLOSE, "%s", "Не удалось подтвердить сохранение настроек.");
+        gtk_message_dialog_format_secondary_text(
+            GTK_MESSAGE_DIALOG(error), "%s",
+            "Сервису не отправлена команда применения. Откройте настройки повторно, "
+            "чтобы проверить сохранённые значения.");
+        (void)gtk_dialog_run(GTK_DIALOG(error));
+        gtk_widget_destroy(error);
+      }
     }
   }
 

@@ -3,15 +3,138 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
+#include <xcb/xcbext.h>
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wkeyword-macro"
+#endif
+#define explicit explicit_value
+#include <xcb/xkb.h>
+#undef explicit
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+
+namespace {
+bool consume_private_fault_marker(const char *path) {
+  const int marker =
+      ::open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (marker < 0) {
+    return false;
+  }
+  struct stat metadata {};
+  const bool armed =
+      ::fstat(marker, &metadata) == 0 && S_ISREG(metadata.st_mode) &&
+      metadata.st_uid == ::geteuid() && metadata.st_nlink == 1 &&
+      (metadata.st_mode & 0077) == 0;
+  (void)::close(marker);
+  return armed && ::unlink(path) == 0;
+}
+
+std::mutex keyboard_query_mutex;
+std::optional<std::pair<xcb_connection_t *, unsigned int>> keyboard_query;
+} // namespace
+
+extern "C" decltype(xcb_xkb_get_state) __real_xcb_xkb_get_state;
+extern "C" xcb_xkb_get_state_cookie_t __wrap_xcb_xkb_get_state(
+    xcb_connection_t *connection, xcb_xkb_device_spec_t device) {
+  const auto cookie = __real_xcb_xkb_get_state(connection, device);
+  if (consume_private_fault_marker("/run/punto-e2e-arm-keyboard-observation")) {
+    std::lock_guard lock{keyboard_query_mutex};
+    keyboard_query = std::pair{connection, cookie.sequence};
+  }
+  return cookie;
+}
+
+extern "C" decltype(xcb_poll_for_reply) __real_xcb_poll_for_reply;
+extern "C" int __wrap_xcb_poll_for_reply(
+    xcb_connection_t *connection, unsigned int sequence, void **reply,
+    xcb_generic_error_t **error) {
+  const int result = __real_xcb_poll_for_reply(connection, sequence, reply, error);
+  bool observed = false;
+  if (result != 0 && reply != nullptr && *reply != nullptr) {
+    std::lock_guard lock{keyboard_query_mutex};
+    if (keyboard_query == std::optional{std::pair{connection, sequence}}) {
+      keyboard_query.reset();
+      observed = true;
+    }
+  }
+  if (observed) {
+    const bool hold = consume_private_fault_marker("/run/punto-e2e-hold-keyboard-observation");
+    const int marker = ::open("/run/punto-e2e-keyboard-observed",
+                              O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (marker >= 0) {
+      (void)::close(marker);
+    }
+    // Test-only delayed delivery of an already captured reply, not a server
+    // delay or a production timeout. Never retain the mutex while waiting.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    while (hold && std::chrono::steady_clock::now() < deadline &&
+           !consume_private_fault_marker("/run/punto-e2e-release-keyboard-observation")) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+  }
+  return result;
+}
+
+extern "C" decltype(xcb_disconnect) __real_xcb_disconnect;
+extern "C" void __wrap_xcb_disconnect(xcb_connection_t *connection) {
+  {
+    std::lock_guard lock{keyboard_query_mutex};
+    if (keyboard_query && keyboard_query->first == connection) {
+      keyboard_query.reset();
+    }
+  }
+  __real_xcb_disconnect(connection);
+}
+
+extern "C" int __real_fsync(int fd);
+extern "C" int __wrap_fsync(int fd) {
+  constexpr const char *arm = "/run/punto-e2e-fail-directory-fsync";
+  struct stat target {}, runtime {};
+  if (::fstat(fd, &target) == 0 && S_ISDIR(target.st_mode) &&
+      ::stat("/run", &runtime) == 0 &&
+      target.st_dev == runtime.st_dev && target.st_ino == runtime.st_ino &&
+      consume_private_fault_marker(arm)) {
+    errno = EIO;
+    return -1;
+  }
+  return __real_fsync(fd);
+}
+
+extern "C" decltype(xcb_xkb_get_map) __real_xcb_xkb_get_map;
+extern "C" xcb_xkb_get_map_cookie_t __wrap_xcb_xkb_get_map(
+    xcb_connection_t *connection, xcb_xkb_device_spec_t device,
+    std::uint16_t full, std::uint16_t partial, std::uint8_t first_type,
+    std::uint8_t types, xcb_keycode_t first_symbol, std::uint8_t symbols,
+    xcb_keycode_t first_action, std::uint8_t actions,
+    xcb_keycode_t first_behavior, std::uint8_t behaviors,
+    std::uint16_t virtual_modifiers, xcb_keycode_t first_explicit,
+    std::uint8_t explicit_count, xcb_keycode_t first_modifier,
+    std::uint8_t modifiers, xcb_keycode_t first_virtual_modifier,
+    std::uint8_t virtual_modifier_count) {
+  if (consume_private_fault_marker("/run/punto-e2e-fail-xkb-map")) {
+    return {};
+  }
+  return __real_xcb_xkb_get_map(
+      connection, device, full, partial, first_type, types, first_symbol,
+      symbols, first_action, actions, first_behavior, behaviors,
+      virtual_modifiers, first_explicit, explicit_count, first_modifier,
+      modifiers, first_virtual_modifier, virtual_modifier_count);
+}
 
 namespace {
 
@@ -77,6 +200,10 @@ punto::x11_detail::ProbeResult probe_test_session() {
                                                      : "/tmp/punto-old-config")
                                       : required_environment("XDG_CONFIG_HOME");
   info.observed_keyboard_layout = 0;
+  if (std::getenv("PUNTO_E2E_DYNAMIC_LAYOUT") != nullptr &&
+      std::filesystem::exists("/run/punto-e2e-layout-ru")) {
+    info.observed_keyboard_layout = 1;
+  }
   if (const char *layout = std::getenv("PUNTO_E2E_OBSERVED_LAYOUT");
       layout != nullptr && (layout[0] == '0' || layout[0] == '1') &&
       layout[1] == '\0') {
@@ -198,15 +325,21 @@ punto::DictionaryLoadOutcome deterministic_dictionary_loader() {
   const std::string suffix = "-" + std::to_string(::getpid()) + ".dic";
   const ScopedFixturePath english{"/tmp/punto-e2e-en" + suffix};
   const ScopedFixturePath russian{"/tmp/punto-e2e-ru" + suffix};
+  const ScopedFixturePath affix{"/tmp/punto-e2e" + suffix + ".aff"};
   punto::DictionaryLoadOutcome outcome;
   if (!write_fixture(english.path, "2\nhello\nworld\n") ||
-      !write_fixture(russian.path, "1\nпривет\n")) {
+      !write_fixture(russian.path, "1\nпривет\n") ||
+      !write_fixture(affix.path, "SET UTF-8\nTRY esiarntolcdugmphbyfvkwzxjq\n")) {
     return outcome;
   }
 
   punto::DictionaryLoadSpec spec;
   spec.english_paths = {english.path};
   spec.russian_paths = {russian.path};
+  spec.english_affix = affix.path;
+  spec.english_hunspell_dictionary = english.path;
+  spec.russian_affix = affix.path;
+  spec.russian_hunspell_dictionary = russian.path;
   auto dictionary = std::make_unique<punto::Dictionary>();
   outcome.result = dictionary->initialize_bounded(spec);
   if (outcome.result == punto::DictionaryLoadResult::Ok) {

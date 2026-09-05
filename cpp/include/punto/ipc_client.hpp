@@ -20,6 +20,8 @@ enum class ServiceStatus {
   Disabled // Автопереключение выключено
 };
 
+enum class MutationCapability { Unknown, Disabled, X11 };
+
 /// Классификация отказа одного IPC-обмена.
 enum class IpcClientError {
   None,
@@ -38,6 +40,7 @@ struct IpcClientResult {
   IpcClientError error = IpcClientError::None;
   ServiceStatus status = ServiceStatus::Unknown;
   std::string response;
+  MutationCapability capability = MutationCapability::Unknown;
 
   [[nodiscard]] bool ok() const noexcept {
     return error == IpcClientError::None;
@@ -67,6 +70,10 @@ public:
    * @return Статус сервиса или Unknown при ошибке
    */
   static ServiceStatus get_status();
+
+  static IpcClientResult get_runtime_snapshot();
+  static IpcClientResult diagnose_runtime_socket(const std::string &socket_path);
+  static bool set_auto_enabled(bool enabled);
 
   /**
    * @brief Отправляет команду перезагрузки конфигурации
@@ -98,9 +105,11 @@ public:
 #if defined(PUNTO_IPC_CLIENT_INTERNAL_TESTING)
   [[nodiscard]] static IpcClientResult
   exchange_for_test(const std::string &command, const std::string &socket_path);
+  static bool set_auto_enabled_for_test(bool enabled, const std::string &socket_path);
 #endif
 
 private:
+  static bool set_auto_enabled_to_socket(bool enabled, const std::string &socket_path);
   /**
    * @brief Отправляет команду и получает ответ
    * @param command Команда для отправки

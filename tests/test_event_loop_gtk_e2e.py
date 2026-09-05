@@ -2,6 +2,8 @@
 
 import ctypes
 import ctypes.util
+import array
+import fcntl
 import os
 import pathlib
 import queue
@@ -12,9 +14,11 @@ import socket
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
 import unittest
+import warnings
 
 
 SKIP_EXIT = 77
@@ -25,6 +29,8 @@ EV_SYN = 0
 EV_KEY = 1
 SYN_REPORT = 0
 KEY_BACKSPACE = 14
+KEY_TAB = 15
+KEY_ENTER = 28
 KEY_LEFTCTRL = 29
 KEY_LEFTSHIFT = 42
 KEY_C = 46
@@ -32,10 +38,12 @@ KEY_V = 47
 KEY_DOT = 52
 KEY_LEFTALT = 56
 KEY_SPACE = 57
+KEY_NUMLOCK = 69
 KEY_RIGHTCTRL = 97
 KEY_LEFT = 105
 KEY_RIGHT = 106
 KEY_PAUSE = 119
+KEY_Z = 44
 
 LETTER_CODES = {
     "a": 30,
@@ -77,10 +85,22 @@ class InputEvent(ctypes.Structure):
     ]
 
 
+class XkbState(ctypes.Structure):
+    _fields_ = [
+        ("group", ctypes.c_ubyte), ("locked_group", ctypes.c_ubyte),
+        ("base_group", ctypes.c_ushort), ("latched_group", ctypes.c_ushort),
+        ("mods", ctypes.c_ubyte), ("base_mods", ctypes.c_ubyte),
+        ("latched_mods", ctypes.c_ubyte), ("locked_mods", ctypes.c_ubyte),
+        ("compat_state", ctypes.c_ubyte), ("grab_mods", ctypes.c_ubyte),
+        ("compat_grab_mods", ctypes.c_ubyte), ("lookup_mods", ctypes.c_ubyte),
+        ("compat_lookup_mods", ctypes.c_ubyte), ("ptr_buttons", ctypes.c_ushort),
+    ]
+
+
 def missing_runtime() -> list[str]:
     missing = [
         name
-        for name in ("bwrap", "Xvfb", "xdotool", "xclip")
+        for name in ("bwrap", "Xvfb", "xdotool", "xclip", "setxkbmap", "xkbcomp", "xmodmap")
         if shutil.which(name) is None
     ]
     if ctypes.util.find_library("X11") is None:
@@ -138,6 +158,8 @@ def run_in_sandbox(driver: pathlib.Path) -> int:
         "/run",
         "--tmpfs",
         "/tmp",
+        "--tmpfs",
+        "/etc/punto",
         "--ro-bind",
         str(driver.resolve()),
         "/tmp/punto-event-loop-e2e-driver",
@@ -217,6 +239,7 @@ class NestedX11:
     def __init__(self) -> None:
         self.process: subprocess.Popen[bytes] | None = None
         self.display = ""
+        self.stderr_file = tempfile.TemporaryFile()
 
     def start(self) -> None:
         read_fd, write_fd = os.pipe()
@@ -238,8 +261,12 @@ class NestedX11:
                 pass_fds=(write_fd,),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+                stderr=self.stderr_file,
             )
+        except OSError:
+            os.close(read_fd)
+            self.stderr_file.close()
+            raise
         finally:
             os.close(write_fd)
 
@@ -252,8 +279,9 @@ class NestedX11:
         os.close(read_fd)
         if not number.isdecimal() or self.process.poll() is not None:
             detail = ""
-            if self.process.poll() is not None and self.process.stderr is not None:
-                detail = self.process.stderr.read().decode("utf-8", errors="replace")
+            if self.process.poll() is not None:
+                self.stderr_file.seek(0)
+                detail = self.stderr_file.read(4096).decode("utf-8", errors="replace")
             self.stop()
             raise RuntimeError(
                 "nested Xvfb did not publish a display"
@@ -263,6 +291,7 @@ class NestedX11:
 
     def stop(self) -> None:
         if self.process is None:
+            self.stderr_file.close()
             return
         if self.process.poll() is None:
             self.process.terminate()
@@ -271,8 +300,7 @@ class NestedX11:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=2)
-        if self.process.stderr is not None and not self.process.stderr.closed:
-            self.process.stderr.close()
+        self.stderr_file.close()
         self.process = None
 
 
@@ -439,6 +467,11 @@ class XTestRelay:
                         raise RuntimeError("delayed Ctrl+V was never released")
 
                 pressed = value != 0
+                # XTest ignores a second press of an already held key. Evdev
+                # repeat is a delivered keystroke, represented by X11's pair.
+                if value == 2 and code in keys_down:
+                    if xtst.XTestFakeKeyEvent(connection, code + 8, False, 0) == 0:
+                        raise RuntimeError(f"XTest rejected repeat release {code}")
                 if xtst.XTestFakeKeyEvent(connection, code + 8, pressed, 0) == 0:
                     raise RuntimeError(f"XTest rejected evdev code {code}")
                 x11.XFlush(connection)
@@ -632,6 +665,7 @@ def ipc_request_at(path: str, command: bytes, timeout: float = EVENT_TIMEOUT) ->
 Gtk = None
 Gdk = None
 Vte = None
+GLib = None
 
 
 class EventLoopGtkE2E(unittest.TestCase):
@@ -687,7 +721,7 @@ class EventLoopGtkE2E(unittest.TestCase):
         if x11.XInitThreads() == 0:
             raise RuntimeError("XInitThreads failed before GTK initialization")
 
-        global Gtk, Gdk, Vte
+        global Gtk, Gdk, Vte, GLib
         import gi
 
         gi.require_version("Gtk", "3.0")
@@ -696,10 +730,12 @@ class EventLoopGtkE2E(unittest.TestCase):
         from gi.repository import Gdk as imported_gdk
         from gi.repository import Gtk as imported_gtk
         from gi.repository import Vte as imported_vte
+        from gi.repository import GLib as imported_glib
 
         Gtk = imported_gtk
         Gdk = imported_gdk
         Vte = imported_vte
+        GLib = imported_glib
         initialized, _ = Gtk.init_check([])
         if not initialized:
             raise RuntimeError("GTK could not open nested Xvfb")
@@ -710,10 +746,21 @@ class EventLoopGtkE2E(unittest.TestCase):
             Gtk.main_iteration_do(False)
 
     def setUp(self) -> None:
+        subprocess.run(
+            ["setxkbmap", "-display", self.x11.display, "-option", "", "-layout", "us"],
+            check=True,
+            timeout=3,
+        )
+        # Replacing the map does not clear the locked group left by a previous
+        # correction. Reset server state, not just the map, between scenarios.
+        self.lock_keyboard_group(0)
+        self.keyboard_locks(0)
         # The outer bwrap gives this suite a private /run. Start each case with
         # a fresh control-plane epoch after the prior harness has been stopped.
         for runtime_name in ("punto-control.state", "punto-control.lock"):
             pathlib.Path("/run", runtime_name).unlink(missing_ok=True)
+        for exclusion_name in ("undo_exclusions.txt", ".undo_exclusions.txt.lock"):
+            pathlib.Path("/etc/punto", exclusion_name).unlink(missing_ok=True)
         self.window = Gtk.Window(title="punto-event-loop-e2e")
         self.addCleanup(self._destroy_window)
         self.window.set_wmclass("gedit", "Gedit")
@@ -740,20 +787,34 @@ class EventLoopGtkE2E(unittest.TestCase):
         self.set_selection(Gdk.SELECTION_PRIMARY, "startup primary baseline")
 
         harness_environment: dict[str, str] = {}
+        if self._testMethodName == "test_initial_user_config_sets_auto_default":
+            path = pathlib.Path("/tmp/punto-home/.config/punto/config.yaml")
+            original = path.read_text(encoding="utf-8")
+            self.addCleanup(path.write_text, original, encoding="utf-8")
+            path.write_text(
+                original.replace("enabled: true", "enabled: false", 1),
+                encoding="utf-8",
+            )
+        if self._testMethodName == "test_x11_refresh_preserves_runtime_disable":
+            pathlib.Path("/run/punto-e2e-layout-ru").unlink(missing_ok=True)
+            harness_environment["PUNTO_E2E_DYNAMIC_LAYOUT"] = "1"
         if self._testMethodName in {
             "test_auto_candidate_delimiter_bypasses_unresponsive_x11",
             "test_ru_layout_snapshot_drives_analysis_without_input_x11",
+            "test_keyboard_observation_stall_keeps_input_live_and_recovers",
         }:
             blackhole = BlackholeX11()
             blackhole.start()
             self.addCleanup(blackhole.stop)
+            self.blackhole = blackhole
             harness_environment["PUNTO_E2E_PROBE_DISPLAY"] = blackhole.display
         if self._testMethodName == "test_blocking_config_io_keeps_input_responsive":
             pathlib.Path("/run/punto-e2e-stuck-config-ready").unlink(missing_ok=True)
             harness_environment["PUNTO_E2E_STUCK_CONFIG"] = "1"
-        if self._testMethodName == (
-            "test_session_config_reload_retries_after_obsolete_load"
-        ):
+        if self._testMethodName in {
+            "test_session_config_reload_retries_after_obsolete_load",
+            "test_config_completion_does_not_override_newer_status",
+        }:
             for marker_name in (
                 "punto-e2e-switch-session",
                 "punto-e2e-new-session-observed",
@@ -813,6 +874,7 @@ class EventLoopGtkE2E(unittest.TestCase):
             diagnostic = self.harness.diagnostic()
             diagnostic += f"\nprocess={self.harness.process.poll()}"
             diagnostic += f"\nrelay={self.harness.relay.snapshot()[-40:]}"
+        diagnostic += f"\neditor={self.entry.get_text()!r} keys={self.key_events[-20:]}"
         self.fail(f"timed out waiting for {description}\n{diagnostic}")
 
     def xdo(self, *arguments: str) -> str:
@@ -910,7 +972,7 @@ class EventLoopGtkE2E(unittest.TestCase):
             self.pump_until(
                 lambda: bool(select.select([client], [], [], 0)[0]), description
             )
-            self.assertEqual(client.recv(512), b"OK DISABLED\n")
+            self.assertIn(client.recv(512), (b"OK ENABLED\n", b"OK DISABLED\n"))
 
     def stats_fields(self) -> tuple[bytes, dict[str, str]]:
         response = ipc_request(b"STATS\n", timeout=0.5)
@@ -925,7 +987,6 @@ class EventLoopGtkE2E(unittest.TestCase):
         self.set_selection(Gdk.SELECTION_CLIPBOARD, clipboard_before)
         self.set_selection(Gdk.SELECTION_PRIMARY, primary_before)
 
-        self.assertEqual(ipc_request(b"SET_STATUS 0\n"), b"OK DISABLED\n")
         _, initial_fields = self.stats_fields()
         self.assertEqual(initial_fields["configured_enabled"], "1")
 
@@ -1004,15 +1065,19 @@ class EventLoopGtkE2E(unittest.TestCase):
             ],
         )
         self.assertEqual(fields["corrections"], "0")
-        self.assertEqual(ipc_request(b"GET_STATUS\n"), b"OK DISABLED\n")
+        self.assertEqual(ipc_request(b"GET_STATUS\n"), b"OK ENABLED\n")
         self.assertEqual(
-            ipc_request(b"SET_STATUS 1\n"), b"ERROR Text mutation disabled\n"
+            ipc_request(b"SET_STATUS 1\n"), b"OK ENABLED\n"
         )
         self.assertEqual(self.entry.get_text(), "ghbdtn .")
         self.assertEqual(self.selection_text(Gdk.SELECTION_CLIPBOARD), clipboard_before)
         self.assertEqual(self.selection_text(Gdk.SELECTION_PRIMARY), primary_before)
 
     def test_secondary_status_sync_cannot_override_configured_analysis(self) -> None:
+        self.pump_until(
+            lambda: self.stats_fields()[1]["config_pending"] == "0",
+            "initial config commit",
+        )
         self.assertEqual(ipc_request(b"SET_STATUS 0\n"), b"OK DISABLED\n")
         environment = os.environ.copy()
         secondary = subprocess.Popen(
@@ -1060,6 +1125,210 @@ class EventLoopGtkE2E(unittest.TestCase):
         self.assertEqual(latest["enabled"], "0")
         self.assertEqual(latest["configured_enabled"], "1")
         self.assertEqual(ipc_request(b"GET_STATUS\n"), b"OK DISABLED\n")
+
+    def test_config_completion_does_not_override_newer_status(self) -> None:
+        ready = pathlib.Path("/run/punto-e2e-old-config-ready")
+        release = pathlib.Path("/run/punto-e2e-release-old-config")
+        self.pump_until(ready.exists, "old config load paused")
+        self.assertEqual(self.stats_fields()[1]["config_pending"], "1")
+        self.assertEqual(ipc_request(b"SET_STATUS 0\n"), b"OK DISABLED\n")
+        release.touch()
+        self.pump_until(
+            lambda: self.stats_fields()[1]["config_pending"] == "0",
+            "older config completion",
+        )
+        fields = self.stats_fields()[1]
+        self.assertEqual(fields["config_result"], "ok")
+        self.assertEqual(fields["configured_enabled"], "1")
+        self.assertEqual(fields["enabled"], "0")
+        self.assertEqual(ipc_request(b"GET_STATUS\n"), b"OK DISABLED\n")
+        self.prepare_word_editor()
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn", "source word")
+        self.harness.send_key(KEY_SPACE)
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn ", "auto disabled")
+        self.pump_for(0.2)
+        self.assertEqual(self.entry.get_text(), "ghbdtn ")
+        self.assertNotIn("Word edit dispatch status=", self.harness.diagnostic())
+
+    def test_x11_refresh_preserves_runtime_disable(self) -> None:
+        self.prepare_word_editor()
+        self.assertEqual(ipc_request(b"SET_STATUS 0\n"), b"OK DISABLED\n")
+        config_generation = self.stats_fields()[1]["config_generation"]
+        self.pump_until(
+            lambda: "Configuration reloaded:" in self.harness.diagnostic(),
+            "initial config diagnostic delivered",
+        )
+        config_loads = self.harness.diagnostic().count("Configuration reloaded:")
+        self.lock_keyboard_group(1)
+        pathlib.Path("/run/punto-e2e-layout-ru").touch()
+        self.pump_until(
+            lambda: "X11 observation refreshed, layout: RU" in self.harness.diagnostic(),
+            "changed layout observed by session refresh",
+        )
+        self.pump_until(
+            lambda: self.stats_fields()[1]["config_pending"] == "0",
+            "session refresh config completion",
+        )
+        self.assertEqual(ipc_request(b"GET_STATUS\n"), b"OK DISABLED\n")
+        self.assertEqual(self.stats_fields()[1]["config_generation"], config_generation)
+        self.assertEqual(self.harness.diagnostic().count("Configuration reloaded:"), config_loads)
+        self.harness.type_word("hello")
+        self.pump_until(lambda: self.entry.get_text() == "руддщ", "Russian source")
+        self.harness.send_key(KEY_SPACE)
+        self.pump_until(lambda: self.entry.get_text() == "руддщ ", "auto stays off")
+        self.pump_for(0.2)
+        self.assertEqual(self.entry.get_text(), "руддщ ")
+        self.assertNotIn("Word edit dispatch status=", self.harness.diagnostic())
+
+    def test_config_publication_failure_preserves_runtime_and_recovers(self) -> None:
+        self.prepare_word_editor()
+        config_path = pathlib.Path("/tmp/punto-home/.config/punto/config.yaml")
+        previous_config = config_path.read_text(encoding="utf-8")
+        self.addCleanup(config_path.write_text, previous_config, encoding="utf-8")
+        config_path.write_text(
+            previous_config.replace("enabled: true", "enabled: false", 1),
+            encoding="utf-8",
+        )
+        state_path = pathlib.Path("/run/punto-control.state")
+        previous_state = state_path.read_bytes()
+        self.addCleanup(state_path.chmod, 0o660)
+        state_path.chmod(0o666)
+        self.assertEqual(ipc_request(b"RELOAD\n"), b"OK Scheduled\n")
+        self.pump_until(
+            lambda: self.stats_fields()[1]["config_pending"] == "0",
+            "failed config publication",
+        )
+        fields = self.stats_fields()[1]
+        self.assertEqual(fields["config_result"], "error")
+        self.assertEqual(fields["configured_enabled"], "1")
+        self.assertEqual(fields["enabled"], "1")
+        self.assertEqual(state_path.read_bytes(), previous_state)
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn", "old config source")
+        self.harness.send_key(KEY_SPACE)
+        self.pump_until(lambda: self.entry.get_text() == "привет ", "old auto still on")
+        state_path.chmod(0o660)
+        self.assertEqual(ipc_request(b"RELOAD\n"), b"OK Scheduled\n")
+        self.pump_until(
+            lambda: self.stats_fields()[1]["config_pending"] == "0",
+            "config publication recovered",
+        )
+        fields = self.stats_fields()[1]
+        self.assertEqual(fields["config_result"], "ok")
+        self.assertEqual(fields["configured_enabled"], "0")
+        self.assertEqual(ipc_request(b"GET_STATUS\n"), b"OK DISABLED\n")
+        self.harness.type_word("hello")
+        self.pump_until(lambda: self.entry.get_text() == "привет руддщ", "new source")
+        self.harness.send_key(KEY_SPACE)
+        self.pump_until(lambda: self.entry.get_text() == "привет руддщ ", "auto off")
+        self.pump_for(0.2)
+        self.assertEqual(self.entry.get_text(), "привет руддщ ")
+
+    def test_initial_user_config_sets_auto_default(self) -> None:
+        self.prepare_word_editor()
+        fields = self.stats_fields()[1]
+        self.assertEqual(fields["configured_enabled"], "0")
+        self.assertEqual(fields["enabled"], "0")
+        self.assertEqual(ipc_request(b"GET_STATUS\n"), b"OK DISABLED\n")
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn", "source word")
+        self.harness.send_key(KEY_SPACE)
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn ", "auto default off")
+        self.pump_for(0.2)
+        self.assertEqual(self.entry.get_text(), "ghbdtn ")
+
+    def test_xvfb_repeated_keymaps_do_not_block_diagnostic_output(self) -> None:
+        for index in range(40):
+            subprocess.run(
+                ["setxkbmap", "-display", self.x11.display, "-layout",
+                 "us,ru" if index % 2 else "us"],
+                check=True,
+                timeout=1,
+            )
+        self.lock_keyboard_group(0)
+        self.harness.type_word("hello")
+        self.pump_until(lambda: self.entry.get_text() == "hello", "Xvfb still responsive")
+
+    def test_nondurable_status_and_config_keep_visible_state(self) -> None:
+        self.prepare_word_editor()
+        marker = pathlib.Path("/run/punto-e2e-fail-directory-fsync")
+        self.addCleanup(marker.unlink, missing_ok=True)
+        state_path = pathlib.Path("/run/punto-control.state")
+
+        def state() -> dict[str, str]:
+            return dict(
+                line.split("=", 1)
+                for line in state_path.read_text(encoding="utf-8").splitlines()
+            )
+
+        previous = state()
+        marker.touch(mode=0o600)
+        self.assertEqual(
+            ipc_request(b"SET_STATUS 0\n"),
+            b"ERROR Status published but durability not confirmed\n",
+        )
+        self.assertFalse(marker.exists(), "exact directory-fsync fault was consumed")
+        visible = state()
+        self.assertEqual(visible["enabled"], "0")
+        self.assertEqual(
+            int(visible["status_generation"]), int(previous["status_generation"]) + 1
+        )
+        self.assertEqual(visible["config_generation"], previous["config_generation"])
+        self.assertEqual(visible["config_path"], previous["config_path"])
+        self.assertEqual(ipc_request(b"GET_STATUS\n"), b"OK DISABLED\n")
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn", "source word")
+        self.harness.send_key(KEY_SPACE)
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn ", "visible auto off")
+        self.pump_for(0.2)
+        self.assertEqual(self.entry.get_text(), "ghbdtn ")
+        self.assertEqual(ipc_request(b"SET_STATUS 1\n"), b"OK ENABLED\n")
+
+        config_path = pathlib.Path("/tmp/punto-home/.config/punto/nondurable.yaml")
+        self.addCleanup(config_path.unlink, missing_ok=True)
+        original = config_path.with_name("config.yaml").read_text(encoding="utf-8")
+        config_path.write_text(
+            original.replace("enabled: true", "enabled: false", 1),
+            encoding="utf-8",
+        )
+        previous = state()
+        marker.touch(mode=0o600)
+        self.assertEqual(
+            ipc_request(f"RELOAD {config_path}\n".encode("ascii")), b"OK Scheduled\n"
+        )
+        self.pump_until(
+            lambda: self.stats_fields()[1]["config_pending"] == "0",
+            "nondurable config completion",
+        )
+        self.assertFalse(marker.exists())
+        visible = state()
+        self.assertEqual(visible["enabled"], "0")
+        self.assertEqual(visible["config_path"], str(config_path))
+        self.assertEqual(
+            int(visible["status_generation"]), int(previous["status_generation"]) + 1
+        )
+        self.assertEqual(
+            int(visible["config_generation"]), int(previous["config_generation"]) + 1
+        )
+        fields = self.stats_fields()[1]
+        self.assertEqual(fields["config_result"], "error")
+        self.assertEqual(fields["configured_enabled"], "0")
+        self.assertEqual(ipc_request(b"GET_STATUS\n"), b"OK DISABLED\n")
+
+        self.assertEqual(ipc_request(b"RELOAD\n"), b"OK Scheduled\n")
+        self.pump_until(
+            lambda: self.stats_fields()[1]["config_pending"] == "0",
+            "durable config retry",
+        )
+        fields = self.stats_fields()[1]
+        self.assertEqual(fields["config_result"], "ok")
+        self.assertEqual(fields["configured_enabled"], "1")
+        self.assertEqual(ipc_request(b"GET_STATUS\n"), b"OK ENABLED\n")
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn ghbdtn", "retry source")
+        self.harness.send_key(KEY_SPACE)
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn привет ", "auto recovered")
 
     def test_dictionary_oversize_fails_once_without_ipc_readiness(self) -> None:
         sockets_before = {
@@ -1228,6 +1497,17 @@ class EventLoopGtkE2E(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 0.5)
 
     def test_ru_layout_snapshot_drives_analysis_without_input_x11(self) -> None:
+        def diagnostic_analysis_ready() -> bool:
+            _, fields = self.stats_fields()
+            return (
+                fields["config_pending"] == "0"
+                and fields["config_result"] == "ok"
+                and fields["analysis_health"] == "ready"
+                and fields["worker_threads"] == "1"
+                and "X11 observation refreshed, layout: RU" in self.harness.diagnostic()
+            )
+
+        self.pump_until(diagnostic_analysis_ready, "initialized RU diagnostic analysis")
         self.harness.type_word("hello")
         self.pump_until(
             lambda: self.entry.get_text() == "hello", "RU-layout physical word"
@@ -1349,6 +1629,11 @@ class EventLoopGtkE2E(unittest.TestCase):
 
         self.pump_until(latest_config_committed, "latest-session config commit")
         self.assertEqual(latest["configured_enabled"], "0")
+        self.pump_until(
+            lambda: 'Configuration reloaded: "/tmp/punto-new-config/punto/config.yaml"'
+            in self.harness.diagnostic(),
+            "latest-session configuration log delivery",
+        )
         diagnostic = self.harness.diagnostic()
         self.assertIn("Config reload superseded by newer session", diagnostic)
         self.assertIn(
@@ -1379,7 +1664,13 @@ class EventLoopGtkE2E(unittest.TestCase):
         self.assertEqual(fields["config_generation"], generation)
         self.assertEqual(fields["config_pending"], "0")
 
-    def test_selection_gui_hotkey_is_swallowed_before_dispatch(self) -> None:
+    def test_selection_gui_rejects_unsupported_single_layout(self) -> None:
+        layout = subprocess.run(
+            ["setxkbmap", "-display", self.x11.display, "-query"],
+            check=True, capture_output=True, text=True, timeout=3,
+        ).stdout
+        self.assertEqual(next(line.split(":", 1)[1].strip() for line in layout.splitlines()
+                              if line.startswith("layout:")), "us")
         original = "before sEleCt after"
         self.entry.set_text(original)
         start = original.index("sEleCt")
@@ -1392,7 +1683,8 @@ class EventLoopGtkE2E(unittest.TestCase):
         before = self.harness.relay.snapshot()
 
         self.harness.hotkey(KEY_LEFTALT, repeat=True)
-        self.wait_event_loop_idle("GUI selection pre-dispatch skip")
+        self.pump_until(lambda: "Word edit dispatch status=0" in self.harness.diagnostic(),
+                        "unsupported single-layout selection rejection")
 
         self.assertEqual(self.entry.get_text(), original)
         self.assertEqual(self.entry.get_selection_bounds(), (start, start + 6))
@@ -1547,6 +1839,1145 @@ class EventLoopGtkE2E(unittest.TestCase):
         )
         self.assertFalse(any(name == "Pause" for _, name, _ in self.key_events))
 
+    def prepare_word_editor(self) -> None:
+        self.pump_until(
+            lambda: self.stats_fields()[1]["config_pending"] == "0",
+            "initial config commit",
+        )
+        subprocess.run(
+            ["setxkbmap", "-display", self.x11.display, "-layout", "us,ru"],
+            check=True,
+            timeout=3,
+        )
+        # An active PRIMARY owned by this application is deliberately excluded
+        # by the first word-editor stage. Selection support has a separate gate.
+        Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY).clear()
+        self.pump_until(
+            lambda: self.selection_text(Gdk.SELECTION_PRIMARY) is None,
+            "empty primary selection",
+        )
+
+    def lock_keyboard_group(self, group: int) -> None:
+        x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XkbLockGroup.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
+        x11.XkbLockGroup.restype = ctypes.c_int
+        x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        connection = x11.XOpenDisplay(self.x11.display.encode("ascii"))
+        self.assertTrue(connection)
+        try:
+            self.assertNotEqual(x11.XkbLockGroup(connection, 0x0100, group), 0)
+            x11.XSync(connection, False)
+        finally:
+            x11.XCloseDisplay(connection)
+
+    def keyboard_locks(self, mask: int | None = None) -> int:
+        x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XkbLockModifiers.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+        ]
+        x11.XkbLockModifiers.restype = ctypes.c_int
+        x11.XkbGetState.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(XkbState)]
+        x11.XkbGetState.restype = ctypes.c_int
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        connection = x11.XOpenDisplay(self.x11.display.encode("ascii"))
+        self.assertTrue(connection)
+        try:
+            if mask is not None:
+                self.assertNotEqual(x11.XkbLockModifiers(connection, 0x0100, 255, mask), 0)
+            state = XkbState()
+            self.assertEqual(x11.XkbGetState(connection, 0x0100, ctypes.byref(state)), 0)
+            if mask is not None:
+                self.assertEqual(state.locked_mods, mask)
+            return state.locked_mods
+        finally:
+            x11.XCloseDisplay(connection)
+
+    def install_word_test_map(self, symbols: str = "", types: str = "") -> None:
+        # Compile only into this suite's private Xvfb; no host keymap is touched.
+        source = (
+            'xkb_keymap { xkb_keycodes { include "evdev+aliases(qwerty)" }; '
+            'xkb_types { include "complete" ' + types + ' }; '
+            'xkb_compatibility { include "complete" }; '
+            'xkb_symbols { include "pc+us+ru:2+inet(evdev)" ' + symbols + ' }; };'
+        )
+        result = subprocess.run(
+            ["xkbcomp", "-w", "0", "-", self.x11.display], input=source,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=3, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.pump_for(0.02)
+
+    def lookup_test_keysym(self, code: int, group: int, modifiers: int) -> str:
+        x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XkbLookupKeySym.argtypes = [
+            ctypes.c_void_p, ctypes.c_ubyte, ctypes.c_uint,
+            ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_ulong),
+        ]
+        x11.XkbLookupKeySym.restype = ctypes.c_int
+        x11.XKeysymToString.argtypes = [ctypes.c_ulong]
+        x11.XKeysymToString.restype = ctypes.c_char_p
+        x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        connection = x11.XOpenDisplay(self.x11.display.encode("ascii"))
+        self.assertTrue(connection)
+        try:
+            consumed, symbol = ctypes.c_uint(), ctypes.c_ulong()
+            self.assertNotEqual(x11.XkbLookupKeySym(
+                connection, code + 8, modifiers | (group << 13),
+                ctypes.byref(consumed), ctypes.byref(symbol),
+            ), 0)
+            return x11.XKeysymToString(symbol.value).decode("ascii")
+        finally:
+            x11.XCloseDisplay(connection)
+
+    def assert_numlock_word_correction(self, lock_mask: int) -> None:
+        self.harness.send_key(KEY_NUMLOCK)
+        self.pump_until(
+            lambda: any(name == "Num_Lock" and kind == "release" for kind, name, _ in self.key_events),
+            "NumLock key release",
+        )
+        self.assertEqual(self.keyboard_locks(), lock_mask)
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn", "NumLock source")
+        self.harness.send_key(KEY_SPACE)
+        self.pump_until(lambda: self.entry.get_text() == "привет ", "NumLock correction")
+        self.assertEqual(self.keyboard_locks(), lock_mask)
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+        self.assertEqual(self.selection_text(Gdk.SELECTION_CLIPBOARD), "startup clipboard baseline")
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.entry.get_text() == "привет привет", "target layout retained")
+        self.assertEqual(self.keyboard_locks(), lock_mask)
+
+    def test_numlock_allows_word_correction(self) -> None:
+        self.prepare_word_editor()
+        self.assert_numlock_word_correction(16)
+
+    def test_remapped_numlock_allows_word_correction(self) -> None:
+        self.prepare_word_editor()
+        subprocess.run(
+            ["xmodmap", "-display", self.x11.display, "-e", "clear Mod2",
+             "-e", "clear Mod3", "-e", "add Mod3 = Num_Lock"],
+            check=True, timeout=3,
+        )
+        self.assert_numlock_word_correction(32)
+
+    def assert_locked_word_rejected(self, source: str, mask: int) -> None:
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.entry.get_text() == source, "locked source word")
+        self.harness.send_key(KEY_PAUSE)
+        self.pump_until(
+            lambda: "Word edit dispatch status=0" in self.harness.diagnostic(),
+            "incompatible lock/map rejected before selection",
+        )
+        self.assertEqual(self.entry.get_text(), source)
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+        self.assertFalse(any(name == "Left" for _, name, _ in self.key_events))
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "0")
+        self.assertEqual(self.keyboard_locks(), mask)
+        self.assertEqual(self.selection_text(Gdk.SELECTION_CLIPBOARD), "startup clipboard baseline")
+
+    def test_numlock_with_caps_corrects_and_preserves_locks(self) -> None:
+        self.prepare_word_editor()
+        self.keyboard_locks(18)
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.entry.get_text() == "GHBDTN", "CapsLock source word")
+        self.harness.send_key(KEY_PAUSE)
+        self.pump_until(lambda: self.entry.get_text() == "ПРИВЕТ", "CapsLock layout correction")
+        self.assertEqual(self.keyboard_locks(), 18)
+        self.harness.type_word("f")
+        self.pump_until(lambda: self.entry.get_text() == "ПРИВЕТА", "CapsLock and corrected layout remain active")
+
+    def test_capslock_case_correction_preserves_locks(self) -> None:
+        self.prepare_word_editor()
+        self.keyboard_locks(2)
+        self.harness.type_word("hello")
+        self.pump_until(lambda: self.entry.get_text() == "HELLO", "CapsLock source word")
+        self.send_chord((KEY_LEFTCTRL,))
+        self.pump_until(lambda: self.entry.get_text() == "hello", "case correction under CapsLock")
+        self.assertEqual(self.keyboard_locks(), 2)
+        self.harness.type_word("f")
+        self.pump_until(lambda: self.entry.get_text() == "helloF", "CapsLock remains active")
+
+    def test_numlock_mixed_alt_row_is_rejected(self) -> None:
+        self.prepare_word_editor()
+        self.install_word_test_map('modifier_map Mod2 { <LALT> };')
+        self.keyboard_locks(16)
+        self.assert_locked_word_rejected("ghbdtn", 16)
+
+    def test_numlock_replacement_type_is_rejected_and_recovers(self) -> None:
+        self.prepare_word_editor()
+        self.install_word_test_map(
+            'key <AC05> { type[Group2]="KEYPAD", '
+            'symbols[Group2]=[ Cyrillic_pe, Cyrillic_PE ] };',
+        )
+        self.assertEqual(self.lookup_test_keysym(LETTER_CODES["g"], 0, 16), "g")
+        self.assertEqual(self.lookup_test_keysym(LETTER_CODES["g"], 1, 0), "Cyrillic_pe")
+        self.assertEqual(self.lookup_test_keysym(LETTER_CODES["g"], 1, 16), "Cyrillic_PE")
+        self.keyboard_locks(16)
+        self.assert_locked_word_rejected("ghbdtn", 16)
+        self.install_word_test_map()
+        self.keyboard_locks(0)
+        self.harness.send_key(KEY_PAUSE)
+        self.pump_until(lambda: self.entry.get_text() == "привет", "compatible map recovery")
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+        self.assertEqual(self.keyboard_locks(), 0)
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+
+    def test_numlock_map_query_failure_is_rejected_and_recovers(self) -> None:
+        self.prepare_word_editor()
+        self.keyboard_locks(16)
+        marker = pathlib.Path("/run/punto-e2e-fail-xkb-map")
+        marker.touch(mode=0o600)
+        self.addCleanup(marker.unlink, missing_ok=True)
+        self.assert_locked_word_rejected("ghbdtn", 16)
+        self.assertFalse(marker.exists(), "fault must reach the new XKB map query")
+        self.harness.send_key(KEY_PAUSE)
+        self.pump_until(lambda: self.entry.get_text() == "привет", "map query recovery")
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+        self.assertEqual(self.keyboard_locks(), 16)
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+
+    def assert_fresh_layout_correction(self, automatic: bool) -> None:
+        self.prepare_word_editor()
+        generation = self.stats_fields()[1]["config_generation"]
+        self.lock_keyboard_group(1)
+        self.harness.type_word("hello")
+        self.pump_until(lambda: self.entry.get_text() == "руддщ", "externally selected Russian source")
+        self.harness.send_key(KEY_SPACE if automatic else KEY_PAUSE)
+        expected = "hello " if automatic else "hello"
+        self.pump_until(lambda: self.entry.get_text() == expected, "fresh-layout correction", timeout=1)
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+        self.assertEqual(self.stats_fields()[1]["config_generation"], generation)
+        self.assertEqual(self.selection_text(Gdk.SELECTION_CLIPBOARD), "startup clipboard baseline")
+        self.harness.type_word("f")
+        self.pump_until(lambda: self.entry.get_text() == expected + "f", "corrected English group")
+
+    def test_immediate_external_layout_manual_correction(self) -> None:
+        self.assert_fresh_layout_correction(automatic=False)
+
+    def test_immediate_external_layout_auto_correction(self) -> None:
+        self.assert_fresh_layout_correction(automatic=True)
+
+    def arm_keyboard_observation(self, hold: bool = False) -> tuple[pathlib.Path, pathlib.Path]:
+        for name in ("arm-keyboard-observation", "hold-keyboard-observation",
+                     "keyboard-observed", "release-keyboard-observation"):
+            pathlib.Path("/run", "punto-e2e-" + name).unlink(missing_ok=True)
+        pathlib.Path("/run/punto-e2e-arm-keyboard-observation").touch(mode=0o600)
+        if hold:
+            pathlib.Path("/run/punto-e2e-hold-keyboard-observation").touch(mode=0o600)
+        ready = pathlib.Path("/run/punto-e2e-keyboard-observed")
+        release = pathlib.Path("/run/punto-e2e-release-keyboard-observation")
+        self.addCleanup(release.touch, mode=0o600, exist_ok=True)
+        return ready, release
+
+    def assert_no_word_mutation(self, expected: str) -> None:
+        self.assertEqual(self.entry.get_text(), expected)
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+        self.assertFalse(any(name == "Left" for _, name, _ in self.key_events))
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "0")
+        self.assertEqual(self.selection_text(Gdk.SELECTION_CLIPBOARD), "startup clipboard baseline")
+
+    def test_layout_changes_after_observation_reject_before_selection(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("hello")
+        self.pump_until(lambda: self.entry.get_text() == "hello", "source word")
+        ready, _ = self.arm_keyboard_observation()
+        self.harness.send_events([(EV_KEY, KEY_PAUSE, 1), (EV_SYN, SYN_REPORT, 0)])
+        self.pump_until(ready.exists, "exact keyboard state reply captured")
+        self.assertFalse(pathlib.Path("/run/punto-e2e-arm-keyboard-observation").exists())
+        self.lock_keyboard_group(1)
+        self.harness.send_events([(EV_KEY, KEY_PAUSE, 0), (EV_SYN, SYN_REPORT, 0)])
+        self.pump_until(
+            lambda: "Word edit dispatch status=0" in self.harness.diagnostic(),
+            "changed source group rejected",
+        )
+        self.assert_no_word_mutation("hello")
+        self.lock_keyboard_group(0)
+        self.harness.send_key(KEY_PAUSE)
+        self.pump_until(lambda: self.entry.get_text() == "руддщ", "fresh request recovery")
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+
+    def test_new_input_invalidates_delayed_keyboard_observation(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("hello")
+        self.pump_until(lambda: self.entry.get_text() == "hello", "source word")
+        ready, release = self.arm_keyboard_observation(hold=True)
+        self.harness.send_events([(EV_KEY, KEY_PAUSE, 1), (EV_SYN, SYN_REPORT, 0)])
+        self.pump_until(ready.exists, "keyboard reply held in test driver")
+        self.harness.type_word("f")
+        self.pump_until(lambda: self.entry.get_text() == "hellof", "new input during observation", timeout=0.2)
+        self.assert_no_word_mutation("hellof")
+        release.touch(mode=0o600)
+        self.harness.send_events([(EV_KEY, KEY_PAUSE, 0), (EV_SYN, SYN_REPORT, 0)])
+        self.pump_until(lambda: not release.exists(), "old reply delivered")
+        self.harness.send_key(KEY_PAUSE)
+        self.pump_until(lambda: self.entry.get_text() == "руддща", "fresh candidate after cancelled reply")
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+
+    def assert_control_invalidates_observation(self, command: bytes) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn", "source word")
+        ready, release = self.arm_keyboard_observation(hold=True)
+        self.harness.send_key(KEY_SPACE)
+        self.pump_until(ready.exists, "automatic keyboard reply held")
+        generation_before = int(self.stats_fields()[1]["config_generation"])
+        expected_reply = b"OK Scheduled\n" if command == b"RELOAD\n" else b"OK DISABLED\n"
+        self.assertEqual(ipc_request(command), expected_reply)
+        self.pump_until(lambda: self.stats_fields()[1]["config_pending"] == "0", "control commit")
+        committed = self.stats_fields()[1]
+        self.assertEqual(committed["config_result"], "ok")
+        if command == b"RELOAD\n":
+            self.assertGreater(int(committed["config_generation"]), generation_before)
+        else:
+            self.assertEqual(int(committed["config_generation"]), generation_before)
+        self.assert_no_word_mutation("ghbdtn ")
+        release.touch(mode=0o600)
+        self.pump_until(lambda: not release.exists(), "obsolete automatic reply delivered")
+        self.pump_until(lambda: int(self.stats_fields()[1]["analyzed"]) == 1, "cancelled candidate retains diagnostic analysis")
+        self.assert_no_word_mutation("ghbdtn ")
+        expected = "привет "
+        if command == b"RELOAD\n":
+            # A committed reload deliberately discards the old physical buffer.
+            self.harness.type_word("ghbdtn")
+            self.pump_until(lambda: self.entry.get_text() == "ghbdtn ghbdtn", "fresh word after reload")
+            expected = "ghbdtn привет"
+        self.harness.send_key(KEY_PAUSE)
+        self.pump_until(lambda: self.entry.get_text() == expected, "new manual request after control command")
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+
+    def test_status_change_invalidates_delayed_keyboard_observation(self) -> None:
+        self.assert_control_invalidates_observation(b"SET_STATUS 0\n")
+        self.assertEqual(ipc_request(b"GET_STATUS\n"), b"OK DISABLED\n")
+
+    def test_reload_invalidates_delayed_keyboard_observation(self) -> None:
+        self.assert_control_invalidates_observation(b"RELOAD\n")
+
+    def test_keyboard_observation_stall_keeps_input_live_and_recovers(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn", "source word")
+        self.harness.send_key(KEY_PAUSE)
+        self.pump_until(lambda: bool(self.blackhole.connections), "observation connection accepted by blackhole")
+        self.harness.type_word("f")
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtnf", "passthrough behind stalled observation", timeout=0.2)
+        self.assertEqual(ipc_request(b"GET_STATUS\n", timeout=0.2), b"OK ENABLED\n")
+        self.assert_no_word_mutation("ghbdtnf")
+
+        def observation_connection_closed() -> bool:
+            try:
+                return self.blackhole.connections[0].recv(4096, socket.MSG_DONTWAIT) == b""
+            except BlockingIOError:
+                return False
+
+        self.pump_until(observation_connection_closed, "bounded observation transport shutdown", timeout=1)
+        path = self.blackhole.path
+        assert path is not None
+        self.blackhole.stop()
+        # The production connector rejects symlinks. Alias the actual private
+        # socket inode so recovery retains that socket-type security check.
+        path.hardlink_to(pathlib.Path("/tmp/.X11-unix/X" + self.x11.display[1:]))
+        self.harness.send_key(KEY_PAUSE)
+        self.pump_until(lambda: self.entry.get_text() == "привета", "healthy observation transport recovery")
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+
+    def test_word_case_hotkey_changes_real_editor_text(self) -> None:
+        self.prepare_word_editor()
+        self.set_selection(Gdk.SELECTION_CLIPBOARD, "clipboard remains unchanged")
+        self.harness.type_word("hELLo")
+        self.pump_until(lambda: self.entry.get_text() == "hELLo", "original word")
+        self.harness.hotkey(KEY_LEFTCTRL, repeat=True)
+        self.pump_until(lambda: self.entry.get_text() == "HellO", "case correction")
+        self.pump_for(0.1)
+        self.assertEqual(self.entry.get_text(), "HellO")
+        self.assertEqual(self.entry.get_position(), 5)
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+        self.assertEqual(
+            self.selection_text(Gdk.SELECTION_CLIPBOARD),
+            "clipboard remains unchanged",
+        )
+        self.assertFalse(any(name == "Pause" for _, name, _ in self.key_events))
+
+    def test_auto_layout_changes_real_editor_text(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn", "original word")
+        self.harness.send_key(KEY_SPACE)
+        self.pump_until(lambda: self.entry.get_text() == "привет ", "auto correction")
+        self.assertEqual(self.entry.get_position(), 7)
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+        self.assertEqual(
+            self.selection_text(Gdk.SELECTION_CLIPBOARD),
+            "startup clipboard baseline",
+        )
+        self.harness.type_word("f")
+        self.pump_until(
+            lambda: self.entry.get_text() == "привет а", "corrected keyboard layout"
+        )
+
+    def test_word_hotkey_waits_for_modifier_release(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("hELLo")
+        self.pump_until(lambda: self.entry.get_text() == "hELLo", "original word")
+        self.harness.send_events([
+            (EV_KEY, KEY_LEFTCTRL, 1), (EV_SYN, SYN_REPORT, 0),
+            (EV_KEY, KEY_PAUSE, 1), (EV_SYN, SYN_REPORT, 0),
+        ])
+        self.pump_for(0.1)
+        self.assertEqual(self.entry.get_text(), "hELLo")
+        self.harness.send_events([
+            (EV_KEY, KEY_PAUSE, 0), (EV_SYN, SYN_REPORT, 0),
+        ])
+        self.pump_for(0.1)
+        self.assertEqual(self.entry.get_text(), "hELLo")
+        self.harness.send_events([
+            (EV_KEY, KEY_LEFTCTRL, 0), (EV_SYN, SYN_REPORT, 0),
+        ])
+        self.pump_until(lambda: self.entry.get_text() == "HellO", "released hotkey")
+
+    def test_auto_layout_preserves_trailing_punctuation(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("ghbdtn")
+        self.harness.send_key(KEY_DOT)
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn.", "punctuated word")
+        self.harness.send_key(KEY_SPACE)
+        self.pump_until(
+            lambda: self.entry.get_text() == "привет. ", "punctuation preservation"
+        )
+
+    def test_word_editor_rejects_stale_content(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("hello")
+        self.pump_until(lambda: self.entry.get_text() == "hello", "original word")
+        self.entry.set_text("other")
+        self.entry.set_position(5)
+        self.harness.hotkey(KEY_LEFTCTRL, repeat=False)
+        self.pump_until(
+            lambda: "Word edit dispatch status=" in self.harness.diagnostic(),
+            "stale edit decision",
+        )
+        self.assertEqual(self.entry.get_text(), "other")
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+        self.harness.type_word("f")
+        self.pump_until(lambda: self.entry.get_text() == "otherf", "typing after rejected correction preserves existing text")
+
+    def send_chord(self, modifiers: tuple[int, ...], key: int = KEY_PAUSE) -> None:
+        events = []
+        for modifier in modifiers:
+            events.extend([(EV_KEY, modifier, 1), (EV_SYN, SYN_REPORT, 0)])
+        events.extend([(EV_KEY, key, 1), (EV_SYN, SYN_REPORT, 0),
+                       (EV_KEY, key, 0), (EV_SYN, SYN_REPORT, 0)])
+        for modifier in reversed(modifiers):
+            events.extend([(EV_KEY, modifier, 0), (EV_SYN, SYN_REPORT, 0)])
+        self.harness.send_events(events)
+
+    def test_rejected_word_edit_preserves_newer_same_client_selection(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("hello")
+        self.pump_until(lambda: self.entry.get_text() == "hello", "tracked source word")
+        self.entry.set_text("other")
+        self.entry.set_position(5)
+
+        class SelectionRequest(ctypes.Structure):
+            _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                        ("send_event", ctypes.c_int), ("display", ctypes.c_void_p),
+                        ("owner", ctypes.c_ulong), ("requestor", ctypes.c_ulong),
+                        ("selection", ctypes.c_ulong), ("target", ctypes.c_ulong),
+                        ("property", ctypes.c_ulong), ("time", ctypes.c_ulong)]
+
+        gdk = ctypes.CDLL(ctypes.util.find_library("gdk-3"))
+        xlib = ctypes.CDLL(ctypes.util.find_library("X11"))
+        xlib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        xlib.XInternAtom.restype = ctypes.c_ulong
+        callback_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                                        ctypes.c_void_p, ctypes.c_void_p)
+        requests = []
+
+        @callback_type
+        def observe_selection(raw_event, _event, _data):
+            request = ctypes.cast(raw_event, ctypes.POINTER(SelectionRequest)).contents
+            if request.type == 30 and request.selection == 1:
+                utf8 = xlib.XInternAtom(request.display, b"UTF8_STRING", 0)
+                if request.target == utf8:
+                    requests.append(request.serial)
+                    if len(requests) == 2:
+                        self.entry.select_region(0, 2)
+            return 0
+
+        for name in ("gdk_window_add_filter", "gdk_window_remove_filter"):
+            getattr(gdk, name).argtypes = [ctypes.c_void_p, callback_type, ctypes.c_void_p]
+        gdk.gdk_window_add_filter(None, observe_selection, None)
+        self.addCleanup(gdk.gdk_window_remove_filter, None, observe_selection, None)
+        self.send_chord((KEY_LEFTCTRL,))
+        self.pump_until(lambda: len(requests) >= 2, "selection changed at second real request")
+        self.pump_until(lambda: "Word edit dispatch status=" in self.harness.diagnostic(),
+                        "stale correction rejected after selection change")
+        self.pump_for(0.02)
+        self.assertEqual(self.entry.get_text(), "other")
+        self.assertEqual(self.entry.get_selection_bounds(), (0, 2))
+        self.assertFalse(any(name == "Right" for _, name, _ in self.key_events))
+
+    def assert_selection_correction(self, source: str, replacement: str,
+                                    modifiers: tuple[int, ...]) -> None:
+        self.prepare_word_editor()
+        original = "before " + source + " after"
+        self.entry.set_text(original)
+        self.entry.select_region(7, 7 + len(source))
+        self.pump_until(lambda: self.selection_text(Gdk.SELECTION_PRIMARY) == source,
+                        "selected source text")
+        self.send_chord(modifiers)
+        self.pump_until(lambda: self.entry.get_text() == "before " + replacement + " after",
+                        "selection transformation changes only selected range")
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+        self.assertEqual(self.output_count(KEY_PAUSE), 0)
+        self.pump_until(lambda: self.selection_text(Gdk.SELECTION_CLIPBOARD) == "startup clipboard baseline",
+                        "clipboard restored after transfer")
+
+    def test_selection_layout_hotkey_changes_real_editor_text(self) -> None:
+        self.assert_selection_correction("ghbdtn", "привет", (KEY_LEFTSHIFT,))
+        self.harness.type_word("f")
+        self.pump_until(lambda: self.entry.get_text() == "before привета after",
+                        "selection layout correction toggles subsequent typing layout")
+
+    def test_selection_case_hotkey_changes_real_editor_text(self) -> None:
+        self.assert_selection_correction("sEleCt", "SeLEcT", (KEY_LEFTALT,))
+
+    def test_selection_transliteration_has_modifier_priority(self) -> None:
+        self.assert_selection_correction("привет", "privet", (KEY_LEFTCTRL, KEY_LEFTALT))
+
+    def delay_selection_paste(self):
+        self.prepare_word_editor()
+        self.entry.set_text("before AbC after")
+        self.entry.select_region(7, 10)
+        self.pump_until(lambda: self.selection_text(Gdk.SELECTION_PRIMARY) == "AbC",
+                        "actual selected source before delayed paste")
+        intercepted = []
+
+        def delay_paste(editor):
+            intercepted.append(True)
+            editor.stop_emission_by_name("paste-clipboard")
+
+        handler = self.entry.connect("paste-clipboard", delay_paste)
+        self.send_chord((KEY_LEFTALT,))
+        self.pump_until(lambda: len(intercepted) == 1, "application receives paste chord")
+        self.pump_until(lambda: "Word edit dispatch status=3" in self.harness.diagnostic(),
+                        "bounded paste transfer wait expires")
+        self.assertEqual(self.entry.get_text(), "before AbC after")
+        self.assertEqual(self.entry.get_selection_bounds(), (7, 10))
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "0")
+        self.assertEqual(ipc_request(b"GET_STATUS\n", timeout=0.2), b"OK ENABLED\n")
+        self.entry.disconnect(handler)
+
+    def test_late_paste_receipt_restores_clipboard_without_false_undo(self) -> None:
+        self.delay_selection_paste()
+        # Only the application's late request may acknowledge payload delivery.
+        self.entry.emit("paste-clipboard")
+        self.pump_until(lambda: self.entry.get_text() == "before aBc after", "late real GTK paste receives retained payload")
+        self.pump_until(lambda: self.selection_text(Gdk.SELECTION_CLIPBOARD) == "startup clipboard baseline",
+                        "late transfer restores original clipboard")
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "0")
+        self.send_chord((KEY_LEFTCTRL,), KEY_Z)
+        self.pump_until(lambda: self.output_count(KEY_Z, 0) == 1, "partial operation has no Punto undo")
+        self.assertEqual(self.output_count(KEY_Z, 1), 1)
+
+    def test_foreign_copy_after_paste_timeout_is_preserved_and_recovers(self) -> None:
+        self.delay_selection_paste()
+        self.set_selection(Gdk.SELECTION_CLIPBOARD, "new user copy")
+        self.wait_event_loop_idle("foreign clipboard ownership observed")
+        self.assertEqual(self.selection_text(Gdk.SELECTION_CLIPBOARD), "new user copy")
+        self.send_chord((KEY_LEFTALT,))
+        self.pump_until(lambda: self.entry.get_text() == "before aBc after", "new correction after clipboard owner recovery")
+        self.pump_until(lambda: self.selection_text(Gdk.SELECTION_CLIPBOARD) == "new user copy",
+                        "new copy preserved after later successful correction")
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+
+    def test_full_stdout_stops_buffered_macro_drain_after_first_failure(self) -> None:
+        self.prepare_word_editor()
+        self.entry.set_text("AbC")
+        self.entry.select_region(0, 3)
+        self.pump_until(lambda: self.selection_text(Gdk.SELECTION_PRIMARY) == "AbC", "selected source")
+        intercepted = []
+
+        def delay_paste(editor):
+            editor.stop_emission_by_name("paste-clipboard")
+            intercepted.append(True)
+
+        self.entry.connect("paste-clipboard", delay_paste)
+        self.send_chord((KEY_LEFTALT,))
+        self.pump_until(lambda: len(intercepted) == 1, "macro is awaiting application transfer")
+        self.harness.relay.stop()
+        self.assertFalse(self.harness.relay.reader.is_alive())
+        self.assertFalse(self.harness.relay.injector.is_alive())
+        output = self.harness.process.stdout
+        assert output is not None and not output.closed
+        writer = os.open(f"/proc/{self.harness.process.pid}/fd/1", os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            self.assertEqual(os.fstat(writer).st_ino, os.fstat(output.fileno()).st_ino)
+            for size in (4096, 1):
+                while True:
+                    try:
+                        os.write(writer, bytes(size))
+                    except BlockingIOError:
+                        break
+        finally:
+            os.close(writer)
+        probe = os.open(f"/proc/{self.harness.process.pid}/fd/0", os.O_RDONLY | os.O_NONBLOCK)
+        started = time.monotonic()
+        try:
+            self.harness.send_events([(EV_SYN, SYN_REPORT, 0)] * 3)
+
+            def all_frames_buffered():
+                available = array.array("i", [0])
+                fcntl.ioctl(probe, termios.FIONREAD, available, True)
+                return available[0] == 0
+
+            self.pump_until(all_frames_buffered, "macro consumed all queued input frames", timeout=0.15)
+            self.assertNotIn("Word edit dispatch status=", self.harness.diagnostic())
+            self.pump_until(lambda: self.harness.process.poll() is not None,
+                            "one stdout timeout terminates buffered drain", timeout=3.0)
+            self.assertEqual(self.harness.process.returncode, 3)
+            self.assertGreater(time.monotonic() - started, 1.8)
+        finally:
+            os.close(probe)
+            output.close()
+
+    def assert_eof_during_macro(self, payload: bytes, exit_code: int) -> None:
+        self.prepare_word_editor()
+        self.entry.set_text("AbC")
+        self.entry.select_region(0, 3)
+        self.pump_until(lambda: self.selection_text(Gdk.SELECTION_PRIMARY) == "AbC", "selected source")
+        intercepted = []
+
+        def delay_paste(editor):
+            editor.stop_emission_by_name("paste-clipboard")
+            intercepted.append(True)
+
+        self.entry.connect("paste-clipboard", delay_paste)
+        self.send_chord((KEY_LEFTALT,))
+        self.pump_until(lambda: len(intercepted) == 1, "macro awaiting application paste")
+        stream = self.harness.process.stdin
+        assert stream is not None
+        os.write(stream.fileno(), payload)
+        stream.close()
+        self.pump_until(lambda: self.harness.process.poll() is not None,
+                        "EOF during macro reaches terminal process state")
+        self.assertEqual(self.harness.process.returncode, exit_code)
+
+    def test_partial_input_event_during_macro_is_runtime_failure(self) -> None:
+        self.assert_eof_during_macro(b"\0", 3)
+
+    def test_missing_syn_during_macro_is_runtime_failure(self) -> None:
+        self.assert_eof_during_macro(bytes(InputEvent(type=EV_KEY, code=LETTER_CODES["f"], value=1)), 3)
+
+    def test_complete_frame_eof_during_macro_is_orderly(self) -> None:
+        self.assert_eof_during_macro(bytes(InputEvent(type=EV_SYN, code=SYN_REPORT, value=0)), 0)
+
+    def test_repeated_manual_word_correction_is_reversible(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("hELLo")
+        self.pump_until(lambda: self.entry.get_text() == "hELLo", "physical source word")
+        self.send_chord((KEY_LEFTCTRL,))
+        self.pump_until(lambda: self.entry.get_text() == "HellO", "first case correction")
+        self.send_chord((KEY_LEFTCTRL,))
+        self.pump_until(lambda: self.entry.get_text() == "hELLo", "second case correction")
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "2")
+
+    def test_immediate_undo_restores_word_and_then_passes_through(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("hELLo")
+        self.pump_until(lambda: self.entry.get_text() == "hELLo", "physical source word")
+        self.send_chord((KEY_LEFTCTRL,))
+        self.pump_until(lambda: self.entry.get_text() == "HellO", "case correction before undo")
+        self.send_chord((KEY_LEFTCTRL,), KEY_Z)
+        self.pump_until(lambda: self.entry.get_text() == "hELLo", "immediate Punto undo")
+        self.wait_event_loop_idle("Punto undo completed")
+        self.assertEqual(self.output_count(KEY_Z, 1), 0)
+        self.assertEqual(self.output_count(KEY_Z, 0), 0)
+        self.send_chord((KEY_LEFTCTRL,), KEY_Z)
+        self.pump_until(lambda: self.output_count(KEY_Z, 0) == 1, "second undo release passed to application")
+        self.assertEqual(self.output_count(KEY_Z, 1), 1)
+        self.assertEqual(self.output_count(KEY_Z, 2), 0)
+
+    def test_manual_case_after_backspace_uses_visible_word(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("hELLo")
+        self.pump_until(lambda: self.entry.get_text() == "hELLo", "physical source word")
+        self.send_chord((KEY_LEFTCTRL,))
+        self.pump_until(lambda: self.entry.get_text() == "HellO", "first case correction")
+        self.harness.send_key(KEY_BACKSPACE)
+        self.pump_until(lambda: self.entry.get_text() == "Hell", "backspace edits visible correction")
+        self.send_chord((KEY_LEFTCTRL,))
+        self.pump_until(lambda: self.entry.get_text() == "hELL", "case correction uses remaining visible word")
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+        self.assertEqual(self.selection_text(Gdk.SELECTION_CLIPBOARD), "startup clipboard baseline")
+
+    def test_ctrl_shift_z_passes_through_with_fresh_punto_undo(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("hELLo")
+        self.pump_until(lambda: self.entry.get_text() == "hELLo", "physical source word")
+        self.send_chord((KEY_LEFTCTRL,))
+        self.pump_until(lambda: self.entry.get_text() == "HellO", "fresh correction before native redo")
+        self.send_chord((KEY_LEFTCTRL, KEY_LEFTSHIFT), KEY_Z)
+        self.pump_until(lambda: self.output_count(KEY_Z, 0) == 1, "native redo release")
+        self.assertEqual(self.output_count(KEY_Z, 1), 1)
+        self.wait_event_loop_idle("native redo completed")
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+        self.assertEqual(self.entry.get_text(), "HellO")
+
+    def assert_native_undo_after_invalidation(self, expire: bool) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("hELLo")
+        self.pump_until(lambda: self.entry.get_text() == "hELLo", "physical source word")
+        self.send_chord((KEY_LEFTCTRL,))
+        self.pump_until(lambda: self.entry.get_text() == "HellO", "successful correction")
+        if expire:
+            self.pump_for(2.6)
+            expected = "HellO"
+        else:
+            self.harness.type_word("f")
+            self.pump_until(lambda: self.entry.get_text() == "HellOf", "new physical input invalidates undo")
+            expected = "HellOf"
+        self.send_chord((KEY_LEFTCTRL,), KEY_Z)
+        self.pump_until(lambda: self.output_count(KEY_Z, 0) == 1, "native undo release after invalidation")
+        self.assertEqual(self.output_count(KEY_Z, 1), 1)
+        self.wait_event_loop_idle("invalidated undo processed")
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+        self.assertEqual(self.entry.get_text(), expected)
+
+    def test_expired_undo_passes_to_application(self) -> None:
+        self.assert_native_undo_after_invalidation(expire=True)
+
+    def test_new_input_invalidates_punto_undo(self) -> None:
+        self.assert_native_undo_after_invalidation(expire=False)
+
+    def test_manual_layout_preserves_repeated_space(self) -> None:
+        self.prepare_word_editor()
+        self.assertEqual(ipc_request(b"SET_STATUS 0\n"), b"OK DISABLED\n")
+        self.harness.type_word("ghbdtn")
+        self.harness.send_events([
+            (EV_KEY, KEY_SPACE, 1), (EV_SYN, SYN_REPORT, 0),
+            (EV_KEY, KEY_SPACE, 2), (EV_SYN, SYN_REPORT, 0),
+            (EV_KEY, KEY_SPACE, 0), (EV_SYN, SYN_REPORT, 0),
+        ])
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn  ", "physical repeated spaces")
+        self.assertEqual(self.output_count(KEY_SPACE, 1), 1)
+        self.assertEqual(self.output_count(KEY_SPACE, 2), 1)
+        self.assertEqual(self.output_count(KEY_SPACE, 0), 1)
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "0")
+        self.harness.send_key(KEY_PAUSE)
+        self.pump_until(lambda: self.entry.get_text() == "привет  ", "manual correction preserves repeated separators")
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+        self.assertEqual(self.output_count(KEY_PAUSE), 0)
+
+    def test_manual_word_layout_preserves_literal_textview_tab(self) -> None:
+        self.prepare_word_editor()
+        self.assertEqual(ipc_request(b"SET_STATUS 0\n"), b"OK DISABLED\n")
+        self.window.remove(self.entry)
+        editor = Gtk.TextView()
+        self.window.add(editor)
+        self.window.show_all()
+        editor.grab_focus()
+        self.pump_until(editor.has_focus, "text view focus")
+        document = editor.get_buffer()
+
+        def visible_text():
+            start, end = document.get_bounds()
+            return document.get_text(start, end, True)
+
+        self.harness.type_word("ghbdtn")
+        self.harness.send_key(KEY_TAB)
+        self.pump_until(lambda: visible_text() == "ghbdtn\t", "physical literal tab in text view")
+        self.harness.send_key(KEY_PAUSE)
+        self.pump_until(lambda: visible_text() == "привет\t", "word correction preserves literal tab")
+        self.assertFalse(document.get_has_selection())
+        self.pump_until(lambda: self.selection_text(Gdk.SELECTION_CLIPBOARD) == "startup clipboard baseline",
+                        "tab replacement restores clipboard after transfer")
+
+    def test_auto_word_layout_preserves_literal_textview_tab(self) -> None:
+        self.prepare_word_editor()
+        self.window.remove(self.entry)
+        editor = Gtk.TextView()
+        self.window.add(editor)
+        self.window.show_all()
+        editor.grab_focus()
+        self.pump_until(editor.has_focus, "text view focus")
+        document = editor.get_buffer()
+
+        def visible_text():
+            return document.get_text(*document.get_bounds(), True)
+
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: visible_text() == "ghbdtn", "physical source before automatic Tab")
+        self.harness.send_key(KEY_TAB)
+        self.pump_until(lambda: visible_text() == "привет\t", "automatic correction preserves literal tab")
+        self.assertFalse(document.get_has_selection())
+        self.assertEqual(self.output_count(KEY_TAB, 1), 1)
+        self.assertEqual(self.output_count(KEY_TAB, 0), 1)
+        self.assertEqual(self.output_count(KEY_PAUSE), 0)
+        self.pump_until(lambda: self.selection_text(Gdk.SELECTION_CLIPBOARD) == "startup clipboard baseline",
+                        "automatic tab replacement restores clipboard")
+        self.harness.type_word("f")
+        self.pump_until(lambda: visible_text() == "привет\tа", "automatic Tab retains target layout")
+
+    def send_text_batch(self, text: str) -> None:
+        events = []
+        for character in text:
+            code = KEY_SPACE if character == " " else LETTER_CODES[character]
+            events.extend([(EV_KEY, code, 1), (EV_SYN, SYN_REPORT, 0),
+                           (EV_KEY, code, 0), (EV_SYN, SYN_REPORT, 0)])
+        self.harness.send_events(events)
+
+    def test_auto_correction_preserves_younger_unfinished_word(self) -> None:
+        self.prepare_word_editor()
+        self.send_text_batch("ghbdtn hel")
+        self.pump_until(lambda: self.entry.get_text() == "привет hel", "older correction preserves unfinished English tail")
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+        self.harness.type_word("f")
+        self.pump_until(lambda: self.entry.get_text() == "привет helа", "new input follows corrected layout")
+
+    def test_auto_history_preserves_words_observed_in_different_layouts(self) -> None:
+        self.assert_auto_history_preserves_words_observed_in_different_layouts()
+
+    def test_auto_history_waits_for_slow_gtk_replacement(self) -> None:
+        self.assert_auto_history_preserves_words_observed_in_different_layouts(slow_replacement=True)
+
+    def assert_auto_history_preserves_words_observed_in_different_layouts(self, slow_replacement=False) -> None:
+        self.prepare_word_editor()
+        stalled_selections = []
+        if slow_replacement:
+            def stall_first_replacement(entry, event):
+                bounds = entry.get_selection_bounds()
+                if event.keyval == Gdk.KEY_Cyrillic_pe and bounds and not stalled_selections:
+                    stalled_selections.append(entry.get_chars(*bounds))
+                    time.sleep(0.08)
+                return False
+
+            handler = self.entry.connect("key-press-event", stall_first_replacement)
+            self.addCleanup(self.entry.disconnect, handler)
+        ready, release = self.arm_keyboard_observation(hold=True)
+        self.send_text_batch("ghbdtn ")
+        self.pump_until(ready.exists, "first word observed in English layout")
+        self.lock_keyboard_group(1)
+        self.send_text_batch("world ")
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn цщкдв ", "second physical word in Russian layout")
+        release.touch(mode=0o600)
+        if slow_replacement:
+            self.pump_until(lambda: bool(stalled_selections), "GTK receives first replacement with suffix selected")
+            self.assertEqual(stalled_selections, ["ghbdtn цщкдв "])
+        self.pump_until(lambda: self.entry.get_text() == "привет world ", "ordered corrections preserve each word source layout")
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "2")
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+        self.harness.type_word("f")
+        self.pump_until(lambda: self.entry.get_text() == "привет world f", "last correction sets English layout")
+
+    def test_variable_length_typo_preserves_younger_word_and_undo(self) -> None:
+        self.prepare_word_editor()
+        config = pathlib.Path("/tmp/punto-home/.config/punto/config.yaml")
+        original = config.read_text(encoding="utf-8")
+        self.addCleanup(config.write_text, original, encoding="utf-8")
+        config.write_text(original.replace("typo_correction_enabled: false",
+                                           "typo_correction_enabled: true"), encoding="utf-8")
+        before = int(self.stats_fields()[1]["config_generation"])
+        self.assertEqual(ipc_request(b"RELOAD\n"), b"OK Scheduled\n")
+        self.pump_until(lambda: int(self.stats_fields()[1]["config_generation"]) > before
+                        and self.stats_fields()[1]["config_pending"] == "0", "typo config committed")
+        self.send_text_batch("helllo world ")
+        self.pump_until(lambda: self.entry.get_text() == "hello world ", "variable length typo correction preserves younger word")
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+        self.send_chord((KEY_LEFTCTRL,), KEY_Z)
+        self.pump_until(lambda: self.entry.get_text() == "helllo world ", "undo restores original lengths and tail")
+
+    def test_automatic_undo_learns_exclusion_and_survives_restart(self) -> None:
+        self.prepare_word_editor()
+        self.send_text_batch("ghbdtn ")
+        self.pump_until(lambda: self.entry.get_text() == "привет ", "automatic correction before learning")
+        self.send_chord((KEY_LEFTCTRL,), KEY_Z)
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn ", "undo restores automatic correction")
+        self.send_text_batch("ghbdtn ")
+        self.pump_until(lambda: self.stats_fields()[1]["analyzed"] == "2", "repeated word analyzed")
+        self.pump_for(0.1)
+        self.assertEqual(self.entry.get_text(), "ghbdtn ghbdtn ")
+        exclusions = pathlib.Path("/etc/punto/undo_exclusions.txt")
+        self.pump_until(lambda: exclusions.exists() and "ghbdtn\n" in exclusions.read_text(),
+                        "learned exclusion persisted")
+        self.harness.send_key(KEY_PAUSE)
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn привет ", "manual correction remains available for learned exclusion")
+        self.harness.stop()
+        self.entry.set_text("")
+        self.lock_keyboard_group(0)
+        Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY).clear()
+        self.harness = EventLoopHarness(DRIVER, self.x11.display)
+        self.addCleanup(self.harness.stop)
+        self.harness.wait_ready(self.pump_once)
+        self.prepare_word_editor()
+        self.send_text_batch("ghbdtn ")
+        self.pump_until(lambda: self.stats_fields()[1]["analyzed"] == "1", "word analyzed after restart")
+        self.pump_for(0.1)
+        self.assertEqual(self.entry.get_text(), "ghbdtn ")
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "0")
+
+    def assert_backspace_learning(self, intervening_key: bool) -> None:
+        self.prepare_word_editor()
+        self.send_text_batch("ghbdtn ")
+        self.pump_until(lambda: self.entry.get_text() == "привет ", "automatic correction before backspaces")
+        self.pump_until(lambda: self.stats_fields()[1]["word_dispatches"] == "1", "automatic dispatch recorded")
+        if intervening_key:
+            self.harness.type_word("f")
+            self.pump_until(lambda: self.entry.get_text() == "привет а", "intervening ordinary input")
+        for _ in range(3):
+            self.harness.send_key(KEY_BACKSPACE)
+        remaining = "приве" if intervening_key else "прив"
+        self.pump_until(lambda: self.entry.get_text() == remaining, "three real backspaces delivered")
+        self.assertEqual(self.output_count(KEY_BACKSPACE, 1), 3)
+        self.assertEqual(self.output_count(KEY_BACKSPACE, 0), 3)
+        exclusions = pathlib.Path("/etc/punto/undo_exclusions.txt")
+        if not intervening_key:
+            self.pump_until(lambda: exclusions.exists() and "ghbdtn\n" in exclusions.read_text(),
+                            "three-backspace learning durably stored")
+        self.harness.send_key(KEY_LEFT)
+        self.pump_until(lambda: self.output_count(KEY_LEFT, 0) == 1, "navigation resets old word tracking")
+        self.entry.set_text("")
+        self.entry.set_position(0)
+        self.lock_keyboard_group(0)
+        Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY).clear()
+        self.send_text_batch("ghbdtn ")
+        if intervening_key:
+            self.pump_until(lambda: self.entry.get_text() == "привет ", "intervening input prevents exclusion learning")
+            self.assertEqual(self.stats_fields()[1]["word_dispatches"], "2")
+            self.assertFalse(exclusions.exists() and "ghbdtn\n" in exclusions.read_text())
+        else:
+            self.pump_until(lambda: self.stats_fields()[1]["analyzed"] == "2", "learned word analyzed again")
+            self.wait_event_loop_idle("exclusion decision completed")
+            self.assertEqual(self.entry.get_text(), "ghbdtn ")
+            self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+
+    def test_three_backspaces_learn_automatic_correction(self) -> None:
+        self.assert_backspace_learning(intervening_key=False)
+
+    def test_ordinary_key_before_backspaces_does_not_learn(self) -> None:
+        self.assert_backspace_learning(intervening_key=True)
+
+    def assert_failed_undo_does_not_learn(self, failure: str) -> None:
+        self.prepare_word_editor()
+        self.send_text_batch("ghbdtn ")
+        self.pump_until(lambda: self.entry.get_text() == "привет ", "automatic correction before reserved undo")
+        self.pump_until(lambda: self.stats_fields()[1]["word_dispatches"] == "1", "automatic correction recorded")
+        self.entry.set_text("other")
+        self.entry.set_position(-1)
+        if failure == "rejected":
+            self.lock_keyboard_group(0)
+        if failure == "cancelled":
+            ready, release = self.arm_keyboard_observation(hold=True)
+        self.send_chord((KEY_LEFTCTRL,), KEY_Z)
+        if failure == "cancelled":
+            self.pump_until(ready.exists, "reserved undo keyboard reply held")
+        else:
+            status = 0 if failure == "rejected" else 1
+            self.pump_until(lambda: f"Word edit dispatch status={status}" in self.harness.diagnostic(),
+                            "reserved undo rejected without successful restoration")
+        self.assertEqual(self.entry.get_text(), "other")
+        self.assertEqual(self.output_count(KEY_Z, 1), 0, "original Ctrl+Z was reserved, not passed through")
+        for _ in range(3):
+            self.harness.send_key(KEY_BACKSPACE)
+        self.pump_until(lambda: self.entry.get_text() == "ot", "backspaces edit unrelated text", timeout=0.5)
+        if failure == "cancelled":
+            release.touch(mode=0o600)
+            self.pump_until(lambda: not release.exists(), "cancelled undo reply delivered")
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+        self.harness.send_key(KEY_LEFT)
+        self.pump_until(lambda: self.output_count(KEY_LEFT, 0) == 1, "old word tracking reset")
+        self.entry.set_text("")
+        self.entry.set_position(0)
+        self.lock_keyboard_group(0)
+        Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY).clear()
+        self.send_text_batch("ghbdtn ")
+        self.pump_until(lambda: self.entry.get_text() == "привет ", "failed undo must not teach an exclusion")
+        exclusions = pathlib.Path("/etc/punto/undo_exclusions.txt")
+        self.assertFalse(exclusions.exists() and "ghbdtn\n" in exclusions.read_text())
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "2")
+
+    def test_prepared_undo_failure_does_not_learn_from_backspaces(self) -> None:
+        self.assert_failed_undo_does_not_learn("prepared")
+
+    def test_rejected_undo_does_not_learn_from_backspaces(self) -> None:
+        self.assert_failed_undo_does_not_learn("rejected")
+
+    def test_cancelled_undo_observation_does_not_learn_from_backspaces(self) -> None:
+        self.assert_failed_undo_does_not_learn("cancelled")
+
+    def test_combined_fix_preserves_trailing_punctuation(self) -> None:
+        self.prepare_word_editor()
+        config = pathlib.Path("/tmp/punto-home/.config/punto/config.yaml")
+        original = config.read_text(encoding="utf-8")
+        self.addCleanup(config.write_text, original, encoding="utf-8")
+        config.write_text(
+            original.replace("sticky_shift_correction_enabled: false",
+                             "sticky_shift_correction_enabled: true"),
+            encoding="utf-8",
+        )
+        _, before = self.stats_fields()
+        self.assertEqual(ipc_request(b"RELOAD\n"), b"OK Scheduled\n")
+
+        def committed() -> bool:
+            fields = self.stats_fields()[1]
+            return (
+                int(fields["config_generation"]) > int(before["config_generation"])
+                and fields["config_pending"] == "0"
+                and fields["config_result"] == "ok"
+            )
+
+        self.pump_until(
+            committed,
+            "case correction config commit",
+        )
+        self.harness.type_word("GHbdtn")
+        self.harness.send_key(KEY_DOT)
+        self.pump_until(lambda: self.entry.get_text() == "GHbdtn.", "original word")
+        self.harness.send_key(KEY_SPACE)
+        self.pump_until(
+            lambda: self.entry.get_text() == "Привет. ", "combined correction"
+        )
+
+    def test_later_input_cancels_pending_word_hotkey(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("hello")
+        self.pump_until(lambda: self.entry.get_text() == "hello", "original word")
+        self.harness.send_events([
+            (EV_KEY, KEY_PAUSE, 1), (EV_SYN, SYN_REPORT, 0),
+            (EV_KEY, KEY_PAUSE, 0), (EV_SYN, SYN_REPORT, 0),
+            (EV_KEY, LETTER_CODES["a"], 1), (EV_SYN, SYN_REPORT, 0),
+            (EV_KEY, LETTER_CODES["a"], 0), (EV_SYN, SYN_REPORT, 0),
+        ])
+        self.pump_until(lambda: self.entry.get_text() == "helloa", "newer input")
+        self.pump_for(0.1)
+        self.assertEqual(self.entry.get_text(), "helloa")
+
+    def test_word_hotkey_waits_for_ordinary_key_release(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("hell")
+        self.harness.send_events([
+            (EV_KEY, LETTER_CODES["o"], 1), (EV_SYN, SYN_REPORT, 0),
+        ])
+        self.pump_until(lambda: self.entry.get_text() == "hello", "held final key")
+        self.harness.hotkey(KEY_LEFTCTRL, repeat=False)
+        self.pump_for(0.1)
+        self.assertEqual(self.entry.get_text(), "hello")
+        self.harness.send_events([
+            (EV_KEY, LETTER_CODES["o"], 0), (EV_SYN, SYN_REPORT, 0),
+        ])
+        self.pump_until(lambda: self.entry.get_text() == "HELLO", "final key release")
+
+    def test_modifier_press_cancels_pending_auto_correction(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("ghbdtn")
+        self.harness.send_events([
+            (EV_KEY, KEY_SPACE, 1), (EV_SYN, SYN_REPORT, 0),
+        ])
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn ", "held delimiter")
+        self.pump_until(
+            lambda: self.stats_fields()[1]["need_switch"] == "1", "auto decision"
+        )
+        self.harness.send_events([
+            (EV_KEY, KEY_LEFTCTRL, 1), (EV_SYN, SYN_REPORT, 0),
+            (EV_KEY, KEY_LEFTCTRL, 0), (EV_SYN, SYN_REPORT, 0),
+            (EV_KEY, KEY_SPACE, 0), (EV_SYN, SYN_REPORT, 0),
+        ])
+        self.pump_for(0.2)
+        self.assertEqual(self.entry.get_text(), "ghbdtn ")
+        self.assertNotIn("Word edit dispatch status=", self.harness.diagnostic())
+
+    def test_disable_cancels_pending_auto_correction(self) -> None:
+        self.prepare_word_editor()
+        self.pump_until(
+            lambda: self.stats_fields()[1]["config_pending"] == "0",
+            "initial config commit",
+        )
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn", "source word")
+        self.harness.send_events(
+            [(EV_KEY, KEY_SPACE, 1), (EV_SYN, SYN_REPORT, 0)]
+        )
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn ", "held space")
+        self.pump_until(
+            lambda: int(self.stats_fields()[1]["need_switch"]) >= 1,
+            "pending automatic correction",
+        )
+        self.assertEqual(ipc_request(b"SET_STATUS 0\n"), b"OK DISABLED\n")
+        self.harness.send_events(
+            [(EV_KEY, KEY_SPACE, 0), (EV_SYN, SYN_REPORT, 0)]
+        )
+        self.pump_for(0.2)
+        self.assertEqual(self.entry.get_text(), "ghbdtn ")
+        self.assertNotIn("Word edit dispatch status=", self.harness.diagnostic())
+
+    def test_auto_toggle_controls_real_text_without_changing_config(self) -> None:
+        self.prepare_word_editor()
+        self.pump_until(
+            lambda: self.stats_fields()[1]["config_pending"] == "0",
+            "initial config commit",
+        )
+        self.assertEqual(ipc_request(b"SET_STATUS 0\n"), b"OK DISABLED\n")
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn", "source word")
+        self.harness.send_key(KEY_SPACE)
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn ", "disabled auto")
+        self.pump_for(0.2)
+        self.assertEqual(self.entry.get_text(), "ghbdtn ")
+        self.assertEqual(self.stats_fields()[1]["configured_enabled"], "1")
+        self.assertEqual(ipc_request(b"SET_STATUS 1\n"), b"OK ENABLED\n")
+        self.harness.type_word("ghbdtn")
+        self.pump_until(
+            lambda: self.entry.get_text() == "ghbdtn ghbdtn", "second source word"
+        )
+        self.harness.send_key(KEY_SPACE)
+        self.pump_until(
+            lambda: self.entry.get_text() == "ghbdtn привет ", "enabled auto"
+        )
+        fields = self.stats_fields()[1]
+        self.assertEqual(fields["enabled"], "1")
+        self.assertEqual(fields["text_mutation"], "x11")
+        self.assertEqual(fields["word_dispatches"], "1")
+
+    def test_manual_word_edit_remains_available_when_auto_disabled(self) -> None:
+        self.prepare_word_editor()
+        self.pump_until(
+            lambda: self.stats_fields()[1]["config_pending"] == "0",
+            "initial config commit",
+        )
+        self.assertEqual(ipc_request(b"SET_STATUS 0\n"), b"OK DISABLED\n")
+        self.harness.type_word("hELLo")
+        self.pump_until(lambda: self.entry.get_text() == "hELLo", "source word")
+        self.harness.hotkey(KEY_LEFTCTRL, repeat=False)
+        self.pump_until(lambda: self.entry.get_text() == "HellO", "manual case edit")
+        self.assertEqual(ipc_request(b"GET_STATUS\n"), b"OK DISABLED\n")
+
+    def test_word_editor_rejects_unsupported_keyboard_map(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("hello")
+        self.pump_until(lambda: self.entry.get_text() == "hello", "original word")
+        subprocess.run(
+            ["setxkbmap", "-display", self.x11.display, "-layout", "de,ru"],
+            check=True, timeout=3,
+        )
+        self.harness.hotkey(KEY_LEFTCTRL, repeat=False)
+        self.pump_until(
+            lambda: "Word edit dispatch status=0" in self.harness.diagnostic(),
+            "unsupported map rejection",
+        )
+        self.assertEqual(self.entry.get_text(), "hello")
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+
     def test_stale_word_gui_hotkey_does_not_select_or_mutate(self) -> None:
         self.set_selection(Gdk.SELECTION_CLIPBOARD, "abort clipboard sentinel")
         self.set_selection(Gdk.SELECTION_PRIMARY, "abort primary sentinel")
@@ -1586,43 +3017,220 @@ class EventLoopGtkE2E(unittest.TestCase):
             )
         )
 
-    def assert_vte_selection_transform_is_rejected(
-        self, instance: str, klass: str, clipboard_sentinel: str
-    ) -> None:
+    def prepare_vte_line_editor(self, selected_source: str = "AbC"):
+        self.prepare_word_editor()
         self.window.destroy()
-        self.window = Gtk.Window(title="punto-event-loop-vte-e2e")
-        self.window.set_wmclass(instance, klass)
+        self.window = Gtk.Window(title="punto-event-loop-vte-line-e2e")
+        self.window.set_wmclass("gnome-terminal-server", "Gnome-terminal")
+        self.window.set_default_size(640, 320)
         terminal = Vte.Terminal()
         self.window.add(terminal)
+        accelerator = Gtk.AccelGroup()
+        self.window.add_accel_group(accelerator)
+
+        def paste_clipboard(*_arguments):
+            terminal.paste_clipboard()
+            return True
+
+        accelerator.connect(Gdk.KEY_v,
+                            Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK,
+                            Gtk.AccelFlags.VISIBLE, paste_clipboard)
         self.window.show_all()
-        terminal.grab_focus()
-        terminal.feed(b"AbC")
-        self.pump_until(
-            lambda: self.window.get_window() is not None,
-            "VTE window realization",
+        temporary = tempfile.TemporaryDirectory(prefix="punto-vte-line-")
+        self.addCleanup(temporary.cleanup)
+        received = pathlib.Path(temporary.name) / "received"
+        reader = (
+            "import pathlib, sys\n"
+            "destination = pathlib.Path(sys.argv[1])\n"
+            "print(sys.argv[2], flush=True)\n"
+            "print('scrollback sentinel', flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    with destination.open('a', encoding='utf-8') as stream:\n"
+            "        stream.write(line)\n"
+            "        stream.flush()\n"
         )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            spawned, child_pid = terminal.spawn_sync(
+                Vte.PtyFlags.DEFAULT, None,
+                [sys.executable, "-c", reader, str(received), selected_source],
+                ["PATH=/usr/bin:/bin", "LANG=C.UTF-8", "LC_ALL=C.UTF-8"],
+                GLib.SpawnFlags.DEFAULT, None, None, None)
+        self.assertTrue(spawned)
+        self.assertGreater(child_pid, 1)
+
+        def stop_reader():
+            try:
+                os.kill(child_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                try:
+                    waited, _ = os.waitpid(child_pid, os.WNOHANG)
+                except ChildProcessError:
+                    return
+                if waited == child_pid:
+                    return
+                self.pump_for(0.01)
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            try:
+                os.waitpid(child_pid, 0)
+            except ChildProcessError:
+                pass
+
+        self.addCleanup(stop_reader)
+        terminal.grab_focus()
+        self.pump_until(lambda: self.window.get_window().is_viewable(), "VTE window mapped")
         xid = self.window.get_window().get_xid()
         self.xdo("windowfocus", "--sync", str(xid))
         self.publish_active_window(xid)
-        terminal.select_all()
-        self.pump_for(0.1)
-        primary_before = self.selection_text(Gdk.SELECTION_PRIMARY)
-        self.assertIsNotNone(primary_before, "VTE select_all must own PRIMARY")
-        self.set_selection(Gdk.SELECTION_CLIPBOARD, clipboard_sentinel)
+        self.pump_until(lambda: "scrollback sentinel" in terminal.get_text_format(Vte.Format.TEXT),
+                        "canonical PTY reader ready")
+        Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY).clear()
+        return terminal, received
 
+    def select_vte_source_word(self, terminal, source: str) -> None:
+        pointer_events = []
+
+        def record_pointer(_widget, event):
+            pointer_events.append((event.type, event.time, event.x, event.y,
+                                   int(event.state), getattr(event, "button", None)))
+            return False
+
+        for event_name in ("button-press-event", "button-release-event", "motion-notify-event"):
+            terminal.connect(event_name, record_pointer)
+        self.pump_until(
+            lambda: terminal.get_mapped() and terminal.get_realized()
+            and terminal.get_char_width() > 0 and terminal.get_char_height() > 0
+            and terminal.get_allocated_width() > (len(source) + 1) * terminal.get_char_width()
+            and terminal.get_allocated_height() > terminal.get_char_height()
+            and terminal.get_text_format(Vte.Format.TEXT).startswith(source + "\n"),
+            "visible first-row VTE source and allocated character cells")
+        origin = terminal.translate_coordinates(self.window, 0, 0)
+        self.assertIsNotNone(origin)
+        padding = terminal.get_style_context().get_padding(Gtk.StateFlags.NORMAL)
+        x = origin[0] + padding.left + 1
+        y = origin[1] + padding.top + terminal.get_char_height() // 2
+        xid = str(self.window.get_window().get_xid())
+        deadline = time.monotonic() + EVENT_TIMEOUT
+
+        def wait_receipt(predicate, description):
+            self.pump_until(predicate, description, timeout=max(0.0, deadline - time.monotonic()))
+
+        try:
+            try:
+                self.xdo("mousemove", "--sync", "--window", xid, str(x), str(y), "mousedown", "1")
+                wait_receipt(lambda: any(event[0] == Gdk.EventType.BUTTON_PRESS and event[5] == 1
+                                         for event in pointer_events), "VTE received gesture button press")
+                after_press = len(pointer_events)
+                end_x = x + len(source) * terminal.get_char_width()
+                self.xdo("mousemove", "--sync", "--window", xid, str(end_x), str(y))
+                wait_receipt(lambda: any(
+                    event[0] == Gdk.EventType.MOTION_NOTIFY
+                    and event[4] & int(Gdk.ModifierType.BUTTON1_MASK)
+                    and abs(event[2] - (end_x - origin[0])) <= 1
+                    and abs(event[3] - (y - origin[1])) <= 1
+                    for event in pointer_events[after_press:]), "VTE received held-button endpoint motion")
+                after_motion = len(pointer_events)
+            finally:
+                self.xdo("mouseup", "1")
+            wait_receipt(lambda: any(event[0] == Gdk.EventType.BUTTON_RELEASE and event[5] == 1
+                                     for event in pointer_events[after_motion:]), "VTE received gesture release")
+            wait_receipt(lambda: terminal.get_has_selection()
+                         and self.selection_text(Gdk.SELECTION_PRIMARY) == source,
+                         "real VTE drag selects exactly the source word")
+        except AssertionError:
+            print(f"VTE pointer diagnostic source={source!r} origin={origin!r} "
+                  f"cell={terminal.get_char_width()}x{terminal.get_char_height()} "
+                  f"selection={terminal.get_has_selection()} "
+                  f"primary={self.selection_text(Gdk.SELECTION_PRIMARY)!r} "
+                  f"events={pointer_events!r} text={terminal.get_text_format(Vte.Format.TEXT)!r}",
+                  file=sys.stderr)
+            raise
+
+    def test_vte_word_layout_correction_reaches_real_pty(self) -> None:
+        terminal, received = self.prepare_vte_line_editor()
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: "ghbdtn" in terminal.get_text_format(Vte.Format.TEXT),
+                        "terminal physical source word")
+        self.harness.send_key(KEY_PAUSE)
+        self.pump_until(lambda: "привет" in terminal.get_text_format(Vte.Format.TEXT),
+                        "terminal corrected line")
+        self.assertFalse(received.exists(), "correction must not submit a command")
+        self.assertIn("scrollback sentinel", terminal.get_text_format(Vte.Format.TEXT))
+        self.harness.send_key(KEY_ENTER)
+        self.pump_until(lambda: received.exists() and received.read_bytes() == "привет\n".encode(),
+                        "exact corrected canonical PTY input")
+        self.assertEqual(self.selection_text(Gdk.SELECTION_CLIPBOARD), "startup clipboard baseline")
+
+    def assert_vte_selection_inserts(self, source: str, transformed: str,
+                                     modifiers: tuple[int, ...]) -> None:
+        terminal, received = self.prepare_vte_line_editor(source)
+        self.harness.type_word("prefix")
+        self.pump_until(lambda: "prefix" in terminal.get_text_format(Vte.Format.TEXT),
+                        "nonempty live terminal input")
+        self.select_vte_source_word(terminal, source)
+        self.assertEqual(self.selection_text(Gdk.SELECTION_PRIMARY), source)
+        self.send_chord(modifiers)
+        self.pump_until(lambda: "prefix" + transformed in terminal.get_text_format(Vte.Format.TEXT),
+                        "transformed selection inserted without deleting live input")
+        self.assertFalse(received.exists(), "selection insertion must not submit a command")
+        self.assertIn(source + "\n", terminal.get_text_format(Vte.Format.TEXT))
+        self.assertIn("scrollback sentinel", terminal.get_text_format(Vte.Format.TEXT))
+        self.pump_until(lambda: self.selection_text(Gdk.SELECTION_CLIPBOARD) == "startup clipboard baseline",
+                        "terminal paste restores clipboard after transfer")
+        self.harness.send_key(KEY_ENTER)
+        self.pump_until(lambda: received.exists() and received.read_bytes() == ("prefix" + transformed + "\n").encode(),
+                        "exact canonical PTY selection insertion")
+
+    def test_vte_selection_case_inserts_without_deleting_scrollback(self) -> None:
+        self.assert_vte_selection_inserts("AbC", "aBc", (KEY_LEFTALT,))
+
+    def test_vte_selection_layout_inserts_without_deleting_scrollback(self) -> None:
+        self.assert_vte_selection_inserts("ghbdtn", "привет", (KEY_LEFTSHIFT,))
+
+    def test_vte_selection_translit_has_full_modifier_priority(self) -> None:
+        self.assert_vte_selection_inserts("привет", "privet", (KEY_LEFTCTRL, KEY_LEFTALT, KEY_LEFTSHIFT))
+
+    def assert_vte_selection_transform_is_rejected(
+        self, missing_class: bool, clipboard_sentinel: str
+    ) -> None:
+        terminal, received = self.prepare_vte_line_editor()
+        self.harness.type_word("prefix")
+        self.pump_until(lambda: "prefix" in terminal.get_text_format(Vte.Format.TEXT), "real terminal input before rejected selection")
+        xid = self.window.get_window().get_xid()
+        if missing_class:
+            self.select_vte_source_word(terminal, "AbC")
+            subprocess.run(["xprop", "-display", self.x11.display, "-id", str(xid), "-remove", "WM_CLASS"],
+                           check=True, timeout=3)
+            wm_class = subprocess.run(["xprop", "-display", self.x11.display, "-id", str(xid), "WM_CLASS"],
+                                      check=True, capture_output=True, text=True, timeout=3).stdout
+            self.assertIn("not found", wm_class)
+        else:
+            terminal.select_all()
+            self.pump_until(terminal.get_has_selection, "real multiline VTE selection")
+        primary_before = self.selection_text(Gdk.SELECTION_PRIMARY)
+        self.assertIsNotNone(primary_before, "VTE selection must own PRIMARY")
+        if missing_class:
+            self.assertEqual(primary_before, "AbC")
+        else:
+            self.assertIn("\n", primary_before)
+            self.assertIn("AbC", primary_before)
+        terminal_before = terminal.get_text_format(Vte.Format.TEXT)
+        key_events = []
+        terminal.connect("key-press-event", lambda _widget, event: key_events.append(Gdk.keyval_name(event.keyval)) or False)
+        self.set_selection(Gdk.SELECTION_CLIPBOARD, clipboard_sentinel)
         before = self.harness.relay.snapshot()
         self.harness.hotkey(KEY_LEFTALT, repeat=True)
-        completed = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.addCleanup(completed.close)
-        completed.settimeout(EVENT_TIMEOUT)
-        completed.connect("/run/punto.sock")
-        completed.sendall(b"GET_STATUS\n")
-        self.pump_until(
-            lambda: bool(select.select([completed], [], [], 0)[0]),
-            "terminal pre-dispatch rejection",
-        )
-        self.assertEqual(completed.recv(512), b"OK DISABLED\n")
-
+        self.pump_until(lambda: "Word edit dispatch status=0" in self.harness.diagnostic(), "terminal selection pre-dispatch rejection")
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "0")
+        self.assertEqual(terminal.get_text_format(Vte.Format.TEXT), terminal_before)
+        self.assertFalse(received.exists(), "rejected selection must not submit terminal input")
+        self.assertFalse(any(key in {"v", "V", "BackSpace", "Left", "Right", "Return"} for key in key_events))
         self.assertEqual(self.output_count(KEY_C), 0)
         self.assertEqual(self.output_count(KEY_V), 0)
         self.assertEqual(self.output_count(KEY_PAUSE), 0)
@@ -1641,15 +3249,18 @@ class EventLoopGtkE2E(unittest.TestCase):
             ),
             "terminal/unknown pre-dispatch skip emitted a mutating key",
         )
+        self.harness.send_key(KEY_ENTER)
+        self.pump_until(lambda: received.exists() and received.read_bytes() == b"prefix\n",
+                        "rejected transformation preserves exact canonical PTY input")
 
     def test_vte_selection_transform_is_rejected_before_dispatch(self) -> None:
         self.assert_vte_selection_transform_is_rejected(
-            "xterm", "XTerm", "vte clipboard sentinel"
+            False, "vte clipboard sentinel"
         )
 
     def test_custom_vte_unknown_wm_class_is_rejected_before_dispatch(self) -> None:
         self.assert_vte_selection_transform_is_rejected(
-            "nebula-shell", "NebulaShell", "custom vte clipboard sentinel"
+            True, "custom vte clipboard sentinel"
         )
 
     def test_output_epipe_before_action_leaves_gtk_state_untouched(self) -> None:
@@ -1749,5 +3360,5 @@ if __name__ == "__main__":
     test_name = os.environ.get("PUNTO_EVENT_LOOP_E2E_TEST")
     arguments = [sys.argv[0]]
     if test_name:
-        arguments.append(f"EventLoopGtkE2E.{test_name}")
+        arguments.extend(f"EventLoopGtkE2E.{name}" for name in test_name.split(","))
     unittest.main(argv=arguments, verbosity=2)

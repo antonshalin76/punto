@@ -10,6 +10,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 
 #include <gtk/gtk.h>
 
@@ -63,21 +64,19 @@ private:
   static void on_settings_clicked(GtkMenuItem *item, gpointer user_data);
   static void on_about_clicked(GtkMenuItem *item, gpointer user_data);
   static void on_quit_clicked(GtkMenuItem *item, gpointer user_data);
+  static void on_auto_toggled(GtkCheckMenuItem *item, gpointer user_data);
 
   // Callback для периодического обновления статуса
   static gboolean on_status_update(gpointer user_data);
   static gboolean on_status_result(gpointer user_data);
 
-  void request_status_update();
+  void request_status_update(std::optional<bool> requested_enabled = std::nullopt);
 
   /// Обновляет иконку в соответствии с текущим статусом
   void update_icon();
 
   /// Обновляет состояние пункта меню автопереключения
   void update_auto_toggle_state();
-
-  /// Обновляет состояние пункта меню звука
-  void update_sound_toggle_state();
 
   /// Создаёт контекстное меню
   GtkWidget *create_menu();
@@ -86,19 +85,21 @@ private:
   AppIndicator *indicator_ = nullptr;
   GtkWidget *menu_ = nullptr;
   GtkWidget *toggle_item_ = nullptr;
-  GtkWidget *sound_toggle_item_ = nullptr;
+  GtkWidget *sound_settings_item_ = nullptr;
 
   // Текущий статус
   ServiceStatus current_status_ = ServiceStatus::Unknown;
-
-  // Текущий статус звука (берём из user config)
-  bool sound_enabled_ = true;
+  MutationCapability current_capability_ = MutationCapability::Unknown;
+  bool updating_toggle_ = false;
+  bool last_command_failed_ = false;
 
   // ID таймера обновления статуса
   guint status_timer_id_ = 0;
 
   std::shared_ptr<StatusPollState> status_poll_state_;
-  std::function<ServiceStatus()> status_provider_;
+  std::function<IpcClientResult()> status_provider_;
+  std::function<bool(bool)> status_setter_;
+  std::function<bool(const std::string &)> config_reloader_;
 };
 
 } // namespace punto

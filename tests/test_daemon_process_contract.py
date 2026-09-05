@@ -839,7 +839,7 @@ def wait_until_ready(process: SandboxedDaemon, socket_path: Path) -> bytes:
 
         try:
             response = ipc_request(socket_path, b"GET_STATUS\n")
-            if response != b"OK DISABLED\n":
+            if response not in (b"OK ENABLED\n", b"OK DISABLED\n"):
                 fail(f"unexpected readiness response: {response!r}")
 
             endpoint = socket_path.lstat()
@@ -1175,17 +1175,17 @@ def test_service_home_is_not_startup_config_authority(daemon: str) -> None:
         try:
             captured = wait_until_ready(process, socket_path)
             response = ipc_request(socket_path, b"GET_STATUS\n")
-            if response != b"OK DISABLED\n":
+            if response != b"OK ENABLED\n":
                 fail(
-                    f"safe-mode effective status is not disabled: {response!r}",
+                    f"system config did not enable runtime automation: {response!r}",
                     captured,
                 )
             fields = parse_stats(ipc_request(socket_path, b"STATS\n"))
             if (
-                fields.get("text_mutation") != "disabled"
-                or fields.get("enabled") != "0"
+                fields.get("text_mutation") != "x11"
+                or fields.get("enabled") != "1"
             ):
-                fail(f"safe-mode STATS capability is inconsistent: {fields!r}")
+                fail(f"experimental word STATS capability is inconsistent: {fields!r}")
             if fields.get("configured_enabled") != "1":
                 fail(
                     "service HOME config overrode the system analysis intent: "
@@ -1203,6 +1203,192 @@ def test_service_home_is_not_startup_config_authority(daemon: str) -> None:
             )
         finally:
             cleanup_process(process)
+
+
+def assert_runtime_status(socket_path: Path, enabled: bool, configured: bool) -> None:
+    expected = b"OK ENABLED\n" if enabled else b"OK DISABLED\n"
+    response = ipc_request(socket_path, b"GET_STATUS\n")
+    if response != expected:
+        fail(f"runtime status differs: {response!r} != {expected!r}")
+    fields = parse_stats(ipc_request(socket_path, b"STATS\n"))
+    if fields.get("enabled") != str(int(enabled)) or fields.get(
+        "configured_enabled"
+    ) != str(int(configured)):
+        fail(f"runtime/configured status differs: {fields!r}")
+
+
+def test_runtime_status_toggle_and_shared_publication(daemon: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="punto-status-toggle-") as directory:
+        root = Path(directory)
+        socket_path = root / "run" / IPC_SOCKET_NAME
+        state_path = root / "run" / "punto-control.state"
+        process = spawn_daemon(daemon, root, subprocess.DEVNULL)
+        try:
+            wait_until_ready(process, socket_path)
+            assert_runtime_status(socket_path, True, True)
+            previous = read_control_plane_state(state_path)
+            for enabled in (False, True):
+                response = ipc_request(
+                    socket_path, f"SET_STATUS {int(enabled)}\n".encode("ascii")
+                )
+                expected = b"OK ENABLED\n" if enabled else b"OK DISABLED\n"
+                if response != expected:
+                    fail(f"runtime status command was not accepted: {response!r}")
+                assert_runtime_status(socket_path, enabled, True)
+                current = read_control_plane_state(state_path)
+                if (
+                    current.get("enabled") != str(int(enabled))
+                    or int(current.get("status_generation", "-1"))
+                    <= int(previous.get("status_generation", "-1"))
+                    or current.get("config_generation")
+                    != previous.get("config_generation")
+                ):
+                    fail(f"SET_STATUS did not publish only status: {current!r}")
+                previous = current
+            response = ipc_request(socket_path, b"SET_STATUS 2\n")
+            if response != b"ERROR Unknown command\n":
+                fail(f"invalid status was not rejected: {response!r}")
+            assert_runtime_status(socket_path, True, True)
+            if read_control_plane_state(state_path) != previous:
+                fail("invalid status changed shared state")
+        finally:
+            cleanup_process(process)
+
+
+def test_runtime_status_not_published_preserves_local_state(daemon: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="punto-status-publication-") as directory:
+        root = Path(directory)
+        socket_path = root / "run" / IPC_SOCKET_NAME
+        state_path = root / "run" / "punto-control.state"
+        process = spawn_daemon(daemon, root, subprocess.DEVNULL)
+        try:
+            wait_until_ready(process, socket_path)
+            assert_runtime_status(socket_path, True, True)
+            before = state_path.read_bytes()
+            state_path.chmod(0o666)
+            response = ipc_request(socket_path, b"SET_STATUS 0\n")
+            if not response.startswith(b"ERROR "):
+                fail(f"unsafe state file did not reject publication: {response!r}")
+            assert_runtime_status(socket_path, True, True)
+            if state_path.read_bytes() != before:
+                fail("NotPublished changed shared enabled or generations")
+            state_path.chmod(0o660)
+            if ipc_request(socket_path, b"SET_STATUS 0\n") != b"OK DISABLED\n":
+                fail("publication did not recover after restoring file authority")
+            assert_runtime_status(socket_path, False, True)
+            if read_control_plane_state(state_path).get("enabled") != "0":
+                fail("recovered status was not published")
+        finally:
+            cleanup_process(process)
+
+
+def test_runtime_status_startup_shared_authority(daemon: str) -> None:
+    for enabled, configured in ((False, True), (True, False)):
+        with tempfile.TemporaryDirectory(prefix="punto-status-seeded-") as directory:
+            root = Path(directory)
+            prepare_fixture(root, daemon, True)
+            config_path = root / "etc-punto" / "config.yaml"
+            if not configured:
+                write_fixture(
+                    config_path,
+                    config_path.read_text(encoding="utf-8").replace(
+                        "enabled: true", "enabled: false", 1
+                    ),
+                )
+            state_path = root / "run" / "punto-control.state"
+            write_fixture(
+                state_path,
+                "config_generation=7\nstatus_generation=11\n"
+                f"enabled={int(enabled)}\nconfig_path=/etc/punto/config.yaml\n",
+                0o660,
+            )
+            process = spawn_daemon(
+                daemon, root, subprocess.DEVNULL,
+                reuse_fixture=True, start_gate="seeded-status",
+            )
+            try:
+                socket_path = root / "run" / IPC_SOCKET_NAME
+                wait_until_ready(process, socket_path)
+                assert_runtime_status(socket_path, enabled, configured)
+                state = read_control_plane_state(state_path)
+                if state.get("enabled") != str(int(enabled)):
+                    fail(f"startup overwrote authoritative enabled: {state!r}")
+            finally:
+                cleanup_process(process)
+
+
+def test_runtime_status_generation_exhaustion(daemon: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="punto-status-exhausted-") as directory:
+        root = Path(directory)
+        prepare_fixture(root, daemon, True)
+        state_path = root / "run" / "punto-control.state"
+        write_fixture(
+            state_path,
+            "config_generation=7\nstatus_generation=18446744073709551615\n"
+            "enabled=1\nconfig_path=/etc/punto/config.yaml\n",
+            0o660,
+        )
+        process = spawn_daemon(
+            daemon, root, subprocess.DEVNULL,
+            reuse_fixture=True, start_gate="exhausted-status",
+        )
+        try:
+            socket_path = root / "run" / IPC_SOCKET_NAME
+            wait_until_ready(process, socket_path)
+            assert_runtime_status(socket_path, True, True)
+            before = state_path.read_bytes()
+            response = ipc_request(socket_path, b"SET_STATUS 0\n")
+            if not response.startswith(b"ERROR "):
+                fail(f"exhausted status generation was accepted: {response!r}")
+            assert_runtime_status(socket_path, True, True)
+            if state_path.read_bytes() != before:
+                fail("exhaustion changed shared enabled or wrapped generation")
+        finally:
+            cleanup_process(process)
+
+
+def test_secondary_status_applies_when_config_path_is_rejected(daemon: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="punto-status-secondary-") as directory:
+        root = Path(directory)
+        processes: list[SandboxedDaemon] = []
+        try:
+            primary = spawn_daemon(daemon, root, subprocess.DEVNULL)
+            processes.append(primary)
+            wait_until_ready(primary, root / "run" / IPC_SOCKET_NAME)
+            secondary = spawn_daemon(
+                daemon, root, subprocess.DEVNULL,
+                reuse_fixture=True, start_gate="status-secondary",
+            )
+            processes.append(secondary)
+            socket_path = root / "run" / "punto-2.sock"
+            captured = wait_until_ready(secondary, socket_path)
+            assert_runtime_status(socket_path, True, True)
+            if not send_pidfd_signal(secondary.daemon_pidfd, signal.SIGSTOP):
+                fail("secondary exited before shared-state barrier")
+            state_path = root / "run" / "punto-control.state"
+            previous = read_control_plane_state(state_path)
+            write_fixture(
+                state_path,
+                f"config_generation={int(previous['config_generation']) + 1}\n"
+                f"status_generation={int(previous['status_generation']) + 1}\n"
+                "enabled=0\nconfig_path=/outside/not-authorized.yaml\n",
+                0o660,
+            )
+            if not send_pidfd_signal(secondary.daemon_pidfd, signal.SIGCONT):
+                fail("secondary exited before rejected config synchronization")
+            wait_for_stderr(
+                secondary, captured, b"shared control-plane config sync failed"
+            )
+            assert_runtime_status(socket_path, False, True)
+            response = ipc_request(socket_path, b"SET_STATUS 1\n")
+            if response != b"ERROR Read-only diagnostic endpoint\n":
+                fail(f"secondary accepted status mutation: {response!r}")
+            assert_runtime_status(socket_path, False, True)
+        finally:
+            for process in reversed(processes):
+                if pidfd_is_alive(process.daemon_pidfd):
+                    send_pidfd_signal(process.daemon_pidfd, signal.SIGCONT)
+                cleanup_process(process)
 
 
 def test_control_plane_promotion_reconciles_authoritative_snapshot(
@@ -1279,6 +1465,11 @@ def test_control_plane_promotion_reconciles_authoritative_snapshot(
                 peer_stderr,
                 b'Configuration reloaded: "/etc/punto/alternate.yaml"',
             )
+            if ipc_request(primary_socket, b"SET_STATUS 1\n") != b"OK ENABLED\n":
+                fail("primary failed to override disabled config at runtime")
+            committed_state = read_control_plane_state(state_path)
+            if committed_state.get("enabled") != "1":
+                fail("primary runtime override was not published")
             if not send_pidfd_signal(synced_peer.daemon_pidfd, signal.SIGSTOP):
                 fail("synced peer exited before the failover barrier")
 
@@ -1302,6 +1493,8 @@ def test_control_plane_promotion_reconciles_authoritative_snapshot(
                 (stale_secondary, synced_peer),
             )
             promoted_generation = int(promoted_state["config_generation"])
+            if promoted_state.get("enabled") != "1":
+                fail("promotion discarded runtime override for disabled config")
             if promoted_generation <= committed_generation:
                 fail(
                     "promoted generation did not advance strictly: "
@@ -1316,6 +1509,7 @@ def test_control_plane_promotion_reconciles_authoritative_snapshot(
                     if (
                         fields.get("control_plane") == "primary"
                         and fields.get("configured_enabled") == "0"
+                        and fields.get("enabled") == "1"
                     ):
                         break
                     last_error = f"unexpected promoted state: {fields!r}"
@@ -1844,6 +2038,26 @@ def main() -> int:
             lambda: test_service_home_is_not_startup_config_authority(daemon),
         ),
         (
+            "runtime status toggle and shared publication",
+            lambda: test_runtime_status_toggle_and_shared_publication(daemon),
+        ),
+        (
+            "runtime status publication failure and recovery",
+            lambda: test_runtime_status_not_published_preserves_local_state(daemon),
+        ),
+        (
+            "runtime status startup shared authority",
+            lambda: test_runtime_status_startup_shared_authority(daemon),
+        ),
+        (
+            "runtime status generation exhaustion",
+            lambda: test_runtime_status_generation_exhaustion(daemon),
+        ),
+        (
+            "secondary status independent of config path rejection",
+            lambda: test_secondary_status_applies_when_config_path_is_rejected(daemon),
+        ),
+        (
             "control-plane authoritative failover",
             lambda: test_control_plane_promotion_reconciles_authoritative_snapshot(
                 daemon
@@ -1879,6 +2093,8 @@ def main() -> int:
             case()
         except AssertionError as error:
             failures.append(f"[{name}] {error}")
+        else:
+            print(f"PASS: {name}", flush=True)
     if failures:
         raise AssertionError("\n\n".join(failures))
     print("test_daemon_process_contract: OK")

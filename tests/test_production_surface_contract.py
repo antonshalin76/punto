@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guard the v2.8.8 production daemon's no-mutation link boundary."""
+"""Check the restored executor link boundary and exclude the obsolete injector."""
 
 from __future__ import annotations
 
@@ -10,21 +10,11 @@ import sys
 
 
 FORBIDDEN_SOURCES = {
-    "src/clipboard_manager.cpp",
     "src/key_injector.cpp",
-    "src/macro_lock.cpp",
-    "src/sound_manager.cpp",
-    "src/terminal_detection.cpp",
-    "src/undo_detector.cpp",
 }
 
 FORBIDDEN_SYMBOLS = (
-    "punto::ClipboardManager",
     "punto::KeyInjector",
-    "punto::MacroLock",
-    "punto::SoundManager",
-    "punto::TerminalDetection",
-    "punto::UndoDetector",
 )
 
 
@@ -75,12 +65,17 @@ def main() -> int:
     forbidden = sorted(production_sources & FORBIDDEN_SOURCES)
     if forbidden:
         return fail("forbidden source(s): " + ", ".join(forbidden))
+    required = {
+        "src/word_editor.cpp", "src/clipboard_manager.cpp", "src/macro_lock.cpp",
+        "src/sound_manager.cpp",
+        "src/undo_detector.cpp",
+    }
+    if not required <= production_sources:
+        return fail("word editor implementation is missing from production")
 
     production_prefix = cmake.split("# Tests (CTest)", maxsplit=1)[0]
     if "PUNTO_ENABLE_TEST_SEAMS" in production_prefix:
         return fail("test-only exception seam is enabled before the test section")
-    if "XCB_XFIXES" in production_prefix or "xcb-xfixes" in production_prefix:
-        return fail("XFixes entered the production configure/link surface")
 
     try:
         dynamic = run_tool("readelf", "-dW", str(binary_path)).lower()
@@ -89,8 +84,10 @@ def main() -> int:
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         return fail(str(error))
 
-    if "xfixes" in dynamic:
-        return fail("production ELF has an XFixes dynamic dependency")
+    if "xcb-xtest" not in dynamic or "xcb-xfixes" not in dynamic:
+        return fail("production ELF is missing the bounded word-editor transport")
+    if "punto::WordEditor::execute(" not in symbols:
+        return fail("production ELF does not contain word-edit execution")
     linked_symbols = [symbol for symbol in FORBIDDEN_SYMBOLS if symbol in symbols]
     if linked_symbols:
         return fail("forbidden linked symbol(s): " + ", ".join(linked_symbols))

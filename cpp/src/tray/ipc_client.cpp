@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -396,10 +397,105 @@ IpcClientResult IpcClient::exchange_for_test(const std::string &command,
                                              const std::string &socket_path) {
   return send_command_to_socket(command, socket_path);
 }
+
+bool IpcClient::set_auto_enabled_for_test(bool enabled, const std::string &socket_path) {
+  return set_auto_enabled_to_socket(enabled, socket_path);
+}
 #endif
 
 ServiceStatus IpcClient::get_status() {
   return diagnose_socket(kSocketPath).status;
+}
+
+IpcClientResult IpcClient::diagnose_runtime_socket(const std::string &socket_path) {
+  auto result = send_command_to_socket("STATS", socket_path);
+  if (!result.ok()) {
+    return result;
+  }
+  std::vector<std::string_view> fields;
+  std::string_view remaining{result.response};
+  while (!remaining.empty() && fields.size() <= 31) {
+    const auto space = remaining.find(' ');
+    fields.push_back(remaining.substr(0, space));
+    if (space == std::string_view::npos) {
+      remaining = {};
+      break;
+    }
+    remaining.remove_prefix(space + 1);
+    if (remaining.empty()) {
+      return failure(IpcClientError::ProtocolError);
+    }
+  }
+  if (!remaining.empty() || fields.size() < 30 || fields[0] != "OK") {
+    return failure(IpcClientError::ProtocolError);
+  }
+  const bool x11 = fields[10] == "text_mutation=x11";
+  if ((!x11 && fields[10] != "text_mutation=disabled") ||
+      fields.size() != (x11 ? 31U : 30U)) {
+    return failure(IpcClientError::ProtocolError);
+  }
+  static constexpr std::array<std::string_view, 29> names{
+      "x11_health", "analysis_health", "input_health", "x11_last_progress_ms",
+      "analysis_last_progress_ms", "input_last_progress_ms", "analysis_outstanding",
+      "input_in_flight", "log_dropped", "text_mutation", "enabled",
+      "configured_enabled", "config_pending", "config_generation", "config_result",
+      "analyzed", "need_switch", "corrections", "pending_words", "ready_results",
+      "worker_threads", "daemon_peers", "analysis_mode", "control_plane",
+      "queued_tasks", "avg_queue_us", "avg_analysis_us", "avg_macro_us", "avg_tail_len"};
+  for (std::size_t i = 0; i + 1 < fields.size(); ++i) {
+    const auto name = x11 && i == 18
+                          ? std::string_view{"word_dispatches"}
+                          : names[i - (x11 && i > 18 ? 1U : 0U)];
+    auto field = fields[i + 1];
+    if (!field.starts_with(name) || field.size() <= name.size() + 1 ||
+        field[name.size()] != '=') {
+      return failure(IpcClientError::ProtocolError);
+    }
+    field.remove_prefix(name.size() + 1);
+    bool valid = false;
+    if (name.ends_with("_health")) {
+      valid = field == "ready" || field == "degraded" || field == "failed";
+    } else if (name == "text_mutation") {
+      valid = true; // Exact capability was checked before choosing the schema.
+    } else if (name == "enabled") {
+      valid = field == "0" || (x11 && field == "1");
+      result.status = field == "1" ? ServiceStatus::Enabled : ServiceStatus::Disabled;
+    } else if (name == "input_in_flight" || name == "configured_enabled" ||
+               name == "config_pending") {
+      valid = field == "0" || field == "1";
+    } else if (name == "config_result") {
+      valid = field == "none" || field == "ok" || field == "error";
+    } else if (name == "analysis_mode") {
+      valid = field == "auto" || field == "fixed";
+    } else if (name == "control_plane") {
+      valid = field == "primary" || field == "secondary";
+    } else {
+      std::uint64_t value = 0;
+      const auto parsed = std::from_chars(field.data(), field.data() + field.size(), value);
+      valid = (field == "0" || field.front() != '0') &&
+              parsed.ec == std::errc{} && parsed.ptr == field.data() + field.size();
+    }
+    if (!valid) {
+      return failure(IpcClientError::ProtocolError);
+    }
+  }
+  result.capability = x11 ? MutationCapability::X11
+                                   : MutationCapability::Disabled;
+  return result;
+}
+
+IpcClientResult IpcClient::get_runtime_snapshot() {
+  return diagnose_runtime_socket(kSocketPath);
+}
+
+bool IpcClient::set_auto_enabled(bool enabled) {
+  return set_auto_enabled_to_socket(enabled, kSocketPath);
+}
+
+bool IpcClient::set_auto_enabled_to_socket(bool enabled, const std::string &socket_path) {
+  const auto result = send_command_to_socket(
+      enabled ? "SET_STATUS 1" : "SET_STATUS 0", socket_path);
+  return result.ok() && result.response == (enabled ? "OK ENABLED" : "OK DISABLED");
 }
 
 bool IpcClient::reload_config(const std::string &config_path) {

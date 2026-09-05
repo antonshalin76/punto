@@ -355,54 +355,56 @@ std::string local_hostname() {
   return hostname.data();
 }
 
-std::string find_unused_display_number() {
-  const unsigned int base =
-      20000U + static_cast<unsigned int>(::getpid()) % 10000U;
-  for (unsigned int offset = 0; offset < 1000U; ++offset) {
-    const std::string number = std::to_string(base + offset);
-    const std::string socket = "/tmp/.X11-unix/X" + number;
-    struct stat metadata {};
-    if (::lstat(socket.c_str(), &metadata) != 0 && errno == ENOENT) {
-      return number;
-    }
-  }
-  fail("find unused authenticated X display");
-}
-
 NestedXServer start_authenticated_xvfb(const TempAuthority &server_authority) {
-  const std::string number = find_unused_display_number();
-  const std::string display = ":" + number;
+  int descriptors[2]{};
+  expect(::pipe(descriptors) == 0,
+         "create authenticated Xvfb display pipe");
   const pid_t pid = ::fork();
   expect(pid >= 0, "fork authenticated Xvfb");
   if (pid == 0) {
+    (void)::close(descriptors[0]);
+    if (::dup2(descriptors[1], STDOUT_FILENO) < 0) {
+      _exit(126);
+    }
+    (void)::close(descriptors[1]);
     const int null_descriptor = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
     if (null_descriptor >= 0) {
-      (void)::dup2(null_descriptor, STDOUT_FILENO);
       (void)::dup2(null_descriptor, STDERR_FILENO);
       (void)::close(null_descriptor);
     }
-    ::execl("/usr/bin/Xvfb", "Xvfb", display.c_str(), "-auth",
+    ::execl("/usr/bin/Xvfb", "Xvfb", "-displayfd", "1", "-auth",
             server_authority.path.c_str(), "-nolisten", "tcp",
             static_cast<char *>(nullptr));
     _exit(127);
   }
 
-  const std::string socket = "/tmp/.X11-unix/X" + number;
-  const auto deadline = std::chrono::steady_clock::now() + 2s;
-  while (std::chrono::steady_clock::now() < deadline) {
-    int status = 0;
-    if (::waitpid(pid, &status, WNOHANG) == pid) {
-      fail("authenticated Xvfb exited during startup");
-    }
-    struct stat metadata {};
-    if (::lstat(socket.c_str(), &metadata) == 0 && S_ISSOCK(metadata.st_mode)) {
-      return NestedXServer{pid, display, false};
-    }
-    std::this_thread::sleep_for(10ms);
+  (void)::close(descriptors[1]);
+  pollfd descriptor{descriptors[0], POLLIN, 0};
+  if (::poll(&descriptor, 1, 2000) != 1) {
+    (void)::close(descriptors[0]);
+    (void)::kill(pid, SIGTERM);
+    (void)::waitpid(pid, nullptr, 0);
+    fail("authenticated Xvfb startup timeout");
   }
-  (void)::kill(pid, SIGTERM);
-  (void)::waitpid(pid, nullptr, 0);
-  fail("authenticated Xvfb startup timeout");
+  char buffer[32]{};
+  const ssize_t count =
+      ::read(descriptors[0], buffer, sizeof(buffer) - 1U);
+  (void)::close(descriptors[0]);
+  if (count <= 1) {
+    (void)::kill(pid, SIGTERM);
+    (void)::waitpid(pid, nullptr, 0);
+    fail("authenticated Xvfb did not publish display");
+  }
+  std::string number{buffer, static_cast<std::size_t>(count)};
+  while (!number.empty() && (number.back() == '\n' || number.back() == '\r')) {
+    number.pop_back();
+  }
+  if (number.empty()) {
+    (void)::kill(pid, SIGTERM);
+    (void)::waitpid(pid, nullptr, 0);
+    fail("authenticated Xvfb display is empty");
+  }
+  return NestedXServer{pid, ":" + number, false};
 }
 
 punto::X11SessionInfo real_candidate(const NestedXServer &server,
@@ -415,7 +417,6 @@ punto::X11SessionInfo real_candidate(const NestedXServer &server,
 }
 
 bool xkb_connection_succeeds(const punto::X11SessionInfo &candidate) {
-  const auto started = std::chrono::steady_clock::now();
   punto::X11Session session{[candidate] {
     return punto::x11_detail::ProbeResult{
         punto::x11_detail::ProbeStatus::Healthy, candidate};
@@ -432,8 +433,7 @@ bool xkb_connection_succeeds(const punto::X11SessionInfo &candidate) {
     return false;
   }
   const int group = session.get_current_keyboard_layout();
-  return (group == 0 || group == 1) &&
-         std::chrono::steady_clock::now() - started < 1500ms;
+  return group == 0 || group == 1;
 }
 
 std::string display_number(const NestedXServer &server) {

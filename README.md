@@ -299,6 +299,10 @@ sudo apt install build-essential cmake pkg-config libyaml-cpp-dev \
 # Только для сборки clipboard contract-тестов (не product runtime)
 sudo apt install libxcb-xfixes0-dev
 
+# Для изолированных CLI/package/daemon/GTK contract-тестов
+sudo apt install apparmor bubblewrap busybox-static strace util-linux \
+  python3-gi gir1.2-vte-2.91 xauth xclip xdotool xvfb
+
 # Обязательно для default-пакета с tray (GTK3 + AppIndicator/Ayatana)
 sudo apt install libgtk-3-dev libayatana-appindicator3-dev
 
@@ -311,6 +315,11 @@ sudo apt install hunspell hunspell-en-us hunspell-ru
 sudo apt install wamerican-huge
 
 ```
+
+Сетевые sandbox-тесты используют private user/network namespaces Bubblewrap и
+не имеют fallback на сеть хоста. На GitHub-hosted Ubuntu 24.04 workflow
+устанавливает CI-only AppArmor-профиль, разрешающий `userns` только исполняемому
+файлу `/usr/bin/bwrap`; глобальный sysctl безопасности не отключается.
 
 #### Сборка
 

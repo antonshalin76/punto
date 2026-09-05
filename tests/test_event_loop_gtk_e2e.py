@@ -194,6 +194,25 @@ def run_in_sandbox(driver: pathlib.Path) -> int:
     return completed.returncode
 
 
+def require_private_network_namespace() -> None:
+    interfaces = {
+        line.split(":", maxsplit=1)[0].strip()
+        for line in pathlib.Path("/proc/net/dev")
+        .read_text(encoding="ascii")
+        .splitlines()[2:]
+    }
+    routes = (
+        pathlib.Path("/proc/net/route")
+        .read_text(encoding="ascii")
+        .splitlines()[1:]
+    )
+    if interfaces != {"lo"} or routes:
+        raise RuntimeError(
+            "sandbox must expose only loopback and no IPv4 routes: "
+            f"interfaces={sorted(interfaces)!r}, routes={len(routes)}"
+        )
+
+
 class NestedX11:
     def __init__(self) -> None:
         self.process: subprocess.Popen[bytes] | None = None
@@ -1726,6 +1745,7 @@ if __name__ == "__main__":
         raise SystemExit(2)
     if os.environ.get("PUNTO_EVENT_LOOP_E2E_INNER") != "1":
         raise SystemExit(run_in_sandbox(DRIVER))
+    require_private_network_namespace()
     test_name = os.environ.get("PUNTO_EVENT_LOOP_E2E_TEST")
     arguments = [sys.argv[0]]
     if test_name:

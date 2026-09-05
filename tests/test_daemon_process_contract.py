@@ -1789,7 +1789,11 @@ def preflight() -> None:
             var_contract = (
                 'test -L /var/run; test "$(readlink /var/run)" = /run; '
                 'test -z "$(find /var -mindepth 1 -maxdepth 1 '
-                '! -name run -print -quit)"'
+                '! -name run -print -quit)"; '
+                'test "$(awk \'NR > 2 { sub(/:.*/, "", $1); print $1 }\' '
+                '/proc/net/dev)" = lo; '
+                'test "$(awk \'NR > 1 { count++ } END { print count + 0 }\' '
+                '/proc/net/route)" = 0'
             )
             smoke = subprocess.run(
                 sandbox_prefix(root)

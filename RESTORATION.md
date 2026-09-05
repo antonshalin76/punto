@@ -97,8 +97,27 @@ Release/Debug pass 5/5 in `/tmp/punto-key-release-release-green.log` and
 pre-RED SRP, actual RED critic and final source/SRP reviews passed. WordEditor
 owns admission/deadline, existing XCB helpers own bounded transport, and fixture
 adapters supply evidence only; persistence/UI/broker policy are unchanged/N/A.
-No further refactor was needed. Five existing files add 160 lines, of which 13
-are production runtime; no file or parallel state owner is added.
+The initial implementation changed five existing files by 160 lines, including
+13 production lines; no file or parallel state owner was added.
+
+CI 33998951691 passed Release, sanitizers and package gates but clang-tidy-18
+reported ten unchecked optional accesses in the existing guarded PRIMARY loop.
+The same diagnostics reproduced locally in `/tmp/punto-key-release-tidy-red.log`.
+Isolating only the initial fence in a synchronous local bool lambda made the
+unchanged optional guards analyzable: `/tmp/punto-key-release-tidy-green.log`.
+The call position, query/context/wait order, deadline, cancellation and rejection
+stage are unchanged; no warning suppression or optional access was modified.
+Existing passing key-release/editor cases provide the refactor characterization.
+BDD critic, separate invariant auditor and pre-SRP review passed. The lambda is
+a subordinate mechanical unit of WordEditor, not a second policy owner. The
+wrapper adds three lines for static verifiability, with no new state or API.
+Final source/SRP audit passed. The exact CI clang-tidy profile on the changed
+translation unit passed in `/tmp/punto-key-release-tidy-full-profile.log`.
+Unchanged GTK/VTE 91, Chrome 9 and browser lifecycle 3 cases passed again in
+both builds: `/tmp/punto-tidy-refactor-release-e2e.log` and
+`/tmp/punto-tidy-refactor-debug-e2e.log`. Other source gates are covered by the
+preceding runtime CI and repeated in the next exact-commit full CI; no additional
+behavior change or test weakening was needed.
 
 This addresses ordinary keys already visible as held at initial preflight.
 Held modifiers can still be rejected earlier by idle_layout; this is not a new

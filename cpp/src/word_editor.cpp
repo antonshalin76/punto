@@ -714,17 +714,20 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   };
   // Forwarded input can reach X after our local key-up bookkeeping. XTEST
   // ignores a press of an already-held key, then releases that user's key.
-  outcome.rejection_stage = "key_release";
-  for (;;) {
-    if (!context_matches()) return outcome;
-    const auto keys = reply<xcb_query_keymap_reply_t>(
-        connection, xcb_query_keymap(connection.get()).sequence, deadline);
-    if (!keys) return outcome;
-    if (std::ranges::all_of(keys->keys, [](auto byte) { return byte == 0; })) {
-      break;
+  const auto wait_for_key_release = [&] {
+    for (;;) {
+      if (!context_matches()) return false;
+      const auto keys = reply<xcb_query_keymap_reply_t>(
+          connection, xcb_query_keymap(connection.get()).sequence, deadline);
+      if (!keys) return false;
+      if (std::ranges::all_of(keys->keys, [](auto byte) { return byte == 0; })) {
+        return true;
+      }
+      if (!wait(Clock::now() + std::chrono::milliseconds{1})) return false;
     }
-    if (!wait(Clock::now() + std::chrono::milliseconds{1})) return outcome;
-  }
+  };
+  outcome.rejection_stage = "key_release";
+  if (!wait_for_key_release()) return outcome;
   outcome.rejection_stage = "context_changed";
   if (!context_matches()) {
     return outcome;

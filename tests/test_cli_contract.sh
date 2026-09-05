@@ -2818,7 +2818,7 @@ PY
     done
     assert_contains "$CLI_OUTPUT" '--version' "B26 help documents --version"
     assert_contains "$CLI_OUTPUT" 'text mutations are disabled' \
-        "B26 help reports the 2.8.6 safety-mode capability"
+        "B26 help reports the 2.8.7 safety-mode capability"
     assert_no_control_calls "B26 --help"
     assert_bounded "$CLI_RC" "$CLI_DURATION_MS" 500 "B26 --help is bounded"
 

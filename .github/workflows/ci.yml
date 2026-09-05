@@ -46,13 +46,17 @@ jobs:
             xdotool \
             xvfb
       - name: Configure
-        run: cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+        run: >-
+          cmake -S cpp -B cpp/build
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
       - name: Build
         run: cmake --build cpp/build -j"$(nproc)"
       - name: Test
         env:
           PUNTO_REQUIRE_EVENT_LOOP_E2E: "1"
-        run: ctest --test-dir cpp/build --output-on-failure
+        run: >-
+          ctest --test-dir cpp/build --output-on-failure --no-tests=error
       - name: CLI contract
         run: bash tests/test_cli_contract.sh
       - name: Shell safety
@@ -94,6 +98,7 @@ jobs:
         run: >-
           cmake -S cpp -B cpp/build-debug
           -DCMAKE_BUILD_TYPE=Debug
+          -DBUILD_TESTING=ON
           -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer'
           -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
       - name: Build
@@ -104,14 +109,14 @@ jobs:
           PUNTO_REQUIRE_EVENT_LOOP_E2E: "1"
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: >-
-          ctest --test-dir cpp/build-debug --output-on-failure
+          ctest --test-dir cpp/build-debug --output-on-failure --no-tests=error
           -E '^punto-clipboard-gtk-contract$'
       - name: Test GTK clipboard with ASan and UBSan
         env:
           ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: >-
-          ctest --test-dir cpp/build-debug --output-on-failure
+          ctest --test-dir cpp/build-debug --output-on-failure --no-tests=error
           -R '^punto-clipboard-gtk-contract$'
 
   clang-tidy:

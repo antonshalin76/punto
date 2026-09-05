@@ -62,7 +62,7 @@ struct AnalysisAdmission {
   [[nodiscard]] explicit operator bool() const noexcept { return accepted; }
 };
 
-/// Тип распознанной коррекции. EventLoop v2.8.6 учитывает её только в
+/// Тип распознанной коррекции. EventLoop v2.8.7 учитывает её только в
 /// телеметрии.
 enum class CorrectionType {
   NoCorrection, // Коррекция не требуется

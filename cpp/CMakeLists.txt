@@ -157,7 +157,7 @@ endfunction()
 add_executable(punto ${PUNTO_SOURCES} ${PUNTO_HEADERS})
 configure_punto_daemon_target(punto)
 
-# Text mutation is intentionally disabled in the v2.8.6 production daemon.
+# Text mutation is intentionally disabled in the v2.8.7 production daemon.
 # Keep this boundary configure-time fatal; the inactive components remain
 # available only to the isolated contract-test targets below.
 set(PUNTO_FORBIDDEN_PRODUCTION_SOURCES

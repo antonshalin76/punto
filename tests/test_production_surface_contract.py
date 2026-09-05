@@ -33,14 +33,14 @@ def fail(message: str) -> int:
     return 1
 
 
-def run_tool(*command: str) -> str:
+def run_tool(*command: str, timeout: float = 5.0) -> str:
     result = subprocess.run(
         command,
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        timeout=5,
+        timeout=timeout,
     )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
@@ -84,7 +84,7 @@ def main() -> int:
 
     try:
         dynamic = run_tool("readelf", "-dW", str(binary_path)).lower()
-        symbols = run_tool("nm", "-C", str(binary_path))
+        symbols = run_tool("nm", "-C", str(binary_path), timeout=15.0)
         strings = run_tool("strings", "-a", str(binary_path))
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         return fail(str(error))

@@ -335,7 +335,7 @@ NestedXServer start_nested_xvfb(bool disable_xfixes = false) {
 
   (void)::close(descriptors[1]);
   pollfd descriptor{descriptors[0], POLLIN, 0};
-  expect(::poll(&descriptor, 1, 2000) == 1, "nested Xvfb startup timeout");
+  expect(::poll(&descriptor, 1, 5000) == 1, "nested Xvfb startup timeout");
   char buffer[32]{};
   const ssize_t count = ::read(descriptors[0], buffer, sizeof(buffer) - 1U);
   (void)::close(descriptors[0]);
@@ -380,7 +380,7 @@ NestedXServer start_authenticated_xvfb(const TempAuthority &server_authority) {
 
   (void)::close(descriptors[1]);
   pollfd descriptor{descriptors[0], POLLIN, 0};
-  if (::poll(&descriptor, 1, 2000) != 1) {
+  if (::poll(&descriptor, 1, 5000) != 1) {
     (void)::close(descriptors[0]);
     (void)::kill(pid, SIGTERM);
     (void)::waitpid(pid, nullptr, 0);

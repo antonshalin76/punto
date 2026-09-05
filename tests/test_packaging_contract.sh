@@ -430,7 +430,7 @@ SPY
 
     local tool target
     for tool in pkg-config file strip gzip sha256sum; do
-        target=$(command -v "$tool")
+        target=/usr/bin/$tool
         cat >"$directory/$tool" <<SPY
 #!/usr/bin/env bash
 set -u
@@ -991,7 +991,7 @@ write_real_tool_spies() {
     mkdir -p "$directory"
     write_mutation_spies "$directory"
     for name in cmake dpkg-deb dpkg-shlibdeps pkg-config file strip gzip sha256sum; do
-        target=$(command -v "$name")
+        target=/usr/bin/$name
         upper=${name^^}
         cat >"$directory/$name" <<SPY
 #!/usr/bin/env bash

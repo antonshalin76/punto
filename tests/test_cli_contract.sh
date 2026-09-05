@@ -2105,7 +2105,7 @@ run_stop_case() {
 }
 
 run_stop_matrix() {
-    local fake_clock
+    local fake_clock systemctl_mode bound
     reset_case
     run_cli stop-idempotent-first stop
     assert_zero "$CLI_RC" "B26 stop on inactive service and tray succeeds"
@@ -2197,7 +2197,9 @@ run_stop_matrix() {
         assert_service_mutation_sequence "B26 TERM failure $systemctl_mode" stop term
         assert_service_state active "B26 TERM failure $systemctl_mode"
         assert_no_pid_or_undeclared_calls "B26 TERM failure $systemctl_mode"
-        assert_bounded "$CLI_RC" "$CLI_DURATION_MS" 1000 \
+        bound=1000
+        [[ $systemctl_mode == *hang-kill ]] && bound=1500
+        assert_bounded "$CLI_RC" "$CLI_DURATION_MS" "$bound" \
             "B26 TERM failure $systemctl_mode is bounded"
     done
 

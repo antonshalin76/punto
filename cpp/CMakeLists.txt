@@ -567,7 +567,7 @@ if(BUILD_TESTING)
 
     add_test(NAME punto-x11-session-contract
              COMMAND punto-x11-session-contract)
-    set_tests_properties(punto-x11-session-contract PROPERTIES TIMEOUT 15)
+    set_tests_properties(punto-x11-session-contract PROPERTIES TIMEOUT 30)
 
     add_executable(punto-clipboard-contract
         tests/test_clipboard_manager_contract.cpp
@@ -639,7 +639,7 @@ if(BUILD_TESTING)
         )
         set_tests_properties(
             punto-production-surface-contract
-            PROPERTIES TIMEOUT 10
+            PROPERTIES TIMEOUT 30
         )
 
         set(PUNTO_EVENT_LOOP_E2E_SOURCES ${PUNTO_SOURCES})

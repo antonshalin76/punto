@@ -320,6 +320,8 @@ sudo apt install wamerican-huge
 не имеют fallback на сеть хоста. На GitHub-hosted Ubuntu 24.04 workflow
 устанавливает CI-only AppArmor-профиль, разрешающий `userns` только исполняемому
 файлу `/usr/bin/bwrap`; глобальный sysctl безопасности не отключается.
+Xvfb сообщает готовность через `-displayfd`, а package-test spies вызывают
+инструменты из заявленных Debian providers по точным путям `/usr/bin/*`.
 
 #### Сборка
 

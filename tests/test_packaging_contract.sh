@@ -1621,7 +1621,7 @@ assert_exact_derived_dependencies() {
     local -a elf_args=() derived_parts=() control_parts=()
     local -a explicit_parts=(
         interception-tools hunspell-en-us hunspell-ru netcat-openbsd passwd
-        'util-linux (>= 2.38)' 'systemd (>= 249)' \
+        'util-linux (>= 2.38)' 'systemd (>= 249.10)' \
         'init-system-helpers (>= 1.66)'
     )
     depends=$(/usr/bin/dpkg-deb -f "$artifact" Depends 2>/dev/null || true)
@@ -1943,7 +1943,7 @@ prepare_lifecycle_root() {
     mkdir -p "$root/bin" "$root/contract-bin" "$root/contract-state" "$root/dev" \
         "$root/etc" "$root/tmp" "$root/var/lib/dpkg/info" "$root/var/lib/dpkg/updates" \
         "$root/var/lib/dpkg/triggers" "$root/var/lib/dpkg/parts" "$root/var/log" \
-        "$root/run/systemd/system"
+        "$root/run/systemd/system" "$root/usr/bin" "$root/usr/sbin"
     chmod 0777 "$root/tmp" "$root/contract-state"
     : >"$root/var/lib/dpkg/status"
     : >"$root/var/lib/dpkg/available"
@@ -1961,6 +1961,7 @@ prepare_lifecycle_root() {
     for applet in sh cat chmod chown cp date grep id mkdir mv rm sed sleep stat tr; do
         ln -s busybox "$root/bin/$applet"
     done
+    cp -- /usr/bin/timeout "$root/usr/bin/timeout"
 
     cat >"$root/contract-bin/getent" <<'SPY'
 #!/bin/sh
@@ -1986,12 +1987,46 @@ fi
 : >/contract-state/group.exists
 exit 0
 SPY
+    : >"$root/contract-state/tray-1000.active"
     cat >"$root/contract-bin/systemctl" <<'SPY'
 #!/bin/sh
-printf 'UNEXPECTED systemctl' >>/contract-state/calls.log
+printf 'SYSTEMCTL' >>/contract-state/calls.log
 printf ' %s' "$@" >>/contract-state/calls.log
 printf '\n' >>/contract-state/calls.log
-exit 97
+case "$*" in
+    '--system --no-legend --plain --state=active --type=service list-units user@*.service')
+        printf '%s\n' \
+            'user@1000.service loaded active running User Manager for UID 1000' \
+            'user@1001.service loaded active running User Manager for UID 1001' \
+            'user@01.service loaded active running malformed leading zero' \
+            'user@evil.service loaded active running malformed nonnumeric'
+        exit 0
+        ;;
+    '--quiet --no-block --user --machine=1000@ try-restart -- punto-tray.service')
+        [ "${CONTRACT_SERVICE_MODE:-ok}" = fail ] && exit 6
+        [ -f /contract-state/tray-1000.active ] && \
+            printf 'RESTARTED 1000\n' >>/contract-state/calls.log
+        ;;
+    '--quiet --no-block --user --machine=1001@ try-restart -- punto-tray.service')
+        [ "${CONTRACT_SERVICE_MODE:-ok}" = fail ] && exit 6
+        [ -f /contract-state/tray-1001.active ] && \
+            printf 'RESTARTED 1001\n' >>/contract-state/calls.log
+        ;;
+    *) exit 97 ;;
+esac
+exit 0
+SPY
+    cat >"$root/usr/sbin/policy-rc.d" <<'SPY'
+#!/bin/sh
+printf 'POLICY_RC_D' >>/contract-state/calls.log
+printf ' %s' "$@" >>/contract-state/calls.log
+printf '\n' >>/contract-state/calls.log
+case "${CONTRACT_POLICY_MODE:-allow}" in
+    allow) exit 0 ;;
+    deny) exit 101 ;;
+    error) exit 103 ;;
+    *) exit 97 ;;
+esac
 SPY
     cat >"$root/contract-bin/invoke-rc.d" <<'SPY'
 #!/bin/sh
@@ -2026,7 +2061,7 @@ printf '\n' >>/contract-state/calls.log
 exit 97
 SPY
     done
-    chmod 0755 "$root/contract-bin/"*
+    chmod 0755 "$root/contract-bin/"* "$root/usr/sbin/policy-rc.d"
     : >"$root/contract-state/calls.log"
     chmod 0666 "$root/contract-state/calls.log"
 }
@@ -2034,6 +2069,7 @@ SPY
 LIFECYCLE_RC=0
 LIFECYCLE_GROUP_MODE=ok
 LIFECYCLE_SERVICE_MODE=ok
+LIFECYCLE_POLICY_MODE=allow
 
 run_lifecycle_command() {
     local root=$1 name=$2
@@ -2050,6 +2086,7 @@ run_lifecycle_command() {
         --setenv LC_ALL C.UTF-8 --setenv DEBIAN_FRONTEND noninteractive \
         --setenv CONTRACT_GROUP_MODE "$LIFECYCLE_GROUP_MODE" \
         --setenv CONTRACT_SERVICE_MODE "$LIFECYCLE_SERVICE_MODE" \
+        --setenv CONTRACT_POLICY_MODE "$LIFECYCLE_POLICY_MODE" \
         "$@" >"$output" 2>&1
     LIFECYCLE_RC=$?
     set +e
@@ -2094,10 +2131,10 @@ assert_package_absent() {
 
 assert_lifecycle_service_log() {
     local root=$1 expected=$2 message=$3 actual
-    actual=$(grep -E '^(INVOKE_RC_D|DEB_SYSTEMD_INVOKE)' \
+    actual=$(grep -E '^(INVOKE_RC_D|DEB_SYSTEMD_INVOKE|SYSTEMCTL)' \
         "$root/contract-state/calls.log" || true)
     if [[ $actual == "$expected" ]] && \
-       ! grep -Eq '^(UNEXPECTED|SYSTEMCTL)' "$root/contract-state/calls.log"; then
+       ! grep -Eq '^(UNEXPECTED|INVOKE_RC_D)' "$root/contract-state/calls.log"; then
         pass "$message does not control a foreign service"
     else
         fail "$message service-helper log differs (actual: ${actual//$'\n'/; })"
@@ -2155,6 +2192,9 @@ run_package_lifecycle_gate() {
             /var/lib/dpkg/info/punto-switcher.postinst configure "$EXPECTED_VERSION"
         assert_zero "$LIFECYCLE_RC" "B14 lifecycle repeated postinst"
         expected_service_calls+=$'\nDEB_SYSTEMD_INVOKE --user daemon-reload'
+        expected_service_calls+=$'\nSYSTEMCTL --system --no-legend --plain --state=active --type=service list-units user@*.service'
+        expected_service_calls+=$'\nSYSTEMCTL --quiet --no-block --user --machine=1000@ try-restart -- punto-tray.service'
+        expected_service_calls+=$'\nSYSTEMCTL --quiet --no-block --user --machine=1001@ try-restart -- punto-tray.service'
         assert_lifecycle_service_log "$root" "$expected_service_calls" \
             "B14 lifecycle repeated postinst"
     else
@@ -2196,6 +2236,9 @@ run_package_lifecycle_gate() {
         --force-confold -i "$upgrade_artifact"
     assert_zero "$LIFECYCLE_RC" "B14 lifecycle isolated upgrade"
     expected_service_calls+=$'\nDEB_SYSTEMD_INVOKE --user daemon-reload'
+    expected_service_calls+=$'\nSYSTEMCTL --system --no-legend --plain --state=active --type=service list-units user@*.service'
+    expected_service_calls+=$'\nSYSTEMCTL --quiet --no-block --user --machine=1000@ try-restart -- punto-tray.service'
+    expected_service_calls+=$'\nSYSTEMCTL --quiet --no-block --user --machine=1001@ try-restart -- punto-tray.service'
     assert_lifecycle_service_log "$root" "$expected_service_calls" \
         "B14 lifecycle upgrade"
     assert_package_status "$root" 'ii ' "B14 lifecycle upgrade"
@@ -2256,6 +2299,8 @@ run_package_lifecycle_gate() {
     assert_package_absent "$root" "B14 lifecycle repeated purge"
 
     run_package_setup_failure "$artifact"
+    run_package_service_failure "$artifact"
+    run_package_policy_denial "$artifact"
 }
 
 run_package_setup_failure() {
@@ -2290,6 +2335,54 @@ run_package_setup_failure() {
     fi
     LIFECYCLE_GROUP_MODE=ok
     LIFECYCLE_SERVICE_MODE=ok
+}
+
+run_package_service_failure() {
+    local artifact=$1 root="$tmp_root/lifecycle-failure-service/root"
+    local expected
+    prepare_lifecycle_root "$root"
+    run_lifecycle_command "$root" service-fixture-install /usr/bin/dpkg \
+        --root="$root" --log="$root/var/log/dpkg.log" --force-depends \
+        --force-confdef --force-confold -i "$artifact"
+    assert_zero "$LIFECYCLE_RC" \
+        "B14 lifecycle service-failure fixture installs"
+    : >"$root/contract-state/calls.log"
+    LIFECYCLE_SERVICE_MODE=fail
+    run_lifecycle_command "$root" failure-service /usr/sbin/chroot "$root" \
+        /var/lib/dpkg/info/punto-switcher.postinst configure "$EXPECTED_VERSION"
+    assert_zero "$LIFECYCLE_RC" \
+        "B14 lifecycle service helper failures are fail-soft"
+    expected=$'DEB_SYSTEMD_INVOKE --user daemon-reload\nSYSTEMCTL --system --no-legend --plain --state=active --type=service list-units user@*.service\nSYSTEMCTL --quiet --no-block --user --machine=1000@ try-restart -- punto-tray.service\nSYSTEMCTL --quiet --no-block --user --machine=1001@ try-restart -- punto-tray.service'
+    assert_lifecycle_service_log "$root" "$expected" \
+        "B14 lifecycle failed helpers keep exact owned-unit ordering"
+    assert_package_status "$root" 'ii ' \
+        "B14 lifecycle service helper failures"
+    LIFECYCLE_GROUP_MODE=ok
+    LIFECYCLE_SERVICE_MODE=ok
+}
+
+run_package_policy_denial() {
+    local artifact=$1 root="$tmp_root/lifecycle-policy-denial/root"
+    local expected calls
+    prepare_lifecycle_root "$root"
+    run_lifecycle_command "$root" policy-fixture-install /usr/bin/dpkg \
+        --root="$root" --log="$root/var/log/dpkg.log" --force-depends \
+        --force-confdef --force-confold -i "$artifact"
+    assert_zero "$LIFECYCLE_RC" "B14 lifecycle policy fixture installs"
+    : >"$root/contract-state/calls.log"
+    LIFECYCLE_POLICY_MODE=deny
+    run_lifecycle_command "$root" policy-denial /usr/sbin/chroot "$root" \
+        /var/lib/dpkg/info/punto-switcher.postinst configure "$EXPECTED_VERSION"
+    assert_zero "$LIFECYCLE_RC" "B14 lifecycle policy denial is fail-soft"
+    expected='DEB_SYSTEMD_INVOKE --user daemon-reload'
+    assert_lifecycle_service_log "$root" "$expected" \
+        "B14 lifecycle policy denial performs no per-user restart"
+    calls=$(<"$root/contract-state/calls.log")
+    assert_contains "$calls" 'POLICY_RC_D punto-tray.service restart' \
+        "B14 lifecycle policy denial consults policy before enumeration"
+    assert_not_contains "$calls" 'SYSTEMCTL ' \
+        "B14 lifecycle policy denial skips systemctl"
+    LIFECYCLE_POLICY_MODE=allow
 }
 
 run_full_to_daemon_lifecycle_gate() {

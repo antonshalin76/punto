@@ -172,7 +172,7 @@ Privet  →  [LCtrl+LAlt+Pause]  →  Привет
   не создаёт primary IPC и не повышает generation. Успешный failover всегда
   публикует строго следующее поколение.
 - Пользователи tray и локальных IPC-клиентов должны состоять в группе `punto`.
-- Tray поддерживается в графической сессии с `systemd --user` версии 249 или
+- Tray поддерживается в графической сессии с `systemd --user` версии 249.10 или
   новее. Desktop entry и CLI управляют только статическим package-owned unit
   `punto-tray.service`; отсутствие user manager выдаёт `WARN tray-unavailable`
   и не меняет состояние уже здорового backend. User manager должен получить
@@ -238,10 +238,13 @@ Privet  →  [LCtrl+LAlt+Pause]  →  Привет
   анализ, уровень логов и resource policy, но не может включить изменение
   документа; исправленный конфиг применяется командой `RELOAD` или следующим
   успешным session reload.
-- Maintainer scripts не стартуют и не перезапускают статический user unit от
-  root. Обычный upgrade делает только user-manager daemon-reload: уже активный
-  tray обновится после `punto restart` или следующего login. Явный переход на
-  `--without-tray` останавливает только `punto-tray.service` и помечает
+- Maintainer scripts не стартуют неактивный статический user unit от root.
+  Обычный full-package upgrade выполняет user-manager daemon-reload и
+  per-manager `try-restart` только уже активного `punto-tray.service` в общем
+  жёстком лимите 3 секунды, чтобы процесс не продолжал исполнять удалённый ELF
+  и не запускался в других
+  активных user managers. Fresh install user units не перезапускает. Явный
+  переход на `--without-tray` останавливает только этот unit и помечает
   системный XDG autostart conffile как `remove-on-upgrade`.
 - Compose/dead keys/AltGr пока не поддерживаются полноценно и считаются отдельной инициативой.
 - Безопасная замена слова и преобразование выделения требуют проверяемой,

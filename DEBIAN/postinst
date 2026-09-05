@@ -4,6 +4,69 @@ set -e
 PKG_VERSION="@PUNTO_VERSION@"
 : "$PKG_VERSION"
 
+update_user_tray() {
+    case "${1:-}" in
+        reload|restart|stop) punto_tray_action=$1 ;;
+        *) return 0 ;;
+    esac
+    # init-system-helpers 1.66 accumulates the restart list across user
+    # managers. Use systemd's per-manager atomic try-restart instead: an
+    # inactive static unit stays inactive. One hard deadline covers policy,
+    # reload, discovery and actions so no user bus can stall dpkg configuration.
+    # shellcheck disable=SC2016  # The inner shell expands these variables.
+    timeout --signal=KILL 3s /bin/sh -c '
+        punto_tray_action=$1
+        punto_restart_allowed=true
+        if [ "$punto_tray_action" = restart ] &&
+           [ -x /usr/sbin/policy-rc.d ]; then
+            if /usr/sbin/policy-rc.d punto-tray.service restart \
+                >/dev/null 2>&1; then
+                punto_policy_rc=0
+            else
+                punto_policy_rc=$?
+            fi
+            case "$punto_policy_rc" in
+                0|104) ;;
+                101) punto_restart_allowed=false ;;
+                *)
+                    echo "punto-switcher: policy-rc.d returned $punto_policy_rc; continuing bounded tray refresh" >&2
+                    ;;
+            esac
+        fi
+
+        if [ "$punto_tray_action" = stop ]; then
+            deb-systemd-invoke --user stop punto-tray.service \
+                >/dev/null 2>&1 || true
+        fi
+        deb-systemd-invoke --user daemon-reload >/dev/null 2>&1 || true
+        if [ "$punto_tray_action" != restart ] ||
+           [ "$punto_restart_allowed" != true ]; then
+            exit 0
+        fi
+
+        systemctl --system --no-legend --plain --state=active \
+            --type=service list-units '\''user@*.service'\'' |
+        while IFS=" " read -r punto_manager _; do
+            case "$punto_manager" in
+                user@*.service) ;;
+                *) continue ;;
+            esac
+            punto_user=${punto_manager#user@}
+            punto_user=${punto_user%.service}
+            case "$punto_user" in
+                ""|*[!0-9]*) continue ;;
+            esac
+            case "$punto_user" in
+                0|[1-9]*) ;;
+                *) continue ;;
+            esac
+            systemctl --quiet --no-block --user \
+                --machine="${punto_user}@" try-restart -- \
+                punto-tray.service >/dev/null 2>&1 || true
+        done
+    ' punto-tray-lifecycle "$punto_tray_action" >/dev/null || true
+}
+
 case "${1:-}" in
     configure)
         if ! getent group punto >/dev/null 2>&1; then
@@ -73,13 +136,15 @@ case "${1:-}" in
         fi
 
         # Static user units are started by XDG autostart, not globally from a
-        # root maintainer script. A daemon-only replacement must still stop a
-        # tray left running by an earlier full package.
+        # root maintainer script. A daemon-only replacement must stop an
+        # earlier full-package tray.
         if [ ! -x /usr/bin/punto-tray ]; then
-            deb-systemd-invoke --user stop punto-tray.service \
-                >/dev/null 2>&1 || true
+            update_user_tray stop
+        elif [ -n "${2:-}" ]; then
+            update_user_tray restart
+        else
+            update_user_tray reload
         fi
-        deb-systemd-invoke --user daemon-reload >/dev/null 2>&1 || true
 
         ;;
 esac

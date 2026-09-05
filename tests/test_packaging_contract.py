@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 
 
@@ -26,9 +27,13 @@ class MaintainerHarness:
         self.root = pathlib.Path(self._temporary.name)
         self.etc = self.root / "etc-punto"
         self.bin = self.root / "bin"
+        self.sbin = self.root / "usr-sbin"
         self.etc.mkdir()
         self.etc.chmod(0o755)
         self.bin.mkdir()
+        self.sbin.mkdir()
+        self.tray = self.root / "punto-tray"
+        write_executable(self.tray, "#!/bin/sh\nexit 0\n")
         self.calls = self.etc / "calls"
         self.calls.touch()
         self._install_fixtures()
@@ -77,11 +82,62 @@ class MaintainerHarness:
                 f"""
                 #!/bin/sh
                 printf '{name} %s\\n' "$*" >>/etc/punto/calls
+                [ "${{CONTRACT_SERVICE_MODE:-ok}}" = hang-helper ] && sleep 30
+                [ "${{CONTRACT_SERVICE_MODE:-ok}}" = fail ] && exit 6
                 exit 0
                 """,
             )
+        write_executable(
+            self.sbin / "policy-rc.d",
+            """
+            #!/bin/sh
+            printf 'policy-rc.d %s\n' "$*" >>/etc/punto/calls
+            [ "${CONTRACT_POLICY_MODE:-allow}" = hang ] && sleep 30
+            [ "${CONTRACT_POLICY_MODE:-allow}" = deny ] && exit 101
+            [ "${CONTRACT_POLICY_MODE:-allow}" = error ] && exit 103
+            exit 0
+            """,
+        )
+        write_executable(
+            self.bin / "systemctl",
+            """
+            #!/bin/sh
+            printf 'systemctl %s\n' "$*" >>/etc/punto/calls
+            case "$*" in
+                '--system --no-legend --plain --state=active --type=service list-units user@*.service')
+                    printf '%s\n' \
+                        'user@1000.service loaded active running User Manager for UID 1000' \
+                        'user@1001.service loaded active running User Manager for UID 1001' \
+                        'user@01.service loaded active running malformed leading zero' \
+                        'user@evil.service loaded active running malformed nonnumeric'
+                    exit 0
+                    ;;
+                '--quiet --no-block --user --machine=1000@ try-restart -- punto-tray.service')
+                    [ "${CONTRACT_SERVICE_MODE:-ok}" = hang ] && sleep 30
+                    [ "${CONTRACT_SERVICE_MODE:-ok}" = fail ] && exit 6
+                    [ -f /etc/punto/tray-1000.active ] && \
+                        printf 'restarted 1000\n' >>/etc/punto/calls
+                    ;;
+                '--quiet --no-block --user --machine=1001@ try-restart -- punto-tray.service')
+                    [ "${CONTRACT_SERVICE_MODE:-ok}" = hang ] && sleep 30
+                    [ "${CONTRACT_SERVICE_MODE:-ok}" = fail ] && exit 6
+                    [ -f /etc/punto/tray-1001.active ] && \
+                        printf 'restarted 1001\n' >>/etc/punto/calls
+                    ;;
+                *) exit 97 ;;
+            esac
+            exit 0
+            """,
+        )
 
-    def run(self, script: pathlib.Path, action: str) -> subprocess.CompletedProcess[str]:
+    def run(
+        self,
+        script: pathlib.Path,
+        action: str,
+        service_mode: str = "ok",
+        policy_mode: str = "allow",
+        previous_version: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         command = [
             "bwrap",
             "--ro-bind",
@@ -90,6 +146,12 @@ class MaintainerHarness:
             "--bind",
             str(self.etc),
             "/etc/punto",
+            "--ro-bind",
+            str(self.tray),
+            "/usr/bin/punto-tray",
+            "--bind",
+            str(self.sbin),
+            "/usr/sbin",
             "--dev",
             "/dev",
             "--proc",
@@ -106,16 +168,24 @@ class MaintainerHarness:
             "--setenv",
             "PATH",
             f"{self.bin}:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "--setenv",
+            "CONTRACT_SERVICE_MODE",
+            service_mode,
+            "--setenv",
+            "CONTRACT_POLICY_MODE",
+            policy_mode,
             "/bin/sh",
             str(script),
             action,
         ]
+        if previous_version is not None:
+            command.append(previous_version)
         return subprocess.run(
             command,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=5,
+            timeout=7,
             check=False,
         )
 
@@ -134,18 +204,37 @@ class MaintainerScriptContract(unittest.TestCase):
         postinst = POSTINST.read_text(encoding="utf-8")
         prerm = PRERM.read_text(encoding="utf-8")
         postrm = POSTRM.read_text(encoding="utf-8")
-        for source in (postinst, prerm, postrm):
+        for source in (prerm, postrm):
             self.assertNotIn("udevmon", source)
             self.assertNotIn("systemctl", source)
             self.assertNotIn("invoke-rc.d", source)
             self.assertNotIn("sudo", source)
+        self.assertNotIn("udevmon", postinst)
+        self.assertNotIn("sudo", postinst)
         for source in (postinst, postrm):
             self.assertNotIn("deb-systemd-helper", source)
             self.assertNotIn("update-rc.d", source)
         self.assertIn("deb-systemd-invoke --user daemon-reload", postinst)
         self.assertIn("if [ ! -x /usr/bin/punto-tray ]; then", postinst)
         self.assertIn("deb-systemd-invoke --user stop punto-tray.service", postinst)
-        self.assertNotIn("restart punto-tray.service", postinst)
+        self.assertIn('elif [ -n "${2:-}" ]; then', postinst)
+        self.assertIn("update_user_tray stop", postinst)
+        self.assertIn("update_user_tray restart", postinst)
+        self.assertIn("update_user_tray reload", postinst)
+        self.assertNotIn("deb-systemd-invoke --user restart punto-tray.service", postinst)
+        self.assertIn("timeout --signal=KILL 3s /bin/sh -c", postinst)
+        self.assertNotIn("--kill-after", postinst)
+        self.assertRegex(postinst, r"try-restart -- \\\s+punto-tray\.service")
+        self.assertIn("--machine=\"${punto_user}@\"", postinst)
+        self.assertIn("list-units '\\''user@*.service'\\''", postinst)
+        self.assertLess(
+            postinst.index("policy-rc.d punto-tray.service restart"),
+            postinst.index("deb-systemd-invoke --user daemon-reload"),
+        )
+        self.assertLess(
+            postinst.index("deb-systemd-invoke --user daemon-reload"),
+            postinst.index("list-units '\\''user@*.service'\\''"),
+        )
         self.assertIn(
             "deb-systemd-invoke --user stop punto-tray.service", prerm
         )
@@ -162,6 +251,132 @@ class MaintainerScriptContract(unittest.TestCase):
         self.assertIn("getent group punto", source)
         self.assertIn("stat -c '%u:%g:%a' /etc/punto", source)
         self.assertNotIn("%F", source)
+
+    def test_upgrade_preserves_active_and_inactive_user_units(self) -> None:
+        (self.harness.etc / "tray-1000.active").touch()
+        result = self.harness.run(
+            POSTINST,
+            "configure",
+            previous_version="2.8.6",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.harness.calls.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            [
+                line
+                for line in calls
+                if line.startswith(("deb-systemd-invoke ", "systemctl "))
+            ],
+            [
+                "deb-systemd-invoke --user daemon-reload",
+                "systemctl --system --no-legend --plain --state=active --type=service list-units user@*.service",
+                "systemctl --quiet --no-block --user --machine=1000@ try-restart -- punto-tray.service",
+                "systemctl --quiet --no-block --user --machine=1001@ try-restart -- punto-tray.service",
+            ],
+        )
+        self.assertTrue((self.harness.etc / "tray-1000.active").is_file())
+        self.assertFalse((self.harness.etc / "tray-1001.active").exists())
+        self.assertIn("restarted 1000", calls)
+        self.assertNotIn("restarted 1001", calls)
+
+    def test_full_configure_service_helpers_are_ordered_and_fail_soft(self) -> None:
+        result = self.harness.run(
+            POSTINST,
+            "configure",
+            service_mode="fail",
+            previous_version="2.8.6",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.harness.calls.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            [line for line in calls if line.startswith("systemctl ")],
+            [
+                "systemctl --system --no-legend --plain --state=active --type=service list-units user@*.service",
+                "systemctl --quiet --no-block --user --machine=1000@ try-restart -- punto-tray.service",
+                "systemctl --quiet --no-block --user --machine=1001@ try-restart -- punto-tray.service",
+            ],
+        )
+        self.assertFalse(any(line.startswith("restarted ") for line in calls))
+
+    def test_hanging_user_manager_is_bounded_and_fail_soft(self) -> None:
+        started = time.monotonic()
+        result = self.harness.run(
+            POSTINST,
+            "configure",
+            service_mode="hang",
+            previous_version="2.8.6",
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 4.0)
+
+    def test_hanging_policy_is_inside_hard_total_deadline(self) -> None:
+        started = time.monotonic()
+        result = self.harness.run(
+            POSTINST,
+            "configure",
+            policy_mode="hang",
+            previous_version="2.8.6",
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 4.0)
+
+    def test_hanging_daemon_reload_is_inside_hard_total_deadline(self) -> None:
+        started = time.monotonic()
+        result = self.harness.run(
+            POSTINST,
+            "configure",
+            service_mode="hang-helper",
+            previous_version="2.8.6",
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 4.0)
+
+    def test_fresh_install_does_not_touch_preexisting_same_name_unit(self) -> None:
+        (self.harness.etc / "tray-1000.active").touch()
+        result = self.harness.run(POSTINST, "configure")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.harness.calls.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            [
+                line
+                for line in calls
+                if line.startswith(("deb-systemd-invoke ", "systemctl "))
+            ],
+            ["deb-systemd-invoke --user daemon-reload"],
+        )
+        self.assertNotIn("restarted 1000", calls)
+
+    def test_policy_denial_skips_all_per_user_restarts(self) -> None:
+        (self.harness.etc / "tray-1000.active").touch()
+        result = self.harness.run(
+            POSTINST,
+            "configure",
+            policy_mode="deny",
+            previous_version="2.8.6",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.harness.calls.read_text(encoding="utf-8").splitlines()
+        self.assertIn("policy-rc.d punto-tray.service restart", calls)
+        self.assertFalse(any(line.startswith("systemctl ") for line in calls))
+        self.assertNotIn("restarted 1000", calls)
+
+    def test_policy_error_warns_and_continues_fail_soft(self) -> None:
+        result = self.harness.run(
+            POSTINST,
+            "configure",
+            policy_mode="error",
+            previous_version="2.8.6",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "policy-rc.d returned 103; continuing bounded tray refresh",
+            result.stderr,
+        )
+        calls = self.harness.calls.read_text(encoding="utf-8").splitlines()
+        self.assertTrue(any(line.startswith("systemctl ") for line in calls))
 
     def test_runtime_gid_is_removed_only_on_purge(self) -> None:
         self.assertTrue(POSTRM.is_file())
@@ -193,9 +408,7 @@ class MaintainerScriptContract(unittest.TestCase):
         self.assertEqual(
             [line for line in calls if line.startswith("deb-systemd-invoke ")],
             [
-                "deb-systemd-invoke --user stop punto-tray.service",
                 "deb-systemd-invoke --user daemon-reload",
-                "deb-systemd-invoke --user stop punto-tray.service",
                 "deb-systemd-invoke --user daemon-reload",
             ],
         )

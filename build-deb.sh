@@ -273,7 +273,7 @@ derived_dependencies=${derived_dependencies#shlibs:Depends=}
 
 explicit_dependencies=(
     interception-tools hunspell-en-us hunspell-ru netcat-openbsd passwd
-    'util-linux (>= 2.38)' 'systemd (>= 249)' \
+    'util-linux (>= 2.38)' 'systemd (>= 249.10)' \
     'init-system-helpers (>= 1.66)'
 )
 if grep -Eq '(^|[;&|()[:space:]])((/usr/bin/|/bin/)?sudo)([[:space:]]|$)' \

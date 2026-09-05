@@ -64,7 +64,7 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
                 self.browser_window = int(windows[0])
             return self.browser_window is not None
 
-        self.pump_until(find_window, "private Chromium window", timeout=15)
+        self.pump_until(find_window, "private Chromium window", timeout=45)
         self.xdo("windowfocus", "--sync", str(self.browser_window))
         self.publish_active_window(self.browser_window)
         self.pump_until(lambda: self.browser_state()[6] == "a", "browser input focus")

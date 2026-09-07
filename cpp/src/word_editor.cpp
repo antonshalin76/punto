@@ -19,8 +19,8 @@
 #endif
 #include <xkbcommon/xkbcommon.h>
 
-#include <array>
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <chrono>
 #include <cstdlib>
@@ -33,6 +33,12 @@
 
 namespace punto {
 namespace {
+
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+extern "C" void punto_e2e_after_paste_receipt_arm();
+extern "C" void punto_e2e_after_word_dispatch();
+extern "C" void punto_e2e_before_post_dispatch_wait();
+#endif
 
 using Clock = std::chrono::steady_clock;
 using Deadline = Clock::time_point;
@@ -51,16 +57,20 @@ template <typename T> using Reply = std::unique_ptr<T, decltype(&std::free)>;
 
 template <typename T>
 Reply<T> reply(BoundedXcbConnection &connection, unsigned int sequence,
-               Deadline deadline) {
-  x11_detail::XcbOperationResult result{};
-  return Reply<T>{static_cast<T *>(
-                      connection.wait_for_reply(sequence, deadline, result)),
-                  &std::free};
+               Deadline deadline,
+               x11_detail::XcbOperationResult *operation_result = nullptr) {
+  x11_detail::XcbOperationResult local_result{};
+  auto &result = operation_result == nullptr ? local_result : *operation_result;
+  return Reply<T>{
+      static_cast<T *>(connection.wait_for_reply(sequence, deadline, result)),
+      &std::free};
 }
 
 bool checked(BoundedXcbConnection &connection, xcb_void_cookie_t cookie,
-             Deadline deadline) {
-  x11_detail::XcbOperationResult result{};
+             Deadline deadline,
+             x11_detail::XcbOperationResult *operation_result = nullptr) {
+  x11_detail::XcbOperationResult local_result{};
+  auto &result = operation_result == nullptr ? local_result : *operation_result;
   return connection.check_request(cookie, deadline, result);
 }
 
@@ -77,14 +87,14 @@ struct KeyboardPlan {
   std::uint8_t caps_lock_mask = 0;
 };
 
-std::optional<KeyboardPlan> make_keyboard_plan(
-    BoundedXcbConnection &connection, Deadline deadline) {
+std::optional<KeyboardPlan> make_keyboard_plan(BoundedXcbConnection &connection,
+                                               Deadline deadline) {
   if (!connection.is_open()) {
     return std::nullopt;
   }
   const auto *setup = xcb_get_setup(connection.get());
-  const auto count = static_cast<std::uint8_t>(
-      setup->max_keycode - setup->min_keycode + 1);
+  const auto count =
+      static_cast<std::uint8_t>(setup->max_keycode - setup->min_keycode + 1);
   auto map = reply<xcb_get_keyboard_mapping_reply_t>(
       connection,
       xcb_get_keyboard_mapping(connection.get(), setup->min_keycode, count)
@@ -108,19 +118,22 @@ std::optional<KeyboardPlan> make_keyboard_plan(
   }
 
   auto modifiers = reply<xcb_get_modifier_mapping_reply_t>(
-      connection, xcb_get_modifier_mapping(connection.get()).sequence, deadline);
+      connection, xcb_get_modifier_mapping(connection.get()).sequence,
+      deadline);
   if (!modifiers) {
     return std::nullopt;
   }
   KeyboardPlan plan;
-  const auto *modifier_keys = xcb_get_modifier_mapping_keycodes(modifiers.get());
+  const auto *modifier_keys =
+      xcb_get_modifier_mapping_keycodes(modifiers.get());
   bool caps_found = false;
   bool only_caps = true;
   bool shift_found = false;
   bool control_found = false;
   for (unsigned int i = 0; i < modifiers->keycodes_per_modifier; ++i) {
     shift_found |= modifier_keys[i] == kShift;
-    control_found |= modifier_keys[2U * modifiers->keycodes_per_modifier + i] == kControl;
+    control_found |=
+        modifier_keys[2U * modifiers->keycodes_per_modifier + i] == kControl;
     const auto key = modifier_keys[modifiers->keycodes_per_modifier + i];
     if (key == 0) {
       continue;
@@ -146,7 +159,8 @@ std::optional<KeyboardPlan> make_keyboard_plan(
     bool found = false;
     bool only_num_lock = true;
     for (unsigned int i = 0; i < modifiers->keycodes_per_modifier; ++i) {
-      const auto key = modifier_keys[slot * modifiers->keycodes_per_modifier + i];
+      const auto key =
+          modifier_keys[slot * modifiers->keycodes_per_modifier + i];
       if (key == 0) {
         continue;
       }
@@ -155,10 +169,12 @@ std::optional<KeyboardPlan> make_keyboard_plan(
         break;
       }
       bool num_lock_key = false;
-      for (unsigned int column = 0; column < map->keysyms_per_keycode; ++column) {
+      for (unsigned int column = 0; column < map->keysyms_per_keycode;
+           ++column) {
         const auto symbol = symbol_at(key, column);
         num_lock_key |= symbol == XKB_KEY_Num_Lock;
-        only_num_lock &= symbol == XKB_KEY_NoSymbol || symbol == XKB_KEY_Num_Lock;
+        only_num_lock &=
+            symbol == XKB_KEY_NoSymbol || symbol == XKB_KEY_Num_Lock;
       }
       only_num_lock &= num_lock_key;
       found = true;
@@ -188,10 +204,10 @@ std::optional<KeyboardPlan> make_keyboard_plan(
         std::array<char, 8> bytes{};
         const int length = xkb_keysym_to_utf8(
             symbol_at(key, group * 2U + shift), bytes.data(), bytes.size());
-        const bool matches = length > 1 &&
-                             *expected == std::string_view{
-                                              bytes.data(),
-                                              static_cast<std::size_t>(length - 1)};
+        const bool matches =
+            length > 1 &&
+            *expected == std::string_view{bytes.data(),
+                                          static_cast<std::size_t>(length - 1)};
         // Reject swapped or non-QWERTY language groups before any action.
         const char qwerty = kScancodeToChar[code];
         if (!matches && qwerty >= 'a' && qwerty <= 'z') {
@@ -211,27 +227,28 @@ std::optional<KeyboardPlan> make_keyboard_plan(
 }
 
 bool resolve_locked_levels(BoundedXcbConnection &connection, std::uint8_t locks,
-                            std::uint8_t num_lock_mask,
-                            std::span<Stroke> expected,
-                            std::span<Stroke> replacement, Deadline deadline) {
+                           std::uint8_t num_lock_mask,
+                           std::span<Stroke> expected,
+                           std::span<Stroke> replacement, Deadline deadline) {
   constexpr std::uint16_t parts = XCB_XKB_MAP_PART_KEY_TYPES |
                                   XCB_XKB_MAP_PART_KEY_SYMS |
                                   XCB_XKB_MAP_PART_VIRTUAL_MODS;
   auto map = reply<xcb_xkb_get_map_reply_t>(
       connection,
-      xcb_xkb_get_map(connection.get(), XCB_XKB_ID_USE_CORE_KBD, parts, 0,
-                      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0).sequence,
+      xcb_xkb_get_map(connection.get(), XCB_XKB_ID_USE_CORE_KBD, parts, 0, 0, 0,
+                      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+          .sequence,
       deadline);
   if (!map || (map->present & parts) != parts || map->firstType != 0 ||
       map->nTypes == 0) {
     return false;
   }
   xcb_xkb_get_map_map_t contents{};
-  xcb_xkb_get_map_map_unpack(
-      xcb_xkb_get_map_map(map.get()), map->nTypes, map->nKeySyms,
-      map->nKeyActions, map->totalActions, map->totalKeyBehaviors,
-      map->virtualMods, map->totalKeyExplicit, map->totalModMapKeys,
-      map->totalVModMapKeys, map->present, &contents);
+  xcb_xkb_get_map_map_unpack(xcb_xkb_get_map_map(map.get()), map->nTypes,
+                             map->nKeySyms, map->nKeyActions, map->totalActions,
+                             map->totalKeyBehaviors, map->virtualMods,
+                             map->totalKeyExplicit, map->totalModMapKeys,
+                             map->totalVModMapKeys, map->present, &contents);
   std::array<std::uint8_t, 16> virtual_masks{};
   const auto *virtual_values = xcb_xkb_get_map_map_vmods_rtrn(&contents);
   for (unsigned int i = 0; i < virtual_masks.size(); ++i) {
@@ -259,9 +276,10 @@ bool resolve_locked_levels(BoundedXcbConnection &connection, std::uint8_t locks,
         mask |= virtual_masks[bit];
       }
     }
-    key_types[i] = Type{types.data, mask,
-                       resolved && (mask & num_lock_mask) == 0 &&
-                           (mask & ~(XCB_MOD_MASK_SHIFT | XCB_MOD_MASK_LOCK)) == 0};
+    key_types[i] =
+        Type{types.data, mask,
+             resolved && (mask & num_lock_mask) == 0 &&
+                 (mask & ~(XCB_MOD_MASK_SHIFT | XCB_MOD_MASK_LOCK)) == 0};
   }
   std::bitset<256> needed;
   needed.set(kShift);
@@ -305,7 +323,8 @@ bool resolve_locked_levels(BoundedXcbConnection &connection, std::uint8_t locks,
       const auto &type = key_types[keys.data->kt_index[stroke.group % groups]];
       const unsigned int desired = stroke.shifted ? 1U : 0U;
       for (unsigned int shift = 0; shift < 2; ++shift) {
-        const auto mask = (locks | (shift ? XCB_MOD_MASK_SHIFT : 0)) & type.mask;
+        const auto mask =
+            (locks | (shift ? XCB_MOD_MASK_SHIFT : 0)) & type.mask;
         unsigned int level = 0;
         auto entries = xcb_xkb_key_type_map_iterator(type.value);
         for (; entries.rem > 0; xcb_xkb_kt_map_entry_next(&entries)) {
@@ -335,8 +354,9 @@ bool resolve_locked_levels(BoundedXcbConnection &connection, std::uint8_t locks,
   return needed.none();
 }
 
-std::optional<std::vector<Stroke>> plan_text(
-    std::string_view text, const std::vector<Stroke> &alphabet) {
+std::optional<std::vector<Stroke>>
+plan_text(std::string_view text, const std::vector<Stroke> &alphabet,
+          std::uint8_t preferred_group) {
   if (text.empty() || text.size() > kMaxCharacters * 2) {
     return std::nullopt;
   }
@@ -344,6 +364,15 @@ std::optional<std::vector<Stroke>> plan_text(
   while (!text.empty() && plan.size() < kMaxCharacters) {
     const Stroke *found = nullptr;
     for (const auto &stroke : alphabet) {
+      if (stroke.group == preferred_group && text.starts_with(stroke.text)) {
+        found = &stroke;
+        break;
+      }
+    }
+    for (const auto &stroke : alphabet) {
+      if (found != nullptr) {
+        break;
+      }
       if (text.starts_with(stroke.text)) {
         found = &stroke;
         break;
@@ -353,18 +382,24 @@ std::optional<std::vector<Stroke>> plan_text(
       return std::nullopt;
     }
     plan.push_back(*found);
+    preferred_group = found->group;
     text.remove_prefix(found->text.size());
   }
   return text.empty() ? std::optional{std::move(plan)} : std::nullopt;
 }
 
-std::optional<xcb_window_t> focus(BoundedXcbConnection &connection,
-                                  Deadline deadline) {
+std::optional<xcb_window_t>
+focus(BoundedXcbConnection &connection, Deadline deadline,
+      x11_detail::XcbOperationResult *result = nullptr) {
   if (!connection.is_open()) {
+    if (result != nullptr) {
+      *result = x11_detail::XcbOperationResult::ConnectionFailed;
+    }
     return std::nullopt;
   }
   auto value = reply<xcb_get_input_focus_reply_t>(
-      connection, xcb_get_input_focus(connection.get()).sequence, deadline);
+      connection, xcb_get_input_focus(connection.get()).sequence, deadline,
+      result);
   if (!value || value->focus == XCB_WINDOW_NONE ||
       value->focus == XCB_INPUT_FOCUS_POINTER_ROOT) {
     return std::nullopt;
@@ -378,16 +413,20 @@ struct IdleKeyboardState {
   bool operator==(const IdleKeyboardState &) const = default;
 };
 
-std::optional<IdleKeyboardState> idle_layout(BoundedXcbConnection &connection,
-                                            std::uint8_t allowed_locks,
-                                            Deadline deadline) {
+std::optional<IdleKeyboardState>
+idle_layout(BoundedXcbConnection &connection, std::uint8_t allowed_locks,
+            Deadline deadline,
+            x11_detail::XcbOperationResult *result = nullptr) {
   if (!connection.is_open()) {
+    if (result != nullptr) {
+      *result = x11_detail::XcbOperationResult::ConnectionFailed;
+    }
     return std::nullopt;
   }
   auto state = reply<xcb_xkb_get_state_reply_t>(
       connection,
       xcb_xkb_get_state(connection.get(), XCB_XKB_ID_USE_CORE_KBD).sequence,
-      deadline);
+      deadline, result);
   if (!state || (state->mods & ~allowed_locks) != 0 || state->baseMods != 0 ||
       state->latchedMods != 0 || (state->lockedMods & ~allowed_locks) != 0 ||
       state->baseGroup != 0 || state->latchedGroup != 0 || state->group > 1 ||
@@ -397,29 +436,64 @@ std::optional<IdleKeyboardState> idle_layout(BoundedXcbConnection &connection,
   return IdleKeyboardState{state->group, state->lockedMods};
 }
 
-bool set_layout(BoundedXcbConnection &connection, int group,
-                 Deadline deadline) {
-  if (!connection.is_open() || Clock::now() >= deadline) {
-    return false;
+enum class LayoutHotkeyResult {
+  Accepted,
+  InvalidRequest,
+  DeadlineExpired,
+  XcbFailure,
+};
+
+LayoutHotkeyResult send_layout_hotkey(BoundedXcbConnection &connection,
+                                      std::uint16_t modifier, std::uint16_t key,
+                                      Deadline deadline) {
+  if (!connection.is_open()) {
+    return LayoutHotkeyResult::XcbFailure;
   }
-  return checked(connection,
-                 xcb_xkb_latch_lock_state_checked(
-                     connection.get(), XCB_XKB_ID_USE_CORE_KBD, 0, 0, 1,
-                     static_cast<std::uint8_t>(group), 0, 0, 0),
-                 deadline);
+  if (Clock::now() >= deadline) {
+    return LayoutHotkeyResult::DeadlineExpired;
+  }
+  if (!is_modifier(modifier) || modifier == key) {
+    return LayoutHotkeyResult::InvalidRequest;
+  }
+  const auto modifier_key = static_cast<xcb_keycode_t>(modifier + 8U);
+  const auto trigger_key = static_cast<xcb_keycode_t>(key + 8U);
+  const std::array events{
+      xcb_test_fake_input_checked(connection.get(), XCB_KEY_PRESS, modifier_key,
+                                  XCB_CURRENT_TIME, XCB_WINDOW_NONE, 0, 0, 0),
+      xcb_test_fake_input_checked(connection.get(), XCB_KEY_PRESS, trigger_key,
+                                  XCB_CURRENT_TIME, XCB_WINDOW_NONE, 0, 0, 0),
+      xcb_test_fake_input_checked(connection.get(), XCB_KEY_RELEASE,
+                                  trigger_key, XCB_CURRENT_TIME,
+                                  XCB_WINDOW_NONE, 0, 0, 0),
+      xcb_test_fake_input_checked(connection.get(), XCB_KEY_RELEASE,
+                                  modifier_key, XCB_CURRENT_TIME,
+                                  XCB_WINDOW_NONE, 0, 0, 0),
+  };
+  for (const auto cookie : events) {
+    x11_detail::XcbOperationResult operation_result{};
+    if (!checked(connection, cookie, deadline, &operation_result)) {
+      return operation_result == x11_detail::XcbOperationResult::TimedOut
+                 ? LayoutHotkeyResult::DeadlineExpired
+                 : LayoutHotkeyResult::XcbFailure;
+    }
+  }
+  return LayoutHotkeyResult::Accepted;
 }
 
 bool tap(BoundedXcbConnection &connection, xcb_keycode_t key, bool shifted,
-          Deadline deadline, bool control = false) {
+         Deadline deadline, bool control = false, bool *queued = nullptr) {
+  if (queued != nullptr) {
+    *queued = false;
+  }
   if (!connection.is_open() || Clock::now() >= deadline) {
     return false;
   }
   std::array<xcb_void_cookie_t, 6> cookies{};
   std::size_t used = 0;
   const auto send = [&](std::uint8_t type, xcb_keycode_t code) {
-    cookies[used++] = xcb_test_fake_input_checked(
-        connection.get(), type, code, XCB_CURRENT_TIME, XCB_WINDOW_NONE, 0, 0,
-        0);
+    cookies[used++] =
+        xcb_test_fake_input_checked(connection.get(), type, code,
+                                    XCB_CURRENT_TIME, XCB_WINDOW_NONE, 0, 0, 0);
   };
   // Queue each complete stroke, including modifier release, before flushing.
   if (control) {
@@ -435,6 +509,9 @@ bool tap(BoundedXcbConnection &connection, xcb_keycode_t key, bool shifted,
   }
   if (control) {
     send(XCB_KEY_RELEASE, kControl);
+  }
+  if (queued != nullptr) {
+    *queued = true;
   }
   for (std::size_t i = 0; i < used; ++i) {
     if (!checked(connection, cookies[i], deadline)) {
@@ -501,7 +578,8 @@ void WordEditor::pump() {
     return;
   }
   if (!clipboard_->is_open() ||
-      !clipboard_->owns_generation(Selection::Clipboard, pending_->generation)) {
+      !clipboard_->owns_generation(Selection::Clipboard,
+                                   pending_->generation)) {
     clipboard_->cancel_paste_receipt(pending_->receipt);
     pending_.reset();
     return;
@@ -524,19 +602,23 @@ void WordEditor::reset() {
 WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   WordEditOutcome outcome;
   const bool word = request.operation == WordEditOperation::Word;
-  const bool paste_word = word &&
-      (request.expected.find('\t') != std::string::npos ||
-       request.replacement.find('\t') != std::string::npos);
+  const bool paste_word =
+      word && (request.expected.find('\t') != std::string::npos ||
+               request.replacement.find('\t') != std::string::npos);
   const bool native_undo = request.operation == WordEditOperation::NativeUndo;
-  const bool selection = request.operation == WordEditOperation::SelectionLayout ||
-                         request.operation == WordEditOperation::SelectionCase ||
-                         request.operation == WordEditOperation::SelectionTranslit;
+  const bool selection =
+      request.operation == WordEditOperation::SelectionLayout ||
+      request.operation == WordEditOperation::SelectionCase ||
+      request.operation == WordEditOperation::SelectionTranslit;
   if ((!word && !native_undo && !selection) ||
-      (word && (request.expected.empty() || request.expected == request.replacement)) ||
-      request.target_layout < -1 ||
-      request.target_layout > 1 || request.source_layout < 0 ||
-      request.source_layout > 1 || request.session_generation == 0 ||
-      request.source_locked_mods < -1 || request.source_locked_mods > 255) {
+      (word &&
+       (request.expected.empty() || request.expected == request.replacement)) ||
+      request.target_layout < -1 || request.target_layout > 1 ||
+      request.source_layout < 0 || request.source_layout > 1 ||
+      request.session_generation == 0 || request.source_locked_mods < -1 ||
+      request.source_locked_mods > 255 ||
+      !is_modifier(request.layout_hotkey_modifier) ||
+      request.layout_hotkey_modifier == request.layout_hotkey_key) {
     return outcome;
   }
   pump();
@@ -587,29 +669,46 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   if (!keyboard) {
     return outcome;
   }
+  const auto *setup = xcb_get_setup(connection.get());
+  const auto hotkey_modifier =
+      static_cast<unsigned int>(request.layout_hotkey_modifier) + 8U;
+  const auto hotkey_key =
+      static_cast<unsigned int>(request.layout_hotkey_key) + 8U;
+  if (hotkey_modifier < setup->min_keycode ||
+      hotkey_modifier > setup->max_keycode || hotkey_key < setup->min_keycode ||
+      hotkey_key > setup->max_keycode) {
+    return outcome;
+  }
   outcome.rejection_stage = "context";
   const auto allowed_locks = static_cast<std::uint8_t>(
       keyboard->num_lock_mask | keyboard->caps_lock_mask);
-  const auto initial_state =
-      idle_layout(connection, allowed_locks, deadline);
+  const auto initial_state = idle_layout(connection, allowed_locks, deadline);
   const auto initial_focus = focus(connection, deadline);
   if (!initial_state || !initial_focus ||
       initial_state->group != request.source_layout ||
-      (request.expected_focus != 0 && request.expected_focus != *initial_focus) ||
+      (request.expected_focus != 0 &&
+       request.expected_focus != *initial_focus) ||
       (request.source_locked_mods >= 0 &&
        request.source_locked_mods != initial_state->locked_mods)) {
     return outcome;
   }
   outcome.rejection_stage = "text_plan";
-  auto expected = word ? plan_text(request.expected, keyboard->alphabet)
-                       : std::optional<std::vector<Stroke>>{std::vector<Stroke>{}};
-  auto replacement = word && !request.replacement.empty()
-                         ? plan_text(request.replacement, keyboard->alphabet)
-                         : std::optional<std::vector<Stroke>>{std::vector<Stroke>{}};
+  auto expected =
+      word ? plan_text(request.expected, keyboard->alphabet,
+                       static_cast<std::uint8_t>(request.source_layout))
+           : std::optional<std::vector<Stroke>>{std::vector<Stroke>{}};
+  const auto replacement_group = static_cast<std::uint8_t>(
+      request.target_layout < 0 ? request.source_layout
+                                : request.target_layout);
+  auto replacement =
+      word && !request.replacement.empty()
+          ? plan_text(request.replacement, keyboard->alphabet,
+                      replacement_group)
+          : std::optional<std::vector<Stroke>>{std::vector<Stroke>{}};
   if (!expected || !replacement ||
       !resolve_locked_levels(connection, initial_state->locked_mods,
-                              keyboard->num_lock_mask, *expected,
-                              *replacement, deadline)) {
+                             keyboard->num_lock_mask, *expected, *replacement,
+                             deadline)) {
     return outcome;
   }
 
@@ -629,7 +728,8 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   if (kind == ActiveWindowKind::Unknown ||
       (word && kind == ActiveWindowKind::Terminal && !request.allow_terminal) ||
       (word && kind == ActiveWindowKind::Terminal &&
-       (!terminal_text(request.expected) || !terminal_text(request.replacement))) ||
+       (!terminal_text(request.expected) ||
+        !terminal_text(request.replacement))) ||
       (word && kind == ActiveWindowKind::Gui && replacement->empty())) {
     return outcome;
   }
@@ -643,10 +743,11 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
       connection,
       xcb_get_selection_owner(connection.get(), XCB_ATOM_PRIMARY).sequence,
       deadline);
-  if (!active_client || !owner ||
-      client_of(*initial_focus) != *active_client) {
+  if (!active_client || !owner || client_of(*initial_focus) != *active_client) {
     return outcome;
   }
+  bool previous_context_admitted = false;
+  bool current_receipt_active = false;
   if (word && owner->owner != XCB_WINDOW_NONE &&
       client_of(owner->owner) == *active_client) {
     outcome.rejection_stage = "retained_selection_context";
@@ -663,17 +764,40 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     if (!current || !same_selection(previous_selection->selection, *current)) {
       return outcome;
     }
+    previous_context_admitted = true;
   }
+  const auto invalidate_retained_context = [&] {
+    if (previous_context_admitted) {
+      previous_selection.reset();
+      previous_context_admitted = false;
+    }
+    if (current_receipt_active) {
+      retained_word_selection_.reset();
+    }
+  };
+  const auto preserve_previous_context = [&] {
+    if (previous_context_admitted) {
+      retained_word_selection_ = std::move(previous_selection);
+      previous_context_admitted = false;
+    }
+  };
+  const auto observation_failure_invalidates =
+      [&](x11_detail::XcbOperationResult result,
+          bool interrupted_wait_is_safe) {
+        return !interrupted_wait_is_safe ||
+               result != x11_detail::XcbOperationResult::TimedOut;
+      };
   outcome.rejection_stage = "pointer";
   auto pointer = reply<xcb_query_pointer_reply_t>(
       connection, xcb_query_pointer(connection.get(), *initial_focus).sequence,
       deadline);
   if (!pointer) {
+    invalidate_retained_context();
     return outcome;
   }
   outcome.source_layout = initial_state->group;
-  outcome.target_layout = request.target_layout < 0 ? initial_state->group
-                                                   : request.target_layout;
+  outcome.target_layout =
+      request.target_layout < 0 ? initial_state->group : request.target_layout;
   outcome.session_generation = lease->generation();
   outcome.focused_window = *initial_focus;
   int group = initial_state->group;
@@ -693,41 +817,156 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     }
     return !cancelled && Clock::now() < deadline;
   };
-  const auto context_matches = [&] {
-    if (!wait(Clock::now()) || !connection.is_open() || !lease->valid() ||
-        focus(connection, deadline) != initial_focus ||
-        idle_layout(connection, allowed_locks, deadline) !=
-            std::optional{IdleKeyboardState{group, initial_state->locked_mods}}) {
+  const auto stable_context_matches = [&](bool interrupted_wait_is_safe =
+                                              false) {
+    if (!wait(Clock::now())) {
+      if (!interrupted_wait_is_safe) {
+        invalidate_retained_context();
+      }
       return false;
     }
+    if (!connection.is_open() || !lease->valid()) {
+      invalidate_retained_context();
+      return false;
+    }
+    x11_detail::XcbOperationResult focus_result{};
+    const auto current_focus = focus(connection, deadline, &focus_result);
+    if (!current_focus) {
+      if (observation_failure_invalidates(focus_result,
+                                          interrupted_wait_is_safe)) {
+        invalidate_retained_context();
+      }
+      return false;
+    }
+    if (current_focus != initial_focus) {
+      invalidate_retained_context();
+      return false;
+    }
+    x11_detail::XcbOperationResult pointer_result{};
     auto current = reply<xcb_query_pointer_reply_t>(
-        connection, xcb_query_pointer(connection.get(), *initial_focus).sequence,
-        deadline);
+        connection,
+        xcb_query_pointer(connection.get(), *initial_focus).sequence, deadline,
+        &pointer_result);
     constexpr std::uint16_t buttons = XCB_BUTTON_MASK_1 | XCB_BUTTON_MASK_2 |
                                       XCB_BUTTON_MASK_3 | XCB_BUTTON_MASK_4 |
                                       XCB_BUTTON_MASK_5;
     // Core pointer state also carries the XKB group. idle_layout validates
     // keyboard state against the group selected by this executor.
-    return current && current->root_x == pointer->root_x &&
-           current->root_y == pointer->root_y &&
-           (current->mask & buttons) == (pointer->mask & buttons);
+    if (!current) {
+      if (observation_failure_invalidates(pointer_result,
+                                          interrupted_wait_is_safe)) {
+        invalidate_retained_context();
+      }
+      return false;
+    }
+    const bool matches = current->root_x == pointer->root_x &&
+                         current->root_y == pointer->root_y &&
+                         (current->mask & buttons) == (pointer->mask & buttons);
+    if (!matches) {
+      invalidate_retained_context();
+    }
+    return matches;
+  };
+  const auto context_matches = [&](bool interrupted_wait_is_safe = false) {
+    if (!stable_context_matches(interrupted_wait_is_safe)) {
+      return false;
+    }
+    x11_detail::XcbOperationResult layout_result{};
+    const auto observed =
+        idle_layout(connection, allowed_locks, deadline, &layout_result);
+    if (!observed) {
+      if (observation_failure_invalidates(layout_result,
+                                          interrupted_wait_is_safe)) {
+        invalidate_retained_context();
+      }
+      return false;
+    }
+    const bool matches =
+        observed ==
+        std::optional{IdleKeyboardState{group, initial_state->locked_mods}};
+    if (!matches) {
+      invalidate_retained_context();
+    }
+    return matches;
+  };
+  const auto ensure_layout = [&](int target) {
+    if (target == group) {
+      return context_matches();
+    }
+    if (!context_matches()) {
+      return false;
+    }
+    const auto hotkey =
+        send_layout_hotkey(connection, request.layout_hotkey_modifier,
+                           request.layout_hotkey_key, deadline);
+    if (hotkey != LayoutHotkeyResult::Accepted) {
+      // A failed checked request may have sent only part of the chord. The
+      // retained selection is safe only after a complete chord was accepted
+      // and the desktop merely failed to activate it before the macro deadline.
+      invalidate_retained_context();
+      return false;
+    }
+    for (;;) {
+      if (!stable_context_matches()) {
+        return false;
+      }
+      const auto observed = idle_layout(connection, allowed_locks, deadline);
+      if (!observed) {
+        invalidate_retained_context();
+        return false;
+      }
+      if (observed->locked_mods != initial_state->locked_mods) {
+        invalidate_retained_context();
+        return false;
+      }
+      if (observed->group == target) {
+        group = target;
+        return true;
+      }
+      if (observed->group != group) {
+        invalidate_retained_context();
+        return false;
+      }
+      if (!wait(Clock::now() + std::chrono::milliseconds{1})) {
+        if (cancelled) {
+          invalidate_retained_context();
+        } else {
+          preserve_previous_context();
+        }
+        // Reaching the shared deadline here is the sole safe retained retry:
+        // the complete desktop chord was accepted and the old group remained
+        // observed under the same context until time expired.
+        return false;
+      }
+    }
   };
   // Forwarded input can reach X after our local key-up bookkeeping. XTEST
   // ignores a press of an already-held key, then releases that user's key.
   const auto wait_for_key_release = [&] {
     for (;;) {
-      if (!context_matches()) return false;
+      if (!context_matches())
+        return false;
+      x11_detail::XcbOperationResult operation_result{};
       const auto keys = reply<xcb_query_keymap_reply_t>(
-          connection, xcb_query_keymap(connection.get()).sequence, deadline);
-      if (!keys) return false;
-      if (std::ranges::all_of(keys->keys, [](auto byte) { return byte == 0; })) {
+          connection, xcb_query_keymap(connection.get()).sequence, deadline,
+          &operation_result);
+      if (!keys) {
+        invalidate_retained_context();
+        return false;
+      }
+      if (std::ranges::all_of(keys->keys,
+                              [](auto byte) { return byte == 0; })) {
         return true;
       }
-      if (!wait(Clock::now() + std::chrono::milliseconds{1})) return false;
+      if (!wait(Clock::now() + std::chrono::milliseconds{1})) {
+        invalidate_retained_context();
+        return false;
+      }
     }
   };
   outcome.rejection_stage = "key_release";
-  if (!wait_for_key_release()) return outcome;
+  if (!wait_for_key_release())
+    return outcome;
   outcome.rejection_stage = "context_changed";
   if (!context_matches()) {
     return outcome;
@@ -735,12 +974,19 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
 
   std::optional<SelectionRead> previous_clipboard;
   if (selection || paste_word) {
-    outcome.rejection_stage = "clipboard_snapshot";
+    outcome.rejection_stage = "clipboard_snapshot_read";
     previous_clipboard = clipboard_->get_text_with_owner(Selection::Clipboard);
-    if (!previous_clipboard || !clipboard_time() ||
-        clipboard_->has_only_text_targets(Selection::Clipboard,
+    if (!previous_clipboard) {
+      return outcome;
+    }
+    outcome.rejection_stage = "clipboard_snapshot_budget";
+    if (!clipboard_time()) {
+      return outcome;
+    }
+    outcome.rejection_stage = "clipboard_snapshot_targets";
+    if (clipboard_->has_only_text_targets(Selection::Clipboard,
                                           *previous_clipboard) !=
-            std::optional<bool>{true}) {
+        std::optional<bool>{true}) {
       return outcome;
     }
   }
@@ -755,60 +1001,76 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   };
 
   const auto shortcut = [&](xcb_keycode_t key, bool shift) {
-    if (!context_matches()) {
+    if (!ensure_layout(0)) {
       return false;
-    }
-    if (group != 0) {
-      if (!set_layout(connection, 0, deadline)) {
-        return false;
-      }
-      group = 0;
     }
     return tap(connection, key, shift, deadline, true);
   };
   const auto finish_layout = [&] {
-    if (!context_matches() ||
-        (group != outcome.target_layout &&
-         !set_layout(connection, outcome.target_layout, deadline))) {
-      return false;
-    }
-    group = outcome.target_layout;
-    return true;
+    return ensure_layout(outcome.target_layout);
   };
   const auto paste_selection = [&](const SelectionRead &source, bool terminal) {
+    outcome.rejection_stage = "layout_transition_paste_preflight";
+    if (!ensure_layout(0)) {
+      return;
+    }
     outcome.rejection_stage = "selection_confirmation";
     auto confirmed = clipboard_->get_text_with_owner(Selection::Primary);
-    if (!confirmed || !same_selection(source, *confirmed) || !context_matches()) {
+    if (!confirmed || !same_selection(source, *confirmed) ||
+        !context_matches()) {
       return;
     }
     auto pending = std::make_unique<PendingPaste>();
     pending->previous = previous_clipboard->text;
     outcome.rejection_stage = "clipboard_ownership";
-    const bool owned = previous_clipboard->owner == XCB_WINDOW_NONE
-                           ? clipboard_->set_text(Selection::Clipboard,
-                                                  outcome.replacement) == ClipboardResult::Ok
-                           : clipboard_->set_text_if_owner(
-                                 Selection::Clipboard, *previous_clipboard,
-                                 outcome.replacement);
+    const bool owned =
+        previous_clipboard->owner == XCB_WINDOW_NONE
+            ? clipboard_->set_text(Selection::Clipboard, outcome.replacement) ==
+                  ClipboardResult::Ok
+            : clipboard_->set_text_if_owner(Selection::Clipboard,
+                                            *previous_clipboard,
+                                            outcome.replacement);
     if (!owned) {
       return;
     }
     outcome.status = WordEditStatus::PreparedNotReplayed;
-    pending->generation = clipboard_->selection_generation(Selection::Clipboard);
+    pending->generation =
+        clipboard_->selection_generation(Selection::Clipboard);
     const auto receipt = clipboard_->arm_paste_receipt(Selection::Clipboard);
-    if (!receipt || !context_matches()) {
+    if (!receipt) {
+      // No paste chord was sent, so this rollback cannot overtake its payload.
+      (void)clipboard_->restore_text_if_generation(
+          Selection::Clipboard, pending->generation, pending->previous);
+      return;
+    }
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    punto_e2e_after_paste_receipt_arm();
+#endif
+    if (!context_matches()) {
+      clipboard_->cancel_paste_receipt(*receipt);
       // No paste chord was sent, so this rollback cannot overtake its payload.
       (void)clipboard_->restore_text_if_generation(
           Selection::Clipboard, pending->generation, pending->previous);
       return;
     }
     pending->receipt = *receipt;
-    pending_ = std::move(pending);
-    outcome.status = WordEditStatus::PartialFailure;
-    if (!shortcut(kPaste, terminal) || !finish_layout()) {
+    bool paste_queued = false;
+    const bool paste_accepted =
+        tap(connection, kPaste, terminal, deadline, true, &paste_queued);
+    if (!paste_queued) {
+      clipboard_->cancel_paste_receipt(*receipt);
+      (void)clipboard_->restore_text_if_generation(
+          Selection::Clipboard, pending->generation, pending->previous);
       return;
     }
-    while (busy() && clipboard_time() && wait(Clock::now() + std::chrono::milliseconds{1})) {
+    invalidate_retained_context();
+    pending_ = std::move(pending);
+    outcome.status = WordEditStatus::PartialFailure;
+    if (!paste_accepted || !finish_layout()) {
+      return;
+    }
+    while (busy() && clipboard_time() &&
+           wait(Clock::now() + std::chrono::milliseconds{1})) {
       pump();
     }
     if (clipboard_ && clipboard_->paste_receipt_seen(*receipt)) {
@@ -853,12 +1115,31 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     }
     outcome.original = terminal ? std::string{} : source->text;
     outcome.terminal_insert = terminal;
+    outcome.rejection_stage = "layout_transition_selection_target";
+    if (!ensure_layout(outcome.target_layout)) {
+      return outcome;
+    }
+    outcome.rejection_stage = "layout_transition_paste_preflight";
+    if (!ensure_layout(0)) {
+      return outcome;
+    }
     paste_selection(*source, terminal);
     return outcome;
   }
 
   outcome.original = request.expected;
   outcome.replacement = request.replacement;
+  outcome.rejection_stage = "layout_transition_preflight";
+  if (!ensure_layout(outcome.target_layout)) {
+    return outcome;
+  }
+  if (paste_word && kind == ActiveWindowKind::Gui) {
+    outcome.rejection_stage = "layout_transition_paste_preflight";
+    if (!ensure_layout(0)) {
+      return outcome;
+    }
+  }
+  invalidate_retained_context();
   outcome.rejection_stage = "selection_prepare";
   const bool terminal = kind == ActiveWindowKind::Terminal;
   for (std::size_t i = 0; i < expected->size(); ++i) {
@@ -874,41 +1155,46 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   xcb_window_t prepared_owner = XCB_WINDOW_NONE;
   std::unique_ptr<RetainedWordSelection> prepared_receipt;
   if (!terminal) {
-    std::optional<SelectionRead> observed;
-    std::optional<SelectionRead> prepared_selection;
+    std::unique_ptr<SelectionRead> confirmed_selection;
+    std::unique_ptr<SelectionRead> prepared_selection;
     while (clipboard_->is_open() &&
            Clock::now() + std::chrono::milliseconds{30} < deadline &&
            context_matches()) {
-      observed = clipboard_->get_text_with_owner(Selection::Primary);
-      if (!prepared_selection && observed &&
-          client_of(observed->owner) == *active_client) {
-        prepared_selection = observed;
-      }
-      if (observed && observed->text == request.expected &&
-          client_of(observed->owner) == *active_client) {
-        break;
+      auto observed = clipboard_->get_text_with_owner(Selection::Primary);
+      if (observed) {
+        SelectionRead current = std::move(observed).value();
+        if (client_of(current.owner) == *active_client) {
+          if (!prepared_selection) {
+            prepared_selection = std::make_unique<SelectionRead>(current);
+          }
+          if (current.text == request.expected) {
+            confirmed_selection =
+                std::make_unique<SelectionRead>(std::move(current));
+            break;
+          }
+        }
       }
       if (!wait(Clock::now() + std::chrono::milliseconds{1})) {
         break;
       }
     }
-    if (!observed || observed->text != request.expected ||
-        client_of(observed->owner) != *active_client || !context_matches()) {
+    if (!confirmed_selection || !context_matches()) {
       if (prepared_selection) {
         cleanup_selection(*prepared_selection);
       }
       return outcome;
     }
     if (paste_word) {
-      paste_selection(*observed, false);
+      paste_selection(*confirmed_selection, false);
       if (outcome.status == WordEditStatus::PreparedNotReplayed) {
-        cleanup_selection(*observed);
+        cleanup_selection(*confirmed_selection);
       }
       return outcome;
     }
-    prepared_owner = observed->owner;
-    prepared_receipt = std::make_unique<RetainedWordSelection>(
-        RetainedWordSelection{*observed, *initial_focus, lease->generation()});
+    prepared_owner = confirmed_selection->owner;
+    prepared_receipt =
+        std::make_unique<RetainedWordSelection>(RetainedWordSelection{
+            *confirmed_selection, *initial_focus, lease->generation()});
   }
 
   for (const auto &stroke : *replacement) {
@@ -916,11 +1202,11 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
       return outcome;
     }
     if (stroke.group != group) {
-      if (!set_layout(connection, stroke.group, deadline)) {
+      outcome.rejection_stage = "layout_transition_replay";
+      if (!ensure_layout(stroke.group)) {
         outcome.status = WordEditStatus::PartialFailure;
         return outcome;
       }
-      group = stroke.group;
     }
     outcome.status = WordEditStatus::PartialFailure;
     if (!tap(connection, stroke.key, stroke.shifted, deadline)) {
@@ -930,18 +1216,35 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   if (finish_layout()) {
     outcome.status = WordEditStatus::Dispatched;
     retained_word_selection_ = std::move(prepared_receipt);
+    current_receipt_active = retained_word_selection_ != nullptr;
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    punto_e2e_after_word_dispatch();
+#endif
     // Server acceptance can precede the client's processing of the replacement.
     // Let our prepared selection settle before another word macro's preflight.
-    while (prepared_owner != XCB_WINDOW_NONE && context_matches()) {
+    while (prepared_owner != XCB_WINDOW_NONE && context_matches(true)) {
+      x11_detail::XcbOperationResult owner_result{};
       const auto current_owner = reply<xcb_get_selection_owner_reply_t>(
           connection,
           xcb_get_selection_owner(connection.get(), XCB_ATOM_PRIMARY).sequence,
-          deadline);
-      if (!current_owner || current_owner->owner != prepared_owner ||
-          !wait(Clock::now() + std::chrono::milliseconds{1})) {
+          deadline, &owner_result);
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+      punto_e2e_before_post_dispatch_wait();
+#endif
+      if (!current_owner) {
+        if (owner_result != x11_detail::XcbOperationResult::TimedOut) {
+          invalidate_retained_context();
+        }
+        break;
+      }
+      if (current_owner->owner != prepared_owner) {
+        break;
+      }
+      if (!wait(Clock::now() + std::chrono::milliseconds{1})) {
         break;
       }
     }
+    current_receipt_active = false;
   }
   return outcome;
 }

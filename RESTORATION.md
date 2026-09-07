@@ -1,8 +1,115 @@
 # Product restoration
 
-This document records the source restoration through 2.8.11. Source tests, package
+This document records the source restoration through 2.8.12. Source tests, package
 validation, publication and machine installation are separate evidence gates;
 runtime health alone is not proof of an editor correction.
+
+## 2.8.12 product verification matrix
+
+This matrix binds each shipped capability to its production owner and real test
+seam. Results describe the final source candidate; package publication and the
+installed runtime remain separate release gates.
+
+| Capability | Production owner | Verification seam | Candidate result / limit |
+| --- | --- | --- | --- |
+| Manual word layout and case | `EventLoop` + `WordEditor` | Native GTK and Chromium editor text, four consecutive `Pause` operations | PASS; X11 US/RU only |
+| Automatic correction | analyzer/sequencer + `EventLoop` + `WordEditor` | Native GTK/Chromium consecutive corrections, punctuation, Tab and younger-tail cases | PASS; unknown dictionary words remain unchanged |
+| Selection layout, case and transliteration | `WordEditor` + `ClipboardManager` | Native GTK, Chromium and VTE selection/paste cases | PASS; editor must support ordinary X11 selection/paste |
+| Desktop layout transition | `WordEditor` + configured desktop `hotkey` | Independent desktop-source fixture, lock/modifier lifecycle and negative XKB-only control | PASS; Punto does not create the desktop binding |
+| Undo and learning | `EventLoop` + `UndoDetector` | Immediate/expired undo, invalidation, exclusion persistence and reset across restart | PASS; Punto undo window is 2.5 seconds |
+| Clipboard ownership and recovery | `ClipboardManager` | Late receipt, foreign copy, post-arm rejection, timeout and context-change cases | PASS; clipboard delivery is not an editor transaction |
+| Terminal safety | `WordEditor` terminal policy | Native VTE/PTY word and selection cases, scrollback and stalled-paste recovery | PASS; unsupported control payloads fail closed |
+| Runtime control and reload | IPC + CLI + tray | Native IPC/tray contracts, config races, 5315 CLI checks | PASS; mutating commands may cancel pending edits |
+| Service and package lifecycle | systemd/udevmon scripts + Debian package | 817 isolated install/upgrade/purge checks and ShellCheck | PASS for candidate; live installation is a separate gate |
+| Diagnostics | runtime health + `STATS` + journald | Native health contracts and rejection-stage assertions | PASS; no typed text, clipboard payload or window id is logged |
+
+## Desktop-owned layout transition contract
+
+WordEditor does not mutate the XKB group behind the desktop environment. Every
+required transition is requested through the configured `hotkey` chord and is
+accepted only after the target group is observed with the same session, focus,
+pointer position and lock modifiers. The whole macro retains one 300 ms
+deadline. Word and selection-paste paths preflight the required target and
+native-paste groups before Backspace, selection preparation, clipboard mutation
+or paste dispatch. If a later transition fails after an editor action was
+actually queued, the result is a partial failure rather than a successful
+dispatch; no blind undo or compensating toggle is attempted. An ungrabbed
+desktop chord remains ordinary application input and is therefore outside
+Punto's mutation rollback guarantee.
+
+EventLoop transports the same immutable hotkey configuration that admitted the
+word candidate, including delayed automatic correction and undo. A physical
+press of that exact configured chord clears pending word/history state but keeps
+only a completed Chromium selection receipt, allowing the next correction after
+the desktop changes its active source. Other control chords and all runtime,
+configuration, session and focus resets continue to invalidate that receipt.
+
+Native Xvfb tests use a desktop-shortcut stand-in whose source index changes
+from its own state and is never derived from XKB at activation time. A negative
+control changes only XKB and proves the desktop source remains unchanged.
+Captured, captured-without-switch, absent, delayed, activation-limit and
+lock-modifier variants cover safe preflight rejection, recovery without restart
+or reselection, and honest post-paste partial failure. Chromium checks fresh DOM
+serials, text, caret, group, source index, activation count, exact modifier
+sides/lifecycle and recovery without stuck synthetic keys. GTK/VTE additionally
+prove clipboard preservation and rejection before terminal Backspace.
+
+Iteration 3 separates a safe desktop-shortcut timeout from a detected context
+violation. A retained Chromium receipt survives only the former: focus, pointer,
+lock, session or non-deadline observation failures invalidate it permanently.
+The post-arm/pre-dispatch paste path now cancels its receipt before the
+generation-checked clipboard rollback. Deterministic fixture barriers exercise
+all three live context changes and the exact post-arm boundary. Negative browser
+checks take their serial after the rejection, delayed activation or release and
+then require a later DOM snapshot.
+
+Iteration 4 closes the remaining transport exits after retained receipt
+admission. A failed keymap reply or checked XTEST layout request, cancellation,
+or any unconfirmed context now invalidates the receipt. The only preserving exit
+is a fully accepted desktop layout chord followed by repeated observation of the
+unchanged group and context until the shared macro deadline. Driver-only fault
+injection proves both protocol-error paths reject a later retry without a second
+dispatch, while the safe timeout control still recovers to a second dispatch.
+The post-arm GTK regression now observes the direct XTEST paste key in the
+editor itself, with the successful recovery as its positive control.
+
+Iteration 5 separates ownership of the admitted prior receipt from the receipt
+created by the current successful dispatch. The prior receipt stays local and
+returns to object state only for the explicitly safe pre-mutation desktop
+activation timeout; mutation permanently consumes it. A newly prepared receipt
+then has its own post-dispatch lifecycle. Exhausting the shared budget or a
+new-input interruption before a further context check or in its lower wait ends
+settlement without revoking that receipt. Pointer, focus, lock, session and
+observation failures still revoke it. Native Chromium tests cover four
+consecutive Pause corrections, both deadline boundaries and each context change
+after both a first and retained correction. The ordinary repeated-manual and
+consecutive-automatic scenarios also passed ten consecutive focused runs after
+the final post-dispatch classification change.
+
+The final sanitizer pass also exposed an intermittent completed paste whose
+receipt was not confirmed: `pump_events()` had reused its two-millisecond
+aggregate polling deadline for the checked property-and-notify transfer. A
+selection request now receives ClipboardManager's existing ten-millisecond
+operation budget and ends that pump cycle, so the bound is not multiplied by
+the event count. The original failing literal-Tab scenario subsequently passed
+20 consecutive Debug sanitizer runs together with the late-receipt,
+foreign-copy and post-arm rejection contracts. No timeout value was increased.
+
+Final iteration-5 evidence was produced from one unchanged source snapshot.
+Release passed all 26 CTest targets, including 103 GTK/VTE and 41
+Chromium/browser-lifecycle cases. Debug passed the 25 non-clipboard-GTK targets
+with ASan, UBSan and LeakSanitizer enabled; the separate clipboard-GTK target
+passed with the narrow external GTK cache exception documented below.
+CI-equivalent clang-tidy, Python fixture compilation, clang-format and
+whitespace checks also passed. The final binaries from that snapshot have these
+SHA256 fingerprints:
+
+| Artifact | SHA256 |
+| --- | --- |
+| Release daemon | `b2d1b94c7067b003058e61c0d9af3dcdfff6018a22f18b805aa8c0f3874860d0` |
+| Release EventLoop driver | `bce34967aad7dfb8349c651d10778607cfcd197440d49c8e76eb41d4429ae558` |
+| Debug daemon | `1f2ed73c897f453b6be47e364dec0eaf3fa2483db60bf58fb044ad7b5b271fbb` |
+| Debug EventLoop driver | `f47076051632b43c76b20b234df8325aadbda60e08c3ac56fe0ef3eb25b7d010` |
 
 ## Runtime stability and learning control (2026-09-07, 2.8.11)
 

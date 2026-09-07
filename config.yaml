@@ -1,10 +1,10 @@
 # Punto Switcher Configuration
 # Путь по умолчанию: /etc/punto/config.yaml
-# Config version: 2.8.11
+# Config version: 2.8.12
 
-# Поле совместимости со старыми конфигами. Runtime его принимает и
-# сохраняет, но не наблюдает и не применяет: системный hotkey настраивается
-# только средствами desktop environment.
+# Комбинация, которую runtime отправляет для смены группы. Она должна в точности
+# совпадать с системным hotkey, настроенным средствами desktop environment;
+# Punto не создаёт и не изменяет этот binding самостоятельно.
 hotkey:
   modifier: leftctrl
   key: grave

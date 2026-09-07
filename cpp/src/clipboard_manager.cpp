@@ -851,9 +851,15 @@ std::size_t ClipboardManager::pump_events() {
       break;
     }
     if (type == XCB_SELECTION_REQUEST) {
+      // A payload transfer has its own bounded operation budget. Reusing the
+      // shorter aggregate pump deadline can expire after the application has
+      // consumed the property but before the checked notify confirms the
+      // receipt. Process at most one such request per pump so this does not
+      // multiply the per-operation bound by the event budget.
       (void)handle_selection_request(
           *reinterpret_cast<const xcb_selection_request_event_t *>(event.get()),
-          deadline);
+          std::chrono::steady_clock::now() + timeout_);
+      break;
     } else if (type == XCB_SELECTION_CLEAR) {
       handle_selection_clear(
           *reinterpret_cast<const xcb_selection_clear_event_t *>(event.get()));

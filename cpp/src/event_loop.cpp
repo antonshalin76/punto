@@ -64,6 +64,41 @@ KeyEntry normalize_caps(KeyEntry key, int layout, bool caps) {
   return key;
 }
 
+bool exact_modifier_active(const ModifierState &state,
+                           ScanCode configured) noexcept {
+  const unsigned int active = static_cast<unsigned int>(state.left_shift) +
+                              static_cast<unsigned int>(state.right_shift) +
+                              static_cast<unsigned int>(state.left_ctrl) +
+                              static_cast<unsigned int>(state.right_ctrl) +
+                              static_cast<unsigned int>(state.left_alt) +
+                              static_cast<unsigned int>(state.right_alt) +
+                              static_cast<unsigned int>(state.left_meta) +
+                              static_cast<unsigned int>(state.right_meta);
+  if (active != 1U) {
+    return false;
+  }
+  switch (configured) {
+  case KEY_LEFTSHIFT:
+    return state.left_shift;
+  case KEY_RIGHTSHIFT:
+    return state.right_shift;
+  case KEY_LEFTCTRL:
+    return state.left_ctrl;
+  case KEY_RIGHTCTRL:
+    return state.right_ctrl;
+  case KEY_LEFTALT:
+    return state.left_alt;
+  case KEY_RIGHTALT:
+    return state.right_alt;
+  case KEY_LEFTMETA:
+    return state.left_meta;
+  case KEY_RIGHTMETA:
+    return state.right_meta;
+  default:
+    return false;
+  }
+}
+
 std::uint64_t make_daemon_epoch() noexcept {
   std::uint64_t epoch = 0;
   ssize_t count = 0;
@@ -1079,7 +1114,11 @@ void EventLoop::handle_event(const input_event &ev) {
     return;
   }
 
+  const auto cfg = std::atomic_load(&config_);
   if (is_modifier(code)) {
+    const bool layout_hotkey =
+        !is_release && !is_repeat && code == cfg->hotkey.key &&
+        exact_modifier_active(modifiers_, cfg->hotkey.modifier);
     if (!is_release && !is_repeat) {
       for (auto &word : word_history_)
         word.eligible = false;
@@ -1094,6 +1133,11 @@ void EventLoop::handle_event(const input_event &ev) {
       }
     }
     update_modifier_state(code, !is_release);
+    if (layout_hotkey) {
+      reset_async_state(/*bump_task_barrier=*/true,
+                        /*preserve_completed_selection=*/true);
+      buffer_.reset_all();
+    }
     emit_passthrough_event(ev);
     return;
   }
@@ -1141,7 +1185,16 @@ void EventLoop::handle_event(const input_event &ev) {
   pending_word_edit_.reset();
   pending_is_undo_ = false;
 
-  auto cfg = std::atomic_load(&config_);
+  const bool layout_hotkey =
+      code == cfg->hotkey.key &&
+      exact_modifier_active(modifiers_, cfg->hotkey.modifier);
+  if (layout_hotkey) {
+    reset_async_state(/*bump_task_barrier=*/true,
+                      /*preserve_completed_selection=*/true);
+    buffer_.reset_all();
+    emit_passthrough_event(ev);
+    return;
+  }
 
   if (modifiers_.any_ctrl() || modifiers_.any_alt() || modifiers_.any_meta()) {
     reset_async_state();
@@ -1212,6 +1265,8 @@ void EventLoop::handle_event(const input_event &ev) {
     word_history_.push_back(TrackedWord{
         word_id, std::vector<KeyEntry>{full_word.begin(), full_word.end()},
         trailing, active_word_visible_});
+    word_history_.back().layout_hotkey_modifier = cfg->hotkey.modifier;
+    word_history_.back().layout_hotkey_key = cfg->hotkey.key;
     RawWordCandidate candidate{
         RawWordCandidate::Kind::Automatic,
         ++next_word_observation_id_,
@@ -2046,7 +2101,10 @@ void EventLoop::finish_word_candidate(
                                            observation->session_generation,
                                            operation,
                                            observation->focus_window,
-                                           observation->locked_mods};
+                                           observation->locked_mods,
+                                           true,
+                                           candidate.config->hotkey.modifier,
+                                           candidate.config->hotkey.key};
       return;
     }
     const auto source =
@@ -2066,7 +2124,10 @@ void EventLoop::finish_word_candidate(
         observation->session_generation,
         WordEditOperation::Word,
         observation->focus_window,
-        observation->locked_mods};
+        observation->locked_mods,
+        true,
+        candidate.config->hotkey.modifier,
+        candidate.config->hotkey.key};
     active_word_visible_ = *source;
     return;
   }
@@ -2261,7 +2322,9 @@ void EventLoop::process_pending_word_edit() {
                                          WordEditOperation::Word,
                                          candidate->focus_window,
                                          keyboard_observation_->locked_mods,
-                                         allow_terminal};
+                                         allow_terminal,
+                                         candidate->layout_hotkey_modifier,
+                                         candidate->layout_hotkey_key};
     corrected_word = candidate->id;
   }
   WordEditRequest request = std::move(*pending_word_edit_);
@@ -2289,7 +2352,10 @@ void EventLoop::process_pending_word_edit() {
                              keyboard_observation_->session_generation,
                              WordEditOperation::NativeUndo,
                              keyboard_observation_->focus_window,
-                             keyboard_observation_->locked_mods};
+                             keyboard_observation_->locked_mods,
+                             true,
+                             request.layout_hotkey_modifier,
+                             request.layout_hotkey_key};
     (void)word_editor_->execute(fallback);
   }
   macro_active_ = false;
@@ -2315,7 +2381,10 @@ void EventLoop::process_pending_word_edit() {
           outcome.session_generation,
           WordEditOperation::Word,
           outcome.focused_window,
-          request.source_locked_mods};
+          request.source_locked_mods,
+          true,
+          request.layout_hotkey_modifier,
+          request.layout_hotkey_key};
       undo_applied_at_ = std::chrono::steady_clock::now();
       undo_input_sequence_ = user_input_sequence_;
     }

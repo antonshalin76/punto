@@ -110,6 +110,9 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.assertTrue(title.startswith("PUNTO["), title)
         return json.loads(title[5:])
 
+    def wait_for_fresh_dom(self, serial, description):
+        self.pump_until(lambda: self.browser_state()[-1] > serial, description)
+
     def dispatches(self):
         return int(self.stats_fields()[1]["word_dispatches"])
 
@@ -205,6 +208,568 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
                         "second native browser correction with retained PRIMARY")
         self.pump_until(lambda: self.dispatches() == 2, "second dispatch receipt")
+
+    def test_four_manual_conversions_retain_each_successful_receipt(self):
+        self.harness.type_word("ghbdtn")
+        expected = (("привет", 1), ("ghbdtn", 0),
+                    ("привет", 1), ("ghbdtn", 0))
+        for dispatch, (text, group) in enumerate(expected, 1):
+            with self.subTest(dispatch=dispatch):
+                self.harness.send_key(gtk.KEY_PAUSE)
+                self.pump_until(
+                    lambda text=text: self.browser_state()[:3] == [text, 6, 6],
+                    f"browser correction {dispatch}",
+                )
+                self.pump_until(lambda dispatch=dispatch:
+                                self.dispatches() == dispatch,
+                                f"dispatch receipt {dispatch}")
+                self.assertEqual(self.keyboard_group(), group)
+                self.assertEqual(self.layout_shortcut.source_index, group)
+
+    def assert_post_dispatch_deadline_preserves_new_receipt(self, marker_name):
+        self.first_manual_conversion()
+        marker = pathlib.Path("/run", marker_name)
+        marker.unlink(missing_ok=True)
+        marker.touch(mode=0o600)
+        self.addCleanup(marker.unlink, missing_ok=True)
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+                        f"second correction before {marker_name}")
+        self.pump_until(lambda: self.dispatches() == 2,
+                        f"second dispatch before {marker_name}")
+        self.assertFalse(marker.exists(), f"{marker_name} was not reached")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет", 6, 6],
+                        f"third correction after {marker_name}")
+        self.pump_until(lambda: self.dispatches() == 3,
+                        f"third dispatch after {marker_name}")
+
+    def test_post_dispatch_deadline_before_context_preserves_new_receipt(self):
+        self.assert_post_dispatch_deadline_preserves_new_receipt(
+            "punto-e2e-expire-before-post-dispatch-context")
+
+    def test_post_dispatch_deadline_in_wait_preserves_new_receipt(self):
+        self.assert_post_dispatch_deadline_preserves_new_receipt(
+            "punto-e2e-expire-in-post-dispatch-wait")
+
+    def assert_post_dispatch_context_change_invalidates_new_receipt(
+            self, *, after_retained, change, restore):
+        if after_retained:
+            self.first_manual_conversion()
+        else:
+            self.harness.type_word("ghbdtn")
+            self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+                            "browser source before first dispatch")
+        marker_names = (
+            "punto-e2e-arm-after-word-dispatch",
+            "punto-e2e-after-word-dispatch",
+            "punto-e2e-release-after-word-dispatch",
+        )
+        markers = {name: pathlib.Path("/run", name) for name in marker_names}
+        for marker in markers.values():
+            marker.unlink(missing_ok=True)
+            self.addCleanup(marker.unlink, missing_ok=True)
+        self.addCleanup(markers["punto-e2e-release-after-word-dispatch"].touch,
+                        exist_ok=True)
+        markers["punto-e2e-arm-after-word-dispatch"].touch(mode=0o600)
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(markers["punto-e2e-after-word-dispatch"].exists,
+                        "successful replay reached post-dispatch settlement")
+        change()
+        markers["punto-e2e-release-after-word-dispatch"].touch(mode=0o600)
+        dispatch = 2 if after_retained else 1
+        text = "ghbdtn" if after_retained else "привет"
+        self.pump_until(lambda: self.dispatches() == dispatch,
+                        "successful dispatch completes after context change")
+        self.pump_until(lambda: self.browser_state()[:3] == [text, 6, 6],
+                        "successful replay is visible after context change")
+        restore()
+        self.assert_pause_rejected()
+
+    def post_dispatch_pointer_change(self, after_retained):
+        original = self.pointer_position()
+        self.assert_post_dispatch_context_change_invalidates_new_receipt(
+            after_retained=after_retained,
+            change=lambda: self.xdo("mousemove", str(original[0] + 40),
+                                    str(original[1])),
+            restore=lambda: self.xdo("mousemove", str(original[0]),
+                                     str(original[1])),
+        )
+
+    def post_dispatch_focus_change(self, after_retained):
+        gtk_window = self.window.get_window().get_xid()
+        self.assert_post_dispatch_context_change_invalidates_new_receipt(
+            after_retained=after_retained,
+            change=lambda: self.xdo("windowfocus", "--sync", str(gtk_window)),
+            restore=lambda: (self.xdo("windowfocus", "--sync",
+                                      str(self.browser_window)),
+                             self.publish_active_window(self.browser_window)),
+        )
+
+    def post_dispatch_lock_change(self, after_retained):
+        self.assert_post_dispatch_context_change_invalidates_new_receipt(
+            after_retained=after_retained,
+            change=lambda: self.keyboard_locks(2),
+            restore=lambda: self.keyboard_locks(0),
+        )
+
+    def test_post_dispatch_pointer_change_invalidates_first_receipt(self):
+        self.post_dispatch_pointer_change(False)
+
+    def test_post_dispatch_pointer_change_invalidates_retained_receipt(self):
+        self.post_dispatch_pointer_change(True)
+
+    def test_post_dispatch_focus_change_invalidates_first_receipt(self):
+        self.post_dispatch_focus_change(False)
+
+    def test_post_dispatch_focus_change_invalidates_retained_receipt(self):
+        self.post_dispatch_focus_change(True)
+
+    def test_post_dispatch_lock_change_invalidates_first_receipt(self):
+        self.post_dispatch_lock_change(False)
+
+    def test_post_dispatch_lock_change_invalidates_retained_receipt(self):
+        self.post_dispatch_lock_change(True)
+
+    def test_correction_uses_desktop_layout_shortcut(self):
+        self.first_manual_conversion()
+        self.pump_until(lambda: self.layout_shortcut.activations == 1,
+                        "configured desktop layout shortcut")
+        self.assertEqual(self.keyboard_group(), 1)
+        self.assertEqual(self.layout_shortcut.source_index, 1)
+        self.assertFalse(self.key_is_down(gtk.KEY_LEFTCTRL))
+        self.assertFalse(self.key_is_down(gtk.KEY_GRAVE))
+
+    def test_correction_uses_reloaded_layout_shortcut(self):
+        self.layout_shortcut.stop()
+        self.layout_shortcut = gtk.DesktopLayoutShortcut(
+            self.x11.display,
+            modifier=gtk.KEY_LEFTALT,
+            key=gtk.KEY_BACKSLASH,
+            modifier_mask=8,
+        )
+        self.layout_shortcut.start()
+        self.addCleanup(self.layout_shortcut.stop)
+
+        config = pathlib.Path("/tmp/punto-home/.config/punto/config.yaml")
+        original = config.read_text(encoding="utf-8")
+        self.addCleanup(config.write_text, original, encoding="utf-8")
+        config.write_text(
+            original.replace("modifier: leftctrl", "modifier: leftalt")
+                    .replace("key: grave", "key: backslash"),
+            encoding="utf-8",
+        )
+        generation = int(self.stats_fields()[1]["config_generation"])
+        self.assertEqual(gtk.ipc_request(b"RELOAD\n"), b"OK Scheduled\n")
+        self.pump_until(
+            lambda: int(self.stats_fields()[1]["config_generation"]) > generation
+            and self.stats_fields()[1]["config_result"] == "ok",
+            "custom layout shortcut config commit",
+        )
+
+        self.first_manual_conversion()
+        self.assertEqual(self.layout_shortcut.activations, 1)
+        self.assertEqual(self.layout_shortcut.source_index, 1)
+        self.assertFalse(self.key_is_down(gtk.KEY_LEFTALT))
+        self.assertFalse(self.key_is_down(gtk.KEY_BACKSLASH))
+
+    def test_correction_uses_modifier_only_layout_shortcut(self):
+        self.layout_shortcut.stop()
+        self.layout_shortcut = gtk.DesktopLayoutShortcut(
+            self.x11.display,
+            modifier=gtk.KEY_LEFTCTRL,
+            key=gtk.KEY_RIGHTCTRL,
+            modifier_mask=4,
+        )
+        self.layout_shortcut.start()
+        self.addCleanup(self.layout_shortcut.stop)
+
+        config = pathlib.Path("/tmp/punto-home/.config/punto/config.yaml")
+        original = config.read_text(encoding="utf-8")
+        self.addCleanup(config.write_text, original, encoding="utf-8")
+        config.write_text(
+            original.replace("key: grave", "key: rightctrl"),
+            encoding="utf-8",
+        )
+        generation = int(self.stats_fields()[1]["config_generation"])
+        self.assertEqual(gtk.ipc_request(b"RELOAD\n"), b"OK Scheduled\n")
+        self.pump_until(
+            lambda: int(self.stats_fields()[1]["config_generation"]) > generation
+            and self.stats_fields()[1]["config_result"] == "ok",
+            "modifier-only layout shortcut config commit",
+        )
+
+        self.first_manual_conversion()
+        self.assertEqual(self.layout_shortcut.activations, 1)
+        self.assertEqual(self.layout_shortcut.source_index, 1)
+        self.assertFalse(self.key_is_down(gtk.KEY_LEFTCTRL))
+        self.assertFalse(self.key_is_down(gtk.KEY_RIGHTCTRL))
+        activations = self.layout_shortcut.activations
+        self.send_chord((gtk.KEY_LEFTCTRL,), key=gtk.KEY_RIGHTCTRL)
+        self.pump_until(
+            lambda: self.layout_shortcut.activations == activations + 1
+            and self.keyboard_group() == 0,
+            "physical modifier-only desktop shortcut",
+        )
+        self.harness.send_key(gtk.KEY_SPACE)
+        self.harness.type_word("ghbdtn")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(
+            lambda: self.browser_state()[:3] == ["привет привет", 13, 13],
+            "correction after physical modifier-only shortcut",
+        )
+        self.assertEqual(self.dispatches(), 2)
+
+    def test_layout_shortcut_with_num_lock(self):
+        self.keyboard_locks(16)
+        self.first_manual_conversion()
+        self.pump_until(lambda: self.layout_shortcut.activations == 1,
+                        "desktop shortcut with lock modifiers")
+        self.assertEqual(self.keyboard_group(), 1)
+        self.assertEqual(self.layout_shortcut.source_index, 1)
+        self.assertEqual(self.keyboard_locks(), 16)
+
+    def test_physical_layout_shortcut_lock_variants(self):
+        for locks in (0, 2, 16, 18):
+            with self.subTest(locks=locks):
+                self.set_desktop_layout(0)
+                self.keyboard_locks(locks)
+                activations = self.layout_shortcut.activations
+                self.send_chord((gtk.KEY_LEFTCTRL,), key=gtk.KEY_GRAVE)
+                self.pump_until(
+                    lambda: self.layout_shortcut.activations == activations + 1
+                    and self.keyboard_group() == 1,
+                    f"desktop shortcut with lock mask {locks}",
+                )
+                self.assertEqual(self.layout_shortcut.source_index, 1)
+                self.assertEqual(self.keyboard_locks(), locks)
+
+    def test_delayed_layout_shortcut_uses_shared_macro_budget(self):
+        self.layout_shortcut.handling_delay = 0.05
+        self.first_manual_conversion()
+        self.assertEqual(self.layout_shortcut.activations, 1)
+        self.assertEqual(self.keyboard_group(), 1)
+
+    def test_layout_shortcut_past_macro_deadline_does_not_mutate_text(self):
+        self.layout_shortcut.handling_delay = 0.35
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+                        "browser typed source")
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(
+                "Word edit dispatch status=0") > rejected,
+            "late desktop layout shortcut rejection",
+            timeout=1,
+        )
+        serial = self.browser_state()[-1]
+        self.wait_for_fresh_dom(serial, "fresh DOM after late shortcut rejection")
+        self.assertEqual(self.browser_state()[:3], ["ghbdtn", 6, 6])
+        self.assertEqual(self.dispatches(), 0)
+        self.pump_until(lambda: self.layout_shortcut.activations == 1,
+                        "late desktop layout activation")
+        serial = self.browser_state()[-1]
+        self.wait_for_fresh_dom(serial, "fresh DOM after late layout activation")
+        self.assertEqual(self.browser_state()[:3], ["ghbdtn", 6, 6])
+        self.assertFalse(self.key_is_down(gtk.KEY_LEFTCTRL))
+        self.assertFalse(self.key_is_down(gtk.KEY_GRAVE))
+
+    def test_missing_layout_shortcut_rejects_before_text_replacement(self):
+        self.layout_shortcut.stop()
+        self.layout_shortcut = gtk.DesktopLayoutShortcut(
+            self.x11.display, captured=False)
+        self.layout_shortcut.start()
+        self.addCleanup(self.layout_shortcut.stop)
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+                        "browser typed source")
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(
+                "Word edit dispatch status=0") > rejected,
+            "missing layout shortcut rejection",
+        )
+        serial = self.browser_state()[-1]
+        self.wait_for_fresh_dom(serial, "fresh DOM after missing shortcut rejection")
+        self.assertEqual(self.browser_state()[:3], ["ghbdtn", 6, 6])
+        self.assertEqual(self.keyboard_group(), 0)
+        self.assertEqual(self.dispatches(), 0)
+
+    def test_physical_layout_shortcut_preserves_next_correction(self):
+        self.first_manual_conversion()
+
+        activations = self.layout_shortcut.activations
+        self.send_chord((gtk.KEY_LEFTCTRL,), key=gtk.KEY_GRAVE)
+        self.pump_until(
+            lambda: self.layout_shortcut.activations == activations + 1
+            and self.keyboard_group() == 0,
+            "physical desktop layout shortcut",
+        )
+        activations = self.layout_shortcut.activations
+        self.harness.send_events([
+            (gtk.EV_KEY, gtk.KEY_LEFTCTRL, 1), (gtk.EV_SYN, gtk.SYN_REPORT, 0),
+            (gtk.EV_KEY, gtk.KEY_GRAVE, 2), (gtk.EV_SYN, gtk.SYN_REPORT, 0),
+            (gtk.EV_KEY, gtk.KEY_GRAVE, 0), (gtk.EV_SYN, gtk.SYN_REPORT, 0),
+            (gtk.EV_KEY, gtk.KEY_LEFTCTRL, 0), (gtk.EV_SYN, gtk.SYN_REPORT, 0),
+        ])
+        self.pump_until(
+            lambda: self.layout_shortcut.activations == activations + 1
+            and self.keyboard_group() == 1,
+            "repeated configured layout shortcut press",
+        )
+        self.send_chord((gtk.KEY_LEFTCTRL,), key=gtk.KEY_GRAVE)
+        self.pump_until(lambda: self.keyboard_group() == 0,
+                        "configured layout shortcut after repeat")
+        self.harness.send_key(gtk.KEY_SPACE)
+        self.harness.type_word("ghbdtn")
+        self.pump_until(
+            lambda: self.browser_state()[:3] == ["привет ghbdtn", 13, 13],
+            "fresh source after physical layout shortcut",
+        )
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(
+            lambda: self.browser_state()[:3] == ["привет привет", 13, 13],
+            "correction after physical layout shortcut",
+        )
+        self.assertEqual(self.dispatches(), 2)
+
+    def test_wrong_modifier_side_invalidates_retained_receipt(self):
+        self.first_manual_conversion()
+        activations = self.layout_shortcut.activations
+        self.send_chord((gtk.KEY_RIGHTCTRL,), key=gtk.KEY_GRAVE)
+        self.pump_until(
+            lambda: self.layout_shortcut.activations == activations + 1
+            and self.keyboard_group() == 0,
+            "desktop shortcut from unconfigured Control side",
+        )
+        self.harness.send_key(gtk.KEY_SPACE)
+        self.harness.type_word("ghbdtn")
+        self.pump_until(
+            lambda: self.browser_state()[:3] == ["привет ghbdtn", 13, 13],
+            "fresh source after unconfigured Control side",
+        )
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(
+                "Word edit dispatch status=0") > rejected,
+            "retained receipt invalidation for wrong modifier side",
+        )
+        serial = self.browser_state()[-1]
+        self.wait_for_fresh_dom(serial, "fresh DOM after wrong-side rejection")
+        self.assertEqual(self.browser_state()[:3], ["привет ghbdtn", 13, 13])
+        self.assertEqual(self.dispatches(), 1)
+
+    def test_extra_modifier_invalidates_retained_receipt(self):
+        self.first_manual_conversion()
+        activations = self.layout_shortcut.activations
+        self.send_chord((gtk.KEY_LEFTCTRL, gtk.KEY_LEFTSHIFT), key=gtk.KEY_GRAVE)
+        self.pump_for(0.03)
+        self.assertEqual(self.layout_shortcut.activations, activations)
+        self.assertEqual(self.keyboard_group(), 1)
+
+        self.send_chord((gtk.KEY_LEFTCTRL,), key=gtk.KEY_GRAVE)
+        self.pump_until(lambda: self.keyboard_group() == 0,
+                        "layout reset after extra-modifier chord")
+        self.harness.send_key(gtk.KEY_SPACE)
+        self.harness.type_word("ghbdtn")
+        self.pump_until(
+            lambda: self.browser_state()[:3] == ["привет ghbdtn", 13, 13],
+            "fresh source after extra-modifier chord",
+        )
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(
+                "Word edit dispatch status=0") > rejected,
+            "retained receipt invalidation for extra modifier",
+        )
+        serial = self.browser_state()[-1]
+        self.wait_for_fresh_dom(serial, "fresh DOM after extra-modifier rejection")
+        self.assertEqual(self.browser_state()[:3], ["привет ghbdtn", 13, 13])
+        self.assertEqual(self.dispatches(), 1)
+
+    def test_unhandled_layout_shortcut_rejects_before_text_replacement(self):
+        self.layout_shortcut.enabled = False
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+                        "browser typed source")
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(
+                "Word edit dispatch status=0") > rejected,
+            "unhandled layout shortcut rejection",
+        )
+        serial = self.browser_state()[-1]
+        self.wait_for_fresh_dom(serial, "fresh DOM after unhandled shortcut rejection")
+        self.assertEqual(self.browser_state()[:3], ["ghbdtn", 6, 6])
+        self.assertEqual(self.layout_shortcut.activations, 0)
+        self.assertEqual(self.keyboard_group(), 0)
+        self.assertEqual(self.dispatches(), 0)
+
+    def test_retained_receipt_survives_safe_layout_rejection(self):
+        self.first_manual_conversion()
+        self.layout_shortcut.enabled = False
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(
+                "Word edit dispatch status=0") > rejected,
+            "safe repeated correction rejection",
+        )
+        serial = self.browser_state()[-1]
+        self.wait_for_fresh_dom(serial, "fresh DOM after safe repeated rejection")
+        self.assertEqual(self.browser_state()[:3], ["привет", 6, 6])
+        self.assertEqual(self.dispatches(), 1)
+
+        self.layout_shortcut.enabled = True
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+                        "retained receipt recovery without restart")
+        self.assertEqual(self.dispatches(), 2)
+
+    def assert_transport_fault_invalidates_retained_receipt(self, marker_name):
+        self.first_manual_conversion()
+        marker = pathlib.Path("/run", marker_name)
+        marker.unlink(missing_ok=True)
+        self.addCleanup(marker.unlink, missing_ok=True)
+        marker.touch(mode=0o600)
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(
+                "Word edit dispatch status=0") > rejected,
+            f"{marker_name} rejects retained correction",
+        )
+        serial = self.browser_state()[-1]
+        self.wait_for_fresh_dom(serial, f"fresh DOM after {marker_name}")
+        self.assertEqual(self.dispatches(), 1)
+        self.assertFalse(marker.exists(), f"{marker_name} fault was not reached")
+        self.assert_pause_rejected()
+        self.assertEqual(self.dispatches(), 1)
+
+    def test_keymap_failure_invalidates_retained_receipt(self):
+        self.assert_transport_fault_invalidates_retained_receipt(
+            "punto-e2e-fail-word-keymap")
+
+    def test_layout_hotkey_send_failure_invalidates_retained_receipt(self):
+        self.assert_transport_fault_invalidates_retained_receipt(
+            "punto-e2e-fail-layout-hotkey-send")
+
+    def assert_context_change_invalidates_retained_receipt(self, change, restore):
+        self.first_manual_conversion()
+        activations = self.layout_shortcut.activations
+        self.layout_shortcut.arm_blocked_activation()
+        self.addCleanup(self.layout_shortcut.permit_activation.set)
+        before = self.browser_state()
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(self.layout_shortcut.activation_started.is_set,
+                        "retained correction entered layout preflight")
+        change()
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(
+                "Word edit dispatch status=0") > rejected,
+            "context change rejects retained correction",
+        )
+        serial = self.browser_state()[-1]
+        self.wait_for_fresh_dom(serial, "fresh DOM after context rejection")
+        self.assertEqual(self.browser_state()[:6], before[:6])
+        self.assertEqual(self.dispatches(), 1)
+
+        self.layout_shortcut.permit_activation.set()
+        self.pump_until(
+            lambda: self.layout_shortcut.activations == activations + 1
+            and self.keyboard_group() == 0,
+            "blocked desktop activation completed",
+        )
+        restore()
+        self.assert_pause_rejected()
+
+    def test_pointer_change_invalidates_retained_receipt(self):
+        original = self.pointer_position()
+        self.assert_context_change_invalidates_retained_receipt(
+            lambda: self.xdo("mousemove", str(original[0] + 40), str(original[1])),
+            lambda: self.xdo("mousemove", str(original[0]), str(original[1])),
+        )
+
+    def test_focus_change_invalidates_retained_receipt(self):
+        gtk_window = self.window.get_window().get_xid()
+        self.assert_context_change_invalidates_retained_receipt(
+            lambda: self.xdo("windowfocus", "--sync", str(gtk_window)),
+            lambda: (self.xdo("windowfocus", "--sync", str(self.browser_window)),
+                     self.publish_active_window(self.browser_window)),
+        )
+
+    def test_lock_change_invalidates_retained_receipt(self):
+        self.assert_context_change_invalidates_retained_receipt(
+            lambda: self.keyboard_locks(2),
+            lambda: self.keyboard_locks(0),
+        )
+
+    def test_new_selection_after_safe_rejection_invalidates_old_receipt(self):
+        self.first_manual_conversion()
+        self.layout_shortcut.enabled = False
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(
+                "Word edit dispatch status=0") > rejected,
+            "safe rejection before genuine replacement selection",
+        )
+        self.layout_shortcut.enabled = True
+
+        left, top, decoration = self.browser_state()[8]
+        self.xdo("mousemove", "--window", str(self.browser_window),
+                 str(int(left + 30)), str(int(top + decoration + 20)))
+        self.xdo("click", "--repeat", "2", "--delay", "100", "1")
+        self.pump_until(lambda: self.browser_state()[3:7] ==
+                        ["ghbdtn", 0, 6, "b"],
+                        "genuine same-text selection after safe rejection")
+        self.xdo("mousemove", "--window", str(self.browser_window),
+                 str(int(left + 30)), str(int(top + decoration - 40)))
+        self.xdo("click", "1")
+        self.pump_until(lambda: self.browser_state()[6] == "a",
+                        "original browser field refocused")
+        before = self.browser_state()
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(
+                "Word edit dispatch status=0") > rejected,
+            "new same-text selection rejects old receipt",
+        )
+        serial = self.browser_state()[-1]
+        self.wait_for_fresh_dom(serial, "fresh DOM after stale receipt rejection")
+        self.assertEqual(self.browser_state()[:-1], before[:-1])
+        self.assertEqual(self.dispatches(), 1)
+
+    def test_selection_layout_stall_preserves_browser_selection(self):
+        left, top, decoration = self.browser_state()[8]
+        self.xdo("mousemove", "--window", str(self.browser_window),
+                 str(int(left + 30)), str(int(top + decoration + 20)))
+        self.xdo("click", "--repeat", "2", "--delay", "100", "1")
+        self.pump_until(lambda: self.browser_state()[3:7] ==
+                        ["ghbdtn", 0, 6, "b"],
+                        "browser selection before layout preflight")
+        self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_PRIMARY), "ghbdtn")
+        self.layout_shortcut.enabled = False
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        self.send_chord((gtk.KEY_LEFTSHIFT,))
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(
+                "Word edit dispatch status=0") > rejected,
+            "browser selection layout preflight rejection",
+        )
+        serial = self.browser_state()[-1]
+        self.wait_for_fresh_dom(serial, "fresh DOM after selection rejection")
+        self.assertEqual(self.browser_state()[3:7], ["ghbdtn", 0, 6, "b"])
+        self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD),
+                         "startup clipboard baseline")
+        self.assertEqual(self.dispatches(), 0)
 
     def test_delayed_clipboard_initialization_uses_remaining_macro_budget(self):
         marker = pathlib.Path("/run/punto-e2e-slow-clipboard-init")

@@ -19,6 +19,7 @@
 #include <thread>
 #include <vector>
 #include <xcb/xcbext.h>
+#include <xcb/xtest.h>
 
 #if defined(__clang__)
 #pragma clang diagnostic push
@@ -49,6 +50,8 @@ bool consume_private_fault_marker(const char *path) {
 
 std::mutex keyboard_query_mutex;
 std::optional<std::pair<xcb_connection_t *, unsigned int>> keyboard_query;
+std::optional<std::pair<xcb_connection_t *, unsigned int>> failed_keymap_query;
+std::optional<std::pair<xcb_connection_t *, unsigned int>> failed_xtest_request;
 std::atomic<bool> macro_ipc_hold{false};
 std::atomic<bool> macro_ipc_admitted{false};
 
@@ -67,6 +70,46 @@ void observe_admitted_macro_ipc() noexcept {
   }
 }
 } // namespace
+
+extern "C" void punto_e2e_after_paste_receipt_arm() {
+  if (!consume_private_fault_marker("/run/punto-e2e-arm-after-paste-receipt")) {
+    return;
+  }
+  mark_private_macro_event("/run/punto-e2e-after-paste-receipt");
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  while (std::chrono::steady_clock::now() < deadline &&
+         !consume_private_fault_marker(
+             "/run/punto-e2e-release-after-paste-receipt")) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+}
+
+extern "C" void punto_e2e_after_word_dispatch() {
+  if (consume_private_fault_marker(
+          "/run/punto-e2e-expire-before-post-dispatch-context")) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{350});
+    return;
+  }
+  if (!consume_private_fault_marker("/run/punto-e2e-arm-after-word-dispatch")) {
+    return;
+  }
+  mark_private_macro_event("/run/punto-e2e-after-word-dispatch");
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  while (std::chrono::steady_clock::now() < deadline &&
+         !consume_private_fault_marker(
+             "/run/punto-e2e-release-after-word-dispatch")) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+}
+
+extern "C" void punto_e2e_before_post_dispatch_wait() {
+  if (consume_private_fault_marker(
+          "/run/punto-e2e-expire-in-post-dispatch-wait")) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{350});
+  }
+}
 
 extern "C" decltype(xcb_intern_atom) __real_xcb_intern_atom;
 extern "C" xcb_intern_atom_cookie_t
@@ -102,10 +145,30 @@ extern "C" decltype(xcb_xkb_get_state) __real_xcb_xkb_get_state;
 extern "C" decltype(xcb_query_keymap) __real_xcb_query_keymap;
 extern "C" xcb_query_keymap_cookie_t
 __wrap_xcb_query_keymap(xcb_connection_t *connection) {
+  const auto cookie = __real_xcb_query_keymap(connection);
   if (consume_private_fault_marker("/run/punto-e2e-arm-key-release-check")) {
     mark_private_macro_event("/run/punto-e2e-key-release-checked");
   }
-  return __real_xcb_query_keymap(connection);
+  if (consume_private_fault_marker("/run/punto-e2e-fail-word-keymap")) {
+    std::lock_guard lock{keyboard_query_mutex};
+    failed_keymap_query = std::pair{connection, cookie.sequence};
+  }
+  return cookie;
+}
+
+extern "C" decltype(xcb_test_fake_input_checked)
+    __real_xcb_test_fake_input_checked;
+extern "C" xcb_void_cookie_t __wrap_xcb_test_fake_input_checked(
+    xcb_connection_t *connection, std::uint8_t type, std::uint8_t detail,
+    std::uint32_t time, xcb_window_t root, std::int16_t root_x,
+    std::int16_t root_y, std::uint8_t device_id) {
+  const auto cookie = __real_xcb_test_fake_input_checked(
+      connection, type, detail, time, root, root_x, root_y, device_id);
+  if (consume_private_fault_marker("/run/punto-e2e-fail-layout-hotkey-send")) {
+    std::lock_guard lock{keyboard_query_mutex};
+    failed_xtest_request = std::pair{connection, cookie.sequence};
+  }
+  return cookie;
 }
 
 extern "C" xcb_xkb_get_state_cookie_t
@@ -123,6 +186,29 @@ extern "C" decltype(xcb_poll_for_reply) __real_xcb_poll_for_reply;
 extern "C" int __wrap_xcb_poll_for_reply(xcb_connection_t *connection,
                                          unsigned int sequence, void **reply,
                                          xcb_generic_error_t **error) {
+  bool inject_protocol_error = false;
+  {
+    std::lock_guard lock{keyboard_query_mutex};
+    const auto request = std::optional{std::pair{connection, sequence}};
+    if (failed_keymap_query == request) {
+      failed_keymap_query.reset();
+      inject_protocol_error = true;
+    } else if (failed_xtest_request == request) {
+      failed_xtest_request.reset();
+      inject_protocol_error = true;
+    }
+  }
+  if (inject_protocol_error) {
+    *reply = nullptr;
+    *error = static_cast<xcb_generic_error_t *>(
+        std::calloc(1, sizeof(xcb_generic_error_t)));
+    if (*error == nullptr) {
+      std::abort();
+    }
+    (*error)->error_code = XCB_VALUE;
+    (*error)->sequence = static_cast<std::uint16_t>(sequence);
+    return 1;
+  }
   const int result =
       __real_xcb_poll_for_reply(connection, sequence, reply, error);
   bool observed = false;
@@ -161,6 +247,12 @@ extern "C" void __wrap_xcb_disconnect(xcb_connection_t *connection) {
     std::lock_guard lock{keyboard_query_mutex};
     if (keyboard_query && keyboard_query->first == connection) {
       keyboard_query.reset();
+    }
+    if (failed_keymap_query && failed_keymap_query->first == connection) {
+      failed_keymap_query.reset();
+    }
+    if (failed_xtest_request && failed_xtest_request->first == connection) {
+      failed_xtest_request.reset();
     }
   }
   __real_xcb_disconnect(connection);

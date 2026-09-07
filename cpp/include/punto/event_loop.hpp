@@ -250,6 +250,8 @@ private:
     std::uint32_t focus_window = 0;
     bool eligible = true;
     bool allow_terminal = true;
+    ScanCode layout_hotkey_modifier = 0;
+    ScanCode layout_hotkey_key = 0;
   };
   std::deque<TrackedWord> word_history_;
   std::uint64_t next_word_id_ = 0;

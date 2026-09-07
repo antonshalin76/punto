@@ -82,8 +82,8 @@ public:
 
   /**
    * Processes a bounded event batch and returns the number of consumed events.
-   * A single call never intentionally consumes more than 64 events or spends
-   * more than 2ms in the dispatch loop.
+   * Queue scanning is limited to 64 events and 2ms. At most one
+   * SelectionRequest is handled per call with this manager's operation timeout.
    */
   std::size_t pump_events();
 

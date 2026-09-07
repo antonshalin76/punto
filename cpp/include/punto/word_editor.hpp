@@ -1,5 +1,7 @@
 #pragma once
 
+#include <linux/input.h>
+
 #include <string>
 #include <string_view>
 #include <cstdint>
@@ -30,6 +32,11 @@ struct WordEditRequest {
   std::uint32_t expected_focus = 0;
   int source_locked_mods = -1;
   bool allow_terminal = true;
+  // Invalid until the EventLoop transports the active configuration. This
+  // keeps a missing call path fail-closed instead of silently assuming a
+  // desktop shortcut.
+  std::uint16_t layout_hotkey_modifier = 0;
+  std::uint16_t layout_hotkey_key = 0;
 };
 
 enum class WordEditStatus {

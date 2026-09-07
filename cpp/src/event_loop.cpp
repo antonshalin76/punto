@@ -66,7 +66,7 @@ KeyEntry normalize_caps(KeyEntry key, int layout, bool caps) {
 
 std::uint64_t make_daemon_epoch() noexcept {
   std::uint64_t epoch = 0;
-  ssize_t count;
+  ssize_t count = 0;
   do {
     count = ::getrandom(&epoch, sizeof(epoch), GRND_NONBLOCK);
   } while (count < 0 && errno == EINTR);

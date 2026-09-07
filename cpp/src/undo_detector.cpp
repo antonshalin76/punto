@@ -375,7 +375,7 @@ UndoDetector::~UndoDetector() {
 bool UndoDetector::shutdown(std::chrono::milliseconds timeout) {
   if (!thread_.joinable())
     return true;
-  bool exited;
+  bool exited = false;
   {
     std::unique_lock lock{state_->mutex};
     state_->stopping = true;

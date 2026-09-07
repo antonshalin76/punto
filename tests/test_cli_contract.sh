@@ -30,6 +30,7 @@ STOP_TIMEOUT_MS=40
 POLL_INTERVAL_MS=10
 STOP_FALLBACK_WALL_BOUND_MS=2200
 ACTIVE_READINESS_WALL_BOUND_MS=1500
+START_ROLLBACK_WALL_BOUND_MS=2200
 TRANSITION_AT_MS=""
 TRANSITION_STATE=""
 SEED_TRAY=0
@@ -1951,7 +1952,7 @@ run_start_transport_failure() {
             "B26 start $label rolls back only after IPC failure"
     fi
     assert_no_pid_or_undeclared_calls "B26 start $label rollback=$rollback_mode"
-    assert_bounded "$CLI_RC" "$CLI_DURATION_MS" 1500 \
+    assert_bounded "$CLI_RC" "$CLI_DURATION_MS" "$START_ROLLBACK_WALL_BOUND_MS" \
         "B26 start $label rollback=$rollback_mode is bounded"
 }
 

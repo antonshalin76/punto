@@ -4,6 +4,7 @@ import os
 import pathlib
 import re
 import signal
+import socket
 import subprocess
 import tempfile
 import textwrap
@@ -55,12 +56,17 @@ class CliHarness:
         self.service_state.write_text("inactive\n", encoding="ascii")
         self.tray_state = self.root / "tray.state"
         self.tray_state.write_text("inactive\n", encoding="ascii")
+        self.socket_path = self.root / "socket"
+        self.runtime_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.runtime_socket.bind(str(self.socket_path))
+        self.runtime_socket.listen(1)
         self.observer = self.root / "observer.pid"
         self.version = self.root / "VERSION"
         self.version.write_text("1.2.3\n", encoding="ascii")
         self._install_fixtures()
 
     def cleanup(self) -> None:
+        self.runtime_socket.close()
         if self.observer.exists():
             try:
                 pid = int(self.observer.read_text(encoding="ascii").strip())
@@ -187,7 +193,7 @@ class CliHarness:
             **os.environ,
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "PUNTO_TRAY": str(self.bin / "tray"),
-            "PUNTO_SOCKET": str(self.root / "socket"),
+            "PUNTO_SOCKET": str(self.socket_path),
             "PUNTO_VERSION_FILE": str(self.version),
             "PUNTO_UDEVMON_SERVICE": "udevmon",
             "PUNTO_IPC_TIMEOUT_MS": "30",

@@ -235,6 +235,10 @@ void test_documented_command_grammar() {
        punto::IpcVerb::Reload,
        "/etc/punto/config.yaml"},
       {"STATS", {"STATS\n"}, punto::IpcVerb::Stats, ""},
+      {"CLEAR_EXCLUSIONS",
+       {"CLEAR_", "EXCLUSIONS\n"},
+       punto::IpcVerb::ClearExclusions,
+       ""},
       {"SHUTDOWN", {"SHUT", "DOWN\n"}, punto::IpcVerb::Shutdown, ""},
   };
 
@@ -415,18 +419,21 @@ void test_mailbox_pending_mutations_preserve_fifo_and_wraparound() {
   punto::IpcCommandMailbox mailbox{3};
   int completions = 0;
   const auto complete = [&completions](punto::IpcResult) { ++completions; };
-  const std::array verbs{IpcVerb::GetStatus, IpcVerb::Stats, IpcVerb::SetStatus,
-                         IpcVerb::Reload, IpcVerb::Shutdown,
+  const std::array verbs{IpcVerb::GetStatus,       IpcVerb::Stats,
+                         IpcVerb::SetStatus,       IpcVerb::Reload,
+                         IpcVerb::ClearExclusions, IpcVerb::Shutdown,
                          static_cast<IpcVerb>(999)};
   for (const auto verb : verbs) {
     const bool mutating = verb != IpcVerb::GetStatus && verb != IpcVerb::Stats;
     expect(!mailbox.has_pending_mutation(), "empty mailbox cancelled a macro");
     for (const auto queued : {IpcVerb::GetStatus, IpcVerb::Stats, verb}) {
       expect(mailbox.try_enqueue({queued, {}}, complete) ==
-                 punto::IpcEnqueueResult::Accepted, "matrix enqueue failed");
+                 punto::IpcEnqueueResult::Accepted,
+             "matrix enqueue failed");
     }
     expect(mailbox.try_enqueue({IpcVerb::Reload, {}}, complete) ==
-               punto::IpcEnqueueResult::Failed, "matrix exceeded capacity");
+               punto::IpcEnqueueResult::Failed,
+           "matrix exceeded capacity");
     const auto completed_before = completions;
     for (int repeat = 0; repeat < 10; ++repeat) {
       expect(mailbox.has_pending_mutation() == mutating,
@@ -447,7 +454,8 @@ void test_mailbox_pending_mutations_preserve_fifo_and_wraparound() {
     expect(completions == completed_before + 3, "completion ownership changed");
   }
   expect(mailbox.try_enqueue({IpcVerb::Reload, {}}, complete) ==
-             punto::IpcEnqueueResult::Accepted, "close fixture enqueue failed");
+             punto::IpcEnqueueResult::Accepted,
+         "close fixture enqueue failed");
   expect(mailbox.close() && mailbox.has_pending_mutation(),
          "closing admission hid an already admitted mutation");
   expect(mailbox.try_dequeue().has_value() && !mailbox.has_pending_mutation(),
@@ -759,6 +767,9 @@ public:
       case punto::IpcVerb::Stats:
         response = {true, "counter=1"};
         break;
+      case punto::IpcVerb::ClearExclusions:
+        response = {true, "EXCLUSIONS SCHEDULED 1 2"};
+        break;
       case punto::IpcVerb::Shutdown:
         response = {false, "Shutdown not allowed via IPC"};
         break;
@@ -956,11 +967,14 @@ void test_black_box_server_uses_typed_sink_and_responses() {
       "OK reloaded\n", "RELOAD path");
   expect_exact_response(request_response(fixture.socket(), "STATS\n"),
                         "OK counter=1\n", "STATS");
+  expect_exact_response(
+      request_response(fixture.socket(), "CLEAR_EXCLUSIONS\n"),
+      "OK EXCLUSIONS SCHEDULED 1 2\n", "CLEAR_EXCLUSIONS");
   expect_exact_response(request_response(fixture.socket(), "SHUTDOWN\n"),
                         "ERROR Shutdown not allowed via IPC\n", "SHUTDOWN");
 
   const std::vector<punto::IpcRequest> requests = fixture.requests();
-  expect(requests.size() == 7,
+  expect(requests.size() == 8,
          "black-box server did not enqueue each typed command once");
   const std::vector<std::pair<punto::IpcVerb, std::string>> expected{
       {punto::IpcVerb::GetStatus, ""},
@@ -969,6 +983,7 @@ void test_black_box_server_uses_typed_sink_and_responses() {
       {punto::IpcVerb::SetStatus, "1"},
       {punto::IpcVerb::Reload, "/etc/punto/config.yaml"},
       {punto::IpcVerb::Stats, ""},
+      {punto::IpcVerb::ClearExclusions, ""},
       {punto::IpcVerb::Shutdown, ""},
   };
   for (std::size_t index = 0; index < expected.size(); ++index) {
@@ -1005,9 +1020,9 @@ void test_diagnostic_endpoint_rejects_mutations_before_owner_admission() {
   expect_exact_response(request_response(socket_path.socket(), "STATS\n"),
                         "OK counter=1\n", "diagnostic STATS");
 
-  constexpr std::array<std::string_view, 4> mutations{
+  constexpr std::array<std::string_view, 5> mutations{
       "SET_STATUS 0\n", "RELOAD\n", "RELOAD /etc/punto/config.yaml\n",
-      "SHUTDOWN\n"};
+      "CLEAR_EXCLUSIONS\n", "SHUTDOWN\n"};
   for (const std::string_view request : mutations) {
     expect_exact_response(request_response(socket_path.socket(), request),
                           "ERROR Read-only diagnostic endpoint\n",
@@ -3620,7 +3635,8 @@ int main() {
       {"LF irreversible", test_lf_is_irreversible_across_recv_segmentation},
       {"typed owner-drained mailbox",
        test_typed_mailbox_is_bounded_fifo_and_owner_drained},
-      {"mailbox mutation visibility", test_mailbox_pending_mutations_preserve_fifo_and_wraparound},
+      {"mailbox mutation visibility",
+       test_mailbox_pending_mutations_preserve_fifo_and_wraparound},
       {"linearized mailbox close",
        test_mailbox_close_is_a_linearized_admission_barrier},
       {"bounded mailbox close",

@@ -1,8 +1,36 @@
 # Product restoration
 
-This document records the source restoration through 2.8.10. Source tests, package
+This document records the source restoration through 2.8.11. Source tests, package
 validation, publication and machine installation are separate evidence gates;
 runtime health alone is not proof of an editor correction.
+
+## Runtime stability and learning control (2026-09-07, 2.8.11)
+
+Session discovery and keyboard observation now use independent bounded workers.
+A slow periodic discovery therefore cannot occupy the lane needed to validate a
+Pause action, and a transient first discovery failure no longer revokes the
+last known-good write lease before the retry sequence finishes. Tray reads and
+mutations likewise have independent in-flight state, so periodic polling cannot
+temporarily disable a confirmed control.
+
+CLI start/restart require operational X11, analysis and input health plus the
+X11 mutation backend. Tray keeps a confirmed control-plane toggle available
+during a temporary data-plane degradation and exposes that state separately.
+The last known-good configuration stays operational after a failed reload.
+`CLEAR_EXCLUSIONS` / `punto reset-learning` provides an explicit durable reset;
+its receipt is fenced by a process-lifetime `daemon_epoch`, so primary failover
+cannot acknowledge another daemon's local persistence generation. Native GTK E2E
+covers correction while discovery is deliberately blocked and correction after
+clearing the exclusion store.
+
+The generic X11 editor boundary remains fail-closed. In particular, an
+unattributed stale PRIMARY from another field of the same Chromium client can
+still block an edit; relaxing this check collapses a real newer selection and
+is therefore not shipped as a workaround.
+
+All sections below this 2.8.11 checkpoint are append-only historical evidence.
+Their readiness or blocker verdicts apply only to the version and date named in
+that section; they do not override the current contract above and in README.
 
 ## Sound routing and retained Chromium PRIMARY (2026-09-06, 2.8.10)
 

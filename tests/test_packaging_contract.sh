@@ -1795,6 +1795,10 @@ inspect_artifact() {
     assert_file "$data/usr/share/doc/punto-switcher/changelog.Debian.gz" "$label packages changelog"
     assert_file "$data/usr/share/doc/punto-switcher/examples/udevmon.yaml" \
         "$label packages the udevmon example outside global configuration"
+    assert_contains \
+        "$(<"$data/usr/share/doc/punto-switcher/examples/udevmon.yaml")" \
+        'LINK: .*-event-kbd' \
+        "$label example excludes non-keyboard EV_KEY devices"
     local sound source_sound packaged_sound
     for sound in en_ru ru_en; do
         source_sound="$REPO_ROOT/cpp/src/sound/$sound.wav"

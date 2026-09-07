@@ -8,9 +8,11 @@
 
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <thread>
 
 #include <gtk/gtk.h>
 
@@ -54,6 +56,10 @@ public:
    */
   int run();
 
+  // Completes status workers and drains their queued main-context results.
+  // False means the process must not continue normal GLib/static teardown.
+  [[nodiscard]] bool shutdown_background(std::chrono::milliseconds timeout) noexcept;
+
 private:
   friend struct TrayAppTestAccess;
 
@@ -90,6 +96,9 @@ private:
   // Текущий статус
   ServiceStatus current_status_ = ServiceStatus::Unknown;
   MutationCapability current_capability_ = MutationCapability::Unknown;
+  bool current_runtime_ready_ = false;
+  bool current_config_pending_ = false;
+  bool current_config_failed_ = false;
   bool updating_toggle_ = false;
   bool last_command_failed_ = false;
 
@@ -97,6 +106,8 @@ private:
   guint status_timer_id_ = 0;
 
   std::shared_ptr<StatusPollState> status_poll_state_;
+  std::thread status_read_thread_;
+  std::thread status_mutation_thread_;
   std::function<IpcClientResult()> status_provider_;
   std::function<bool(bool)> status_setter_;
   std::function<bool(const std::string &)> config_reloader_;

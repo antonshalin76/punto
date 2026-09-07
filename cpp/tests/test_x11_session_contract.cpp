@@ -115,17 +115,27 @@ void test_retry_wait_seam_is_deterministic() {
          "retry seam observes the exact schedule without sleeping");
 }
 
-void test_prepare_commit_and_failure_revoke_write() {
+void test_prepare_commit_and_terminal_failure_revoke_write() {
   std::atomic<int> call_count{0};
-  punto::X11Session session{[&] {
-    const int call = call_count.fetch_add(1, std::memory_order_relaxed);
-    if (call == 0) {
-      return punto::x11_detail::ProbeResult{
-          punto::x11_detail::ProbeStatus::Healthy, fake_info()};
-    }
-    return punto::x11_detail::ProbeResult{
-        punto::x11_detail::ProbeStatus::Failed, {}};
-  }};
+  std::atomic<int> wait_count{0};
+  std::atomic<bool> release_retry{false};
+  punto::X11Session session{
+      [&] {
+        const int call = call_count.fetch_add(1, std::memory_order_relaxed);
+        if (call == 0) {
+          return punto::x11_detail::ProbeResult{
+              punto::x11_detail::ProbeStatus::Healthy, fake_info()};
+        }
+        return punto::x11_detail::ProbeResult{
+            punto::x11_detail::ProbeStatus::Failed, {}};
+      },
+      [&](std::chrono::milliseconds, const std::atomic<bool> &) {
+        wait_count.fetch_add(1, std::memory_order_release);
+        while (!release_retry.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+        return false;
+      }};
 
   expect(session.initialize(), "initial healthy snapshot commits");
   expect(session.is_valid(), "committed session enables writes");
@@ -133,17 +143,28 @@ void test_prepare_commit_and_failure_revoke_write() {
          "probe-observed layout is committed with the session snapshot");
   session.start_background_refresh();
 
-  const auto revoke_deadline = std::chrono::steady_clock::now() + 250ms;
-  while (session.is_valid() &&
-         std::chrono::steady_clock::now() < revoke_deadline) {
+  const auto transient_deadline = std::chrono::steady_clock::now() + 1s;
+  while (wait_count.load(std::memory_order_acquire) == 0 &&
+         std::chrono::steady_clock::now() < transient_deadline) {
     std::this_thread::yield();
   }
-  expect(!session.is_valid(),
-         "first failed attempt immediately revokes writes");
-  expect(!session.poll_refresh_result(),
-         "retry sequence does not publish a premature terminal result");
-  expect(session.shutdown_background_refresh(100ms),
-         "cooperative retry wait cancels within shutdown bound");
+  expect(wait_count.load(std::memory_order_acquire) == 1,
+         "first failed probe enters the retry phase");
+  expect(session.is_valid(),
+         "transient discovery failure keeps the last healthy write snapshot");
+  release_retry.store(true, std::memory_order_release);
+
+  const auto deadline = std::chrono::steady_clock::now() + 1s;
+  std::optional<punto::X11Session::RefreshResult> result;
+  while (!result && std::chrono::steady_clock::now() < deadline) {
+    result = session.poll_refresh_result();
+    std::this_thread::yield();
+  }
+  expect(result == punto::X11Session::RefreshResult::Failed,
+         "terminal discovery failure is published after bounded retries");
+  expect(call_count.load(std::memory_order_relaxed) == 5,
+         "healthy initialization plus four failed probes are observed");
+  expect(!session.is_valid(), "terminal failure revokes the write snapshot");
 }
 
 void test_session_absence_is_distinct_from_failure() {
@@ -259,8 +280,7 @@ struct TempAuthority {
     for (const auto &record : records) {
       Xauth auth{};
       auth.family = record.family;
-      auth.address_length =
-          static_cast<unsigned short>(record.address.size());
+      auth.address_length = static_cast<unsigned short>(record.address.size());
       auth.address = const_cast<char *>(record.address.data());
       auth.number_length = static_cast<unsigned short>(record.number.size());
       auth.number = const_cast<char *>(record.number.data());
@@ -268,8 +288,7 @@ struct TempAuthority {
       auth.name = const_cast<char *>(record.protocol.data());
       auth.data_length = static_cast<unsigned short>(record.cookie.size());
       auth.data = const_cast<char *>(record.cookie.data());
-      expect(::XauWriteAuth(file.get(), &auth) == 1,
-             "write Xauthority record");
+      expect(::XauWriteAuth(file.get(), &auth) == 1, "write Xauthority record");
     }
     expect(trailing_bytes.empty() ||
                std::fwrite(trailing_bytes.data(), trailing_bytes.size(), 1,
@@ -277,8 +296,7 @@ struct TempAuthority {
            "write truncated Xauthority tail");
     expect(std::fflush(file.get()) == 0, "flush replacement Xauthority");
     expect(::fsync(::fileno(file.get())) == 0, "sync replacement Xauthority");
-    expect(std::fclose(file.release()) == 0,
-           "close replacement Xauthority");
+    expect(std::fclose(file.release()) == 0, "close replacement Xauthority");
     expect(::rename(replacement.c_str(), path.c_str()) == 0,
            "atomically replace Xauthority");
     cleanup.path.clear();
@@ -326,10 +344,10 @@ struct NestedXServer {
     const bool resumed = !stopped || ::kill(pid, SIGCONT) == 0;
     const bool signalled = ::kill(pid, signal) == 0;
     pid_t result = wait(true);
-    const bool orderly = result == pid && resumed && signalled &&
-                         (signal == SIGTERM
-                              ? WIFEXITED(status) && WEXITSTATUS(status) == 0
-                              : WIFSIGNALED(status) && WTERMSIG(status) == signal);
+    const bool orderly =
+        result == pid && resumed && signalled &&
+        (signal == SIGTERM ? WIFEXITED(status) && WEXITSTATUS(status) == 0
+                           : WIFSIGNALED(status) && WTERMSIG(status) == signal);
     if (result == 0) {
       (void)::kill(pid, SIGKILL);
       result = wait(true);
@@ -397,8 +415,7 @@ private:
 constexpr auto kXvfbStartupTimeout = 10s;
 
 std::string wait_for_xvfb_display(int descriptor, std::string_view label) {
-  const auto deadline =
-      std::chrono::steady_clock::now() + kXvfbStartupTimeout;
+  const auto deadline = std::chrono::steady_clock::now() + kXvfbStartupTimeout;
   pollfd poll_descriptor{descriptor, POLLIN, 0};
   while (true) {
     const auto now = std::chrono::steady_clock::now();
@@ -472,8 +489,7 @@ NestedXServer start_nested_xvfb(bool disable_xfixes = false) {
 
   input_pipe.close();
   ChildGuard child{pid};
-  const std::string number =
-      wait_for_xvfb_display(output_pipe.get(), "nested");
+  const std::string number = wait_for_xvfb_display(output_pipe.get(), "nested");
   std::string display = ":" + number;
   return NestedXServer{child.release(), std::move(display), false};
 }
@@ -487,8 +503,7 @@ std::string local_hostname() {
 
 NestedXServer start_authenticated_xvfb(const TempAuthority &server_authority) {
   int descriptors[2]{};
-  expect(::pipe(descriptors) == 0,
-         "create authenticated Xvfb display pipe");
+  expect(::pipe(descriptors) == 0, "create authenticated Xvfb display pipe");
   ScopedFd output_pipe{descriptors[0]};
   ScopedFd input_pipe{descriptors[1]};
   const pid_t pid = ::fork();
@@ -553,16 +568,15 @@ std::string display_number(const NestedXServer &server) {
 }
 
 TempAuthority::Record authority_record(unsigned short family,
-                                       std::string address,
-                                       std::string number,
+                                       std::string address, std::string number,
                                        std::string cookie) {
   return TempAuthority::Record{family, std::move(address), std::move(number),
                                "MIT-MAGIC-COOKIE-1", std::move(cookie)};
 }
 
 void test_xauthority_metadata_policy_and_production_bridge() {
-  using punto::x11_detail::XauthorityMetadata;
   using punto::x11_detail::xauthority_metadata_is_trusted;
+  using punto::x11_detail::XauthorityMetadata;
   const std::uint32_t uid = static_cast<std::uint32_t>(::geteuid());
   expect(xauthority_metadata_is_trusted(
              XauthorityMetadata{uid, S_IFREG | 0600U, 16}, uid),
@@ -583,22 +597,20 @@ void test_xauthority_metadata_policy_and_production_bridge() {
              XauthorityMetadata{uid, S_IFREG | 0600U, -1}, uid),
          "negative authority size is rejected");
   expect(!xauthority_metadata_is_trusted(
-             XauthorityMetadata{
-                 uid, S_IFREG | 0600U,
-                 static_cast<std::int64_t>(
-                     punto::x11_detail::kMaxXauthorityBytes) +
-                     1},
+             XauthorityMetadata{uid, S_IFREG | 0600U,
+                                static_cast<std::int64_t>(
+                                    punto::x11_detail::kMaxXauthorityBytes) +
+                                    1},
              uid),
          "oversized authority is rejected");
 
   const std::string cookie(16, '\x31');
   TempAuthority server_authority;
-  server_authority.replace(
-      {authority_record(FamilyWild, "", "", cookie)});
+  server_authority.replace({authority_record(FamilyWild, "", "", cookie)});
   NestedXServer server = start_authenticated_xvfb(server_authority);
   TempAuthority client_authority;
-  client_authority.replace({authority_record(
-      FamilyLocal, local_hostname(), display_number(server), cookie)});
+  client_authority.replace({authority_record(FamilyLocal, local_hostname(),
+                                             display_number(server), cookie)});
   expect(::chmod(client_authority.path.c_str(), 0620) == 0,
          "make client authority group-writable");
   expect(!xkb_connection_succeeds(real_candidate(server, client_authority)),
@@ -613,8 +625,7 @@ void test_authenticated_xauthority_empty_number_and_precedence() {
   const std::string cookie_a(16, '\x41');
   const std::string cookie_b(16, '\x42');
   TempAuthority server_authority;
-  server_authority.replace(
-      {authority_record(FamilyWild, "", "", cookie_a)});
+  server_authority.replace({authority_record(FamilyWild, "", "", cookie_a)});
   NestedXServer server = start_authenticated_xvfb(server_authority);
   const std::string number = display_number(server);
   const std::string hostname = local_hostname();
@@ -633,12 +644,10 @@ void test_authenticated_xauthority_empty_number_and_precedence() {
 
   const auto empty_wrong =
       authority_record(FamilyLocal, hostname, "", cookie_b);
-  const auto exact_correct =
-      authority_record(FamilyWild, "", number, cookie_a);
+  const auto exact_correct = authority_record(FamilyWild, "", number, cookie_a);
   const auto empty_correct =
       authority_record(FamilyLocal, hostname, "", cookie_a);
-  const auto exact_wrong =
-      authority_record(FamilyWild, "", number, cookie_b);
+  const auto exact_wrong = authority_record(FamilyWild, "", number, cookie_b);
   for (const bool exact_first : {false, true}) {
     client_authority.replace(exact_first
                                  ? std::vector{exact_correct, empty_wrong}
@@ -657,8 +666,7 @@ void test_xauthority_family_precedence() {
   const std::string cookie_a(16, '\x51');
   const std::string cookie_b(16, '\x52');
   TempAuthority server_authority;
-  server_authority.replace(
-      {authority_record(FamilyWild, "", "", cookie_a)});
+  server_authority.replace({authority_record(FamilyWild, "", "", cookie_a)});
   NestedXServer server = start_authenticated_xvfb(server_authority);
   const std::string hostname = local_hostname();
   const std::string exact = display_number(server);
@@ -688,9 +696,9 @@ void test_xauthority_family_precedence() {
           client_authority.replace(
               higher_first ? std::vector{higher_correct, lower_wrong}
                            : std::vector{lower_wrong, higher_correct});
-          expect(xkb_connection_succeeds(
-                     real_candidate(server, client_authority)),
-                 success_message);
+          expect(
+              xkb_connection_succeeds(real_candidate(server, client_authority)),
+              success_message);
         }
       };
   for (const std::string &number : {std::string{}, exact}) {
@@ -710,8 +718,7 @@ void test_xauthority_family_precedence() {
 void test_xauthority_invalid_records_and_truncated_tail_fail_closed() {
   const std::string cookie_a(16, '\x61');
   TempAuthority server_authority;
-  server_authority.replace(
-      {authority_record(FamilyWild, "", "", cookie_a)});
+  server_authority.replace({authority_record(FamilyWild, "", "", cookie_a)});
   NestedXServer server = start_authenticated_xvfb(server_authority);
   const std::string hostname = local_hostname();
   const std::string exact = display_number(server);
@@ -720,20 +727,18 @@ void test_xauthority_invalid_records_and_truncated_tail_fail_closed() {
   auto invalid_protocol =
       authority_record(FamilyLocal, hostname, exact, cookie_a);
   invalid_protocol.protocol = "XDM-AUTHORIZATION-1";
-  auto invalid_cookie = authority_record(FamilyLocal, hostname, exact,
-                                         std::string(15, '\x61'));
+  auto invalid_cookie =
+      authority_record(FamilyLocal, hostname, exact, std::string(15, '\x61'));
   auto invalid_address =
       authority_record(FamilyLocal, "not-this-host", exact, cookie_a);
   auto invalid_family =
       authority_record(kFamilyInternet, hostname, exact, cookie_a);
-  for (const auto &invalid : {invalid_protocol, invalid_cookie,
-                              invalid_address, invalid_family}) {
-    const auto fallback =
-        authority_record(FamilyWild, "", "", cookie_a);
+  for (const auto &invalid :
+       {invalid_protocol, invalid_cookie, invalid_address, invalid_family}) {
+    const auto fallback = authority_record(FamilyWild, "", "", cookie_a);
     for (const bool invalid_first : {false, true}) {
-      client_authority.replace(
-          invalid_first ? std::vector{invalid, fallback}
-                        : std::vector{fallback, invalid});
+      client_authority.replace(invalid_first ? std::vector{invalid, fallback}
+                                             : std::vector{fallback, invalid});
       expect(xkb_connection_succeeds(real_candidate(server, client_authority)),
              "invalid exact record cannot suppress a valid empty fallback");
     }
@@ -743,9 +748,8 @@ void test_xauthority_invalid_records_and_truncated_tail_fail_closed() {
   expect(!xkb_connection_succeeds(real_candidate(server, client_authority)),
          "unsupported FamilyInternet is never selected");
 
-  client_authority.replace(
-      {authority_record(FamilyWild, "", "", cookie_a)},
-      std::string_view{"\0\1\0", 3});
+  client_authority.replace({authority_record(FamilyWild, "", "", cookie_a)},
+                           std::string_view{"\0\1\0", 3});
   expect(!xkb_connection_succeeds(real_candidate(server, client_authority)),
          "truncated record after a valid cookie rejects the whole snapshot");
 }
@@ -753,12 +757,10 @@ void test_xauthority_invalid_records_and_truncated_tail_fail_closed() {
 void test_xauthority_atomic_replacement_recovers_same_session() {
   const std::string cookie(16, '\x71');
   TempAuthority server_authority;
-  server_authority.replace(
-      {authority_record(FamilyWild, "", "", cookie)});
+  server_authority.replace({authority_record(FamilyWild, "", "", cookie)});
   NestedXServer server = start_authenticated_xvfb(server_authority);
   TempAuthority client_authority;
-  client_authority.replace(
-      {authority_record(FamilyWild, "", "99999", cookie)});
+  client_authority.replace({authority_record(FamilyWild, "", "99999", cookie)});
   const punto::X11SessionInfo candidate =
       real_candidate(server, client_authority);
   const char *authority_before_raw = std::getenv("XAUTHORITY");
@@ -784,14 +786,12 @@ void test_xauthority_atomic_replacement_recovers_same_session() {
   expect(authority_after_failure == authority_before,
          "failed auth never mutates process-global XAUTHORITY");
 
-  client_authority.replace(
-      {authority_record(FamilyWild, "", "", cookie)});
+  client_authority.replace({authority_record(FamilyWild, "", "", cookie)});
   auto recovered = lease->open_bounded_connection(1s);
   expect(recovered.is_open(),
          "same X11 session recovers after atomic Xauthority replacement");
   const int group = session.get_current_keyboard_layout();
-  expect(group == 0 || group == 1,
-         "recovered connection reads the XKB layout");
+  expect(group == 0 || group == 1, "recovered connection reads the XKB layout");
   const char *authority_after_recovery_raw = std::getenv("XAUTHORITY");
   const std::optional<std::string> authority_after_recovery =
       authority_after_recovery_raw == nullptr
@@ -821,8 +821,9 @@ void test_xkb_readiness_does_not_require_xfixes() {
          "production X11 transport does not require XFixes");
   const auto cookie = xcb_query_extension(connection.get(), 6, "XFIXES");
   punto::x11_detail::XcbOperationResult result{};
-  auto *reply = static_cast<xcb_query_extension_reply_t *>(connection.wait_for_reply(
-      cookie.sequence, std::chrono::steady_clock::now() + 1s, result));
+  auto *reply =
+      static_cast<xcb_query_extension_reply_t *>(connection.wait_for_reply(
+          cookie.sequence, std::chrono::steady_clock::now() + 1s, result));
   const bool xfixes_absent = reply != nullptr && reply->present == 0;
   std::free(reply);
   expect(xfixes_absent, "nested server actually has no XFIXES extension");
@@ -830,7 +831,8 @@ void test_xkb_readiness_does_not_require_xfixes() {
   expect(group == 0 || group == 1,
          "XKB layout observation works without XFixes");
   // Xvfb 21.1.12 aborts on last XKB-client disconnect with XFIXES disabled.
-  // End this fixture while its retained connection is alive; reject prior death.
+  // End this fixture while its retained connection is alive; reject prior
+  // death.
   expect(server.shutdown(SIGKILL),
          "XFIXES-disabled fixture ends only by its requested SIGKILL");
 }
@@ -857,8 +859,9 @@ void test_nested_server_shutdown_rejects_early_exit() {
     expect(info.si_pid == child, "early-exit child reaches a terminal state");
     expect(!server.shutdown(signalled ? SIGKILL : SIGTERM),
            "shutdown rejects a child that exited before its requested signal");
-    expect(server.pid == -1 && server.shutdown(),
-           "rejected early-exit child is reaped once and cleanup is idempotent");
+    expect(
+        server.pid == -1 && server.shutdown(),
+        "rejected early-exit child is reaped once and cleanup is idempotent");
   }
 }
 
@@ -989,7 +992,8 @@ void test_unresponsive_handshake_is_cancelled_and_next_connect_recovers() {
   const bool recovery_succeeded = recovered.is_open();
   recovered.close();
   hanging.shutdown();
-  expect(healthy.shutdown(), "healthy recovery server exits normally on SIGTERM");
+  expect(healthy.shutdown(),
+         "healthy recovery server exits normally on SIGTERM");
 
   expect(timeout_is_bounded,
          "accepted X socket without handshake is cancelled by deadline");
@@ -1114,43 +1118,62 @@ void test_keyboard_observation_ownership_and_authority_generation() {
   auto fixture_connection = fixture_lease->open_bounded_connection(1s);
   fixture_lease.reset();
   expect(fixture_connection.is_open(), "open observation fixture connection");
-  const auto screen = xcb_setup_roots_iterator(xcb_get_setup(fixture_connection.get()));
+  const auto screen =
+      xcb_setup_roots_iterator(xcb_get_setup(fixture_connection.get()));
   expect(screen.data != nullptr, "observation fixture has a screen");
-  const xcb_window_t observed_window = xcb_generate_id(fixture_connection.get());
+  const xcb_window_t observed_window =
+      xcb_generate_id(fixture_connection.get());
   punto::x11_detail::XcbOperationResult fixture_result{};
   const auto check = [&](xcb_void_cookie_t cookie) {
-    return fixture_connection.check_request(cookie, std::chrono::steady_clock::now() + 1s,
-                                            fixture_result);
+    return fixture_connection.check_request(
+        cookie, std::chrono::steady_clock::now() + 1s, fixture_result);
   };
-  expect(check(xcb_create_window_checked(fixture_connection.get(), XCB_COPY_FROM_PARENT,
-      observed_window, screen.data->root, 0, 0, 80, 40, 0,
-      XCB_WINDOW_CLASS_INPUT_OUTPUT, XCB_COPY_FROM_PARENT, 0, nullptr)),
-      "create observation fixture window");
-  expect(check(xcb_map_window_checked(fixture_connection.get(), observed_window)),
-         "map observation fixture window");
-  expect(check(xcb_set_input_focus_checked(fixture_connection.get(), XCB_INPUT_FOCUS_PARENT,
-      observed_window, XCB_CURRENT_TIME)), "focus observation fixture window");
+  expect(check(xcb_create_window_checked(
+             fixture_connection.get(), XCB_COPY_FROM_PARENT, observed_window,
+             screen.data->root, 0, 0, 80, 40, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT,
+             XCB_COPY_FROM_PARENT, 0, nullptr)),
+         "create observation fixture window");
+  expect(
+      check(xcb_map_window_checked(fixture_connection.get(), observed_window)),
+      "map observation fixture window");
+  expect(check(xcb_set_input_focus_checked(fixture_connection.get(),
+                                           XCB_INPUT_FOCUS_PARENT,
+                                           observed_window, XCB_CURRENT_TIME)),
+         "focus observation fixture window");
   const auto generation = [&] {
     const auto lease = session.acquire_write_lease();
     expect(lease.has_value(), "valid authority grants a generation lease");
     return lease->generation();
   };
-  const auto collect = [&](std::uint64_t request_id) {
+  const auto collect = [&](std::uint64_t request_id,
+                           bool start_concurrent_discovery = false) {
     const auto deadline = std::chrono::steady_clock::now() + 1s;
     std::optional<punto::X11Session::KeyboardObservation> result;
+    bool discovery_started = false;
     while (!result && std::chrono::steady_clock::now() < deadline) {
       expect(!session.start_background_keyboard_observation(999),
              "busy observation lane cannot replace the original request");
-      expect(!session.start_background_refresh(),
-             "discovery cannot replace a pending keyboard job");
-      expect(!session.poll_refresh_result(),
-             "wrong-kind poll leaves keyboard completion owned by its caller");
+      if (start_concurrent_discovery && !discovery_started) {
+        expect(session.start_background_refresh(),
+               "discovery runs independently of a keyboard observation");
+        discovery_started = true;
+      }
       result = session.poll_keyboard_observation();
       std::this_thread::yield();
     }
-    expect(result.has_value(), "keyboard observation completes within its bound");
+    expect(result.has_value(),
+           "keyboard observation completes within its bound");
     expect(result->request_id == request_id,
            "refused requests never overwrite the original completion id");
+    if (start_concurrent_discovery) {
+      std::optional<punto::X11Session::RefreshResult> refresh;
+      while (!refresh && std::chrono::steady_clock::now() < deadline) {
+        refresh = session.poll_refresh_result();
+        std::this_thread::yield();
+      }
+      expect(refresh.has_value(),
+             "concurrent discovery remains owned by its independent caller");
+    }
     return *result;
   };
 
@@ -1158,21 +1181,27 @@ void test_keyboard_observation_ownership_and_authority_generation() {
   expect(first_generation != 0, "initial authority has a nonzero generation");
   expect(session.start_background_keyboard_observation(1),
          "idle lane admits keyboard observation");
-  const auto first = collect(1);
+  const auto first = collect(1, true);
   expect(first.group == 0 && first.session_generation == first_generation,
          "real Xvfb observation retains its exact authority and group");
   expect(first.focus_window == observed_window && first.locked_mods == 0,
          "keyboard observation captures the focused window and initial locks");
-  expect(discovery_calls == 1, "keyboard job never invokes session discovery");
-  const auto extension_cookie = xcb_xkb_use_extension(fixture_connection.get(), 1, 0);
+  expect(discovery_calls == 2,
+         "keyboard job and one concurrent discovery use separate lanes");
+  const auto extension_cookie =
+      xcb_xkb_use_extension(fixture_connection.get(), 1, 0);
   auto *extension_reply = static_cast<xcb_xkb_use_extension_reply_t *>(
       fixture_connection.wait_for_reply(extension_cookie.sequence,
-          std::chrono::steady_clock::now() + 1s, fixture_result));
-  const bool extension_ready = extension_reply != nullptr && extension_reply->supported;
+                                        std::chrono::steady_clock::now() + 1s,
+                                        fixture_result));
+  const bool extension_ready =
+      extension_reply != nullptr && extension_reply->supported;
   std::free(extension_reply);
   expect(extension_ready, "fixture connection enables XKB");
-  expect(check(xcb_xkb_latch_lock_state_checked(fixture_connection.get(), XCB_XKB_ID_USE_CORE_KBD,
-      XCB_MOD_MASK_LOCK, XCB_MOD_MASK_LOCK, 0, 0, 0, 0, 0)), "lock CapsLock in fixture");
+  expect(check(xcb_xkb_latch_lock_state_checked(
+             fixture_connection.get(), XCB_XKB_ID_USE_CORE_KBD,
+             XCB_MOD_MASK_LOCK, XCB_MOD_MASK_LOCK, 0, 0, 0, 0, 0)),
+         "lock CapsLock in fixture");
   expect(session.start_background_keyboard_observation(2),
          "consuming the result frees the single-flight lane");
   const auto second = collect(2);
@@ -1181,7 +1210,8 @@ void test_keyboard_observation_ownership_and_authority_generation() {
          "next observation captures changed locks without a session refresh");
 
   candidate.observed_keyboard_layout = 1;
-  expect(session.refresh() == punto::X11Session::RefreshResult::HealthyUnchanged,
+  expect(session.refresh() ==
+             punto::X11Session::RefreshResult::HealthyUnchanged,
          "layout-only discovery does not change session identity");
   expect(generation() == first_generation &&
              session.info().observed_keyboard_layout == 1,
@@ -1196,11 +1226,13 @@ void test_keyboard_observation_ownership_and_authority_generation() {
   expect(session.start_background_keyboard_observation(3),
          "observation starts before session revocation");
   session.reset();
-  expect(!session.is_valid(), "reset revokes authority before completion drain");
+  expect(!session.is_valid(),
+         "reset revokes authority before completion drain");
   const auto stale = collect(3);
   expect(stale.group == -1 && stale.session_generation == changed_generation,
          "late completion reports failure under its original authority");
-  expect(!session.is_valid(), "draining stale observation cannot restore writes");
+  expect(!session.is_valid(),
+         "draining stale observation cannot restore writes");
   expect(session.refresh() == punto::X11Session::RefreshResult::HealthyUpdated,
          "healthy discovery restores authority after reset");
   expect(generation() != changed_generation,
@@ -1219,7 +1251,7 @@ int main() {
     test_display_and_wayland_grammar();
     test_retry_schedule_is_exact_and_bounded();
     test_retry_wait_seam_is_deterministic();
-    test_prepare_commit_and_failure_revoke_write();
+    test_prepare_commit_and_terminal_failure_revoke_write();
     test_session_absence_is_distinct_from_failure();
     test_stale_generation_cannot_commit();
     test_shutdown_is_bounded_for_uncooperative_probe();

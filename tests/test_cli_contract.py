@@ -17,12 +17,18 @@ STATS = (
     "OK x11_health=ready analysis_health=ready input_health=ready "
     "x11_last_progress_ms=0 analysis_last_progress_ms=0 "
     "input_last_progress_ms=0 analysis_outstanding=0 input_in_flight=0 "
-    "log_dropped=0 text_mutation=disabled enabled=0 configured_enabled=1 "
+    "log_dropped=0 text_mutation=x11 enabled=0 configured_enabled=1 "
     "config_pending=0 config_generation=1 config_result=ok analyzed=0 "
-    "need_switch=0 corrections=0 pending_words=0 "
+    "need_switch=0 corrections=0 word_dispatches=0 pending_words=0 "
     "ready_results=0 worker_threads=1 daemon_peers=1 analysis_mode=auto "
     "control_plane=primary queued_tasks=0 avg_queue_us=0 avg_analysis_us=0 "
-    "avg_macro_us=0 avg_tail_len=0"
+    "avg_macro_us=0 avg_macro_payload_bytes=0 learning_ready=1 "
+    "learning_pending=0 learning_failed=0 exclusions=0 learning_generation=2 "
+    "learning_completed_generation=2 learning_failed_generation=0 "
+    "daemon_epoch=1"
+)
+PREVIOUS_RELEASE_STATS = (
+    STATS.split(" avg_macro_payload_bytes=", 1)[0] + " avg_tail_len=0"
 )
 
 
@@ -141,7 +147,7 @@ class CliHarness:
             self.bin / "nc",
             f"""
             #!/usr/bin/env bash
-            /bin/cat >/dev/null
+            request=$(/bin/cat)
             if [[ ${{TEST_NC_MODE:-normal}} == hang ]]; then
                 printf '%s\n' "$$" >"${{TEST_OBSERVER:?}}"
                 trap '' TERM
@@ -159,7 +165,19 @@ class CliHarness:
                 /bin/sleep 0.2
                 exit 1
             fi
-            printf '%s\n' {STATS!r}
+            if [[ $request == CLEAR_EXCLUSIONS ]]; then
+                if [[ -n ${{TEST_CLEAR_RESPONSE+x}} ]]; then
+                    printf '%s\n' "$TEST_CLEAR_RESPONSE"
+                else
+                    printf 'OK EXCLUSIONS SCHEDULED 1 2\n'
+                fi
+            else
+                if [[ -n ${{TEST_STATS_OVERRIDE+x}} ]]; then
+                    printf '%s\n' "$TEST_STATS_OVERRIDE"
+                else
+                    printf '%s\n' {STATS!r}
+                fi
+            fi
             """,
         )
         write_executable(self.bin / "tray", "#!/bin/sh\nexit 0\n")
@@ -240,6 +258,53 @@ class CliContract(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 1)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ERROR service-timeout", result.stdout)
+
+    def test_reset_learning_uses_exact_bounded_ipc_contract(self) -> None:
+        result = self.harness.run("reset-learning")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "OK EXCLUSIONS CLEARED\n")
+
+    def test_status_accepts_previous_daemon_during_package_upgrade(self) -> None:
+        result = self.harness.run("status", TEST_STATS_OVERRIDE=PREVIOUS_RELEASE_STATS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, PREVIOUS_RELEASE_STATS + "\n")
+
+    def test_reset_learning_accepts_durable_target_despite_stale_failure(self) -> None:
+        stats = STATS.replace("exclusions=0", "exclusions=5").replace(
+            "learning_failed_generation=0", "learning_failed_generation=1"
+        )
+        result = self.harness.run("reset-learning", TEST_STATS_OVERRIDE=stats)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "OK EXCLUSIONS CLEARED\n")
+
+    def test_reset_learning_reports_target_generation_failure(self) -> None:
+        stats = STATS.replace(
+            "learning_completed_generation=2", "learning_completed_generation=1"
+        ).replace("learning_failed_generation=0", "learning_failed_generation=2")
+        result = self.harness.run("reset-learning", TEST_STATS_OVERRIDE=stats)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "ERROR learning-error\n")
+
+    def test_reset_learning_rejects_primary_failover_receipt(self) -> None:
+        stats = STATS.replace("daemon_epoch=1", "daemon_epoch=2")
+        result = self.harness.run("reset-learning", TEST_STATS_OVERRIDE=stats)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "ERROR learning-error\n")
+
+    def test_reset_learning_rejects_invalid_scheduled_generation(self) -> None:
+        for response in (
+            "OK EXCLUSIONS SCHEDULED 0 2",
+            "OK EXCLUSIONS SCHEDULED 1 0",
+            "OK EXCLUSIONS SCHEDULED invalid 2",
+            "OK EXCLUSIONS SCHEDULED 1 invalid",
+            "OK EXCLUSIONS SCHEDULED 1 2 trailing",
+        ):
+            with self.subTest(response=response):
+                result = self.harness.run(
+                    "reset-learning", TEST_CLEAR_RESPONSE=response
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "ERROR protocol-error\n")
 
     def test_service_unit_override_is_strictly_bounded(self) -> None:
         for hostile in ("--user", "ssh.service", "udevmon@attacker.service"):

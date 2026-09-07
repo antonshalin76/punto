@@ -305,6 +305,9 @@ private:
     std::atomic<std::uint64_t> need_switch_words{0};
     std::atomic<std::uint64_t> analysis_us_sum{0};
     std::atomic<std::uint64_t> queue_us_sum{0};
+    std::atomic<std::uint64_t> macro_count{0};
+    std::atomic<std::uint64_t> macro_us_sum{0};
+    std::atomic<std::uint64_t> tail_len_sum{0};
     std::atomic<std::size_t> ready_results{0};
   } lifetime_telemetry_;
 
@@ -377,6 +380,7 @@ private:
   std::uint64_t applied_status_generation_ = 0;
   std::optional<std::uint64_t> promotion_fallback_applied_generation_;
   std::chrono::steady_clock::time_point last_control_plane_poll_{};
+  const std::uint64_t daemon_epoch_;
 
   /// Schedules a generation-fenced background configuration load.
   IpcResult reload_config(

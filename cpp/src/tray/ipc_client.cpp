@@ -398,8 +398,14 @@ IpcClientResult IpcClient::exchange_for_test(const std::string &command,
   return send_command_to_socket(command, socket_path);
 }
 
-bool IpcClient::set_auto_enabled_for_test(bool enabled, const std::string &socket_path) {
+bool IpcClient::set_auto_enabled_for_test(bool enabled,
+                                          const std::string &socket_path) {
   return set_auto_enabled_to_socket(enabled, socket_path);
+}
+
+bool IpcClient::reload_config_for_test(const std::string &config_path,
+                                       const std::string &socket_path) {
+  return reload_config_to_socket(config_path, socket_path);
 }
 #endif
 
@@ -407,14 +413,15 @@ ServiceStatus IpcClient::get_status() {
   return diagnose_socket(kSocketPath).status;
 }
 
-IpcClientResult IpcClient::diagnose_runtime_socket(const std::string &socket_path) {
+IpcClientResult
+IpcClient::diagnose_runtime_socket(const std::string &socket_path) {
   auto result = send_command_to_socket("STATS", socket_path);
   if (!result.ok()) {
     return result;
   }
   std::vector<std::string_view> fields;
   std::string_view remaining{result.response};
-  while (!remaining.empty() && fields.size() <= 31) {
+  while (!remaining.empty() && fields.size() <= 38) {
     const auto space = remaining.find(' ');
     fields.push_back(remaining.substr(0, space));
     if (space == std::string_view::npos) {
@@ -430,22 +437,62 @@ IpcClientResult IpcClient::diagnose_runtime_socket(const std::string &socket_pat
     return failure(IpcClientError::ProtocolError);
   }
   const bool x11 = fields[10] == "text_mutation=x11";
+  const bool legacy =
+      fields.size() == (x11 ? 31U : 30U) &&
+      fields.back().starts_with("avg_tail_len=");
+  const bool current =
+      fields.size() == (x11 ? 39U : 38U) &&
+      fields.back().starts_with("daemon_epoch=");
   if ((!x11 && fields[10] != "text_mutation=disabled") ||
-      fields.size() != (x11 ? 31U : 30U)) {
+      (!legacy && !current)) {
     return failure(IpcClientError::ProtocolError);
   }
-  static constexpr std::array<std::string_view, 29> names{
-      "x11_health", "analysis_health", "input_health", "x11_last_progress_ms",
-      "analysis_last_progress_ms", "input_last_progress_ms", "analysis_outstanding",
-      "input_in_flight", "log_dropped", "text_mutation", "enabled",
-      "configured_enabled", "config_pending", "config_generation", "config_result",
-      "analyzed", "need_switch", "corrections", "pending_words", "ready_results",
-      "worker_threads", "daemon_peers", "analysis_mode", "control_plane",
-      "queued_tasks", "avg_queue_us", "avg_analysis_us", "avg_macro_us", "avg_tail_len"};
+  static constexpr std::array<std::string_view, 37> names{
+      "x11_health",
+      "analysis_health",
+      "input_health",
+      "x11_last_progress_ms",
+      "analysis_last_progress_ms",
+      "input_last_progress_ms",
+      "analysis_outstanding",
+      "input_in_flight",
+      "log_dropped",
+      "text_mutation",
+      "enabled",
+      "configured_enabled",
+      "config_pending",
+      "config_generation",
+      "config_result",
+      "analyzed",
+      "need_switch",
+      "corrections",
+      "pending_words",
+      "ready_results",
+      "worker_threads",
+      "daemon_peers",
+      "analysis_mode",
+      "control_plane",
+      "queued_tasks",
+      "avg_queue_us",
+      "avg_analysis_us",
+      "avg_macro_us",
+      "avg_macro_payload_bytes",
+      "learning_ready",
+      "learning_pending",
+      "learning_failed",
+      "exclusions",
+      "learning_generation",
+      "learning_completed_generation",
+      "learning_failed_generation",
+      "daemon_epoch"};
+  bool operational = true;
   for (std::size_t i = 0; i + 1 < fields.size(); ++i) {
+    const std::size_t name_index = i - (x11 && i > 18 ? 1U : 0U);
     const auto name = x11 && i == 18
                           ? std::string_view{"word_dispatches"}
-                          : names[i - (x11 && i > 18 ? 1U : 0U)];
+                      : legacy && name_index == 28
+                          ? std::string_view{"avg_tail_len"}
+                          : names[name_index];
     auto field = fields[i + 1];
     if (!field.starts_with(name) || field.size() <= name.size() + 1 ||
         field[name.size()] != '=') {
@@ -455,32 +502,42 @@ IpcClientResult IpcClient::diagnose_runtime_socket(const std::string &socket_pat
     bool valid = false;
     if (name.ends_with("_health")) {
       valid = field == "ready" || field == "degraded" || field == "failed";
+      operational = operational && field == "ready";
     } else if (name == "text_mutation") {
       valid = true; // Exact capability was checked before choosing the schema.
     } else if (name == "enabled") {
       valid = field == "0" || (x11 && field == "1");
-      result.status = field == "1" ? ServiceStatus::Enabled : ServiceStatus::Disabled;
+      result.status =
+          field == "1" ? ServiceStatus::Enabled : ServiceStatus::Disabled;
     } else if (name == "input_in_flight" || name == "configured_enabled" ||
-               name == "config_pending") {
+               name == "config_pending" || name == "learning_ready" ||
+               name == "learning_pending" || name == "learning_failed") {
       valid = field == "0" || field == "1";
+      if (name == "config_pending") {
+        result.config_pending = field == "1";
+      }
     } else if (name == "config_result") {
       valid = field == "none" || field == "ok" || field == "error";
+      result.config_failed = field == "error";
     } else if (name == "analysis_mode") {
       valid = field == "auto" || field == "fixed";
     } else if (name == "control_plane") {
       valid = field == "primary" || field == "secondary";
     } else {
       std::uint64_t value = 0;
-      const auto parsed = std::from_chars(field.data(), field.data() + field.size(), value);
+      const auto parsed =
+          std::from_chars(field.data(), field.data() + field.size(), value);
       valid = (field == "0" || field.front() != '0') &&
-              parsed.ec == std::errc{} && parsed.ptr == field.data() + field.size();
+              parsed.ec == std::errc{} &&
+              parsed.ptr == field.data() + field.size();
     }
     if (!valid) {
       return failure(IpcClientError::ProtocolError);
     }
   }
-  result.capability = x11 ? MutationCapability::X11
-                                   : MutationCapability::Disabled;
+  result.capability =
+      x11 ? MutationCapability::X11 : MutationCapability::Disabled;
+  result.runtime_ready = operational;
   return result;
 }
 
@@ -492,20 +549,28 @@ bool IpcClient::set_auto_enabled(bool enabled) {
   return set_auto_enabled_to_socket(enabled, kSocketPath);
 }
 
-bool IpcClient::set_auto_enabled_to_socket(bool enabled, const std::string &socket_path) {
+bool IpcClient::set_auto_enabled_to_socket(bool enabled,
+                                           const std::string &socket_path) {
   const auto result = send_command_to_socket(
       enabled ? "SET_STATUS 1" : "SET_STATUS 0", socket_path);
-  return result.ok() && result.response == (enabled ? "OK ENABLED" : "OK DISABLED");
+  return result.ok() &&
+         result.response == (enabled ? "OK ENABLED" : "OK DISABLED");
 }
 
 bool IpcClient::reload_config(const std::string &config_path) {
+  return reload_config_to_socket(config_path, kSocketPath);
+}
+
+bool IpcClient::reload_config_to_socket(const std::string &config_path,
+                                        const std::string &socket_path) {
   std::string cmd = "RELOAD";
   if (!config_path.empty()) {
     cmd += " ";
     cmd += config_path;
   }
 
-  return send_command(cmd).ok();
+  const auto result = send_command_to_socket(cmd, socket_path);
+  return result.ok() && result.response == "OK Scheduled";
 }
 
 bool IpcClient::is_service_available() {

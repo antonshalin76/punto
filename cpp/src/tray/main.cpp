@@ -55,5 +55,9 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  return app.run();
+  const int result = app.run();
+  if (!app.shutdown_background(std::chrono::milliseconds{2800})) {
+    std::_Exit(3);
+  }
+  return result;
 }

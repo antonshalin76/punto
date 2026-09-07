@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <cerrno>
 #include <condition_variable>
 #include <deque>
@@ -24,6 +25,176 @@
 namespace punto {
 using Publication = ControlPlanePublicationResult;
 namespace {
+
+constexpr std::string_view kResetMarkerPrefix = "PUNTO_RESET_V1 ";
+
+std::uint64_t monotonic_timestamp() noexcept {
+  const auto elapsed = std::chrono::steady_clock::now().time_since_epoch();
+  const auto nanoseconds =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+  return nanoseconds > 0 ? static_cast<std::uint64_t>(nanoseconds) : 1U;
+}
+
+bool valid_boot_id(std::string_view value) noexcept {
+  if (value.size() != 36U) {
+    return false;
+  }
+  for (std::size_t index = 0; index < value.size(); ++index) {
+    const char character = value[index];
+    if (index == 8U || index == 13U || index == 18U || index == 23U) {
+      if (character != '-') {
+        return false;
+      }
+    } else if (!((character >= '0' && character <= '9') ||
+                 (character >= 'a' && character <= 'f'))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string read_boot_id() {
+  int fd = -1;
+  do {
+    fd = ::open("/proc/sys/kernel/random/boot_id",
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  } while (fd < 0 && errno == EINTR);
+  if (fd < 0) {
+    return {};
+  }
+  const auto payload = detail::read_bounded(fd, 37U);
+  const bool closed = ::close(fd) == 0;
+  if (!payload || !closed) {
+    return {};
+  }
+  std::string boot_id = *payload;
+  if (!boot_id.empty() && boot_id.back() == '\n') {
+    boot_id.pop_back();
+  }
+  return valid_boot_id(boot_id) ? boot_id : std::string{};
+}
+
+struct ResetMarker {
+  std::string boot_id;
+  std::uint64_t timestamp = 0;
+};
+
+std::optional<ResetMarker>
+read_reset_marker_at(int directory_fd, std::string_view name,
+                     const RuntimeFileSecurity &security) {
+  const std::string marker_name = "." + std::string{name} + ".reset";
+  int fd = -1;
+  do {
+    fd = ::openat(directory_fd, marker_name.c_str(),
+                  O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  } while (fd < 0 && errno == EINTR);
+  if (fd < 0) {
+    return errno == ENOENT ? std::optional<ResetMarker>{ResetMarker{}}
+                           : std::nullopt;
+  }
+  struct stat metadata {};
+  if (::fstat(fd, &metadata) != 0 || metadata.st_size < 0 ||
+      metadata.st_size > 128 || !verify_runtime_file_security(fd, security)) {
+    (void)::close(fd);
+    return std::nullopt;
+  }
+  if (metadata.st_size == 0) {
+    (void)::close(fd);
+    return std::nullopt;
+  }
+  std::string payload(static_cast<std::size_t>(metadata.st_size), '\0');
+  std::size_t offset = 0;
+  while (offset < payload.size()) {
+    const ssize_t count = ::pread(fd, payload.data() + offset,
+                                  payload.size() - offset,
+                                  static_cast<off_t>(offset));
+    if (count > 0) {
+      offset += static_cast<std::size_t>(count);
+      continue;
+    }
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    (void)::close(fd);
+    return std::nullopt;
+  }
+  const bool closed = ::close(fd) == 0;
+  if (!closed) {
+    return std::nullopt;
+  }
+  if (!payload.starts_with(kResetMarkerPrefix) || payload.back() != '\n') {
+    return std::nullopt;
+  }
+  payload.pop_back();
+  std::string_view fields{payload};
+  fields.remove_prefix(kResetMarkerPrefix.size());
+  const auto separator = fields.find(' ');
+  if (separator == std::string_view::npos) {
+    return std::nullopt;
+  }
+  ResetMarker marker;
+  marker.boot_id = std::string{fields.substr(0, separator)};
+  if (!valid_boot_id(marker.boot_id)) {
+    return std::nullopt;
+  }
+  fields.remove_prefix(separator + 1U);
+  if (fields.empty()) {
+    return std::nullopt;
+  }
+  const auto parsed = std::from_chars(fields.data(),
+                                      fields.data() + fields.size(),
+                                      marker.timestamp);
+  if (marker.timestamp == 0 || parsed.ec != std::errc{} ||
+      parsed.ptr != fields.data() + fields.size() || fields.front() == '0') {
+    return std::nullopt;
+  }
+  return marker;
+}
+
+bool publish_reset_marker_at(int directory_fd, std::string_view name,
+                             const RuntimeFileSecurity &security,
+                             std::string_view boot_id,
+                             std::uint64_t timestamp) {
+  if (!valid_boot_id(boot_id) || timestamp == 0) {
+    return false;
+  }
+  const std::string payload = std::string{kResetMarkerPrefix} +
+                              std::string{boot_id} + " " +
+                              std::to_string(timestamp) + "\n";
+  const std::string marker_name = "." + std::string{name} + ".reset";
+  static std::atomic<std::uint64_t> sequence{0};
+  int temp_fd = -1;
+  std::string temp_name;
+  for (unsigned int attempt = 0; attempt < 64U && temp_fd < 0; ++attempt) {
+    temp_name = marker_name + ".tmp." + std::to_string(::getpid()) + "." +
+                std::to_string(sequence.fetch_add(1,
+                                                  std::memory_order_relaxed));
+    do {
+      temp_fd = ::openat(directory_fd, temp_name.c_str(),
+                         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                         0600);
+    } while (temp_fd < 0 && errno == EINTR);
+    if (temp_fd < 0 && errno != EEXIST) {
+      break;
+    }
+  }
+  if (temp_fd < 0) {
+    return false;
+  }
+  bool ok = apply_runtime_file_security(temp_fd, security) &&
+            detail::write_all(temp_fd, payload) && ::fsync(temp_fd) == 0;
+  if (::close(temp_fd) != 0) {
+    ok = false;
+  }
+  if (ok) {
+    ok = ::renameat(directory_fd, temp_name.c_str(), directory_fd,
+                    marker_name.c_str()) == 0;
+  }
+  if (!ok) {
+    (void)::unlinkat(directory_fd, temp_name.c_str(), 0);
+  }
+  return ok;
+}
 
 RuntimeFileSecurity exclusion_security() noexcept {
   return RuntimeFileSecurity{::geteuid(), ::getegid(), 0600};
@@ -80,7 +251,8 @@ read_exclusions_at(int directory_fd, std::string_view name,
     (void)::close(fd);
     return std::nullopt;
   }
-  const auto payload = detail::read_bounded(fd, UndoDetector::maximum_file_bytes());
+  const auto payload =
+      detail::read_bounded(fd, UndoDetector::maximum_file_bytes());
   const bool closed = ::close(fd) == 0;
   if (!payload || !closed) {
     return std::nullopt;
@@ -118,10 +290,17 @@ int acquire_persistence_lock(int directory_fd, std::string_view name,
 } // namespace
 
 struct UndoDetector::Store {
+  explicit Store(std::string path)
+      : file_path_{std::move(path)}, boot_id_{read_boot_id()} {}
   std::string file_path_;
+  std::string boot_id_;
   std::unordered_set<std::string> exclusions_;
+  bool reset_in_current_boot_ = false;
+  std::uint64_t reset_timestamp_ = 0;
+  bool last_add_skipped_ = false;
   bool refresh_from_file();
-  Publication persist(PersistenceMutation mutation, std::string_view word);
+  Publication persist(PersistenceMutation mutation, std::string_view word,
+                      std::uint64_t accepted_at);
   int sync_directory(int fd) {
 #ifdef PUNTO_TESTING
     if (directory_sync)
@@ -138,12 +317,16 @@ struct UndoDetector::SharedState {
   struct Request {
     PersistenceMutation mutation = PersistenceMutation::Refresh;
     std::string word;
+    std::uint64_t generation = 0;
+    std::uint64_t accepted_at = 0;
   };
-  explicit SharedState(std::string path) : path{std::move(path)} {}
+  explicit SharedState(std::string path) : path{std::move(path)} {
+    requests.push_back({PersistenceMutation::Refresh, {}, ++generation});
+  }
   std::string path;
   std::mutex mutex;
   std::condition_variable condition;
-  std::deque<Request> requests{{PersistenceMutation::Refresh, {}}};
+  std::deque<Request> requests;
   std::unordered_set<std::string> exclusions;
   bool initialized = false;
   bool storage_ready = false;
@@ -152,6 +335,9 @@ struct UndoDetector::SharedState {
   bool retry = true;
   bool stopping = false;
   bool exited = false;
+  std::uint64_t generation = 0;
+  std::uint64_t completed_generation = 0;
+  std::uint64_t failed_generation = 0;
 #ifdef PUNTO_TESTING
   std::function<void()> before_io;
   std::function<int(int)> directory_sync;
@@ -179,28 +365,33 @@ void UndoDetector::start() {
 }
 
 UndoDetector::~UndoDetector() {
-  if (!thread_.joinable())
+  if (shutdown())
     return;
-  bool exited = false;
+  thread_.detach();
+  std::cerr << "[punto] Undo storage shutdown timed out; persistence may be "
+               "pending\n";
+}
+
+bool UndoDetector::shutdown(std::chrono::milliseconds timeout) {
+  if (!thread_.joinable())
+    return true;
+  bool exited;
   {
     std::unique_lock lock{state_->mutex};
     state_->stopping = true;
     state_->condition.notify_all();
-    exited = state_->condition.wait_for(lock, std::chrono::milliseconds{2500},
+    exited = state_->condition.wait_for(lock, timeout,
                                         [&] { return state_->exited; });
   }
-  if (exited)
-    thread_.join();
-  else {
-    thread_.detach();
-    std::cerr << "[punto] Undo storage shutdown timed out; persistence may be "
-                 "pending\n";
-  }
+  if (!exited)
+    return false;
+  thread_.join();
+  return true;
 }
 
 void UndoDetector::worker(const std::shared_ptr<SharedState> &state) noexcept {
   try {
-    Store store{state->path, {}};
+    Store store{state->path};
 #ifdef PUNTO_TESTING
     store.directory_sync = state->directory_sync;
 #endif
@@ -225,13 +416,21 @@ void UndoDetector::worker(const std::shared_ptr<SharedState> &state) noexcept {
           request.mutation == PersistenceMutation::Refresh
               ? (store.refresh_from_file() ? Publication::Durable
                                            : Publication::NotPublished)
-              : store.persist(request.mutation, request.word);
+              : store.persist(request.mutation, request.word,
+                              request.accepted_at);
       const bool ok = publication == Publication::Durable;
       {
         std::lock_guard lock{state->mutex};
         state->initialized = true;
         state->working = false;
         state->failed = !ok;
+        if (ok) {
+          state->completed_generation =
+              std::max(state->completed_generation, request.generation);
+        } else {
+          state->failed_generation =
+              std::max(state->failed_generation, request.generation);
+        }
         if (publication != Publication::NotPublished) {
           state->storage_ready = true;
           state->exclusions.clear();
@@ -242,14 +441,18 @@ void UndoDetector::worker(const std::shared_ptr<SharedState> &state) noexcept {
               cleared = true;
               break;
             }
-            if (pending->mutation == PersistenceMutation::Add)
+            if (pending->mutation == PersistenceMutation::Add &&
+                (!store.reset_in_current_boot_ ||
+                 pending->accepted_at > store.reset_timestamp_))
               state->exclusions.insert(pending->word);
           }
           if (!cleared) {
-            if (request.mutation == PersistenceMutation::Add ||
+            if ((request.mutation == PersistenceMutation::Add &&
+                !store.last_add_skipped_) ||
                 (request.mutation == PersistenceMutation::SyncDirectory &&
-                 !request.word.empty()))
+                 !request.word.empty() && !store.last_add_skipped_)) {
               state->exclusions.insert(request.word);
+            }
             for (const auto &word : store.exclusions_) {
               if (state->exclusions.size() >= maximum_entries())
                 break;
@@ -280,6 +483,11 @@ void UndoDetector::worker(const std::shared_ptr<SharedState> &state) noexcept {
     state->initialized = true;
     state->working = false;
     state->failed = true;
+    // A fatal worker failure makes every generation accepted so far
+    // unfulfillable by this instance. Publish that terminal boundary so IPC
+    // clients do not wait until their own timeout.
+    state->failed_generation =
+        std::max(state->failed_generation, state->generation);
   }
   {
     std::lock_guard lock{state->mutex};
@@ -358,12 +566,42 @@ bool UndoDetector::persistence_failed() const noexcept {
   return state_->failed;
 }
 
+std::uint64_t UndoDetector::generation() const noexcept {
+  std::lock_guard lock{state_->mutex};
+  return state_->generation;
+}
+
+std::uint64_t UndoDetector::completed_generation() const noexcept {
+  std::lock_guard lock{state_->mutex};
+  return state_->completed_generation;
+}
+
+std::uint64_t UndoDetector::failed_generation() const noexcept {
+  std::lock_guard lock{state_->mutex};
+  return state_->failed_generation;
+}
+
+UndoDetector::PersistenceSnapshot
+UndoDetector::persistence_snapshot() const noexcept {
+  std::lock_guard lock{state_->mutex};
+  return PersistenceSnapshot{
+      state_->initialized,
+      state_->working || !state_->requests.empty(),
+      state_->failed,
+      state_->exclusions.size(),
+      state_->generation,
+      state_->completed_generation,
+      state_->failed_generation,
+  };
+}
+
 bool UndoDetector::valid_word(const std::string &word) noexcept {
-  return !word.empty() && word.front() != '#' && word.size() <= maximum_word_bytes() &&
+  return !word.empty() && word.front() != '#' &&
+         word.size() <= maximum_word_bytes() &&
          std::all_of(word.begin(), word.end(), [](char character) {
            return character != '\0' &&
-                  std::find(kScancodeToChar.begin(), kScancodeToChar.end(), character) !=
-                      kScancodeToChar.end();
+                  std::find(kScancodeToChar.begin(), kScancodeToChar.end(),
+                            character) != kScancodeToChar.end();
          });
 }
 
@@ -377,12 +615,22 @@ bool UndoDetector::Store::refresh_from_file() {
   if (directory_fd < 0) {
     return false;
   }
+  const int lock_fd =
+      acquire_persistence_lock(directory_fd, path->name, security);
+  if (lock_fd < 0) {
+    (void)::close(directory_fd);
+    return false;
+  }
   auto parsed = read_exclusions_at(directory_fd, path->name, security);
+  const auto marker = read_reset_marker_at(directory_fd, path->name, security);
+  (void)::close(lock_fd);
   (void)::close(directory_fd);
-  if (!parsed) {
+  if (!parsed || !marker) {
     return false;
   }
   exclusions_ = std::move(*parsed);
+  reset_in_current_boot_ = marker->boot_id == boot_id_;
+  reset_timestamp_ = reset_in_current_boot_ ? marker->timestamp : 0;
   return true;
 }
 
@@ -394,14 +642,17 @@ void UndoDetector::load_from_file() {
                    [](const auto &request) {
                      return request.mutation == PersistenceMutation::Refresh;
                    })) {
-    state_->requests.push_back({PersistenceMutation::Refresh, {}});
+    state_->requests.push_back(
+        {PersistenceMutation::Refresh, {}, ++state_->generation});
   }
   state_->retry = true;
   state_->condition.notify_all();
 }
 
 Publication UndoDetector::Store::persist(PersistenceMutation mutation,
-                                         std::string_view word) {
+                                         std::string_view word,
+                                         std::uint64_t accepted_at) {
+  last_add_skipped_ = false;
   const auto path = detail::split_runtime_path(file_path_);
   if (!path) {
     return Publication::NotPublished;
@@ -411,11 +662,6 @@ Publication UndoDetector::Store::persist(PersistenceMutation mutation,
   if (directory_fd < 0) {
     return Publication::NotPublished;
   }
-  if (mutation == PersistenceMutation::SyncDirectory) {
-    const bool synced = sync_directory(directory_fd) == 0;
-    (void)::close(directory_fd);
-    return synced ? Publication::Durable : Publication::NotPublished;
-  }
   const int lock_fd =
       acquire_persistence_lock(directory_fd, path->name, security);
   if (lock_fd < 0) {
@@ -424,10 +670,39 @@ Publication UndoDetector::Store::persist(PersistenceMutation mutation,
   }
 
   const auto existing = read_exclusions_at(directory_fd, path->name, security);
-  if (!existing) {
+  auto marker = read_reset_marker_at(directory_fd, path->name, security);
+  if (!existing || (!marker && mutation != PersistenceMutation::Clear) ||
+      (mutation == PersistenceMutation::Clear && boot_id_.empty())) {
     (void)::close(lock_fd);
     (void)::close(directory_fd);
     return Publication::NotPublished;
+  }
+  if (!marker) {
+    marker = ResetMarker{};
+  }
+  reset_in_current_boot_ = marker->boot_id == boot_id_;
+  reset_timestamp_ = reset_in_current_boot_ ? marker->timestamp : 0;
+
+  if (mutation == PersistenceMutation::SyncDirectory) {
+    if (!word.empty() && reset_in_current_boot_ && accepted_at != 0 &&
+        accepted_at <= reset_timestamp_) {
+      last_add_skipped_ = true;
+      exclusions_ = *existing;
+    }
+    const bool synced = sync_directory(directory_fd) == 0;
+    (void)::close(lock_fd);
+    (void)::close(directory_fd);
+    return synced ? Publication::Durable : Publication::NotPublished;
+  }
+
+  if (mutation == PersistenceMutation::Add &&
+      marker->boot_id == boot_id_ && accepted_at != 0 &&
+      accepted_at <= marker->timestamp) {
+    last_add_skipped_ = true;
+    exclusions_ = *existing;
+    (void)::close(lock_fd);
+    (void)::close(directory_fd);
+    return Publication::Durable;
   }
 
   std::unordered_set<std::string> next;
@@ -490,6 +765,17 @@ Publication UndoDetector::Store::persist(PersistenceMutation mutation,
     ok = ::renameat(directory_fd, temp_name.c_str(), directory_fd,
                     path->name.c_str()) == 0;
   }
+  if (ok && mutation == PersistenceMutation::Clear) {
+    const std::uint64_t effective_reset =
+        reset_in_current_boot_ ? std::max(accepted_at, reset_timestamp_)
+                               : accepted_at;
+    ok = publish_reset_marker_at(directory_fd, path->name, security, boot_id_,
+                                 effective_reset);
+    if (ok) {
+      reset_in_current_boot_ = true;
+      reset_timestamp_ = effective_reset;
+    }
+  }
   Publication publication = Publication::NotPublished;
   if (!ok) {
     (void)::unlinkat(directory_fd, temp_name.c_str(), 0);
@@ -504,15 +790,18 @@ Publication UndoDetector::Store::persist(PersistenceMutation mutation,
   return publication;
 }
 
-void UndoDetector::clear_exclusions() {
+std::uint64_t UndoDetector::clear_exclusions() {
   std::lock_guard lock{state_->mutex};
   if (state_->stopping || state_->exited)
-    return;
+    return 0;
   state_->requests.clear();
-  state_->requests.push_back({PersistenceMutation::Clear, {}});
+  const std::uint64_t generation = ++state_->generation;
+  state_->requests.push_back(
+      {PersistenceMutation::Clear, {}, generation, monotonic_timestamp()});
   state_->exclusions.clear();
   state_->retry = true;
   state_->condition.notify_all();
+  return generation;
 }
 
 void UndoDetector::add_exclusion(const std::string &word) {
@@ -526,7 +815,9 @@ void UndoDetector::add_exclusion(const std::string &word) {
     return;
   if (!state_->exclusions.contains(word) &&
       state_->exclusions.size() < maximum_entries()) {
-    state_->requests.push_back({PersistenceMutation::Add, word});
+    state_->requests.push_back(
+        {PersistenceMutation::Add, word, ++state_->generation,
+         monotonic_timestamp()});
     state_->exclusions.insert(word);
   }
   state_->retry = true;

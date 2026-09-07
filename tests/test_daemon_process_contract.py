@@ -1136,6 +1136,21 @@ def test_command_line_contract(daemon: str) -> None:
             version.stderr.encode(),
         )
 
+    help_result = subprocess.run(
+        [daemon, "--help"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=2.0,
+        check=False,
+    )
+    if help_result.returncode != 0:
+        fail("--help is not a successful side-effect-free query")
+    if ("Рабочий режим" not in help_result.stdout or
+            "Pause — смена раскладки" not in help_result.stdout or
+            "поглощаются без изменения текста" in help_result.stdout):
+        fail("--help does not describe the production mutation contract")
+
     invalid = subprocess.run(
         [daemon, "--definitely-invalid"],
         text=True,

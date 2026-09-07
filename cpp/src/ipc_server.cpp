@@ -957,6 +957,10 @@ void IpcFramePolicy::parse_request() {
     request_ = IpcRequest{IpcVerb::Stats, {}};
     return;
   }
+  if (payload_ == "CLEAR_EXCLUSIONS") {
+    request_ = IpcRequest{IpcVerb::ClearExclusions, {}};
+    return;
+  }
   if (payload_ == "SHUTDOWN") {
     request_ = IpcRequest{IpcVerb::Shutdown, {}};
   }

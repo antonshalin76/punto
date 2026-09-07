@@ -25,6 +25,16 @@ inline constexpr const char *kDefaultExclusionsPath =
 
 class UndoDetector {
 public:
+  struct PersistenceSnapshot {
+    bool ready = false;
+    bool pending = false;
+    bool failed = false;
+    std::size_t exclusions = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t completed_generation = 0;
+    std::uint64_t failed_generation = 0;
+  };
+
   explicit UndoDetector(std::string path = kDefaultExclusionsPath);
   ~UndoDetector();
   UndoDetector(const UndoDetector &) = delete;
@@ -48,8 +58,18 @@ public:
   // confirms that accepted changes have reached durable storage.
   [[nodiscard]] bool pending() const noexcept;
   [[nodiscard]] bool persistence_failed() const noexcept;
+  [[nodiscard]] std::uint64_t generation() const noexcept;
+  [[nodiscard]] std::uint64_t completed_generation() const noexcept;
+  [[nodiscard]] std::uint64_t failed_generation() const noexcept;
+  [[nodiscard]] PersistenceSnapshot persistence_snapshot() const noexcept;
 
-  void clear_exclusions();
+  // Stops the persistence worker. A false result means it can still execute
+  // process-static library code and the owning process must not begin normal
+  // static teardown.
+  [[nodiscard]] bool
+  shutdown(std::chrono::milliseconds timeout = std::chrono::milliseconds{2500});
+
+  std::uint64_t clear_exclusions();
   // Schedule a background refresh and retry retained failed mutations.
   void load_from_file();
   void add_exclusion(const std::string &word);

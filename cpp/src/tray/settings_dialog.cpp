@@ -300,8 +300,26 @@ bool SettingsDialog::show(GtkWidget *parent, Section section) {
     return false;
   }
 
-  // Загружаем текущие настройки
-  const SettingsData initial_settings = load_settings();
+  // Never present defaults as if a malformed on-disk configuration had been
+  // loaded successfully: saving that UI would overwrite the user's evidence.
+  const std::filesystem::path config_path = get_user_config_path();
+  const bool config_available = ensure_user_config() && !config_path.empty();
+  const ConfigLoadOutcome loaded =
+      config_available ? load_config_checked(config_path) : ConfigLoadOutcome{};
+  if (!config_available || loaded.result != ConfigResult::Ok) {
+    GtkWidget *error = gtk_message_dialog_new(
+        parent ? GTK_WINDOW(parent) : nullptr, GTK_DIALOG_MODAL,
+        GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE, "%s",
+        "Не удалось прочитать настройки Punto Switcher.");
+    gtk_message_dialog_format_secondary_text(
+        GTK_MESSAGE_DIALOG(error), "%s",
+        "Файл конфигурации не изменён. Исправьте его или восстановите из "
+        "резервной копии, затем откройте настройки снова.");
+    (void)gtk_dialog_run(GTK_DIALOG(error));
+    gtk_widget_destroy(error);
+    return false;
+  }
+  const SettingsData initial_settings = settings_from_config(loaded.config);
 
   // Создаём диалог
   GtkWidget *dialog = gtk_dialog_new_with_buttons(

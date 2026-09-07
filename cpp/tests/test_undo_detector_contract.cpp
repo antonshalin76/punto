@@ -1,5 +1,5 @@
-#include "punto/undo_detector.hpp"
 #include "punto/control_plane_state.hpp"
+#include "punto/undo_detector.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -18,8 +18,8 @@
 #include <thread>
 #include <vector>
 
-#include <sys/stat.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -90,9 +90,11 @@ void test_read_bounded_preserves_default_and_small_limits() {
     expect(::close(fd) == 0, "close bounded read fixture");
     return result;
   };
-  expect(read("a", 1) == std::optional<std::string>{"a"}, "exact one-byte budget accepted");
+  expect(read("a", 1) == std::optional<std::string>{"a"},
+         "exact one-byte budget accepted");
   expect(!read("ab", 1), "small budget cannot underflow when chunk is larger");
-  expect(!read("a", 0) && read("", 0).has_value(), "zero budget admits only empty input");
+  expect(!read("a", 0) && read("", 0).has_value(),
+         "zero budget admits only empty input");
   expect(read(std::string(8192, 'a'), std::nullopt).has_value(),
          "default control-plane read limit remains 8192 bytes");
   expect(!read(std::string(8193, 'a'), std::nullopt),
@@ -169,21 +171,20 @@ void test_shutdown_is_bounded_with_stalled_io() {
            "shutdown fixture reaches initial I/O");
   }
   const auto begin = std::chrono::steady_clock::now();
-  detector.reset();
+  const bool stopped_while_blocked =
+      detector->shutdown(std::chrono::milliseconds{100});
   const auto elapsed = std::chrono::steady_clock::now() - begin;
   {
     std::lock_guard lock{gate->mutex};
     gate->permitted = true;
   }
   gate->condition.notify_all();
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds{2};
-  while (gate.use_count() != 1 && std::chrono::steady_clock::now() < deadline)
-    std::this_thread::yield();
-  expect(gate.use_count() == 1,
-         "detached worker releases owned state after I/O recovery");
-  expect(elapsed < std::chrono::seconds{3},
-         "shutdown does not wait indefinitely for storage");
+  expect(!stopped_while_blocked,
+         "stalled persistence is reported to the process owner");
+  expect(elapsed < std::chrono::milliseconds{500},
+         "explicit shutdown honors the caller deadline");
+  expect(detector->shutdown(std::chrono::seconds{2}),
+         "worker becomes joinable after controlled I/O recovery");
 }
 
 void test_exclusion_lookup_does_not_read_file() {
@@ -232,7 +233,7 @@ void test_learning_is_cached_while_write_is_blocked() {
   }
   const auto begin = std::chrono::steady_clock::now();
   const bool immediately_excluded = detector.is_excluded("learned");
-  const bool pending = detector.pending();
+  const auto persistence = detector.persistence_snapshot();
   const auto elapsed = std::chrono::steady_clock::now() - begin;
   {
     std::lock_guard lock{mutex};
@@ -240,7 +241,10 @@ void test_learning_is_cached_while_write_is_blocked() {
   }
   condition.notify_all();
   expect(started, "learning reaches real controlled write boundary");
-  expect(immediately_excluded && pending,
+  expect(immediately_excluded && persistence.pending &&
+             persistence.exclusions == 1 &&
+             persistence.completed_generation < persistence.generation &&
+             persistence.failed_generation < persistence.generation,
          "learning is cached before durable completion");
   expect(elapsed < std::chrono::milliseconds{100},
          "input-side lookup never waits for disk");
@@ -385,8 +389,10 @@ void test_invalid_words_and_capacity_are_bounded() {
   expect(detector.exclusion_count() == punto::UndoDetector::maximum_entries(),
          "entry count is capped");
   wait_saved(detector);
-  for (std::size_t index = 0; index < punto::UndoDetector::maximum_entries(); ++index)
-    expect(detector.is_excluded(words[index]), "every admitted entry remains cached at capacity");
+  for (std::size_t index = 0; index < punto::UndoDetector::maximum_entries();
+       ++index)
+    expect(detector.is_excluded(words[index]),
+           "every admitted entry remains cached at capacity");
 }
 
 std::string maximum_word(std::size_t index) {
@@ -422,9 +428,11 @@ void test_legacy_exclusions_survive_learning_and_restart() {
            "all 248 legacy exclusions load without truncation");
     for (const auto &word : legacy)
       expect(detector.is_excluded(word), "legacy token spelling is preserved");
-    expect(read_file(path) == payload, "loading legacy exclusions never rewrites them");
+    expect(read_file(path) == payload,
+           "loading legacy exclusions never rewrites them");
     detector.add_exclusion(learned);
-    expect(detector.is_excluded(learned), "physical punctuation and digits can be learned");
+    expect(detector.is_excluded(learned),
+           "physical punctuation and digits can be learned");
     wait_saved(detector);
   }
   punto::UndoDetector restarted{path.string()};
@@ -432,10 +440,13 @@ void test_legacy_exclusions_survive_learning_and_restart() {
   expect(restarted.exclusion_count() == legacy.size() + 1,
          "learning preserves the complete legacy set across restart");
   for (const auto &word : legacy)
-    expect(restarted.is_excluded(word), "no legacy token is lost on publication");
-  expect(restarted.is_excluded(learned), "new printable exclusion survives restart");
+    expect(restarted.is_excluded(word),
+           "no legacy token is lost on publication");
+  expect(restarted.is_excluded(learned),
+         "new printable exclusion survives restart");
   struct stat metadata {};
-  expect(::lstat(path.c_str(), &metadata) == 0 && (metadata.st_mode & 0777) == 0600,
+  expect(::lstat(path.c_str(), &metadata) == 0 &&
+             (metadata.st_mode & 0777) == 0600,
          "legacy rewrite retains private file mode");
 }
 
@@ -468,21 +479,28 @@ void test_duplicate_at_capacity_preserves_all_entries() {
   TempDir dir;
   const auto path = dir.path() / "undo.txt";
   std::string payload;
-  for (std::size_t index = 0; index < punto::UndoDetector::maximum_entries(); ++index)
+  for (std::size_t index = 0; index < punto::UndoDetector::maximum_entries();
+       ++index)
     payload += maximum_word(index).substr(60) + '\n';
   payload += maximum_word(0).substr(60) + '\n';
   {
     std::ofstream output(path);
     output << payload;
   }
-  expect(::chmod(path.c_str(), 0600) == 0, "secure duplicate-at-capacity fixture");
+  expect(::chmod(path.c_str(), 0600) == 0,
+         "secure duplicate-at-capacity fixture");
   punto::UndoDetector detector{path.string()};
   wait_ready(detector);
-  expect(!detector.persistence_failed() && detector.exclusion_count() == punto::UndoDetector::maximum_entries(),
+  expect(!detector.persistence_failed() &&
+             detector.exclusion_count() ==
+                 punto::UndoDetector::maximum_entries(),
          "duplicate row at capacity does not reject existing distinct entries");
-  for (std::size_t index = 0; index < punto::UndoDetector::maximum_entries(); ++index)
-    expect(detector.is_excluded(maximum_word(index).substr(60)), "every distinct entry remains available");
-  expect(read_file(path) == payload, "duplicate row load leaves source unchanged");
+  for (std::size_t index = 0; index < punto::UndoDetector::maximum_entries();
+       ++index)
+    expect(detector.is_excluded(maximum_word(index).substr(60)),
+           "every distinct entry remains available");
+  expect(read_file(path) == payload,
+         "duplicate row load leaves source unchanged");
 }
 
 void test_full_refresh_preserves_accepted_local_additions(
@@ -516,7 +534,8 @@ void test_full_refresh_preserves_accepted_local_additions(
   }
   std::vector<std::string> local_words{"localone"};
   if (completed_add) {
-    for (std::size_t index = 0; index < punto::UndoDetector::maximum_entries() - 1; ++index)
+    for (std::size_t index = 0;
+         index < punto::UndoDetector::maximum_entries() - 1; ++index)
       local_words.push_back("pending" + maximum_word(index).substr(60));
   } else
     local_words.push_back("localtwo");
@@ -529,7 +548,9 @@ void test_full_refresh_preserves_accepted_local_additions(
   };
   const bool accepted = all_local_cached();
   std::string external = completed_add ? "localone\n" : "";
-  for (std::size_t index = 0; index < punto::UndoDetector::maximum_entries() - (completed_add ? 1U : 0U); ++index) {
+  for (std::size_t index = 0; index < punto::UndoDetector::maximum_entries() -
+                                          (completed_add ? 1U : 0U);
+       ++index) {
     auto word = maximum_word(index);
     if (completed_add)
       word[0] = 'z';
@@ -556,7 +577,8 @@ void test_full_refresh_preserves_accepted_local_additions(
          "full persistent store reports pending failure");
   expect(all_local_cached(),
          "full older operation cannot drop accepted local additions");
-  expect(detector.exclusion_count() <= punto::UndoDetector::maximum_entries(), "local overlay stays bounded");
+  expect(detector.exclusion_count() <= punto::UndoDetector::maximum_entries(),
+         "local overlay stays bounded");
   expect(read_file(path) == external,
          "capacity failure leaves external snapshot intact");
 }
@@ -578,7 +600,8 @@ void test_unsafe_and_oversized_files_fail_closed() {
 
   const auto oversized = dir.path() / "oversized.txt";
   std::string oversized_payload;
-  for (std::size_t index = 0; index <= punto::UndoDetector::maximum_file_bytes() / 2; ++index)
+  for (std::size_t index = 0;
+       index <= punto::UndoDetector::maximum_file_bytes() / 2; ++index)
     oversized_payload += "a\n";
   {
     std::ofstream output(oversized, std::ios::binary);
@@ -587,7 +610,8 @@ void test_unsafe_and_oversized_files_fail_closed() {
   expect(::chmod(oversized.c_str(), 0600) == 0, "chmod oversized fixture");
   punto::UndoDetector rejected{oversized.string()};
   wait_ready(rejected);
-  expect(rejected.exclusion_count() == 0 && rejected.persistence_failed(), "oversized file is rejected");
+  expect(rejected.exclusion_count() == 0 && rejected.persistence_failed(),
+         "oversized file is rejected");
   rejected.add_exclusion("newword");
   expect(read_file(oversized) == oversized_payload,
          "oversized file remains unchanged after rejected learning");
@@ -785,6 +809,147 @@ void test_clear_then_stale_process_add_does_not_resurrect_entries() {
          "stale process does not resurrect cleared entries");
 }
 
+void test_clear_discards_add_accepted_before_global_reset() {
+  TempDir dir;
+  const auto path = dir.path() / "undo.txt";
+  std::mutex mutex;
+  std::condition_variable condition;
+  unsigned int io_calls = 0;
+  bool stale_add_blocked = false;
+  bool release_stale_add = false;
+  punto::UndoDetector stale{path.string(), [&] {
+    std::unique_lock lock{mutex};
+    ++io_calls;
+    if (io_calls == 2U) {
+      stale_add_blocked = true;
+      condition.notify_all();
+      condition.wait(lock, [&] { return release_stale_add; });
+    }
+  }};
+  wait_ready(stale);
+  stale.add_exclusion("queuedbeforeclear");
+  {
+    std::unique_lock lock{mutex};
+    expect(condition.wait_for(lock, std::chrono::seconds{1},
+                              [&] { return stale_add_blocked; }),
+           "pre-clear add reaches the blocked persistence seam");
+  }
+
+  punto::UndoDetector clearing{path.string()};
+  wait_ready(clearing);
+  clearing.clear_exclusions();
+  wait_saved(clearing);
+  {
+    std::lock_guard lock{mutex};
+    release_stale_add = true;
+  }
+  condition.notify_all();
+  wait_saved(stale);
+
+  punto::UndoDetector observer{path.string()};
+  wait_ready(observer);
+  expect(!observer.is_excluded("queuedbeforeclear"),
+         "an add accepted before the reset tombstone cannot resurrect");
+}
+
+void test_clear_repairs_invalid_reset_marker_atomically() {
+  TempDir dir;
+  const auto path = dir.path() / "undo.txt";
+  const auto marker = dir.path() / ".undo.txt.reset";
+  {
+    std::ofstream output{path};
+    output << "obsolete\n";
+  }
+  {
+    std::ofstream output{marker};
+    output << "PUNTO_RESET_V1 partial";
+  }
+  expect(::chmod(path.c_str(), 0600) == 0 &&
+             ::chmod(marker.c_str(), 0600) == 0,
+         "invalid-marker fixture has secure metadata");
+
+  punto::UndoDetector detector{path.string()};
+  wait_ready(detector);
+  expect(detector.persistence_failed(),
+         "invalid reset marker fails the initial snapshot closed");
+  detector.clear_exclusions();
+  wait_saved(detector);
+  expect(read_file(path).empty(), "clear repairs the exclusion payload");
+  const std::string repaired = read_file(marker);
+  expect(repaired.starts_with("PUNTO_RESET_V1 ") &&
+             !repaired.ends_with("partial"),
+         "clear replaces an invalid marker with a complete atomic record");
+
+  {
+    std::ofstream debris{marker.string() + ".tmp.crash"};
+    debris << "partial";
+  }
+  detector.add_exclusion("afterclear");
+  wait_saved(detector);
+  punto::UndoDetector observer{path.string()};
+  wait_ready(observer);
+  expect(observer.is_excluded("afterclear"),
+         "unpublished marker temp debris cannot block a post-reset add");
+}
+
+void test_refresh_filters_pending_add_accepted_before_external_reset() {
+  TempDir dir;
+  const auto path = dir.path() / "undo.txt";
+  std::mutex mutex;
+  std::condition_variable condition;
+  unsigned int io_calls = 0;
+  bool refresh_blocked = false;
+  bool release_refresh = false;
+  bool add_blocked = false;
+  bool release_add = false;
+  punto::UndoDetector stale{path.string(), [&] {
+    std::unique_lock lock{mutex};
+    ++io_calls;
+    if (io_calls == 2U) {
+      refresh_blocked = true;
+      condition.notify_all();
+      condition.wait(lock, [&] { return release_refresh; });
+    } else if (io_calls == 3U) {
+      add_blocked = true;
+      condition.notify_all();
+      condition.wait(lock, [&] { return release_add; });
+    }
+  }};
+  wait_ready(stale);
+  stale.load_from_file();
+  {
+    std::unique_lock lock{mutex};
+    expect(condition.wait_for(lock, std::chrono::seconds{1},
+                              [&] { return refresh_blocked; }),
+           "peer refresh reaches the pre-reset I/O seam");
+  }
+  stale.add_exclusion("queuedbeforerefresh");
+
+  punto::UndoDetector clearing{path.string()};
+  wait_ready(clearing);
+  clearing.clear_exclusions();
+  wait_saved(clearing);
+  {
+    std::lock_guard lock{mutex};
+    release_refresh = true;
+  }
+  condition.notify_all();
+  {
+    std::unique_lock lock{mutex};
+    expect(condition.wait_for(lock, std::chrono::seconds{1},
+                              [&] { return add_blocked; }),
+           "pending add remains blocked after refreshed reset snapshot");
+  }
+  expect(!stale.is_excluded("queuedbeforerefresh"),
+         "refresh snapshot immediately removes pending pre-reset cache data");
+  {
+    std::lock_guard lock{mutex};
+    release_add = true;
+  }
+  condition.notify_all();
+  wait_saved(stale);
+}
+
 void test_live_instances_converge_after_background_refresh() {
   TempDir dir;
   const auto path = dir.path() / "undo.txt";
@@ -864,6 +1029,9 @@ int main(int argc, char **argv) {
   test_intervening_input_invalidates_learning_candidate();
   test_concurrent_writers_merge_under_lock();
   test_clear_then_stale_process_add_does_not_resurrect_entries();
+  test_clear_discards_add_accepted_before_global_reset();
+  test_clear_repairs_invalid_reset_marker_atomically();
+  test_refresh_filters_pending_add_accepted_before_external_reset();
   test_live_instances_converge_after_background_refresh();
   std::cout << "PASS: undo detector contract\n";
   return 0;

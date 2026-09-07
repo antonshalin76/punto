@@ -52,9 +52,10 @@ extern "C" int __wrap_fsync(int fd) {
       char path[PATH_MAX + 1]{};
       const std::string descriptor = "/proc/self/fd/" + std::to_string(fd);
       const ssize_t length = ::readlink(descriptor.c_str(), path, PATH_MAX);
-      owned = length > 0 &&
-              std::string_view{path, static_cast<std::size_t>(length)}
-                  .starts_with(directory + "/.control.state.tmp.");
+      owned =
+          length > 0 &&
+          std::string_view{path, static_cast<std::size_t>(length)}.starts_with(
+              directory + "/.control.state.tmp.");
     }
   }
   if (owned) {
@@ -391,6 +392,9 @@ void test_ipc_server() {
           break;
         case IpcVerb::Stats:
           response = {true, "analyzed=3 corrections=1"};
+          break;
+        case IpcVerb::ClearExclusions:
+          response = {true, "EXCLUSIONS SCHEDULED 1 2"};
           break;
         case IpcVerb::Shutdown:
           response = {false, "Shutdown not allowed via IPC"};

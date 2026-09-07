@@ -73,9 +73,9 @@ struct XauthorityMetadata {
 
 [[nodiscard]] bool is_valid_local_display(std::string_view value) noexcept;
 [[nodiscard]] bool is_valid_wayland_display(std::string_view value) noexcept;
-[[nodiscard]] bool xauthority_metadata_is_trusted(
-    const XauthorityMetadata &metadata,
-    std::uint32_t expected_uid) noexcept;
+[[nodiscard]] bool
+xauthority_metadata_is_trusted(const XauthorityMetadata &metadata,
+                               std::uint32_t expected_uid) noexcept;
 [[nodiscard]] std::optional<std::chrono::milliseconds>
 retry_delay_after_failure(std::size_t failure_count) noexcept;
 
@@ -172,8 +172,8 @@ public:
   private:
     friend class X11Session;
     WriteLease(std::shared_ptr<WriteGate> gate,
-               std::unique_lock<std::recursive_mutex> lock,
-               X11SessionInfo info, std::uint64_t generation) noexcept;
+               std::unique_lock<std::recursive_mutex> lock, X11SessionInfo info,
+               std::uint64_t generation) noexcept;
 
     std::shared_ptr<WriteGate> gate_;
     std::unique_lock<std::recursive_mutex> lock_;
@@ -249,6 +249,9 @@ private:
   mutable std::mutex refresh_mutex_;
   std::shared_ptr<BackgroundState> pending_refresh_;
   std::thread refresh_thread_;
+  mutable std::mutex keyboard_mutex_;
+  std::shared_ptr<BackgroundState> pending_keyboard_;
+  std::thread keyboard_thread_;
   std::shared_ptr<std::atomic<std::uint64_t>> generation_clock_;
   ProbeFunction probe_function_;
   RetryWaitFunction retry_wait_function_;

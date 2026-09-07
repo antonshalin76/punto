@@ -1906,6 +1906,24 @@ class EventLoopGtkE2E(unittest.TestCase):
             "empty primary selection",
         )
 
+    def test_manual_word_hotkey_survives_concurrent_session_refresh(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("hello")
+        self.pump_until(lambda: self.entry.get_text() == "hello", "source word")
+        block = pathlib.Path("/run/punto-e2e-block-refresh")
+        blocked = pathlib.Path("/run/punto-e2e-refresh-blocked")
+        block.touch(mode=0o600)
+        self.addCleanup(block.unlink, missing_ok=True)
+        self.addCleanup(blocked.unlink, missing_ok=True)
+        self.pump_until(blocked.exists, "periodic discovery overlap", timeout=4.5)
+        self.send_chord((KEY_LEFTCTRL,))
+        self.pump_until(
+            lambda: self.entry.get_text() == "HELLO",
+            "manual edit while discovery remains blocked",
+        )
+        block.unlink(missing_ok=True)
+
+
     def lock_keyboard_group(self, group: int) -> None:
         x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
         x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
@@ -1999,7 +2017,10 @@ class EventLoopGtkE2E(unittest.TestCase):
         self.pump_until(lambda: self.entry.get_text() == "привет ", "NumLock correction")
         self.assertEqual(self.keyboard_locks(), lock_mask)
         self.assertEqual(self.entry.get_selection_bounds(), ())
-        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+        telemetry = self.stats_fields()[1]
+        self.assertEqual(telemetry["word_dispatches"], "1")
+        self.assertGreater(int(telemetry["avg_macro_us"]), 0)
+        self.assertGreater(int(telemetry["avg_macro_payload_bytes"]), 0)
         self.assertEqual(self.selection_text(Gdk.SELECTION_CLIPBOARD), "startup clipboard baseline")
         self.harness.type_word("ghbdtn")
         self.pump_until(lambda: self.entry.get_text() == "привет привет", "target layout retained")
@@ -2838,6 +2859,35 @@ class EventLoopGtkE2E(unittest.TestCase):
 
         with patch.dict(LETTER_CODES, {";": 39}):
             self.assert_automatic_undo_learning(";tcn", "жест")
+
+    def test_clear_exclusions_restores_automatic_correction(self) -> None:
+        self.prepare_word_editor()
+        self.send_text_batch("ghbdtn ")
+        self.pump_until(lambda: self.entry.get_text() == "привет ",
+                        "automatic correction before learning reset")
+        self.send_chord((KEY_LEFTCTRL,), KEY_Z)
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn ",
+                        "undo records learned exclusion")
+        exclusions = pathlib.Path("/etc/punto/undo_exclusions.txt")
+        self.pump_until(lambda: exclusions.exists() and "ghbdtn\n" in exclusions.read_text(),
+                        "learned exclusion persisted before reset")
+        daemon_epoch = self.stats_fields()[1]["daemon_epoch"]
+        response = ipc_request(b"CLEAR_EXCLUSIONS\n")
+        self.assertRegex(
+            response,
+            rb"^OK EXCLUSIONS SCHEDULED [1-9][0-9]* [1-9][0-9]*\n$",
+        )
+        self.assertEqual(response.decode("ascii").split()[3], daemon_epoch)
+        self.pump_until(lambda: not exclusions.exists() or not exclusions.read_text(),
+                        "cleared exclusion store persisted")
+        self.harness.send_key(KEY_LEFT)
+        self.entry.set_text("")
+        self.entry.set_position(0)
+        self.lock_keyboard_group(0)
+        Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY).clear()
+        self.send_text_batch("ghbdtn ")
+        self.pump_until(lambda: self.entry.get_text() == "привет ",
+                        "automatic correction restored after learning reset")
 
     def assert_automatic_undo_learning(self, source: str, corrected: str) -> None:
         self.prepare_word_editor()

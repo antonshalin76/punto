@@ -180,10 +180,18 @@ wait "$trace_pid" 2>/dev/null || true
 exit "$cli_rc"
 '
 
-VALID_STATS='OK x11_health=ready analysis_health=degraded input_health=failed x11_last_progress_ms=0 analysis_last_progress_ms=18446744073709551615 input_last_progress_ms=30 analysis_outstanding=2 input_in_flight=1 log_dropped=12 text_mutation=disabled enabled=0 configured_enabled=1 config_pending=0 config_generation=13 config_result=ok analyzed=0 need_switch=1 corrections=2 pending_words=3 ready_results=4 worker_threads=5 daemon_peers=6 analysis_mode=fixed control_plane=primary queued_tasks=7 avg_queue_us=8 avg_analysis_us=9 avg_macro_us=10 avg_tail_len=11'
+VALID_STATS='OK x11_health=ready analysis_health=degraded input_health=failed x11_last_progress_ms=0 analysis_last_progress_ms=18446744073709551615 input_last_progress_ms=30 analysis_outstanding=2 input_in_flight=1 log_dropped=12 text_mutation=disabled enabled=0 configured_enabled=1 config_pending=0 config_generation=13 config_result=ok analyzed=0 need_switch=1 corrections=2 pending_words=3 ready_results=4 worker_threads=5 daemon_peers=6 analysis_mode=fixed control_plane=primary queued_tasks=7 avg_queue_us=8 avg_analysis_us=9 avg_macro_us=10 avg_macro_payload_bytes=11 learning_ready=1 learning_pending=0 learning_failed=0 exclusions=12 learning_generation=13 learning_completed_generation=12 learning_failed_generation=0 daemon_epoch=13'
+READY_STATS=${VALID_STATS/analysis_health=degraded/analysis_health=ready}
+READY_STATS=${READY_STATS/input_health=failed/input_health=ready}
+READY_STATS=${READY_STATS/text_mutation=disabled/text_mutation=x11}
+READY_STATS=${READY_STATS/corrections=2/corrections=2 word_dispatches=2}
+TRANSITIONAL_STATS=${READY_STATS/x11_health=ready/x11_health=degraded}
+PREVIOUS_RELEASE_STATS=${READY_STATS%% avg_macro_payload_bytes=*}
+PREVIOUS_RELEASE_STATS+=' avg_tail_len=11'
 ERROR_CATEGORIES=(
     unavailable denied timeout protocol-error daemon-error service-error
-    service-timeout tray-error invalid-configuration usage-error
+    service-timeout tray-error invalid-configuration usage-error not-ready
+    learning-error learning-timeout
 )
 
 pass() {
@@ -495,6 +503,12 @@ while not stopping.is_set():
                 response = response_file.read()
             if response:
                 connection.sendall(response)
+            if mode == "sequence":
+                try:
+                    os.replace(response_path + ".next", response_path)
+                    mode = "normal"
+                except FileNotFoundError:
+                    pass
         except OSError:
             pass
 
@@ -1074,6 +1088,7 @@ reset_case() {
     printf '0\n' >"$tmp_root/sentinel.signals"
     : >"$tmp_root/hang.pid"
     rm -f -- "$tmp_root/harness.cleanup"
+    rm -f -- "$tmp_root/response.bin.next"
     printf '0\n' >"$tmp_root/clock.ms"
     set_response_line "$VALID_STATS"
     SYSTEMCTL_MODE=ok
@@ -1469,8 +1484,14 @@ run_protocol_rejection() {
 
 run_word_capability_matrix() {
     local payload enabled command malformed
-    payload=${VALID_STATS/text_mutation=disabled/text_mutation=x11}
-    payload=${payload/corrections=2/corrections=0 word_dispatches=7}
+    payload=$READY_STATS
+    payload=${payload/corrections=2 word_dispatches=2/corrections=0 word_dispatches=7}
+    reset_case
+    set_response_line "$PREVIOUS_RELEASE_STATS"
+    start_fixture normal || return
+    run_cli previous-release-status status
+    assert_status_success "$PREVIOUS_RELEASE_STATS" \
+        "v2.8.10 daemon remains visible during package upgrade"
     for enabled in 0 1; do
         for command in status start restart; do
             reset_case
@@ -1513,8 +1534,12 @@ run_stats_grammar_matrix() {
         config_pending=0 config_generation=13 config_result=ok analyzed=0
         need_switch=1 corrections=2 pending_words=3
         ready_results=4 worker_threads=5 daemon_peers=6 analysis_mode=fixed
-        control_plane=primary queued_tasks=7 avg_queue_us=8 avg_analysis_us=9
-        avg_macro_us=10 avg_tail_len=11
+        control_plane=primary queued_tasks=7
+        avg_queue_us=8 avg_analysis_us=9
+        avg_macro_us=10 avg_macro_payload_bytes=11 learning_ready=1
+        learning_pending=0 learning_failed=0 exclusions=12 learning_generation=13
+        learning_completed_generation=12 learning_failed_generation=0
+        daemon_epoch=13
     )
     local -a numeric_tokens=(
         x11_last_progress_ms=0 analysis_last_progress_ms=18446744073709551615
@@ -1522,10 +1547,15 @@ run_stats_grammar_matrix() {
         log_dropped=12 configured_enabled=1 config_pending=0 config_generation=13
         analyzed=0 need_switch=1 corrections=2 pending_words=3
         ready_results=4 worker_threads=5 daemon_peers=6 queued_tasks=7
-        avg_queue_us=8 avg_analysis_us=9 avg_macro_us=10 avg_tail_len=11
+        avg_queue_us=8 avg_analysis_us=9 avg_macro_us=10
+        avg_macro_payload_bytes=11 learning_ready=1 learning_pending=0
+        learning_failed=0 exclusions=12 learning_generation=13
+        learning_completed_generation=12 learning_failed_generation=0
+        daemon_epoch=13
     )
     local -a boolean_tokens=(
         input_in_flight=1 configured_enabled=1 config_pending=0
+        learning_ready=1 learning_pending=0 learning_failed=0
     )
 
     reset_case
@@ -1656,7 +1686,7 @@ run_stats_grammar_matrix() {
     done
 
     local -a invalid_payloads=(
-        'OK analysis_health=degraded x11_health=ready input_health=failed x11_last_progress_ms=0 analysis_last_progress_ms=1 input_last_progress_ms=2 analysis_outstanding=0 input_in_flight=0 log_dropped=0 text_mutation=disabled enabled=0 configured_enabled=1 config_pending=0 config_generation=1 config_result=ok analyzed=0 need_switch=0 corrections=0 pending_words=0 ready_results=0 worker_threads=1 daemon_peers=1 analysis_mode=auto control_plane=primary queued_tasks=0 avg_queue_us=0 avg_analysis_us=0 avg_macro_us=0 avg_tail_len=0'
+        'OK analysis_health=degraded x11_health=ready input_health=failed x11_last_progress_ms=0 analysis_last_progress_ms=1 input_last_progress_ms=2 analysis_outstanding=0 input_in_flight=0 log_dropped=0 text_mutation=disabled enabled=0 configured_enabled=1 config_pending=0 config_generation=1 config_result=ok analyzed=0 need_switch=0 corrections=0 pending_words=0 ready_results=0 worker_threads=1 daemon_peers=1 analysis_mode=auto control_plane=primary queued_tasks=0 avg_queue_us=0 avg_analysis_us=0 avg_macro_us=0 avg_macro_payload_bytes=0 learning_ready=1 learning_pending=0 learning_failed=0 exclusions=0 learning_generation=1 learning_completed_generation=1 learning_failed_generation=0 daemon_epoch=1'
         "$VALID_STATS extra=1"
         "$VALID_STATS x11_health=ready"
         "${VALID_STATS/x11_health=ready/x11_health=READY}"
@@ -1777,7 +1807,7 @@ assert_start_command() {
 
 prepare_response() {
     case $1 in
-        valid) set_response_line "$VALID_STATS" ;;
+        valid) set_response_line "$READY_STATS" ;;
         protocol) set_response_line 'OK x11_health=ready' ;;
         daemon) set_response_line 'ERROR contract-sentinel' ;;
     esac
@@ -1790,6 +1820,9 @@ assert_readiness_observation() {
             assert_no_requests "$message"
             assert_nc_count 1 "$message"
             ;;
+        stall)
+            assert_exact_stats_requests "$message" 1 5
+            ;;
         *)
             assert_exact_stats_requests "$message"
             ;;
@@ -1798,6 +1831,19 @@ assert_readiness_observation() {
 
 run_start_success_and_idempotency() {
     reset_case
+    set_response_line "$TRANSITIONAL_STATS"
+    printf '%s\n' "$READY_STATS" >"$tmp_root/response.bin.next"
+    start_fixture sequence || return
+    run_cli start-transitional-readiness start
+    assert_zero "$CLI_RC" "B26 start waits for transitional runtime readiness"
+    assert_service_mutation_sequence "B26 transitional start without rollback" start
+    assert_exact_stats_requests "B26 transitional start readiness" 2
+    assert_service_state active "B26 transitional start keeps backend active"
+    assert_tray_state active "B26 transitional start launches tray after readiness"
+    assert_no_pid_or_undeclared_calls "B26 transitional start"
+
+    reset_case
+    set_response_line "$READY_STATS"
     start_fixture normal || return
     run_cli start-success start
     assert_zero "$CLI_RC" "B26 start success"
@@ -1818,6 +1864,7 @@ run_start_success_and_idempotency() {
     assert_bounded "$CLI_RC" "$CLI_DURATION_MS" 1200 "B26 start success is bounded"
 
     reset_case
+    set_response_line "$READY_STATS"
     printf 'active\n' >"$tmp_root/service.state"
     seed_active_tray
     start_fixture normal || return
@@ -1843,6 +1890,7 @@ run_start_success_and_idempotency() {
     assert_no_pid_or_undeclared_calls "B26 repeated start"
 
     reset_case
+    set_response_line "$READY_STATS"
     TRAY_PATH="$tmp_root/bin/not-installed-tray"
     start_fixture normal || return
     run_cli start-daemon-only start
@@ -1983,6 +2031,7 @@ run_start_failure_matrix() {
     done
 
     reset_case
+    set_response_line "$READY_STATS"
     TRAY_MODE=fail
     start_fixture normal || return
     run_cli start-tray-error start
@@ -2001,6 +2050,7 @@ run_start_failure_matrix() {
 run_restart_transport_failure() {
     local label=$1 fixture_mode=$2 response_kind=$3 expected=$4
     reset_case
+    set_response_line "$READY_STATS"
     printf 'active\n' >"$tmp_root/service.state"
     seed_active_tray
     prepare_response "$response_kind"
@@ -2026,6 +2076,7 @@ run_restart_transport_failure() {
 
 run_restart_matrix() {
     reset_case
+    set_response_line "$READY_STATS"
     printf 'active\n' >"$tmp_root/service.state"
     seed_active_tray
     start_fixture normal || return
@@ -2046,6 +2097,7 @@ run_restart_matrix() {
     assert_no_pid_or_undeclared_calls "B26 restart success"
 
     reset_case
+    set_response_line "$READY_STATS"
     printf 'active\n' >"$tmp_root/service.state"
     TRAY_PATH="$tmp_root/bin/not-installed-tray"
     start_fixture normal || return
@@ -2097,6 +2149,7 @@ run_restart_matrix() {
     run_restart_transport_failure daemon normal daemon daemon-error
 
     reset_case
+    set_response_line "$READY_STATS"
     printf 'active\n' >"$tmp_root/service.state"
     seed_active_tray
     TRAY_MODE=fail
@@ -2851,9 +2904,26 @@ PY
     restore_contract_version
 
     reset_case
+    set_response_line 'OK EXCLUSIONS SCHEDULED 13 13'
+    printf '%s\n' "${READY_STATS/learning_completed_generation=12/learning_completed_generation=13}" \
+        >"$tmp_root/response.bin.next"
+    start_fixture sequence || return
+    run_cli reset-learning-success reset-learning
+    assert_zero "$CLI_RC" "B26 reset-learning waits for durable completion"
+    assert_output_exact_line 'OK EXCLUSIONS CLEARED' \
+        "B26 reset-learning reports durable completion"
+    if [[ $(<"$tmp_root/requests.log") == $'434c4541525f4558434c5553494f4e530a\n53544154530a' ]]; then
+        pass "B26 reset-learning sends exact mutation then STATS"
+    else
+        fail "B26 reset-learning request sequence is not exact"
+    fi
+    assert_no_control_calls "B26 reset-learning"
+    assert_no_pid_or_undeclared_calls "B26 reset-learning"
+
+    reset_case
     run_cli help --help
     assert_zero "$CLI_RC" "B26 --help"
-    for command in start stop restart status; do
+    for command in start stop restart status reset-learning; do
         assert_matches "$CLI_OUTPUT" "(^|[[:space:]])$command([[:space:]]|$)" "B26 help documents $command"
     done
     assert_contains "$CLI_OUTPUT" '--version' "B26 help documents --version"
@@ -2878,7 +2948,7 @@ PY
     assert_no_pid_or_undeclared_calls "B26 missing command"
     assert_bounded "$CLI_RC" "$CLI_DURATION_MS" 500 "B26 missing command is bounded"
 
-    for command in start stop restart status help --help --version; do
+    for command in start stop restart status reset-learning help --help --version; do
         reset_case
         run_cli "usage-extra-${command//[^a-zA-Z0-9]/_}" "$command" unexpected-extra
         assert_nonzero "$CLI_RC" "B26 $command rejects extra arguments"

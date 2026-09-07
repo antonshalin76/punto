@@ -7,8 +7,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <chrono>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -39,10 +39,10 @@ bool consume_private_fault_marker(const char *path) {
     return false;
   }
   struct stat metadata {};
-  const bool armed =
-      ::fstat(marker, &metadata) == 0 && S_ISREG(metadata.st_mode) &&
-      metadata.st_uid == ::geteuid() && metadata.st_nlink == 1 &&
-      (metadata.st_mode & 0077) == 0;
+  const bool armed = ::fstat(marker, &metadata) == 0 &&
+                     S_ISREG(metadata.st_mode) &&
+                     metadata.st_uid == ::geteuid() && metadata.st_nlink == 1 &&
+                     (metadata.st_mode & 0077) == 0;
   (void)::close(marker);
   return armed && ::unlink(path) == 0;
 }
@@ -53,7 +53,8 @@ std::atomic<bool> macro_ipc_hold{false};
 std::atomic<bool> macro_ipc_admitted{false};
 
 void mark_private_macro_event(const char *path) noexcept {
-  const int marker = ::open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+  const int marker =
+      ::open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
   if (marker >= 0) {
     (void)::close(marker);
   }
@@ -68,9 +69,10 @@ void observe_admitted_macro_ipc() noexcept {
 } // namespace
 
 extern "C" decltype(xcb_intern_atom) __real_xcb_intern_atom;
-extern "C" xcb_intern_atom_cookie_t __wrap_xcb_intern_atom(
-    xcb_connection_t *connection, std::uint8_t only_if_exists,
-    std::uint16_t length, const char *name) {
+extern "C" xcb_intern_atom_cookie_t
+__wrap_xcb_intern_atom(xcb_connection_t *connection,
+                       std::uint8_t only_if_exists, std::uint16_t length,
+                       const char *name) {
   if (std::string_view{name, length} == "CLIPBOARD" &&
       consume_private_fault_marker("/run/punto-e2e-slow-clipboard-init")) {
     // A test-only scheduling delay, not proof of interruptible I/O expiry.
@@ -82,7 +84,8 @@ extern "C" xcb_intern_atom_cookie_t __wrap_xcb_intern_atom(
     macro_ipc_admitted.store(false, std::memory_order_relaxed);
     macro_ipc_hold.store(true, std::memory_order_release);
     mark_private_macro_event("/run/punto-e2e-macro-ipc-held");
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{150};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds{150};
     while (std::chrono::steady_clock::now() < deadline &&
            !macro_ipc_admitted.load(std::memory_order_acquire)) {
       std::this_thread::sleep_for(std::chrono::milliseconds{1});
@@ -97,15 +100,17 @@ extern "C" xcb_intern_atom_cookie_t __wrap_xcb_intern_atom(
 
 extern "C" decltype(xcb_xkb_get_state) __real_xcb_xkb_get_state;
 extern "C" decltype(xcb_query_keymap) __real_xcb_query_keymap;
-extern "C" xcb_query_keymap_cookie_t __wrap_xcb_query_keymap(xcb_connection_t *connection) {
+extern "C" xcb_query_keymap_cookie_t
+__wrap_xcb_query_keymap(xcb_connection_t *connection) {
   if (consume_private_fault_marker("/run/punto-e2e-arm-key-release-check")) {
     mark_private_macro_event("/run/punto-e2e-key-release-checked");
   }
   return __real_xcb_query_keymap(connection);
 }
 
-extern "C" xcb_xkb_get_state_cookie_t __wrap_xcb_xkb_get_state(
-    xcb_connection_t *connection, xcb_xkb_device_spec_t device) {
+extern "C" xcb_xkb_get_state_cookie_t
+__wrap_xcb_xkb_get_state(xcb_connection_t *connection,
+                         xcb_xkb_device_spec_t device) {
   const auto cookie = __real_xcb_xkb_get_state(connection, device);
   if (consume_private_fault_marker("/run/punto-e2e-arm-keyboard-observation")) {
     std::lock_guard lock{keyboard_query_mutex};
@@ -115,10 +120,11 @@ extern "C" xcb_xkb_get_state_cookie_t __wrap_xcb_xkb_get_state(
 }
 
 extern "C" decltype(xcb_poll_for_reply) __real_xcb_poll_for_reply;
-extern "C" int __wrap_xcb_poll_for_reply(
-    xcb_connection_t *connection, unsigned int sequence, void **reply,
-    xcb_generic_error_t **error) {
-  const int result = __real_xcb_poll_for_reply(connection, sequence, reply, error);
+extern "C" int __wrap_xcb_poll_for_reply(xcb_connection_t *connection,
+                                         unsigned int sequence, void **reply,
+                                         xcb_generic_error_t **error) {
+  const int result =
+      __real_xcb_poll_for_reply(connection, sequence, reply, error);
   bool observed = false;
   if (result != 0 && reply != nullptr && *reply != nullptr) {
     std::lock_guard lock{keyboard_query_mutex};
@@ -128,17 +134,21 @@ extern "C" int __wrap_xcb_poll_for_reply(
     }
   }
   if (observed) {
-    const bool hold = consume_private_fault_marker("/run/punto-e2e-hold-keyboard-observation");
-    const int marker = ::open("/run/punto-e2e-keyboard-observed",
-                              O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    const bool hold = consume_private_fault_marker(
+        "/run/punto-e2e-hold-keyboard-observation");
+    const int marker =
+        ::open("/run/punto-e2e-keyboard-observed",
+               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (marker >= 0) {
       (void)::close(marker);
     }
     // Test-only delayed delivery of an already captured reply, not a server
     // delay or a production timeout. Never retain the mutex while waiting.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds{2};
     while (hold && std::chrono::steady_clock::now() < deadline &&
-           !consume_private_fault_marker("/run/punto-e2e-release-keyboard-observation")) {
+           !consume_private_fault_marker(
+               "/run/punto-e2e-release-keyboard-observation")) {
       std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
   }
@@ -159,11 +169,11 @@ extern "C" void __wrap_xcb_disconnect(xcb_connection_t *connection) {
 extern "C" int __real_fsync(int fd);
 extern "C" int __wrap_fsync(int fd) {
   constexpr const char *arm = "/run/punto-e2e-fail-directory-fsync";
-  struct stat target {}, runtime {};
+  struct stat target {
+  }, runtime{};
   if (::fstat(fd, &target) == 0 && S_ISDIR(target.st_mode) &&
-      ::stat("/run", &runtime) == 0 &&
-      target.st_dev == runtime.st_dev && target.st_ino == runtime.st_ino &&
-      consume_private_fault_marker(arm)) {
+      ::stat("/run", &runtime) == 0 && target.st_dev == runtime.st_dev &&
+      target.st_ino == runtime.st_ino && consume_private_fault_marker(arm)) {
     errno = EIO;
     return -1;
   }
@@ -228,6 +238,18 @@ punto::x11_detail::ProbeResult probe_test_session() {
     }
     for (;;) {
       std::this_thread::sleep_for(std::chrono::hours{1});
+    }
+  }
+
+  if (std::filesystem::exists("/run/punto-e2e-block-refresh")) {
+    const int marker =
+        ::open("/run/punto-e2e-refresh-blocked",
+               O_CREAT | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (marker >= 0) {
+      ::close(marker);
+    }
+    while (std::filesystem::exists("/run/punto-e2e-block-refresh")) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
   }
 
@@ -384,7 +406,8 @@ punto::DictionaryLoadOutcome deterministic_dictionary_loader() {
   punto::DictionaryLoadOutcome outcome;
   if (!write_fixture(english.path, "2\nhello\nworld\n") ||
       !write_fixture(russian.path, "2\nпривет\nжест\n") ||
-      !write_fixture(affix.path, "SET UTF-8\nTRY esiarntolcdugmphbyfvkwzxjq\n")) {
+      !write_fixture(affix.path,
+                     "SET UTF-8\nTRY esiarntolcdugmphbyfvkwzxjq\n")) {
     return outcome;
   }
 

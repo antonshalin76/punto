@@ -22,7 +22,14 @@ namespace punto {
 inline constexpr const char *kIpcSocketPath = "/var/run/punto.sock";
 inline constexpr std::size_t kIpcMaxConcurrentClients = 32;
 
-enum class IpcVerb { GetStatus, SetStatus, Reload, Stats, Shutdown };
+enum class IpcVerb {
+  GetStatus,
+  SetStatus,
+  Reload,
+  Stats,
+  ClearExclusions,
+  Shutdown
+};
 
 struct IpcRequest {
   IpcVerb verb;

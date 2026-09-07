@@ -41,6 +41,11 @@ struct IpcClientResult {
   ServiceStatus status = ServiceStatus::Unknown;
   std::string response;
   MutationCapability capability = MutationCapability::Unknown;
+  // Data-plane readiness is diagnostic. A valid X11 capability and confirmed
+  // control-plane status remain actionable while a worker lane is degraded.
+  bool runtime_ready = false;
+  bool config_pending = false;
+  bool config_failed = false;
 
   [[nodiscard]] bool ok() const noexcept {
     return error == IpcClientError::None;
@@ -106,10 +111,14 @@ public:
   [[nodiscard]] static IpcClientResult
   exchange_for_test(const std::string &command, const std::string &socket_path);
   static bool set_auto_enabled_for_test(bool enabled, const std::string &socket_path);
+  static bool reload_config_for_test(const std::string &config_path,
+                                     const std::string &socket_path);
 #endif
 
 private:
   static bool set_auto_enabled_to_socket(bool enabled, const std::string &socket_path);
+  static bool reload_config_to_socket(const std::string &config_path,
+                                      const std::string &socket_path);
   /**
    * @brief Отправляет команду и получает ответ
    * @param command Команда для отправки

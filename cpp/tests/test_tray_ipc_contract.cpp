@@ -364,24 +364,40 @@ void test_status_is_exact() {
 void test_runtime_capability_schema_is_exact() {
   const std::string legacy =
       "OK x11_health=ready analysis_health=ready input_health=ready "
-      "x11_last_progress_ms=0 analysis_last_progress_ms=0 input_last_progress_ms=0 "
-      "analysis_outstanding=0 input_in_flight=0 log_dropped=0 text_mutation=disabled "
-      "enabled=0 configured_enabled=1 config_pending=0 config_generation=1 config_result=ok "
-      "analyzed=0 need_switch=0 corrections=0 pending_words=0 ready_results=0 worker_threads=1 "
+      "x11_last_progress_ms=0 analysis_last_progress_ms=0 "
+      "input_last_progress_ms=0 "
+      "analysis_outstanding=0 input_in_flight=0 log_dropped=0 "
+      "text_mutation=disabled "
+      "enabled=0 configured_enabled=1 config_pending=0 config_generation=1 "
+      "config_result=ok "
+      "analyzed=0 need_switch=0 corrections=0 pending_words=0 ready_results=0 "
+      "worker_threads=1 "
       "daemon_peers=1 analysis_mode=auto control_plane=primary queued_tasks=0 "
-      "avg_queue_us=0 avg_analysis_us=0 avg_macro_us=0 avg_tail_len=0";
-  const auto replace = [](std::string text, std::string_view from, std::string_view to) {
+      "avg_queue_us=0 avg_analysis_us=0 avg_macro_us=0 "
+      "avg_macro_payload_bytes=0 learning_ready=1 learning_pending=0 "
+      "learning_failed=0 exclusions=0 learning_generation=1 "
+      "learning_completed_generation=1 learning_failed_generation=0 "
+      "daemon_epoch=1";
+  const auto replace = [](std::string text, std::string_view from,
+                          std::string_view to) {
     const auto offset = text.find(from);
     require(offset != std::string::npos, "mutation fixture field exists");
     text.replace(offset, from.size(), to);
     return text;
   };
-  const auto modern = replace(replace(legacy, "text_mutation=disabled",
-                                      "text_mutation=x11"),
-                              "corrections=0", "corrections=0 word_dispatches=7");
+  const auto modern =
+      replace(replace(legacy, "text_mutation=disabled", "text_mutation=x11"),
+              "corrections=0", "corrections=0 word_dispatches=7");
+  const auto previous_without_control =
+      replace(modern, " daemon_epoch=1", "");
+  const auto previous_release = previous_without_control.substr(
+                                    0, previous_without_control.find(
+                                           " avg_macro_payload_bytes=")) +
+                                " avg_tail_len=0";
   const auto exchange = [](const std::string &payload) {
     OneShotServer server{[&](int fd) {
-      require(read_request(fd) == "STATS\n", "runtime snapshot requests exactly STATS");
+      require(read_request(fd) == "STATS\n",
+              "runtime snapshot requests exactly STATS");
       send_all(fd, payload + "\n");
     }};
     auto result = punto::IpcClient::diagnose_runtime_socket(server.path());
@@ -389,25 +405,57 @@ void test_runtime_capability_schema_is_exact() {
     return result;
   };
   auto result = exchange(legacy);
-  require(result.ok() && result.capability == punto::MutationCapability::Disabled &&
-              result.status == punto::ServiceStatus::Disabled, "legacy disabled snapshot is supported");
+  require(result.ok() &&
+              result.capability == punto::MutationCapability::Disabled &&
+              result.status == punto::ServiceStatus::Disabled &&
+              result.runtime_ready,
+          "legacy disabled snapshot is supported");
   for (const bool enabled : {false, true}) {
-    result = exchange(enabled ? replace(modern, "enabled=0", "enabled=1") : modern);
-    require(result.ok() && result.capability == punto::MutationCapability::X11 &&
-                result.status == (enabled ? punto::ServiceStatus::Enabled : punto::ServiceStatus::Disabled),
+    result =
+        exchange(enabled ? replace(modern, "enabled=0", "enabled=1") : modern);
+    require(result.ok() &&
+                result.capability == punto::MutationCapability::X11 &&
+                result.status == (enabled ? punto::ServiceStatus::Enabled
+                                          : punto::ServiceStatus::Disabled) &&
+                result.runtime_ready,
             "experimental capability is independent of runtime enabled");
   }
-  for (const auto &payload : {
-           replace(modern, "text_mutation=x11", "text_mutation=unknown"),
-           replace(modern, "text_mutation=x11", "text_mutation=disabled"),
-           replace(modern, " word_dispatches=7", ""),
-           modern + " word_dispatches=7",
-           replace(modern, "word_dispatches=7", "word_dispatches=18446744073709551616"),
-           replace(modern, "word_dispatches=7", "word_dispatches=00"),
-           replace(modern, "enabled=0", "enabled=2"),
-           replace(legacy, "enabled=0", "enabled=1"),
-           replace(modern, "corrections=0 word_dispatches=7", "word_dispatches=7 corrections=0"),
-           modern + " "}) {
+  result = exchange(previous_release);
+  require(result.ok() &&
+              result.capability == punto::MutationCapability::X11 &&
+              result.status == punto::ServiceStatus::Disabled &&
+              result.runtime_ready,
+          "v2.8.10 daemon remains controllable during package upgrade");
+  for (const auto &degraded :
+       {replace(modern, "x11_health=ready", "x11_health=degraded"),
+        replace(modern, "analysis_health=ready", "analysis_health=failed"),
+        replace(modern, "input_health=ready", "input_health=degraded")}) {
+    result = exchange(degraded);
+    require(result.ok() &&
+                result.capability == punto::MutationCapability::X11 &&
+                result.status == punto::ServiceStatus::Disabled &&
+                !result.runtime_ready,
+            "data-plane health does not erase confirmed product controls");
+  }
+  result = exchange(replace(modern, "config_pending=0", "config_pending=1"));
+  require(result.ok() && result.config_pending && !result.config_failed,
+          "pending configuration is projected to the tray snapshot");
+  result = exchange(replace(modern, "config_result=ok", "config_result=error"));
+  require(result.ok() && !result.config_pending && result.config_failed,
+          "failed configuration is projected without erasing controls");
+  for (const auto &payload :
+       {replace(modern, "text_mutation=x11", "text_mutation=unknown"),
+        replace(modern, "text_mutation=x11", "text_mutation=disabled"),
+        replace(modern, " word_dispatches=7", ""),
+        modern + " word_dispatches=7",
+        replace(modern, "word_dispatches=7",
+                "word_dispatches=18446744073709551616"),
+        replace(modern, "word_dispatches=7", "word_dispatches=00"),
+        replace(modern, "enabled=0", "enabled=2"),
+        replace(legacy, "enabled=0", "enabled=1"),
+        replace(modern, "corrections=0 word_dispatches=7",
+                "word_dispatches=7 corrections=0"),
+        modern + " "}) {
     result = exchange(payload);
     require(result.error == punto::IpcClientError::ProtocolError &&
                 result.status == punto::ServiceStatus::Unknown &&
@@ -420,18 +468,40 @@ void test_auto_status_command_and_acknowledgement_are_exact() {
   for (const bool enabled : {false, true}) {
     const std::string expected = enabled ? "OK ENABLED\n" : "OK DISABLED\n";
     const std::string opposite = enabled ? "OK DISABLED\n" : "OK ENABLED\n";
-    for (const auto &response : {expected, opposite, std::string{"OK unrelated\n"},
-                                 std::string{"ERROR State publication not durable\n"}}) {
+    for (const auto &response :
+         {expected, opposite, std::string{"OK unrelated\n"},
+          std::string{"ERROR State publication not durable\n"}}) {
       OneShotServer server{[&](int fd) {
-        require(read_request(fd) == (enabled ? "SET_STATUS 1\n" : "SET_STATUS 0\n"),
+        require(read_request(fd) ==
+                    (enabled ? "SET_STATUS 1\n" : "SET_STATUS 0\n"),
                 "toggle submits the exact runtime status command");
         send_all(fd, response);
       }};
-      const bool accepted = punto::IpcClient::set_auto_enabled_for_test(enabled, server.path());
+      const bool accepted =
+          punto::IpcClient::set_auto_enabled_for_test(enabled, server.path());
       server.verify();
-      require(accepted == (response == expected),
-              "only exact matching status acknowledgement confirms the command");
+      require(
+          accepted == (response == expected),
+          "only exact matching status acknowledgement confirms the command");
     }
+  }
+}
+
+void test_reload_acknowledgement_is_exact() {
+  for (const auto &response : {std::string{"OK Scheduled\n"},
+                               std::string{"OK\n"},
+                               std::string{"OK Reloaded\n"},
+                               std::string{"ERROR Rejected\n"}}) {
+    OneShotServer server{[&](int fd) {
+      require(read_request(fd) == "RELOAD /tmp/punto/config.yaml\n",
+              "reload submits the exact config path command");
+      send_all(fd, response);
+    }};
+    const bool accepted = punto::IpcClient::reload_config_for_test(
+        "/tmp/punto/config.yaml", server.path());
+    server.verify();
+    require(accepted == (response == "OK Scheduled\n"),
+            "only the exact scheduled acknowledgement confirms reload");
   }
 }
 
@@ -594,7 +664,9 @@ int main() {
       {"typed success", test_typed_success_and_server_error},
       {"exact status", test_status_is_exact},
       {"runtime capability schema", test_runtime_capability_schema_is_exact},
-      {"exact auto status command", test_auto_status_command_and_acknowledgement_are_exact},
+      {"exact auto status command",
+       test_auto_status_command_and_acknowledgement_are_exact},
+      {"exact reload acknowledgement", test_reload_acknowledgement_is_exact},
       {"malformed frames", test_malformed_frames_are_rejected},
       {"oversized response", test_oversized_response_is_rejected},
       {"request validation", test_request_validation_precedes_connect},

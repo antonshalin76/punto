@@ -1,6 +1,6 @@
 # Punto Switcher Configuration
 # Путь по умолчанию: /etc/punto/config.yaml
-# Config version: 2.8.9
+# Config version: 2.8.11
 
 # Поле совместимости со старыми конфигами. Runtime его принимает и
 # сохраняет, но не наблюдает и не применяет: системный hotkey настраивается
@@ -33,8 +33,8 @@ logging:
   level: info   # error, warning, info, debug
 
 # Runtime budget для многоклавиатурной схемы udevmon.
-# Каждый punto-daemon получает только свою долю worker threads,
-# чтобы суммарный пул не рос линейно от числа клавиатур.
+# Каждый punto-daemon получает долю worker threads по снимку числа процессов
+# при старте. После hotplug/hot-unplug перезапустите udevmon для пересчёта.
 runtime:
   analysis_threads: 0              # 0 = auto-budget, >0 = жёсткий override на процесс
   max_analysis_threads_per_daemon: 4

@@ -652,6 +652,16 @@ if(BUILD_TESTING)
     endif()
 
     if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME punto-cli-python-contract
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_cli_contract.py
+        )
+        set_tests_properties(
+            punto-cli-python-contract
+            PROPERTIES TIMEOUT 15 RUN_SERIAL TRUE
+        )
+
         add_executable(punto-main-exception-probe
             ${PUNTO_SOURCES}
             ${PUNTO_HEADERS}
@@ -820,6 +830,10 @@ if(BUILD_TESTING)
                 PROPERTIES
                     TIMEOUT 30
                     RUN_SERIAL TRUE
+                    # gtk_init keeps process-global Cairo/GDK/Pango/AT-SPI
+                    # caches alive in this short fixture. Address/UB checks
+                    # stay enabled; leak checks run in non-GTK targets.
+                    ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0"
             )
         endif()
 

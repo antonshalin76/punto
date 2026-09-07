@@ -23,6 +23,7 @@ COMMAND_WAIT=""
 POLL_DURATION=""
 IPC_RESULT=""
 IPC_ERROR=""
+LEARNING_TARGET=""
 COMMAND_ERROR=""
 BACKEND_ERROR=""
 TRAY_ERROR=""
@@ -92,7 +93,7 @@ valid_uint64() {
 }
 
 validate_stats_line() {
-    local line=$1 index name value capability
+    local line=$1 index name value capability schema legacy_count current_count
     local -a parts names dispatch_field=()
 
     read -r -a parts <<<"$line"
@@ -104,6 +105,23 @@ validate_stats_line() {
             ;;
         *) return 1 ;;
     esac
+    if [[ $capability == x11 ]]; then
+        legacy_count=31
+        current_count=39
+    else
+        legacy_count=30
+        current_count=38
+    fi
+
+    if [[ ${parts[-1]:-} == avg_tail_len=* &&
+          ${#parts[@]} -eq $legacy_count ]]; then
+        schema=legacy
+    elif [[ ${parts[-1]:-} == daemon_epoch=* &&
+            ${#parts[@]} -eq $current_count ]]; then
+        schema=current
+    else
+        return 1
+    fi
 
     names=(
         x11_health analysis_health input_health x11_last_progress_ms
@@ -112,20 +130,28 @@ validate_stats_line() {
         config_pending config_generation config_result analyzed need_switch corrections
         "${dispatch_field[@]}" pending_words
         ready_results worker_threads daemon_peers analysis_mode control_plane
-        queued_tasks avg_queue_us avg_analysis_us avg_macro_us avg_tail_len
+        queued_tasks avg_queue_us avg_analysis_us avg_macro_us
+        avg_macro_payload_bytes learning_ready learning_pending learning_failed
+        exclusions learning_generation learning_completed_generation
+        learning_failed_generation daemon_epoch
     )
-    [[ ${#parts[@]} -eq $((${#names[@]} + 1)) && ${parts[0]} == OK ]] || return 1
+    [[ ${parts[0]} == OK ]] || return 1
     [[ $line == "${parts[*]}" ]] || return 1
 
-    for ((index = 0; index < ${#names[@]}; ++index)); do
+    for ((index = 0; index + 1 < ${#parts[@]}; ++index)); do
         name=${parts[$((index + 1))]%%=*}
         value=${parts[$((index + 1))]#*=}
-        [[ $name == "${names[$index]}" && $value != "${parts[$((index + 1))]}" ]] || return 1
+        if [[ $schema == legacy && $index -eq $((${#parts[@]} - 2)) ]]; then
+            [[ $name == avg_tail_len ]] || return 1
+        else
+            [[ $name == "${names[$index]}" ]] || return 1
+        fi
+        [[ $value != "${parts[$((index + 1))]}" ]] || return 1
         case $name in
             x11_health|analysis_health|input_health)
                 [[ $value == ready || $value == degraded || $value == failed ]] || return 1
                 ;;
-            input_in_flight|configured_enabled|config_pending)
+            input_in_flight|configured_enabled|config_pending|learning_ready|learning_pending|learning_failed)
                 [[ $value == 0 || $value == 1 ]] || return 1
                 ;;
             text_mutation)
@@ -151,11 +177,14 @@ validate_stats_line() {
 }
 
 query_status() {
+    local request=${1:-STATS}
     local capture_dir response_fifo error_fifo response_file error_file
     local response_reader error_reader response_reader_rc error_reader_rc
-    local rc byte_count line_count payload diagnostic
+    local rc byte_count line_count payload diagnostic owner generation
 
     IPC_RESULT=""
+    LEARNING_OWNER=""
+    LEARNING_TARGET=""
     IPC_ERROR=""
     capture_dir=$(mktemp -d "${TMPDIR:-/tmp}/punto-ipc.XXXXXX" 2>/dev/null) || {
         IPC_ERROR=unavailable
@@ -177,7 +206,11 @@ query_status() {
     head -c 4097 <"$error_fifo" >"$error_file" &
     error_reader=$!
 
-    printf 'STATS\n' | timeout --signal=TERM \
+    [[ $request == STATS || $request == CLEAR_EXCLUSIONS ]] || {
+        IPC_ERROR=usage-error
+        return 1
+    }
+    printf '%s\n' "$request" | timeout --signal=TERM \
         --kill-after="$TIMEOUT_KILL_AFTER" "$IPC_DURATION" nc -U "$SOCKET" \
         >"$response_fifo" 2>"$error_fifo"
     rc=${PIPESTATUS[1]}
@@ -240,11 +273,73 @@ query_status() {
         IPC_ERROR=daemon-error
         return 1
     fi
-    if ! validate_stats_line "$payload"; then
+    if [[ $request == CLEAR_EXCLUSIONS ]]; then
+        if [[ ! $payload =~ ^OK\ EXCLUSIONS\ SCHEDULED\ ([0-9]+)\ ([0-9]+)$ ]]; then
+            IPC_ERROR=protocol-error
+            return 1
+        fi
+        owner=${BASH_REMATCH[1]}
+        generation=${BASH_REMATCH[2]}
+        if [[ $owner == 0 || $generation == 0 ]] ||
+           ! valid_uint64 "$owner" || ! valid_uint64 "$generation"; then
+            IPC_ERROR=protocol-error
+            return 1
+        fi
+        LEARNING_OWNER=$owner
+        LEARNING_TARGET=$generation
+    elif ! validate_stats_line "$payload"; then
         IPC_ERROR=protocol-error
         return 1
     fi
     IPC_RESULT=$payload
+}
+
+runtime_ready() {
+    [[ $IPC_RESULT == 'OK x11_health=ready analysis_health=ready input_health=ready '* &&
+       $IPC_RESULT == *' text_mutation=x11 '* ]]
+}
+
+runtime_terminal_failure() {
+    [[ $IPC_RESULT == *' x11_health=failed '* ||
+       $IPC_RESULT == *' analysis_health=failed '* ||
+       $IPC_RESULT == *' input_health=failed '* ||
+       $IPC_RESULT == *' text_mutation=disabled '* ]]
+}
+
+uint64_ge() {
+    local value=$1 expected=$2
+    valid_uint64 "$value" && valid_uint64 "$expected" || return 1
+    ((${#value} > ${#expected})) && return 0
+    ((${#value} < ${#expected})) && return 1
+    [[ $value == "$expected" || $value > "$expected" ]]
+}
+
+wait_for_runtime_ready() {
+    local deadline=$1 now saw_valid=0
+    while :; do
+        if query_status; then
+            saw_valid=1
+            runtime_ready && return 0
+            if runtime_terminal_failure; then
+                IPC_ERROR=not-ready
+                return 1
+            fi
+        else
+            case $IPC_ERROR in
+                unavailable|timeout) ;;
+                *) return 1 ;;
+            esac
+        fi
+        now=$(date +%s%3N) || {
+            IPC_ERROR=unavailable
+            return 1
+        }
+        if ((10#$now >= deadline)); then
+            ((saw_valid == 0)) || IPC_ERROR=not-ready
+            return 1
+        fi
+        sleep "$POLL_DURATION"
+    done
 }
 
 backend_active() {
@@ -318,10 +413,14 @@ run_service_command() {
     return 1
 }
 
-wait_for_socket() {
-    local started now deadline
+start_deadline() {
+    local started
     started=$(date +%s%3N) || return 1
-    deadline=$((10#$started + 10#$START_TIMEOUT_MS))
+    START_DEADLINE=$((10#$started + 10#$START_TIMEOUT_MS))
+}
+
+wait_for_socket() {
+    local deadline=$1 now
     while [[ ! -S $SOCKET ]]; do
         now=$(date +%s%3N) || return 1
         ((10#$now >= deadline)) && break
@@ -477,7 +576,7 @@ start_service() {
             emit_error unavailable
             return 1
         fi
-        if ! query_status; then
+        if ! start_deadline || ! wait_for_runtime_ready "$START_DEADLINE"; then
             emit_error "$IPC_ERROR"
             return 1
         fi
@@ -494,8 +593,12 @@ start_service() {
         return 1
     fi
 
-    wait_for_socket || true
-    if ! query_status; then
+    if ! start_deadline; then
+        report_start_failure unavailable "$started_here"
+        return 1
+    fi
+    wait_for_socket "$START_DEADLINE" || true
+    if ! wait_for_runtime_ready "$START_DEADLINE"; then
         report_start_failure "$IPC_ERROR" "$started_here"
         return 1
     fi
@@ -507,12 +610,67 @@ restart_service() {
         emit_error "$COMMAND_ERROR"
         return 1
     fi
-    wait_for_socket || true
-    if ! query_status; then
+    if ! start_deadline; then
+        emit_error unavailable
+        return 1
+    fi
+    wait_for_socket "$START_DEADLINE" || true
+    if ! wait_for_runtime_ready "$START_DEADLINE"; then
         emit_error "$IPC_ERROR"
         return 1
     fi
     ensure_tray_restarted || report_tray_warning
+}
+
+reset_learning() {
+    local started now deadline target target_owner owner completed failed
+    if ! query_status CLEAR_EXCLUSIONS; then
+        emit_error "$IPC_ERROR"
+        return 1
+    fi
+    target_owner=$LEARNING_OWNER
+    target=$LEARNING_TARGET
+    started=$(date +%s%3N) || {
+        emit_error unavailable
+        return 1
+    }
+    deadline=$((10#$started + 10#$START_TIMEOUT_MS))
+    while :; do
+        if query_status; then
+            if [[ $IPC_RESULT =~ \ learning_completed_generation=([0-9]+)\ learning_failed_generation=([0-9]+)\ daemon_epoch=([0-9]+)$ ]]; then
+                completed=${BASH_REMATCH[1]}
+                failed=${BASH_REMATCH[2]}
+                owner=${BASH_REMATCH[3]}
+            else
+                emit_error protocol-error
+                return 1
+            fi
+            if [[ $owner != "$target_owner" ]]; then
+                emit_error learning-error
+                return 1
+            fi
+            if uint64_ge "$completed" "$target"; then
+                printf 'OK EXCLUSIONS CLEARED\n'
+                return 0
+            fi
+            if uint64_ge "$failed" "$target"; then
+                emit_error learning-error
+                return 1
+            fi
+        elif [[ $IPC_ERROR != unavailable && $IPC_ERROR != timeout ]]; then
+            emit_error "$IPC_ERROR"
+            return 1
+        fi
+        now=$(date +%s%3N) || {
+            emit_error unavailable
+            return 1
+        }
+        if ((10#$now >= deadline)); then
+            emit_error learning-timeout
+            return 1
+        fi
+        sleep "$POLL_DURATION"
+    done
 }
 
 stop_service() {
@@ -564,6 +722,7 @@ show_help() {
         '  stop       Stop the tray and backend' \
         '  restart    Restart the backend and tray' \
         '  status     Print the daemon STATS line' \
+        '  reset-learning  Clear learned autocorrection exclusions' \
         '  help       Show this help' \
         '  --version  Print the installed version' \
         '' \
@@ -594,6 +753,7 @@ main() {
                 return 1
             fi
             ;;
+        reset-learning) reset_learning ;;
         help|--help|-h)
             version=$(load_version) || {
                 emit_error invalid-configuration

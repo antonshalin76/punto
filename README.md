@@ -10,7 +10,7 @@
 Это best-effort взаимодействие с приложением, а не атомарная транзакция
 редактора. Ограничения перечислены ниже; плагины редактора не требуются.
 
-![Version](https://img.shields.io/badge/version-2.8.10-blue)
+![Version](https://img.shields.io/badge/version-2.8.11-blue)
 ![C++](https://img.shields.io/badge/C%2B%2B-20-orange)
 ![License](https://img.shields.io/badge/license-Personal%20Use%20Only-red)
 
@@ -58,7 +58,7 @@
   - `кОЛБАСА` → `Колбаса` (паттерн L+U+: Caps Lock)
   - `GHbdtn` → `Привет` (комбинированное: смена раскладки + регистр)
   - **Смешанный регистр НЕ исправляется** (например, `СНиП`)
-- **Typo Fix**: автоматическое исправление опечаток:
+- **Typo Fix (beta, по умолчанию выключен)**: автоматическое исправление опечаток:
   - `ппривет` → `привет` (удаление дублей)
   - Использует Hunspell spell() для проверки правильности слова
   - Защита от ложных срабатываний: правильные слова не изменяются
@@ -67,6 +67,7 @@
   - `punto stop` — остановка сервиса
   - `punto restart` — перезапуск с перезагрузкой конфига
   - `punto status` — показать статус
+  - `punto reset-learning` — очистить накопленные исключения автокоррекции
 - **Новые настройки**:
   - `sticky_shift_correction_enabled` — вкл/выкл исправление регистра
   - `typo_correction_enabled` — вкл/выкл исправление опечаток
@@ -139,8 +140,12 @@ ghbdtn  →  [Pause]  →  привет
 - **Один исполнитель** — `WordEditor` обслуживает слова, выделение и отмену;
   `EventLoop` владеет историей и порядком применения, `X11Session` — сессией,
   `ClipboardManager` — передачей clipboard, `UndoDetector` — обучением.
-- **Телеметрия** — логирует `queue_us`, `analysis_us`, `macro_us`, длину хвоста (удобно смотреть в `journalctl -u udevmon -f`)
-- **Auto-budget worker pool** — при нескольких `punto-daemon` суммарный analysis pool автоматически делится между процессами и не раздувается линейно от числа клавиатур
+- **Телеметрия** — `STATS` показывает средние `avg_queue_us`,
+  `avg_analysis_us`, `avg_macro_us` и `avg_macro_payload_bytes`; периодические
+  агрегаты очереди и анализа также доступны в `journalctl -u udevmon -f`
+- **Auto-budget worker pool** — при нескольких `punto-daemon` analysis pool
+  делится по числу daemon-процессов, обнаруженных при старте каждого процесса.
+  После hotplug/hot-unplug перезапустите `udevmon`, чтобы пересчитать бюджет
 - **Primary control-plane** — только один `punto-daemon` держит `/var/run/punto.sock`; secondary daemons синхронизируют `RELOAD`/`SET_STATUS` через shared state в `/var/run/punto-control.state`
 
 Также доступны возможности v2.4:
@@ -151,6 +156,9 @@ ghbdtn  →  [Pause]  →  привет
 - **Настройки + bounded reload** — чтение пользовательского конфига выполняется
   вне input-thread; IPC принимает задачу без остановки passthrough
 - **IPC через Unix Socket** — `/var/run/punto.sock` (GET_STATUS, SET_STATUS, RELOAD, STATS)
+- **Управление обучением** — `CLEAR_EXCLUSIONS` очищает скрытые исключения,
+  накопленные после отмен автокоррекции; secondary daemons перечитывают общий
+  файл при следующей синхронизации.
 - **Анализ раскладки** — словарь-first; N-граммы используются только для
   ambiguous слов (есть в обоих словарях).
 - **Звук** — асинхронно после завершённой смены раскладки, если включён в конфиге.
@@ -207,6 +215,10 @@ ghbdtn  →  [Pause]  →  привет
   здоровый IPC не доказывает изменение текста в приложении.
   `config_pending`, `config_generation` и `config_result`
   (`none|ok|error`) показывают завершение асинхронного reload.
+  `learning_generation`, `learning_completed_generation` и
+  `learning_failed_generation` показывают долговечность операций обучения, а
+  `daemon_epoch` связывает подтверждение `CLEAR_EXCLUSIONS` с тем же процессом
+  даже при failover primary-daemon.
 - Словари загружаются в отдельном потоке после безопасного запуска passthrough,
   signal-fd и диагностического IPC. Пока immutable snapshot не готов, `STATS`
   показывает `analysis_health=degraded` и `worker_threads=0`; ввод при этом
@@ -283,6 +295,10 @@ ghbdtn  →  [Pause]  →  привет
 владелец `root:root`, одна жёсткая ссылка и права `0600`. При обновлении пакет
 переводит только обычный файл `root:root 0644` с одной ссылкой в `0600`,
 не меняя его байты; небезопасные файлы оставляет нетронутыми с предупреждением.
+Служебный атомарно публикуемый reset-marker хранит boot-scoped монотонную
+отметку последнего reset:
+запись secondary-daemon, принятая до подтверждённого `CLEAR_EXCLUSIONS`, не
+может восстановить уже очищенное исключение после освобождения `flock`.
 
 ## Установка
 
@@ -299,7 +315,7 @@ ghbdtn  →  [Pause]  →  привет
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh --non-interactive --skip-runtime-installs
-sudo dpkg -i "punto-switcher_2.8.10_$(dpkg --print-architecture).deb"
+sudo dpkg -i "punto-switcher_2.8.11_$(dpkg --print-architecture).deb"
 ```
 
 Готовые `.deb` и `SHA256SUMS` публикуются в GitHub Releases и не хранятся в
@@ -353,7 +369,7 @@ Xvfb сообщает готовность через `-displayfd`, а package-t
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh
-sudo dpkg -i punto-switcher_2.8.10_amd64.deb
+sudo dpkg -i punto-switcher_2.8.11_amd64.deb
 ```
 
 #### Ручная сборка без пакета
@@ -385,9 +401,15 @@ interception-пайплайны. Создайте или вручную объе
 ```yaml
 - JOB: "interception -g $DEVNODE | /usr/bin/punto-daemon | uinput -d $DEVNODE"
   DEVICE:
+    LINK: .*-event-kbd
     EVENTS:
       EV_KEY: [KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H, KEY_I, KEY_J, KEY_K, KEY_L, KEY_M, KEY_N, KEY_O, KEY_P, KEY_Q, KEY_R, KEY_S, KEY_T, KEY_U, KEY_V, KEY_W, KEY_X, KEY_Y, KEY_Z, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_0, KEY_MINUS, KEY_EQUAL, KEY_BACKSPACE, KEY_TAB, KEY_ENTER, KEY_LEFTSHIFT, KEY_RIGHTSHIFT, KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTALT, KEY_RIGHTALT, KEY_COMMA, KEY_DOT, KEY_SLASH, KEY_SEMICOLON, KEY_APOSTROPHE, KEY_LEFTBRACE, KEY_RIGHTBRACE, KEY_BACKSLASH, KEY_GRAVE, KEY_SPACE, KEY_PAUSE, KEY_LEFT, KEY_RIGHT, KEY_UP, KEY_DOWN, KEY_HOME, KEY_END, KEY_PAGEUP, KEY_PAGEDOWN, KEY_INSERT, KEY_DELETE]
 ```
+
+При обновлении существующей установки проверьте, что фильтр `LINK` добавлен в
+рабочий `/etc/interception/udevmon.yaml`, и затем явно выполните
+`sudo systemctl restart udevmon`. Пакет не меняет этот общий системный файл и
+не перезапускает сервис автоматически.
 
 ### Запуск
 
@@ -397,6 +419,7 @@ interception-пайплайны. Создайте или вручную объе
 punto start     # Запуск сервиса (backend + frontend)
 punto status    # Проверка статуса
 punto restart   # Перезапуск (после изменения конфига)
+punto reset-learning # Очистить исключения, накопленные после отмен исправлений
 punto stop      # Остановка
 ```
 
@@ -436,6 +459,9 @@ auto_switch:
   min_word_len: 2      # Минимальная длина слова для анализа
   min_score: 5.0       # Минимальный скор для уверенного решения
   max_rollback_words: 5 # Максимальная история отложенного исправления
+  sticky_shift_correction_enabled: true
+  typo_correction_enabled: false # Beta: включается пользователем явно
+  max_typo_diff: 2
 
 # Звук завершённой смены раскладки
 sound:
@@ -459,7 +485,9 @@ runtime:
 После изменения можно применить настройки без перезапуска:
 
 ```bash
-# Через tray-приложение: диалог настроек -> "Сохранить" (применяется сразу)
+# Через tray-приложение: диалог настроек -> "Сохранить"
+# Сохранение планирует bounded reload; применение подтверждает следующий STATS:
+# config_pending=0 config_result=ok
 
 # Или через командную строку:
 
@@ -561,7 +589,10 @@ sudo apt install hunspell-en-us hunspell-ru
 3. Проверьте `STATS`: ожидаются `text_mutation=x11 enabled=1`, готовые словари
    и подтверждённый X11-сеанс. `configured_enabled=1` не отменяет runtime-выключение
    через трей. При необходимости выполните `SET_STATUS 1`.
-4. В отдельном пустом текстовом поле при EN введите `ghbdtn` и пробел:
+4. Если отдельные слова перестали исправляться после отмен или серии Backspace,
+   выполните `punto reset-learning`. Команда очищает общий список исключений,
+   не меняя YAML-настройки.
+5. В отдельном пустом текстовом поле при EN введите `ghbdtn` и пробел:
    ожидается `привет `. Проверьте Pause и немедленную отмену Ctrl+Z.
 
 ### Переключение раскладки не срабатывает
@@ -600,6 +631,31 @@ sudo dpkg -r punto-switcher
 | wamerican-huge             | любая (опционально)       |
 
 ## История изменений
+
+### v2.8.11 — Стабильная готовность и управление обучением
+
+- Периодическое обнаружение X11-сеанса и наблюдение клавиатуры разделены на
+  независимые single-flight очереди. Медленный refresh больше не отменяет
+  `Pause` и другие действия, а единичная ошибка discovery сохраняет последний
+  подтверждённый сеанс до исчерпания bounded retry.
+- Фоновый опрос tray больше не делает подтверждённый переключатель недоступным;
+  чтение и пользовательская мутация имеют раздельные состояния выполнения.
+- CLI `start`/`restart` считают запуск успешным только при готовых X11, анализе
+  и input и доступном X11 mutation backend. Tray сохраняет подтверждённый
+  переключатель при временной деградации data-plane и показывает отдельную
+  подсказку. Последняя подтверждённая конфигурация остаётся рабочей, пока
+  ошибочный reload явно отражается в `config_result=error`.
+- Добавлена команда `punto reset-learning` и IPC `CLEAR_EXCLUSIONS` для очистки
+  скрытых исключений автокоррекции с синхронизацией между daemon-процессами и
+  защитой от pre-reset записи, уже поставленной secondary-daemon в очередь.
+- Новый CLI и tray принимают точную схему `STATS` v2.8.10 до ручного рестарта
+  общего `udevmon`; обновление пакета не скрывает управление работающим daemon.
+- Справка daemon снова описывает реально доступные автоматические исправления,
+  Pause-комбинации и Ctrl+Z. Добавлены native GTK E2E гонки refresh/hotkey и
+  сброса обучения, а также contract-тесты tray, IPC и CLI.
+- Защитное ограничение сохраняется: неизвестное stale PRIMARY внутри другого
+  поля того же Chromium-клиента отклоняет исправление, чтобы не разрушить новое
+  выделение пользователя.
 
 ### v2.8.10 — Звуковые настройки и повторные исправления Chromium
 

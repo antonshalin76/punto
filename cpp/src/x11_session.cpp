@@ -606,10 +606,9 @@ enable_xkb(BoundedXcbConnection &connection,
   return supported;
 }
 
-[[nodiscard]] int
-get_xkb_group(BoundedXcbConnection &connection,
-              std::chrono::steady_clock::time_point deadline,
-              std::uint8_t *locked_mods = nullptr) noexcept {
+[[nodiscard]] int get_xkb_group(BoundedXcbConnection &connection,
+                                std::chrono::steady_clock::time_point deadline,
+                                std::uint8_t *locked_mods = nullptr) noexcept {
   if (!enable_xkb(connection, deadline)) {
     return -1;
   }
@@ -1368,21 +1367,13 @@ void X11Session::run_background_probe(
       return;
     }
 
-    {
-      std::unique_lock<std::recursive_mutex> write_lock{
-          state->write_gate->mutex};
-      if (state->generation_clock->load(std::memory_order_acquire) !=
-          state->generation) {
-        std::lock_guard<std::mutex> lock{state->mu};
-        state->probe.status = x11_detail::ProbeStatus::Failed;
-        state->done = true;
-        state->cv.notify_all();
-        return;
-      }
-      if (state->write_gate->enabled) {
-        ++state->write_gate->generation;
-        state->write_gate->enabled = false;
-      }
+    if (state->generation_clock->load(std::memory_order_acquire) !=
+        state->generation) {
+      std::lock_guard<std::mutex> lock{state->mu};
+      state->probe.status = x11_detail::ProbeStatus::Failed;
+      state->done = true;
+      state->cv.notify_all();
+      return;
     }
     ++failures;
     const auto delay = x11_detail::retry_delay_after_failure(failures);
@@ -1439,8 +1430,8 @@ bool X11Session::start_background_refresh() {
 
 bool X11Session::start_background_keyboard_observation(
     std::uint64_t request_id) {
-  std::lock_guard<std::mutex> lock{refresh_mutex_};
-  if (pending_refresh_) {
+  std::lock_guard<std::mutex> lock{keyboard_mutex_};
+  if (pending_keyboard_) {
     return false;
   }
   auto lease = acquire_write_lease();
@@ -1449,48 +1440,44 @@ bool X11Session::start_background_keyboard_observation(
   }
   auto state = std::make_shared<BackgroundState>();
   state->kind = BackgroundState::Kind::Keyboard;
-  state->generation =
-      generation_clock_->fetch_add(1, std::memory_order_acq_rel) + 1;
+  state->generation = generation_clock_->load(std::memory_order_acquire);
   state->keyboard = KeyboardObservation{request_id, lease->generation(), -1};
   state->keyboard_session = lease->info();
-  pending_refresh_ = state;
+  pending_keyboard_ = state;
   // The immutable snapshot travels to the worker; no desktop write lease is
   // held during observation I/O, including a stalled connection handshake.
   lease.reset();
-  refresh_thread_ =
+  keyboard_thread_ =
       std::thread{[state] { X11Session::run_background_probe(state); }};
   return true;
 }
 
 std::optional<X11Session::KeyboardObservation>
 X11Session::poll_keyboard_observation() {
-  std::lock_guard<std::mutex> lock{refresh_mutex_};
-  if (!pending_refresh_ ||
-      pending_refresh_->kind != BackgroundState::Kind::Keyboard) {
+  std::lock_guard<std::mutex> lock{keyboard_mutex_};
+  if (!pending_keyboard_) {
     return std::nullopt;
   }
   KeyboardObservation observation;
   {
-    std::lock_guard<std::mutex> state_lock{pending_refresh_->mu};
-    if (!pending_refresh_->done) {
+    std::lock_guard<std::mutex> state_lock{pending_keyboard_->mu};
+    if (!pending_keyboard_->done) {
       return std::nullopt;
     }
-    observation = pending_refresh_->keyboard;
+    observation = pending_keyboard_->keyboard;
   }
-  if (refresh_thread_.joinable()) {
-    refresh_thread_.join();
+  if (keyboard_thread_.joinable()) {
+    keyboard_thread_.join();
   }
   auto lease = acquire_write_lease();
-  if (!lease || lease->generation() != observation.session_generation ||
-      pending_refresh_->generation !=
-          generation_clock_->load(std::memory_order_acquire)) {
+  if (!lease || lease->generation() != observation.session_generation) {
     observation.group = -1;
   }
   if (observation.group >= 0) {
     std::lock_guard<std::mutex> snapshot_lock{mu_};
     info_.observed_keyboard_layout = observation.group;
   }
-  pending_refresh_.reset();
+  pending_keyboard_.reset();
   return observation;
 }
 
@@ -1519,37 +1506,58 @@ std::optional<X11Session::RefreshResult> X11Session::poll_refresh_result() {
 
 bool X11Session::shutdown_background_refresh(
     std::chrono::milliseconds timeout) noexcept {
-  std::shared_ptr<BackgroundState> state;
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  std::shared_ptr<BackgroundState> discovery;
+  std::shared_ptr<BackgroundState> keyboard;
   {
     std::lock_guard<std::mutex> lock{refresh_mutex_};
-    state = pending_refresh_;
+    discovery = pending_refresh_;
   }
-  if (state) {
+  {
+    std::lock_guard<std::mutex> lock{keyboard_mutex_};
+    keyboard = pending_keyboard_;
+  }
+  const auto cancel_and_wait = [deadline](const auto &state) {
+    if (!state) {
+      return true;
+    }
     {
       std::lock_guard<std::mutex> lock{state->mu};
       state->cancel_requested.store(true, std::memory_order_release);
     }
     state->cv.notify_all();
     std::unique_lock<std::mutex> lock{state->mu};
-    (void)state->cv.wait_for(lock, timeout, [&state] { return state->done; });
-  }
+    (void)state->cv.wait_until(lock, deadline,
+                               [&state] { return state->done; });
+    return state->done;
+  };
+  const bool discovery_completed = cancel_and_wait(discovery);
+  const bool keyboard_completed = cancel_and_wait(keyboard);
 
-  std::lock_guard<std::mutex> lock{refresh_mutex_};
-  bool completed = true;
-  if (state) {
-    std::lock_guard<std::mutex> state_lock{state->mu};
-    completed = state->done;
-  }
-  if (refresh_thread_.joinable()) {
-    if (completed) {
-      refresh_thread_.join();
-    } else {
-      refresh_thread_.detach();
+  {
+    std::lock_guard<std::mutex> lock{refresh_mutex_};
+    if (refresh_thread_.joinable()) {
+      if (discovery_completed) {
+        refresh_thread_.join();
+      } else {
+        refresh_thread_.detach();
+      }
     }
+    pending_refresh_.reset();
   }
-  pending_refresh_.reset();
+  {
+    std::lock_guard<std::mutex> lock{keyboard_mutex_};
+    if (keyboard_thread_.joinable()) {
+      if (keyboard_completed) {
+        keyboard_thread_.join();
+      } else {
+        keyboard_thread_.detach();
+      }
+    }
+    pending_keyboard_.reset();
+  }
   (void)generation_clock_->fetch_add(1, std::memory_order_acq_rel);
-  return completed;
+  return discovery_completed && keyboard_completed;
 }
 
 X11Session::RefreshResult

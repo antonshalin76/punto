@@ -317,7 +317,9 @@ uint64_ge() {
 wait_for_runtime_ready() {
     local deadline=$1 now saw_valid=0
     while :; do
-        if query_status; then
+        if [[ ! -S $SOCKET ]]; then
+            IPC_ERROR=unavailable
+        elif query_status; then
             saw_valid=1
             runtime_ready && return 0
             if runtime_terminal_failure; then

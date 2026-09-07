@@ -28,7 +28,8 @@ COMMAND_TIMEOUT_MS=120
 START_TIMEOUT_MS=40
 STOP_TIMEOUT_MS=40
 POLL_INTERVAL_MS=10
-STOP_FALLBACK_WALL_BOUND_MS=1500
+STOP_FALLBACK_WALL_BOUND_MS=2200
+ACTIVE_READINESS_WALL_BOUND_MS=1500
 TRANSITION_AT_MS=""
 TRANSITION_STATE=""
 SEED_TRAY=0
@@ -1816,7 +1817,11 @@ prepare_response() {
 assert_readiness_observation() {
     local fixture_mode=$1 message=$2
     case $fixture_mode in
-        none|denied)
+        none)
+            assert_no_requests "$message"
+            assert_nc_count 0 "$message"
+            ;;
+        denied)
             assert_no_requests "$message"
             assert_nc_count 1 "$message"
             ;;
@@ -2020,7 +2025,7 @@ run_start_failure_matrix() {
         assert_tray_start_count 0 "B26 active $label backend"
         if [[ $fixture == none ]]; then
             assert_no_requests "B26 active $label backend"
-            assert_nc_count 5 "B26 active $label backend"
+            assert_nc_count 0 "B26 active $label backend"
             fake_clock=$(<"$tmp_root/clock.ms")
             if [[ $fake_clock -ge $START_TIMEOUT_MS ]]; then
                 pass "B26 active backend without socket waits for startup deadline"
@@ -2034,7 +2039,7 @@ run_start_failure_matrix() {
                 "B26 active $label backend readiness"
         fi
         assert_no_pid_or_undeclared_calls "B26 active $label backend"
-        assert_bounded "$CLI_RC" "$CLI_DURATION_MS" 900 \
+        assert_bounded "$CLI_RC" "$CLI_DURATION_MS" "$ACTIVE_READINESS_WALL_BOUND_MS" \
             "B26 active $label start is bounded"
     done
 

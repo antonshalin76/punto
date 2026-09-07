@@ -350,9 +350,11 @@ class CliContract(unittest.TestCase):
                 while process.poll() is None and time.monotonic() < deadline:
                     for capture in self.harness.root.glob("punto-ipc.*/*"):
                         if capture.name in {"response", "error"}:
-                            maximum_capture = max(
-                                maximum_capture, capture.stat().st_size
-                            )
+                            try:
+                                capture_size = capture.stat().st_size
+                            except FileNotFoundError:
+                                continue
+                            maximum_capture = max(maximum_capture, capture_size)
                     time.sleep(0.002)
                 stdout, stderr = process.communicate(timeout=1)
                 self.assertLess(time.monotonic() - started, 1)

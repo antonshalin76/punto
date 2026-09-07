@@ -215,10 +215,14 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
     def test_consecutive_automatic_corrections(self):
         self.assertEqual(gtk.ipc_request(b"SET_STATUS 1\n"), b"OK ENABLED\n")
         self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+                        "first browser source word")
         self.harness.send_key(gtk.KEY_SPACE)
         self.pump_until(lambda: self.browser_state()[:3] == ["привет ", 7, 7],
                         "first browser automatic correction")
         self.harness.type_word("hello")
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет руддщ", 12, 12],
+                        "second browser source word")
         self.harness.send_key(gtk.KEY_SPACE)
         self.pump_until(lambda: self.browser_state()[:3] == ["привет hello ", 13, 13],
                         "second browser automatic correction")

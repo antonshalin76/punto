@@ -572,10 +572,6 @@ start_service() {
     backend_active
     backend_rc=$?
     if ((backend_rc == 0)); then
-        if [[ ! -S $SOCKET ]]; then
-            emit_error unavailable
-            return 1
-        fi
         if ! start_deadline || ! wait_for_runtime_ready "$START_DEADLINE"; then
             emit_error "$IPC_ERROR"
             return 1

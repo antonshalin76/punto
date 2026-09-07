@@ -2020,7 +2020,15 @@ run_start_failure_matrix() {
         assert_tray_start_count 0 "B26 active $label backend"
         if [[ $fixture == none ]]; then
             assert_no_requests "B26 active $label backend"
-            assert_nc_count 0 "B26 active $label backend"
+            assert_nc_count 5 "B26 active $label backend"
+            fake_clock=$(<"$tmp_root/clock.ms")
+            if [[ $fake_clock -ge $START_TIMEOUT_MS ]]; then
+                pass "B26 active backend without socket waits for startup deadline"
+            else
+                fail "B26 active backend without socket returned at ${fake_clock}ms before ${START_TIMEOUT_MS}ms deadline"
+            fi
+            assert_contains "$(<"$tmp_root/calls.log")" 'SLEEP 0.010' \
+                "B26 active backend without socket polls for late readiness"
         else
             assert_readiness_observation "$fixture" \
                 "B26 active $label backend readiness"

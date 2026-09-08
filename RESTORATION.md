@@ -1,10 +1,15 @@
 # Product restoration
 
-This document records the source restoration through 2.8.12. Source tests, package
-validation, publication and machine installation are separate evidence gates;
-runtime health alone is not proof of an editor correction.
+This document records the source restoration through the 2.8.13 candidate.
+Source tests, package validation, publication and machine installation are
+separate evidence gates; runtime health alone is not proof of an editor
+correction.
 
-## 2.8.12 product verification matrix
+Version 2.8.12 was marked prerelease after live GNOME validation exposed valid
+layout transitions taking longer than its 300 ms macro deadline. It remains
+available as historical evidence, but is not the stable release candidate.
+
+## 2.8.13 product verification matrix
 
 This matrix binds each shipped capability to its production owner and real test
 seam. Results describe the final source candidate; package publication and the
@@ -14,28 +19,57 @@ installed runtime remain separate release gates.
 | --- | --- | --- | --- |
 | Manual word layout and case | `EventLoop` + `WordEditor` | Native GTK and Chromium editor text, four consecutive `Pause` operations | PASS; X11 US/RU only |
 | Automatic correction | analyzer/sequencer + `EventLoop` + `WordEditor` | Native GTK/Chromium consecutive corrections, punctuation, Tab and younger-tail cases | PASS; unknown dictionary words remain unchanged |
-| Selection layout, case and transliteration | `WordEditor` + `ClipboardManager` | Native GTK, Chromium and VTE selection/paste cases | PASS; editor must support ordinary X11 selection/paste |
+| Selection layout, case and transliteration | `WordEditor` + `ClipboardManager` | Native GTK, Chromium and VTE selection/paste cases | PASS; GUI rich clipboard uses direct keyboard replay when representable; terminal uses paste |
 | Desktop layout transition | `WordEditor` + configured desktop `hotkey` | Independent desktop-source fixture, lock/modifier lifecycle and negative XKB-only control | PASS; Punto does not create the desktop binding |
 | Undo and learning | `EventLoop` + `UndoDetector` | Immediate/expired undo, invalidation, exclusion persistence and reset across restart | PASS; Punto undo window is 2.5 seconds |
 | Clipboard ownership and recovery | `ClipboardManager` | Late receipt, foreign copy, post-arm rejection, timeout and context-change cases | PASS; clipboard delivery is not an editor transaction |
 | Terminal safety | `WordEditor` terminal policy | Native VTE/PTY word and selection cases, scrollback and stalled-paste recovery | PASS; unsupported control payloads fail closed |
 | Runtime control and reload | IPC + CLI + tray | Native IPC/tray contracts, config races, 5315 CLI checks | PASS; mutating commands may cancel pending edits |
-| Service and package lifecycle | systemd/udevmon scripts + Debian package | 817 isolated install/upgrade/purge checks and ShellCheck | PASS for candidate; live installation is a separate gate |
+| Service and package lifecycle | systemd/udevmon scripts + Debian package | 837 isolated install/upgrade/purge checks and ShellCheck | PASS for candidate; live installation is a separate gate |
 | Diagnostics | runtime health + `STATS` + journald | Native health contracts and rejection-stage assertions | PASS; no typed text, clipboard payload or window id is logged |
 
 ## Desktop-owned layout transition contract
 
-WordEditor does not mutate the XKB group behind the desktop environment. Every
-required transition is requested through the configured `hotkey` chord and is
-accepted only after the target group is observed with the same session, focus,
-pointer position and lock modifiers. The whole macro retains one 300 ms
-deadline. Word and selection-paste paths preflight the required target and
-native-paste groups before Backspace, selection preparation, clipboard mutation
-or paste dispatch. If a later transition fails after an editor action was
+Persistent desktop-source transitions are requested through the configured
+`hotkey` chord and are accepted only after the target group is observed with
+the same session, focus, pointer position and lock modifiers. During mapped GUI
+word or selection replay and paste, WordEditor may lock an internal XKB group
+temporarily.
+It restores the exact source group within 100 ms before requesting the final
+desktop transition. Restoration is allowed only in the original session,
+focus, pointer and lock context, and only while XKB is in an executor-owned
+temporary or source group. Ordinary work uses a 300 ms phase budget.
+A required desktop transition gets up to 1 s, then the ordinary budget is
+renewed; a 3.5 s hard deadline bounds the complete operation. A synchronous
+client must hold the target group for 5 ms. After an observed focus return or
+the release of Punto's own desktop chord, the settle interval is 250 ms. The
+original GUI selection receipt must remain stable for 30 ms; equal text in
+the same client is not accepted as a recreated range. Word paths confirm the
+exact prepared suffix, perform the desktop transition, and revalidate that same
+receipt before replay. GUI selection paths replace the confirmed range before
+any desktop transition can disturb it. If a later transition fails after an editor action was
 actually queued, the result is a partial failure rather than a successful
 dispatch; no blind undo or compensating toggle is attempted. An ungrabbed
 desktop chord remains ordinary application input and is therefore outside
 Punto's mutation rollback guarantee.
+
+GUI selection conversion does not flatten the clipboard. If the replacement
+can be mapped to supported XKB strokes, WordEditor confirms the original exact
+selection, replays the replacement directly, and leaves the clipboard owner and
+targets untouched. An unmappable replacement fails before destructive mutation.
+Terminal selection keeps the bounded clipboard/paste protocol because direct
+replay would insert at the prompt rather than replace scrollback selection;
+completion depends on the paste receipt and bounded client settlement, not on
+PRIMARY changing identity.
+
+The shipped default is `leftctrl+grave`, restored as the user-facing contract.
+The setting remains a contract with the desktop environment, not a binding
+managed by Punto. Mutter/GNOME 46 names the physical key above Tab
+`Above_Tab`, so its accelerator is `<Control>Above_Tab` without a trailing
+angle bracket. GNOME 46 rejects `<Control>Cyrillic_io` as invalid. Binding
+readback is insufficient: release
+acceptance requires two consecutive physical transitions in opposite
+directions with the same persistent desktop source and XKB state.
 
 EventLoop transports the same immutable hotkey configuration that admitted the
 word candidate, including delayed automatic correction and undo. A physical
@@ -110,6 +144,189 @@ SHA256 fingerprints:
 | Release EventLoop driver | `bce34967aad7dfb8349c651d10778607cfcd197440d49c8e76eb41d4429ae558` |
 | Debug daemon | `1f2ed73c897f453b6be47e364dec0eaf3fa2483db60bf58fb044ad7b5b271fbb` |
 | Debug EventLoop driver | `f47076051632b43c76b20b234df8325aadbda60e08c3ac56fe0ef3eb25b7d010` |
+
+Iteration 7 closes the GNOME live-layout blocker found after v2.8.12. A desktop
+transition may temporarily move focus or leave Punto's own chord visible in
+XKB state. WordEditor accepts only those exact transients, waits for the client
+to settle, and rejects any foreign key, pointer, lock, session or unexpected
+group change before further mutation. Word correction was verified through the
+real evdev -> interception -> candidate -> uinput path in both layout
+directions. The next physical key used the final desktop group.
+
+Iteration 8 removes range reconstruction after desktop transitions. A GUI word
+now stabilizes its exact prepared receipt, performs the desktop transition, and
+revalidates the same receipt before replay; a disturbed or adjacent same-text
+range is rejected without replacement. GUI selection conversion confirms the
+original selection, performs direct mapped replay, restores any temporary
+internal XKB group under the original context, and only then requests the final
+desktop source. Mixed-layout replay uses the same bounded cleanup, and completed
+newer words retain their observed final layout without desktop oscillation.
+Adjacent duplicate, middle-field suffix, desktop disturbance, XTEST failure,
+cancellation and deadline regressions cover the unsafe boundaries. The X11
+session/config race fixture now observes a driver-only post-commit marker
+instead of parsing concurrently written diagnostic lines. Chromium clipboard verification compares the owner,
+complete target set and checked rich-target bytes. Its retained exact receipt
+admits the next word correction and undo without clearing PRIMARY. Terminal
+completion uses the paste receipt and bounded client settlement rather than a
+PRIMARY identity change.
+
+Final source evidence for iteration 8: Release 26/26 in 213.95 seconds with
+107 GTK/VTE and 56 Chromium cases; Debug 26/26 in 230.50 seconds with leak
+detection plus the separate GTK clipboard target (1/1 in 0.27 seconds);
+clang-tidy 23 production translation units; CLI 5315/5315; packaging
+817/817; ShellCheck, Python compilation, clang-format and whitespace checks all
+pass. The corresponding local build fingerprints are:
+
+| Artifact | SHA256 |
+| --- | --- |
+| Release daemon | `314a8a45483420677b46970f23a4f4621505b179afb72dc7a3bbeeff494ff3cb` |
+| Release EventLoop driver | `0a4985fb2132792226cd55703b6013f3731cba01697a40a54c0f188cd9bef33c` |
+| Debug daemon | `cb29911c65a310be46f3d370b8ba2b1a1c355a8ce0ce67ed8f369186c694884c` |
+| Debug EventLoop driver | `d6bc947999b908c74f34732ab7b610b4926126735e87f20079d0ff333b2a3ce9` |
+
+Iteration 9 makes temporary internal XKB mutation a single scoped transaction.
+The restore obligation is recorded before the checked request can reach the X
+server, so an applied request followed by a failed barrier is still observed
+and compensated. One scope finalizer covers every paste, direct-selection and
+mixed-word exit. It owns a reserved 100 ms slice of the existing 3.5 s hard
+deadline and uses freshly observed lease, focus, pointer, lock and group state
+after keyboard-idle waiting. Each failed observation stops before the next XCB
+request; an uncertain restore write is re-authorized and observed after a
+bounded reconnect before success is reported.
+
+Chromium demonstrated that retained PRIMARY cannot by itself prove that a
+visible word selection survived the desktop shortcut: a synthetic Right left
+PRIMARY unchanged and the old implementation inserted `привет` after `ghbdtn`.
+GUI word transitions now subscribe to XI2 raw key events on their bounded XCB
+connection and accept only the configured layout chord before receipt
+revalidation. Any other key rejects before replay. The standard `xcb-xinput`
+build/runtime dependency is declared in CMake, CI, package inventory and the
+production ELF contract.
+
+The focused matrix covers paste deadline, cancellation, clipboard ownership
+takeover, an applied XKB request with a failed check barrier, cleanup focus and
+pointer errors, context change after the idle wait, hard-deadline exhaustion,
+and GTK/Chromium selection disturbance. Plain and rich clipboard payloads,
+desktop source, XKB group, next physical key and recovery without restart are
+asserted at their respective boundaries.
+
+Final iteration-9 evidence: Release 26/26 in 223.80 seconds with 115 GTK/VTE
+and 57 Chromium/browser-lifecycle cases; Debug ASan/UBSan/LSan 27/27 in 243.61
+seconds; clang-tidy 23 production translation units; CLI 5315/5315; packaging
+825/825; ShellCheck, Python compilation, clang-format and whitespace checks all
+pass. The binaries from this source snapshot have these SHA256 fingerprints:
+
+| Artifact | SHA256 |
+| --- | --- |
+| Release daemon | `c4855c3bcbadc41335fb43ece40fceda1c08d50624c4d9f5105f352e36bc8dfd` |
+| Release EventLoop driver | `6ad6f30ed4f21464774c1e62e00ec7d0d8d3b0521b7bd6b3eba6c4584f603a97` |
+| Debug daemon | `4ee6c2f87169ef0098e4264752fbc957a69bb0abfa3c9b9d05f9a666789a1a29` |
+| Debug EventLoop driver | `0055b93d281e0f5ac5430fe597dac9de185cc7591de2f6e484aba34e090773ed` |
+
+Iteration 10 makes the reserved cleanup interval an enforced boundary after the
+first internal XKB mutation. Every later phase renewal is capped at that
+boundary; if replay, context observation or client settlement reaches it,
+ordinary work stops and restoration alone may use the remaining part of the
+original 3.5-second deadline. The cancellation regression now proves mailbox
+admission before releasing the held paste phase instead of succeeding through
+the hold timeout.
+
+Reconnect cleanup no longer leaves connection-owned setup metadata in the
+continuation path. The keycode range is copied before mutation, while a
+reconnected continuation rechecks XTEST and recreates its XI2 raw-key
+subscription before any final desktop transition. A checked restore error whose
+write was applied by X is covered through reconnect, final desktop activation,
+the next physical key and ASan/UBSan/LSan.
+
+XI2 evidence collection is fail-closed and bounded independently of the outer
+macro loop: one observation may consume at most 256 queued events and 5 ms.
+A foreign raw key exits immediately; count exhaustion, time exhaustion and a
+connection error reject before replay. Driver-only regressions distinguish all
+three results and retain the existing Chromium Right disturbance and successful
+own-chord controls.
+
+Final iteration-10 evidence: Release 26/26 in 222.26 seconds with 120 GTK/VTE
+and 57 Chromium/browser-lifecycle cases; Debug ASan/UBSan/LSan 27/27 in 243.36
+seconds. Clang-tidy covered all 23 production translation units; CLI passed
+5315/5315 checks and packaging passed 825/825. ShellCheck, Python compilation,
+changed-file clang-format and whitespace checks passed. The binaries from this
+source snapshot have these SHA256 fingerprints:
+
+| Artifact | SHA256 |
+| --- | --- |
+| Release daemon | `c4cd62a91c5730b57594aff5b8d9a04007640c9007cedba09ab7dd27c9aa3c03` |
+| Release EventLoop driver | `58779f58110468fa2815a9bb8db06d95fcbc4e1dfa838776033b487307437ae7` |
+| Debug daemon | `d61983e30153cf867c5189603a9de701b90a905a1f8a14586ed3c7954eec1b20` |
+| Debug EventLoop driver | `88ed6331ffff6d45d91d8998977ed367ebcc55148fa252018f5235fe417a2249` |
+
+Iteration 11 closes the remaining XInput2 initialization failure path. Every
+barrier and XIQueryVersion result is checked before the next use of the bounded
+XCB connection. A timeout, protocol error or transport failure therefore
+rejects the operation without calling `xcb_get_setup` or another XCB API through
+a connection closed by that result. The same fail-closed sequence runs during
+initial word admission and after cleanup reconnect.
+
+Driver-only faults target `Initial/AfterRestore` and `Barrier/Version`
+independently. The regressions assert exact fault consumption, bounded return,
+editor selection and caret, PRIMARY and CLIPBOARD, XKB group, desktop source,
+dispatch count, IPC availability and a following successful correction without
+daemon restart. A separate marker is emitted only when the reopened connection
+actually enters XInput2 preparation. The unsafe `xcb_get_setup(nullptr)` oracle
+is fail-fast so it cannot hide an unrelated null-connection defect.
+
+Iteration-11 test evidence: Release 26/26 in 223.39 seconds with 125 GTK/VTE
+and 57 Chromium/browser-lifecycle cases; Debug ASan/UBSan/LSan 27/27 in 231.65
+seconds with the same GTK/Chromium counts. Clang-tidy covered all 23 production
+translation units; CLI passed 5315/5315 checks and packaging passed 825/825.
+ShellCheck, Python compilation, changed-file clang-format and whitespace checks
+passed. The fingerprints recorded at that checkpoint were later found to mix
+stale production daemons with freshly rebuilt EventLoop drivers and are retained
+only to explain the validation gap:
+
+| Artifact | SHA256 |
+| --- | --- |
+| Release daemon | `c4cd62a91c5730b57594aff5b8d9a04007640c9007cedba09ab7dd27c9aa3c03` |
+| Release EventLoop driver | `2e1d7059de77913e1c229342571b3f90d0b2da48645380719910987dc1319288` |
+| Debug daemon | `d61983e30153cf867c5189603a9de701b90a905a1f8a14586ed3c7954eec1b20` |
+| Debug EventLoop driver | `0b5c864a74066fa0b8cdcba79fccee05dd460f70fe5465143820932788528837` |
+
+Iteration 12 closes that artifact-provenance gap without changing production or
+test logic. Both configurations were generated in new repo-local build trees:
+
+```sh
+cmake -S cpp -B cpp/build-i12-release-clean \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build cpp/build-i12-release-clean --verbose -j4
+
+cmake -S cpp -B cpp/build-i12-debug-clean \
+  -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON \
+  -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
+  -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address,undefined'
+cmake --build cpp/build-i12-debug-clean --verbose -j4
+```
+
+The verbose logs show `word_editor.cpp` compiled separately into both `punto`
+and `punto-event-loop-e2e-driver`, followed by linkage of both targets. Release
+CTest passed 26/26 in 224.80 seconds, including 125 GTK/VTE and 57
+Chromium/browser-lifecycle cases. Debug passed 26/26 in 228.27 seconds with
+`ASAN_OPTIONS=detect_leaks=1:halt_on_error=1` and
+`UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1`; the separately configured
+GTK clipboard contract passed 1/1 with LeakSanitizer disabled, for 27/27 total.
+The source and all four artifact hashes were unchanged after validation:
+
+| Artifact | SHA256 |
+| --- | --- |
+| `cpp/src/word_editor.cpp` | `7224d0c29edcfa05ce8a1f5d0f8af9613820f89cbada21dcd78abe3900020407` |
+| Release daemon | `ede79e96de54885368c7a8e61dfdd431d703a33121caee7cdec077e829f5a789` |
+| Release EventLoop driver | `2e1d7059de77913e1c229342571b3f90d0b2da48645380719910987dc1319288` |
+| Debug daemon | `4ab3b194b35420aa677570c72627b6ded3456386292b8146ec22ff1dd76f7676` |
+| Debug EventLoop driver | `c11781a14244347585269f5936192ca89e6ef76c71d4dd50652e6e39b20b138a` |
+
+The clean Release daemon differs from the stale iteration-11 daemon, confirming
+that the earlier evidence omitted a production-target rebuild. Debug binaries
+also include their build-directory paths in debug information, so only hashes
+from the canonical repo-local validation tree above identify the reviewed
+artifacts.
 
 ## Runtime stability and learning control (2026-09-07, 2.8.11)
 
@@ -1055,3 +1272,88 @@ this fixture evidence alone.
 The latest host readback remains installed `punto-switcher 2.8.8`,
 `text_mutation=disabled enabled=0`, three daemon peers. No new package, release,
 service restart or host desktop input was performed at this checkpoint.
+
+## Iteration 13: restored grave default and live desktop blocker
+
+The compiled default, shipped YAML, SettingsData projection and extracted DEB
+now agree on `leftctrl+grave`. Explicit `space` remains a supported configured
+value. The Chromium stale-PRIMARY recovery helper now sends the committed
+desktop chord instead of hard-coding Ctrl+Space; its RED reached the intended
+post-fault branch with evdev 29/57, then the focused GREEN passed with the
+reloaded LeftAlt+Backslash chord. The strengthened physical-shortcut regression
+also confirms exact activation deltas, released keys, the same daemon PID and
+the next corrected character.
+
+Fresh Release CTest passed 26/26 in 229.04 seconds: GTK/VTE 125 cases and
+Chromium 58. Fresh Debug passed 27/27 in 245.64 seconds with ASan, UBSan and
+LeakSanitizer enabled. CLI passed 5315/5315, packaging 829/829, and the exact CI
+clang-tidy profile passed all 23 production translation units. ShellCheck,
+Python compilation, clang-format and whitespace checks passed. Binary hashes:
+
+| Artifact | SHA256 |
+| --- | --- |
+| Release daemon | `c83feb9c5b0b5e6f463489cda0b9d28a921b25c39c58dbaab1b8fe7ae730fe3a` |
+| Release EventLoop driver | `268d859f53b2034273f0aa00ed58e5c39154f14dee9aa18ef4fd7621c962a6ad` |
+| Debug daemon | `20b1be2c02a7ea22013c7faf136f88f8a628d8488c25deaa928fcf671601d4a3` |
+| Debug EventLoop driver | `06d897cdc2f0f66edf1c2049415404ff8bbad22924cbb37e6f85ea2cc3b4441b` |
+
+The transactional host smoke did not pass. GNOME 46 rejected
+`<Control>Cyrillic_io` as an invalid accelerator. Its valid physical-key alias
+`<Control>Above_Tab` still exposed divergence between the desktop source,
+IBus engine and XKB group: one transition could succeed while a later identical
+chord left the source unchanged. This reproduces the reported one-shot layout
+failure and blocks release/install. The transaction restored the exact original
+user config hash `aa4fbc2d8b37ba205101437d62a6e430cff8af058e7047f1df0024198f1cb6a2`,
+forward/backward bindings, installed v2.8.12 binary hashes and daemon
+PIDs/start times. Reload generation advanced 5 to 6 with `config_pending=0
+config_result=ok`; no binary or process was replaced. The desktop source itself
+could not be made internally consistent: even an explicit IBus RU→US reset left
+`IBus=us`, GNOME `current=0` and XKB `group=1`. That unresolved state is part of
+the release blocker rather than a successful rollback claim.
+
+## Iteration 14: GNOME 46 X11 input-source freeze compatibility
+
+Source inspection of GNOME Shell 46.0 and Mutter 46.2 localized the one-shot
+failure outside Punto's editor pipeline. `activateInputSource()` froze the X11
+keyboard before applying the source and passed `releaseKeyboard` to the
+asynchronous IBus engine change. The popup had already dropped its modal grab
+when that callback ran, so `releaseKeyboard()` selected the ungrab path while
+the synchronous XI2 freeze remained observable. The same failure followed a
+menu source change, which excluded Punto's synthesized chord as the owner.
+
+The opt-in extension installed by the package is a narrow backport of the later
+GNOME change that removed this X11-only hold/release pair. On GNOME 46 X11 it
+shadows `freeze_keyboard` with a no-op and omits only the exact paired
+`KeyboardManager.releaseKeyboard` callback when delegating to the original
+`setEngine`. It never selects a source or writes IBus/XKB state. Wayland, other
+Shell versions, changed method shapes, pre-existing wrappers and stale or
+foreign handles fail closed. Disable removes both wrappers only while the
+extension still owns them. It performs no unpaired release on enable, so an
+already damaged session must be replaced by a fresh login.
+
+The final live test used a clean nested GNOME Shell 46.0/Mutter 46.2 X11
+session, one persistent kernel uinput keyboard and the real
+`<Control>Above_Tab` accelerator. Fifty consecutive physical transitions ran
+without reset or retry. The client observed 50 Control presses, zero delivered
+grave presses and 50 following key sentinels in the exact alternating sequence
+`Cyrillic_a,f`; the final XKB group was 0. A separate GNOME menu EN-to-RU change
+reached group 1 and the next physical sentinel reached the same client.
+Disable/re-enable returned the extension to `ACTIVE`; the next physical chord
+returned to group 0 and its sentinel was received. The host forward binding was
+restored exactly to `['<Control>Above_Tab']` after every transaction. These
+isolated results supersede the iteration-13 live blocker; installation into the
+user's existing session remains a separate release/runtime gate.
+
+Final source validation passed Release CTest 27/27 in 230.77 seconds, including
+GTK/VTE and Chromium E2E; Debug passed 27/27 in 246.15 seconds with ASan, UBSan
+and LeakSanitizer, plus the separate GTK clipboard test 1/1. CLI passed
+5315/5315, packaging passed 837/837, and the exact CI clang-tidy profile passed
+all 23 production translation units. ShellCheck, Python compilation,
+clang-format, whitespace checks and the GJS compatibility contract passed.
+
+| Artifact | SHA256 |
+| --- | --- |
+| Release daemon | `c83feb9c5b0b5e6f463489cda0b9d28a921b25c39c58dbaab1b8fe7ae730fe3a` |
+| Release EventLoop driver | `268d859f53b2034273f0aa00ed58e5c39154f14dee9aa18ef4fd7621c962a6ad` |
+| Debug daemon | `aba7d0c660fad5930820233a2a342362f91fe65c2c20535337889b37efc5e1c7` |
+| Debug EventLoop driver | `efd4400ef7993546163efbf8a07133fbd7969d705ec266380dbc08662d8140e3` |

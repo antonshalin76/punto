@@ -22,7 +22,7 @@ SKIP_RUNTIME_INSTALLS=false
 required_packages=(
     build-essential cmake pkg-config libsystemd-dev libxcb1-dev
     libxcb-xkb-dev libxau-dev libhunspell-dev libyaml-cpp-dev
-    libxcb-xfixes0-dev libxcb-xtest0-dev libxkbcommon-dev
+    libxcb-xfixes0-dev libxcb-xtest0-dev libxcb-xinput-dev libxkbcommon-dev
     dpkg-dev binutils file
 )
 required_tools=(
@@ -144,6 +144,9 @@ done
 
 for input in \
     punto-cli.sh config.yaml udevmon.yaml README.md RESTORATION.md LICENSE \
+    gnome/punto-input-source@antonshalin76/compat.js \
+    gnome/punto-input-source@antonshalin76/extension.js \
+    gnome/punto-input-source@antonshalin76/metadata.json \
     cpp/src/sound/en_ru.wav cpp/src/sound/ru_en.wav \
     DEBIAN/control DEBIAN/postinst DEBIAN/prerm DEBIAN/postrm; do
     require_regular_input "$input"
@@ -206,6 +209,7 @@ install -d -m 0755 \
     "$STAGE_DIR/usr/bin" \
     "$STAGE_DIR/usr/share/punto-switcher" \
     "$STAGE_DIR/usr/share/punto-switcher/sounds" \
+    "$STAGE_DIR/usr/share/gnome-shell/extensions/punto-input-source@antonshalin76" \
     "$STAGE_DIR/usr/share/doc/punto-switcher/examples" \
     "$STAGE_DIR/usr/share/doc/punto-switcher"
 
@@ -225,6 +229,11 @@ if [[ $BUILD_TRAY == true ]]; then
 fi
 
 install -m 0644 VERSION "$STAGE_DIR/usr/share/punto-switcher/VERSION"
+install -m 0644 \
+    gnome/punto-input-source@antonshalin76/compat.js \
+    gnome/punto-input-source@antonshalin76/extension.js \
+    gnome/punto-input-source@antonshalin76/metadata.json \
+    "$STAGE_DIR/usr/share/gnome-shell/extensions/punto-input-source@antonshalin76/"
 install -m 0644 cpp/src/sound/en_ru.wav cpp/src/sound/ru_en.wav \
     "$STAGE_DIR/usr/share/punto-switcher/sounds/"
 install -m 0644 udevmon.yaml \

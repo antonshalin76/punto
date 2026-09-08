@@ -84,7 +84,8 @@ def main() -> int:
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         return fail(str(error))
 
-    if "xcb-xtest" not in dynamic or "xcb-xfixes" not in dynamic:
+    if ("xcb-xtest" not in dynamic or "xcb-xfixes" not in dynamic or
+            "xcb-xinput" not in dynamic):
         return fail("production ELF is missing the bounded word-editor transport")
     if "punto::WordEditor::execute(" not in symbols:
         return fail("production ELF does not contain word-edit execution")

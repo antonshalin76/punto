@@ -18,7 +18,7 @@ tmp_root=""
 REQUIRED_PACKAGES=(
     build-essential cmake pkg-config libhunspell-dev libyaml-cpp-dev
     libsystemd-dev libxcb1-dev libxcb-xkb-dev libxau-dev
-    libxcb-xfixes0-dev libxcb-xtest0-dev libxkbcommon-dev
+    libxcb-xfixes0-dev libxcb-xtest0-dev libxcb-xinput-dev libxkbcommon-dev
     dpkg-dev binutils file
 )
 REQUIRED_TOOLS=(
@@ -1708,6 +1708,7 @@ inspect_artifact() {
     local artifact=$1 expected_version=$2 expect_tray=$3 label=$4 work=$5
     local data="$work/data" control="$work/control" package version architecture section priority
     local maintainer description predepends depends relationships conffiles binary machine expected_machine dynamic
+    local packaged_config
     local elf_header program_headers stack_segment symbols binary_name
     mkdir -p "$data" "$control"
     if /usr/bin/dpkg-deb -x "$artifact" "$data" && /usr/bin/dpkg-deb -e "$artifact" "$control"; then
@@ -1782,12 +1783,29 @@ inspect_artifact() {
     assert_executable "$data/usr/bin/punto" "$label provides /usr/bin/punto"
     assert_executable "$data/usr/bin/punto-daemon" "$label provides /usr/bin/punto-daemon"
     assert_file "$data/etc/punto/config.yaml" "$label packages the active config"
+    if [[ -f $data/etc/punto/config.yaml ]]; then
+        packaged_config=$(<"$data/etc/punto/config.yaml")
+        assert_contains "$packaged_config" '  modifier: leftctrl' \
+            "$label packages left Control as the default layout modifier"
+        assert_contains "$packaged_config" '  key: grave' \
+            "$label packages grave as the default layout key"
+    fi
     if [[ ! -e $data/etc/punto/config.yaml.new ]]; then
         pass "$label ships no inert config.yaml.new"
     else
         fail "$label ships config.yaml.new"
     fi
     assert_file "$data/usr/share/punto-switcher/VERSION" "$label packages canonical VERSION"
+    local extension_dir="$data/usr/share/gnome-shell/extensions/punto-input-source@antonshalin76"
+    assert_file "$extension_dir/compat.js" "$label packages the GNOME 46 X11 compatibility seam"
+    assert_file "$extension_dir/extension.js" "$label packages the guarded GNOME extension"
+    assert_file "$extension_dir/metadata.json" "$label packages GNOME extension metadata"
+    if [[ -f $extension_dir/metadata.json ]]; then
+        local extension_metadata
+        extension_metadata=$(<"$extension_dir/metadata.json")
+        assert_contains "$extension_metadata" '"shell-version": ["46"]' \
+            "$label limits the compatibility extension to GNOME 46"
+    fi
     assert_file "$data/usr/share/doc/punto-switcher/README.md" "$label packages README"
     assert_file "$data/usr/share/doc/punto-switcher/RESTORATION.md" \
         "$label packages the restoration document linked by README"

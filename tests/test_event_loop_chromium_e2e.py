@@ -116,6 +116,43 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
     def dispatches(self):
         return int(self.stats_fields()[1]["word_dispatches"])
 
+    def clipboard_owner(self):
+        x11 = gtk.ctypes.CDLL(gtk.ctypes.util.find_library("X11"))
+        x11.XOpenDisplay.argtypes = [gtk.ctypes.c_char_p]
+        x11.XOpenDisplay.restype = gtk.ctypes.c_void_p
+        x11.XInternAtom.argtypes = [gtk.ctypes.c_void_p, gtk.ctypes.c_char_p,
+                                    gtk.ctypes.c_int]
+        x11.XInternAtom.restype = gtk.ctypes.c_ulong
+        x11.XGetSelectionOwner.argtypes = [gtk.ctypes.c_void_p,
+                                           gtk.ctypes.c_ulong]
+        x11.XGetSelectionOwner.restype = gtk.ctypes.c_ulong
+        x11.XCloseDisplay.argtypes = [gtk.ctypes.c_void_p]
+        connection = x11.XOpenDisplay(self.x11.display.encode("ascii"))
+        self.assertTrue(connection)
+        try:
+            clipboard = x11.XInternAtom(connection, b"CLIPBOARD", 0)
+            return x11.XGetSelectionOwner(connection, clipboard)
+        finally:
+            x11.XCloseDisplay(connection)
+
+    def rich_clipboard_snapshot(self):
+        targets = subprocess.run(
+            ["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"],
+            check=True, capture_output=True, text=True, timeout=3,
+        ).stdout.splitlines()
+        checked_targets = sorted(
+            target for target in targets
+            if target == "text/html" or target.startswith("chromium/x-")
+        )
+        payloads = {
+            target: subprocess.run(
+                ["xclip", "-selection", "clipboard", "-t", target, "-o"],
+                check=True, capture_output=True, timeout=3,
+            ).stdout
+            for target in checked_targets
+        }
+        return self.clipboard_owner(), sorted(targets), payloads
+
     def key_is_down(self, code):
         x11 = gtk.ctypes.CDLL(gtk.ctypes.util.find_library("X11"))
         x11.XOpenDisplay.argtypes = [gtk.ctypes.c_char_p]
@@ -202,12 +239,62 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.assertEqual(self.browser_state()[:-1], before[:-1])
         self.assertEqual(self.dispatches(), dispatches)
 
+    def assert_stale_primary_blocks_fresh_word(self):
+        if self.keyboard_group() != 0:
+            self.send_chord((self.layout_shortcut.modifier,),
+                            key=self.layout_shortcut.key)
+            self.pump_until(lambda: self.keyboard_group() == 0,
+                            "English layout before stale PRIMARY control")
+        self.harness.send_key(gtk.KEY_RIGHT)
+        self.pump_until(
+            lambda: self.browser_state()[1:3] == [6, 6],
+            "collapse prepared selection before stale PRIMARY control",
+        )
+        self.harness.send_key(gtk.KEY_SPACE)
+        self.harness.type_word("ghbdtn")
+        self.pump_until(
+            lambda: self.browser_state()[:3] == ["привет ghbdtn", 13, 13],
+            "fresh word after invalidated prepared receipt",
+        )
+        self.assert_pause_rejected()
+
     def test_repeated_manual_conversion_with_retained_primary(self):
         self.first_manual_conversion()
         self.harness.send_key(gtk.KEY_PAUSE)
         self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
                         "second native browser correction with retained PRIMARY")
         self.pump_until(lambda: self.dispatches() == 2, "second dispatch receipt")
+
+    def test_word_layout_selection_disturbance_never_inserts_at_caret(self):
+        self.harness.type_word("ghbdtn")
+        self.pump_until(
+            lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+            "browser word before desktop selection disturbance",
+        )
+        before = self.browser_state()
+        dispatches = self.dispatches()
+        rejected = self.harness.diagnostic().count(
+            "rejection_stage=layout_transition_foreign_raw_key"
+        )
+        self.layout_shortcut.selection_disturbance = True
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(
+            lambda: self.layout_shortcut.selection_disturbances == 1,
+            "browser word selection disturbed by desktop transition",
+        )
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(
+                "rejection_stage=layout_transition_foreign_raw_key"
+            ) > rejected,
+            "browser word rejects disturbed visible selection",
+        )
+        serial = self.browser_state()[-1]
+        self.wait_for_fresh_dom(serial, "fresh DOM after disturbed word rejection")
+        after = self.browser_state()
+        self.assertEqual(after[0], before[0])
+        self.assertEqual(after[3:7], before[3:7])
+        self.assertEqual(after[1:3], [6, 6])
+        self.assertEqual(self.dispatches(), dispatches)
 
     def test_four_manual_conversions_retain_each_successful_receipt(self):
         self.harness.type_word("ghbdtn")
@@ -341,12 +428,25 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.assertFalse(self.key_is_down(gtk.KEY_GRAVE))
 
     def test_correction_uses_reloaded_layout_shortcut(self):
+        self.reload_layout_shortcut(
+            gtk.KEY_LEFTALT, gtk.KEY_BACKSLASH, 8,
+            "leftctrl", "leftalt", "grave", "backslash",
+        )
+
+        self.first_manual_conversion()
+        self.assertEqual(self.layout_shortcut.activations, 1)
+        self.assertEqual(self.layout_shortcut.source_index, 1)
+        self.assertFalse(self.key_is_down(gtk.KEY_LEFTALT))
+        self.assertFalse(self.key_is_down(gtk.KEY_BACKSLASH))
+
+    def reload_layout_shortcut(self, modifier, key, modifier_mask,
+                               old_modifier, new_modifier, old_key, new_key):
         self.layout_shortcut.stop()
         self.layout_shortcut = gtk.DesktopLayoutShortcut(
             self.x11.display,
-            modifier=gtk.KEY_LEFTALT,
-            key=gtk.KEY_BACKSLASH,
-            modifier_mask=8,
+            modifier=modifier,
+            key=key,
+            modifier_mask=modifier_mask,
         )
         self.layout_shortcut.start()
         self.addCleanup(self.layout_shortcut.stop)
@@ -355,8 +455,9 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         original = config.read_text(encoding="utf-8")
         self.addCleanup(config.write_text, original, encoding="utf-8")
         config.write_text(
-            original.replace("modifier: leftctrl", "modifier: leftalt")
-                    .replace("key: grave", "key: backslash"),
+            original.replace(f"modifier: {old_modifier}",
+                             f"modifier: {new_modifier}")
+                    .replace(f"key: {old_key}", f"key: {new_key}"),
             encoding="utf-8",
         )
         generation = int(self.stats_fields()[1]["config_generation"])
@@ -367,9 +468,15 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
             "custom layout shortcut config commit",
         )
 
-        self.first_manual_conversion()
-        self.assertEqual(self.layout_shortcut.activations, 1)
-        self.assertEqual(self.layout_shortcut.source_index, 1)
+    def test_stale_primary_reset_uses_reloaded_layout_shortcut(self):
+        self.reload_layout_shortcut(
+            gtk.KEY_LEFTALT, gtk.KEY_BACKSLASH, 8,
+            "leftctrl", "leftalt", "grave", "backslash",
+        )
+        self.assert_transport_fault_invalidates_retained_receipt(
+            "punto-e2e-fail-layout-hotkey-send", prepared=True)
+        self.assertEqual(self.layout_shortcut.activations, 2)
+        self.assertEqual(self.layout_shortcut.source_index, 0)
         self.assertFalse(self.key_is_down(gtk.KEY_LEFTALT))
         self.assertFalse(self.key_is_down(gtk.KEY_BACKSLASH))
 
@@ -450,8 +557,123 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.assertEqual(self.layout_shortcut.activations, 1)
         self.assertEqual(self.keyboard_group(), 1)
 
-    def test_layout_shortcut_past_macro_deadline_does_not_mutate_text(self):
-        self.layout_shortcut.handling_delay = 0.35
+    def test_slow_desktop_layout_transition_still_corrects_word(self):
+        self.layout_shortcut.handling_delay = 0.45
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+                        "browser typed source")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет", 6, 6],
+                        "word corrected after slow desktop layout transition")
+        self.assertEqual(self.dispatches(), 1)
+        self.assertEqual(self.keyboard_group(), 1)
+        self.assertFalse(self.key_is_down(gtk.KEY_LEFTCTRL))
+        self.assertFalse(self.key_is_down(gtk.KEY_GRAVE))
+
+    def test_own_layout_chord_transient_state_settles_before_correction(self):
+        marker = pathlib.Path(
+            "/run/punto-e2e-inject-own-layout-modifier-state")
+        self.addCleanup(marker.unlink, missing_ok=True)
+        marker.touch(mode=0o600)
+        self.layout_shortcut.handling_delay = 0.05
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+                        "browser typed before transient layout state")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет", 6, 6],
+                        "correction after own layout chord settled")
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.dispatches(), 1)
+        self.assertEqual(self.keyboard_group(), 1)
+
+    def test_layout_shortcut_focus_transition_settles_before_correction(self):
+        gtk_window = self.window.get_window().get_xid()
+        self.layout_shortcut.focus_transition = (gtk_window,
+                                                 self.browser_window)
+        self.layout_shortcut.handling_delay = 0.05
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+                        "browser typed before desktop focus transition")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет", 6, 6],
+                        "correction after desktop focus transition")
+        self.assertEqual(self.layout_shortcut.focus_transitions, 1)
+        self.assertEqual(self.dispatches(), 1)
+        self.assertEqual(self.keyboard_group(), 1)
+
+    def test_layout_transition_quiesces_before_text_mutation(self):
+        markers = {
+            name: pathlib.Path("/run", "punto-e2e-" + name)
+            for name in ("arm-layout-settle-window",
+                         "layout-settle-too-early",
+                         "layout-settle-observed")
+        }
+        for marker in markers.values():
+            marker.unlink(missing_ok=True)
+            self.addCleanup(marker.unlink, missing_ok=True)
+        transient = pathlib.Path(
+            "/run/punto-e2e-inject-own-layout-modifier-state")
+        transient.unlink(missing_ok=True)
+        transient.touch(mode=0o600)
+        self.addCleanup(transient.unlink, missing_ok=True)
+        markers["arm-layout-settle-window"].touch(mode=0o600)
+        self.first_manual_conversion()
+        self.assertFalse(markers["arm-layout-settle-window"].exists())
+        self.assertFalse(markers["layout-settle-too-early"].exists())
+        self.assertTrue(markers["layout-settle-observed"].exists())
+
+    def test_foreign_modifier_during_layout_transition_rejects_correction(self):
+        marker = pathlib.Path(
+            "/run/punto-e2e-inject-foreign-layout-modifier-state")
+        self.addCleanup(marker.unlink, missing_ok=True)
+        marker.touch(mode=0o600)
+        self.layout_shortcut.handling_delay = 0.05
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+                        "browser typed before foreign modifier state")
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(
+                "Word edit dispatch status=0") > rejected,
+            "foreign modifier layout rejection",
+        )
+        serial = self.browser_state()[-1]
+        self.wait_for_fresh_dom(serial, "fresh DOM after foreign modifier rejection")
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.browser_state()[:3], ["ghbdtn", 6, 6])
+        self.assertEqual(self.dispatches(), 0)
+
+    def test_foreign_key_during_own_layout_transition_rejects_correction(self):
+        markers = [
+            pathlib.Path("/run/punto-e2e-inject-own-layout-modifier-state"),
+            pathlib.Path(
+                "/run/punto-e2e-inject-foreign-key-after-layout-state"),
+        ]
+        for marker in markers:
+            self.addCleanup(marker.unlink, missing_ok=True)
+            marker.touch(mode=0o600)
+        self.layout_shortcut.handling_delay = 0.05
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+                        "browser typed before foreign key state")
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(
+                "Word edit dispatch status=0") > rejected,
+            "foreign key layout rejection",
+        )
+        serial = self.browser_state()[-1]
+        self.wait_for_fresh_dom(serial, "fresh DOM after foreign key rejection")
+        self.assertTrue(all(not marker.exists() for marker in markers))
+        self.assertIn("rejection_stage=layout_transition_foreign_key",
+                      self.harness.diagnostic())
+        self.assertEqual(self.browser_state()[:3], ["ghbdtn", 6, 6])
+        self.assertEqual(self.dispatches(), 0)
+
+    def test_layout_transition_past_extended_budget_does_not_mutate_text(self):
+        self.layout_shortcut.handling_delay = 1.1
         self.harness.type_word("ghbdtn")
         self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
                         "browser typed source")
@@ -460,17 +682,17 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.pump_until(
             lambda: self.harness.diagnostic().count(
                 "Word edit dispatch status=0") > rejected,
-            "late desktop layout shortcut rejection",
-            timeout=1,
+            "desktop layout transition budget rejection",
+            timeout=3,
         )
         serial = self.browser_state()[-1]
-        self.wait_for_fresh_dom(serial, "fresh DOM after late shortcut rejection")
+        self.wait_for_fresh_dom(serial, "fresh DOM after layout timeout")
         self.assertEqual(self.browser_state()[:3], ["ghbdtn", 6, 6])
         self.assertEqual(self.dispatches(), 0)
         self.pump_until(lambda: self.layout_shortcut.activations == 1,
                         "late desktop layout activation")
         serial = self.browser_state()[-1]
-        self.wait_for_fresh_dom(serial, "fresh DOM after late layout activation")
+        self.wait_for_fresh_dom(serial, "fresh DOM after late activation")
         self.assertEqual(self.browser_state()[:3], ["ghbdtn", 6, 6])
         self.assertFalse(self.key_is_down(gtk.KEY_LEFTCTRL))
         self.assertFalse(self.key_is_down(gtk.KEY_GRAVE))
@@ -494,10 +716,11 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         serial = self.browser_state()[-1]
         self.wait_for_fresh_dom(serial, "fresh DOM after missing shortcut rejection")
         self.assertEqual(self.browser_state()[:3], ["ghbdtn", 6, 6])
-        self.assertEqual(self.keyboard_group(), 0)
+        self.assertEqual(self.keyboard_group(), 0, self.harness.diagnostic())
         self.assertEqual(self.dispatches(), 0)
 
     def test_physical_layout_shortcut_preserves_next_correction(self):
+        daemon_pid = self.harness.process.pid
         self.first_manual_conversion()
 
         activations = self.layout_shortcut.activations
@@ -507,6 +730,10 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
             and self.keyboard_group() == 0,
             "physical desktop layout shortcut",
         )
+        self.pump_for(0.05)
+        self.assertEqual(self.layout_shortcut.activations, activations + 1)
+        self.assertFalse(self.key_is_down(gtk.KEY_LEFTCTRL))
+        self.assertFalse(self.key_is_down(gtk.KEY_GRAVE))
         activations = self.layout_shortcut.activations
         self.harness.send_events([
             (gtk.EV_KEY, gtk.KEY_LEFTCTRL, 1), (gtk.EV_SYN, gtk.SYN_REPORT, 0),
@@ -519,9 +746,19 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
             and self.keyboard_group() == 1,
             "repeated configured layout shortcut press",
         )
+        self.pump_for(0.05)
+        self.assertEqual(self.layout_shortcut.activations, activations + 1)
+        self.assertFalse(self.key_is_down(gtk.KEY_LEFTCTRL))
+        self.assertFalse(self.key_is_down(gtk.KEY_GRAVE))
+        activations = self.layout_shortcut.activations
         self.send_chord((gtk.KEY_LEFTCTRL,), key=gtk.KEY_GRAVE)
-        self.pump_until(lambda: self.keyboard_group() == 0,
+        self.pump_until(lambda: self.layout_shortcut.activations == activations + 1
+                        and self.keyboard_group() == 0,
                         "configured layout shortcut after repeat")
+        self.pump_for(0.05)
+        self.assertEqual(self.layout_shortcut.activations, activations + 1)
+        self.assertFalse(self.key_is_down(gtk.KEY_LEFTCTRL))
+        self.assertFalse(self.key_is_down(gtk.KEY_GRAVE))
         self.harness.send_key(gtk.KEY_SPACE)
         self.harness.type_word("ghbdtn")
         self.pump_until(
@@ -534,6 +771,15 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
             "correction after physical layout shortcut",
         )
         self.assertEqual(self.dispatches(), 2)
+        self.assertEqual(self.harness.process.pid, daemon_pid)
+        self.assertIsNone(self.harness.process.poll())
+        self.assertEqual(self.keyboard_group(), 1)
+        self.assertEqual(self.layout_shortcut.source_index, 1)
+        self.harness.type_word("f")
+        self.pump_until(
+            lambda: self.browser_state()[:3] == ["привет привета", 14, 14],
+            "next physical character uses corrected Russian layout",
+        )
 
     def test_wrong_modifier_side_invalidates_retained_receipt(self):
         self.first_manual_conversion()
@@ -631,24 +877,30 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
                         "retained receipt recovery without restart")
         self.assertEqual(self.dispatches(), 2)
 
-    def assert_transport_fault_invalidates_retained_receipt(self, marker_name):
+    def assert_transport_fault_invalidates_retained_receipt(
+            self, marker_name, *, prepared=False):
         self.first_manual_conversion()
         marker = pathlib.Path("/run", marker_name)
         marker.unlink(missing_ok=True)
         self.addCleanup(marker.unlink, missing_ok=True)
         marker.touch(mode=0o600)
-        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        status = 1 if prepared else 0
+        rejected = self.harness.diagnostic().count(
+            f"Word edit dispatch status={status}")
         self.harness.send_key(gtk.KEY_PAUSE)
         self.pump_until(
             lambda: self.harness.diagnostic().count(
-                "Word edit dispatch status=0") > rejected,
+                f"Word edit dispatch status={status}") > rejected,
             f"{marker_name} rejects retained correction",
         )
         serial = self.browser_state()[-1]
         self.wait_for_fresh_dom(serial, f"fresh DOM after {marker_name}")
         self.assertEqual(self.dispatches(), 1)
         self.assertFalse(marker.exists(), f"{marker_name} fault was not reached")
-        self.assert_pause_rejected()
+        if prepared:
+            self.assert_stale_primary_blocks_fresh_word()
+        else:
+            self.assert_pause_rejected()
         self.assertEqual(self.dispatches(), 1)
 
     def test_keymap_failure_invalidates_retained_receipt(self):
@@ -657,7 +909,7 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
 
     def test_layout_hotkey_send_failure_invalidates_retained_receipt(self):
         self.assert_transport_fault_invalidates_retained_receipt(
-            "punto-e2e-fail-layout-hotkey-send")
+            "punto-e2e-fail-layout-hotkey-send", prepared=True)
 
     def assert_context_change_invalidates_retained_receipt(self, change, restore):
         self.first_manual_conversion()
@@ -665,19 +917,22 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.layout_shortcut.arm_blocked_activation()
         self.addCleanup(self.layout_shortcut.permit_activation.set)
         before = self.browser_state()
-        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=1")
         self.harness.send_key(gtk.KEY_PAUSE)
         self.pump_until(self.layout_shortcut.activation_started.is_set,
                         "retained correction entered layout preflight")
         change()
         self.pump_until(
             lambda: self.harness.diagnostic().count(
-                "Word edit dispatch status=0") > rejected,
+                "Word edit dispatch status=1") > rejected,
             "context change rejects retained correction",
         )
         serial = self.browser_state()[-1]
         self.wait_for_fresh_dom(serial, "fresh DOM after context rejection")
-        self.assertEqual(self.browser_state()[:6], before[:6])
+        after = self.browser_state()
+        self.assertEqual(after[0], before[0])
+        self.assertEqual(after[3:6], before[3:6])
+        self.assertEqual(after[1:3], [0, 6])
         self.assertEqual(self.dispatches(), 1)
 
         self.layout_shortcut.permit_activation.set()
@@ -687,7 +942,7 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
             "blocked desktop activation completed",
         )
         restore()
-        self.assert_pause_rejected()
+        self.assert_stale_primary_blocks_fresh_word()
 
     def test_pointer_change_invalidates_retained_receipt(self):
         original = self.pointer_position()
@@ -747,7 +1002,7 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.assertEqual(self.browser_state()[:-1], before[:-1])
         self.assertEqual(self.dispatches(), 1)
 
-    def test_selection_layout_stall_preserves_browser_selection(self):
+    def test_selection_layout_stall_reports_partial_after_browser_replay(self):
         left, top, decoration = self.browser_state()[8]
         self.xdo("mousemove", "--window", str(self.browser_window),
                  str(int(left + 30)), str(int(top + decoration + 20)))
@@ -757,19 +1012,247 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
                         "browser selection before layout preflight")
         self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_PRIMARY), "ghbdtn")
         self.layout_shortcut.enabled = False
-        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=3")
         self.send_chord((gtk.KEY_LEFTSHIFT,))
         self.pump_until(
             lambda: self.harness.diagnostic().count(
-                "Word edit dispatch status=0") > rejected,
-            "browser selection layout preflight rejection",
+                "Word edit dispatch status=3") > rejected,
+            "browser final layout transition failure",
         )
         serial = self.browser_state()[-1]
-        self.wait_for_fresh_dom(serial, "fresh DOM after selection rejection")
-        self.assertEqual(self.browser_state()[3:7], ["ghbdtn", 0, 6, "b"])
+        self.wait_for_fresh_dom(serial, "fresh DOM after partial selection replay")
+        self.assertEqual(self.browser_state()[3:7], ["привет", 6, 6, "b"])
         self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD),
                          "startup clipboard baseline")
         self.assertEqual(self.dispatches(), 0)
+
+    def test_plain_clipboard_selection_layout_completes_without_primary_change(self):
+        left, top, decoration = self.browser_state()[8]
+        self.xdo("mousemove", "--window", str(self.browser_window),
+                 str(int(left + 30)), str(int(top + decoration + 20)))
+        self.xdo("click", "--repeat", "2", "--delay", "100", "1")
+        self.pump_until(lambda: self.browser_state()[3:7] ==
+                        ["ghbdtn", 0, 6, "b"],
+                        "plain clipboard browser selection")
+        self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD),
+                         "startup clipboard baseline")
+        self.send_chord((gtk.KEY_LEFTSHIFT,))
+        self.pump_until(lambda: self.browser_state()[3:7] ==
+                        ["привет", 6, 6, "b"],
+                        "plain clipboard selection replacement")
+        self.pump_until(lambda: self.dispatches() == 1,
+                        "plain clipboard complete dispatch")
+        self.assertEqual(self.layout_shortcut.source_index, 1)
+        self.assertEqual(self.keyboard_group(), 1)
+        self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD),
+                         "startup clipboard baseline")
+        self.harness.type_word("f")
+        self.pump_until(lambda: self.browser_state()[3:7] ==
+                        ["привета", 7, 7, "b"],
+                        "next browser key uses completed layout")
+
+    def test_selection_layout_preserves_chromium_clipboard_metadata(self):
+        left, top, decoration = self.browser_state()[8]
+        self.xdo("mousemove", "--window", str(self.browser_window),
+                 str(int(left + 30)), str(int(top + decoration + 20)))
+        self.xdo("click", "--repeat", "2", "--delay", "100", "1")
+        self.pump_until(lambda: self.browser_state()[3:7] ==
+                        ["ghbdtn", 0, 6, "b"],
+                        "browser selection before rich clipboard copy")
+        self.xdo("key", "ctrl+c")
+        self.pump_until(
+            lambda: self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD) == "ghbdtn",
+            "Chromium clipboard payload",
+        )
+        clipboard_before = self.rich_clipboard_snapshot()
+        self.assertTrue(
+            any(target.startswith("chromium/x-")
+                for target in clipboard_before[1]),
+            clipboard_before[1],
+        )
+        self.send_chord((gtk.KEY_LEFTSHIFT,))
+        self.pump_until(lambda: self.browser_state()[3:7] ==
+                        ["привет", 6, 6, "b"],
+                        "browser selection correction with rich clipboard")
+        self.pump_until(lambda: self.dispatches() == 1,
+                        "rich clipboard selection final layout dispatch")
+        self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD),
+                         "ghbdtn")
+        self.assertEqual(self.rich_clipboard_snapshot(), clipboard_before)
+        self.assertEqual(self.layout_shortcut.source_index, 1)
+        self.assertEqual(self.keyboard_group(), 1)
+
+        self.harness.send_key(gtk.KEY_SPACE)
+        self.harness.type_word("hello")
+        self.pump_until(lambda: self.browser_state()[3:7] ==
+                        ["привет руддщ", 12, 12, "b"],
+                        "new wrong-layout word after rich replay")
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(lambda: self.browser_state()[3:7] ==
+                        ["привет hello", 12, 12, "b"],
+                        "next correction admitted by exact rich replay receipt")
+        self.pump_until(lambda: self.dispatches() == 2,
+                        "second dispatch after rich replay")
+        self.send_chord((gtk.KEY_LEFTCTRL,), gtk.KEY_Z)
+        self.pump_until(lambda: self.browser_state()[3:7] ==
+                        ["привет руддщ", 12, 12, "b"],
+                        "undo after rich replay continuation")
+
+    def test_rich_clipboard_selection_keeps_left_duplicate_range(self):
+        left, top, decoration = self.browser_state()[8]
+        self.xdo("mousemove", "--window", str(self.browser_window),
+                 str(int(left + 30)), str(int(top + decoration + 20)))
+        self.xdo("click", "1")
+        self.set_selection(gtk.Gdk.SELECTION_CLIPBOARD, "aa suffix")
+        self.xdo("key", "ctrl+a")
+        self.xdo("key", "ctrl+v")
+        self.pump_until(lambda: self.browser_state()[3:7] ==
+                        ["aa suffix", 9, 9, "b"],
+                        "duplicate-rich source inserted")
+        self.xdo("key", "Home")
+        self.xdo("key", "shift+Right")
+        self.pump_until(lambda: self.browser_state()[3:7] ==
+                        ["aa suffix", 0, 1, "b"],
+                        "exact left duplicate selected")
+        self.xdo("key", "ctrl+c")
+        self.pump_until(
+            lambda: self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD) == "a",
+            "left duplicate copied with rich targets",
+        )
+        clipboard_before = self.rich_clipboard_snapshot()
+        self.send_chord((gtk.KEY_LEFTSHIFT,))
+        self.pump_until(lambda: self.browser_state()[3:7] ==
+                        ["фa suffix", 1, 1, "b"],
+                        "rich replay changed only the original duplicate")
+        self.pump_until(lambda: self.dispatches() == 1,
+                        "rich duplicate complete dispatch")
+        self.assertEqual(self.rich_clipboard_snapshot(), clipboard_before)
+
+    def prepare_rich_browser_selection(self, source="ghbdtn", source_group=0):
+        left, top, decoration = self.browser_state()[8]
+        self.xdo("mousemove", "--window", str(self.browser_window),
+                 str(int(left + 30)), str(int(top + decoration + 20)))
+        self.xdo("click", "--repeat", "2", "--delay", "100", "1")
+        if source != "ghbdtn":
+            self.set_selection(gtk.Gdk.SELECTION_CLIPBOARD, source)
+            self.xdo("key", "BackSpace")
+            self.xdo("key", "ctrl+v")
+            self.pump_until(lambda: self.browser_state()[3:7] ==
+                            [source, len(source), len(source), "b"],
+                            "custom rich-selection source inserted")
+            self.xdo("key", "ctrl+a")
+        self.set_desktop_layout(source_group)
+        self.pump_until(lambda: self.browser_state()[3:7] ==
+                        [source, 0, len(source), "b"],
+                        "browser selection before internal-layout fault")
+        self.xdo("key", "ctrl+c")
+        self.pump_until(
+            lambda: self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD) == source,
+            "rich clipboard before internal-layout fault",
+        )
+        return self.rich_clipboard_snapshot()
+
+    def assert_internal_layout_failure_restores_source(self, marker_name,
+                                                       status=3):
+        clipboard_before = self.prepare_rich_browser_selection()
+        marker = pathlib.Path("/run", marker_name)
+        marker.unlink(missing_ok=True)
+        marker.touch(mode=0o600)
+        self.addCleanup(marker.unlink, missing_ok=True)
+        status_line = f"Word edit dispatch status={status}"
+        rejected = self.harness.diagnostic().count(status_line)
+        self.send_chord((gtk.KEY_LEFTSHIFT,))
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(status_line) > rejected,
+            "partial replay fault observed",
+        )
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.layout_shortcut.source_index, 0)
+        self.assertEqual(self.keyboard_group(), 0, self.harness.diagnostic())
+        self.assertEqual(self.rich_clipboard_snapshot(), clipboard_before)
+        left, top, decoration = self.browser_state()[8]
+        self.xdo("mousemove", "--window", str(self.browser_window),
+                 str(int(left + 250)), str(int(top + decoration + 20)))
+        self.xdo("click", "1")
+        self.pump_until(lambda: self.browser_state()[6] == "b",
+                        "browser target refocused after internal-layout fault")
+        self.harness.type_word("a")
+        self.pump_until(lambda: self.browser_state()[6] == "b" and
+                        self.browser_state()[3].endswith("a"),
+                        "next physical key uses restored English group")
+
+    def test_internal_layout_failure_before_first_replay_restores_source(self):
+        self.assert_internal_layout_failure_restores_source(
+            "punto-e2e-fail-after-internal-layout")
+
+    def test_internal_layout_failure_after_first_replay_restores_source(self):
+        self.assert_internal_layout_failure_restores_source(
+            "punto-e2e-fail-after-first-replay-stroke")
+
+    def test_internal_layout_deadline_restores_source(self):
+        self.assert_internal_layout_failure_restores_source(
+            "punto-e2e-expire-after-internal-layout", status=0)
+
+    def test_internal_layout_cancellation_restores_source(self):
+        clipboard_before = self.prepare_rich_browser_selection()
+        markers = {
+            name: pathlib.Path("/run", "punto-e2e-" + name)
+            for name in ("arm-after-internal-layout", "after-internal-layout",
+                         "release-after-internal-layout")
+        }
+        for marker in markers.values():
+            marker.unlink(missing_ok=True)
+            self.addCleanup(marker.unlink, missing_ok=True)
+        self.addCleanup(markers["release-after-internal-layout"].touch,
+                        exist_ok=True)
+        markers["arm-after-internal-layout"].touch(mode=0o600)
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        self.send_chord((gtk.KEY_LEFTSHIFT,))
+        self.pump_until(markers["after-internal-layout"].exists,
+                        "internal layout reached before cancellation")
+        with gtk.socket.socket(gtk.socket.AF_UNIX, gtk.socket.SOCK_STREAM) as client:
+            client.settimeout(gtk.EVENT_TIMEOUT)
+            client.connect("/run/punto.sock")
+            client.sendall(b"SET_STATUS 0\n")
+            self.pump_for(0.05)
+            markers["release-after-internal-layout"].touch(mode=0o600)
+            self.assertEqual(client.recv(8192), b"OK DISABLED\n")
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(
+                "Word edit dispatch status=0") > rejected,
+            "queued mutation cancelled internal replay",
+        )
+        self.assertEqual(self.layout_shortcut.source_index, 0)
+        self.assertEqual(self.keyboard_group(), 0, self.harness.diagnostic())
+        self.assertEqual(self.rich_clipboard_snapshot(), clipboard_before)
+
+    def assert_nonlayout_internal_failure_restores_source(
+            self, source_group, modifiers):
+        clipboard_before = self.prepare_rich_browser_selection(
+            source="привет", source_group=source_group)
+        marker = pathlib.Path("/run/punto-e2e-fail-after-internal-layout")
+        marker.unlink(missing_ok=True)
+        marker.touch(mode=0o600)
+        self.addCleanup(marker.unlink, missing_ok=True)
+        partial = self.harness.diagnostic().count("Word edit dispatch status=3")
+        self.send_chord(modifiers)
+        self.pump_until(
+            lambda: self.harness.diagnostic().count(
+                "Word edit dispatch status=3") > partial,
+            "non-layout rich replay fault observed",
+        )
+        self.assertEqual(self.layout_shortcut.source_index, source_group)
+        self.assertEqual(self.keyboard_group(), source_group,
+                         self.harness.diagnostic())
+        self.assertEqual(self.rich_clipboard_snapshot(), clipboard_before)
+
+    def test_selection_case_internal_failure_restores_source(self):
+        self.assert_nonlayout_internal_failure_restores_source(
+            0, (gtk.KEY_LEFTALT,))
+
+    def test_selection_translit_internal_failure_restores_source(self):
+        self.assert_nonlayout_internal_failure_restores_source(
+            1, (gtk.KEY_LEFTCTRL, gtk.KEY_LEFTALT))
 
     def test_delayed_clipboard_initialization_uses_remaining_macro_budget(self):
         marker = pathlib.Path("/run/punto-e2e-slow-clipboard-init")

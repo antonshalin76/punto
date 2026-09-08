@@ -10,7 +10,7 @@
 Это best-effort взаимодействие с приложением, а не атомарная транзакция
 редактора. Ограничения перечислены ниже; плагины редактора не требуются.
 
-![Version](https://img.shields.io/badge/version-2.8.12-blue)
+![Version](https://img.shields.io/badge/version-2.8.13-blue)
 ![C++](https://img.shields.io/badge/C%2B%2B-20-orange)
 ![License](https://img.shields.io/badge/license-Personal%20Use%20Only-red)
 
@@ -274,7 +274,13 @@ ghbdtn  →  [Pause]  →  привет
   lifecycle: штатное завершение ожидания по бюджету сохраняет его, а выявленная
   после replay смена focus, pointer, locks или X11-сеанса отзывает.
 - Повторный ввод слова вместе с сохранённым хвостом ограничен 128 символами
-  (до 256 байт UTF-8); бюджет макроса — 300 мс. `max_rollback_words` ограничивает
+  (до 256 байт UTF-8). Обычная фаза макроса ограничена 300 мс, подтверждение
+  каждого перехода раскладки — 1 с, а вся операция — 3,5 с. В обычном X11
+  клиенте новая группа должна быть стабильна 5 мс. После наблюдаемого возврата
+  фокуса или отпускания собственной desktop-комбинации Punto ждёт 250 мс.
+  Исходное GUI-выделение должно оставаться неизменным ещё 30 мс; совпадение
+  текста в том же клиенте не считается подтверждением того же диапазона.
+  `max_rollback_words` ограничивает
   число слов, но не отменяет лимит длины. Неподдерживаемое действие отклоняется;
   при невозможности немедленной отмены Punto до начала действия используется
   обычный undo приложения.
@@ -283,6 +289,13 @@ ghbdtn  →  [Pause]  →  привет
   Полноэкранные/raw-mode программы не гарантируются. Переносы строк и управляющие
   символы в terminal payload отклоняются; Punto не отправляет Enter для выполнения команды.
 - Clipboard ограничен 4 KiB, обычным UTF-8 текстом без INCR и rich formats.
+  GUI-выделение с клавиатурно представимым результатом заменяется прямым вводом
+  и не меняет clipboard. Для отдельных символов Punto может временно выбрать
+  внутреннюю XKB-группу, но восстанавливает исходную группу до системного
+  переключения и только при неизменном сеансе, фокусе, указателе и locks.
+  Непредставимый результат безопасно отклоняется. В терминале сохраняется
+  ограниченный clipboard/paste-протокол; его завершение не зависит от смены
+  PRIMARY.
   После timeout payload остаётся доступным для позднего запроса; новое копирование
   пользователя имеет приоритет и не затирается восстановлением старого clipboard.
   До передачи, смены владельца clipboard или X11-сеанса новые исправления
@@ -322,7 +335,7 @@ ghbdtn  →  [Pause]  →  привет
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh --non-interactive --skip-runtime-installs
-sudo dpkg -i "punto-switcher_2.8.12_$(dpkg --print-architecture).deb"
+sudo dpkg -i "punto-switcher_2.8.13_$(dpkg --print-architecture).deb"
 ```
 
 Готовые `.deb` и `SHA256SUMS` публикуются в GitHub Releases и не хранятся в
@@ -342,13 +355,13 @@ sudo dpkg -i "punto-switcher_2.8.12_$(dpkg --print-architecture).deb"
 # Ubuntu/Debian (минимум для сборки punto)
 sudo apt install build-essential cmake pkg-config libyaml-cpp-dev \
   libsystemd-dev libxcb1-dev libxcb-xkb-dev libxcb-xfixes0-dev \
-  libxcb-xtest0-dev libxkbcommon-dev libxau-dev \
+  libxcb-xtest0-dev libxcb-xinput-dev libxkbcommon-dev libxau-dev \
   libhunspell-dev \
   interception-tools util-linux
 
 # Для изолированных CLI/package/daemon/GTK contract-тестов
 sudo apt install apparmor bubblewrap busybox-static strace util-linux \
-  python3-gi gir1.2-vte-2.91 xauth xclip xdotool xvfb
+  gjs python3-gi gir1.2-vte-2.91 xauth xclip xdotool xvfb
 
 # Обязательно для default-пакета с tray (GTK3 + AppIndicator/Ayatana)
 sudo apt install libgtk-3-dev libayatana-appindicator3-dev
@@ -376,7 +389,7 @@ Xvfb сообщает готовность через `-displayfd`, а package-t
 git clone https://github.com/antonshalin76/punto.git
 cd punto
 ./build-deb.sh
-sudo dpkg -i punto-switcher_2.8.12_amd64.deb
+sudo dpkg -i punto-switcher_2.8.13_amd64.deb
 ```
 
 #### Ручная сборка без пакета
@@ -456,7 +469,7 @@ desktop-сеанса): `~/.config/punto/config.yaml`
 # Должен совпадать с реальной комбинацией переключения рабочего стола
 hotkey:
   modifier: leftctrl   # leftctrl, rightctrl, leftalt, rightalt, leftshift, rightshift, leftmeta, rightmeta
-  key: grave           # grave (` ~), space, tab, backslash, capslock, а также left/right: shift/ctrl/alt/meta
+  key: grave           # физическая клавиша над Tab (` / ~)
 
 # Раздел delays удалён в v2.8.0 и строгой схемой не принимается.
 # Автокоррекция слова при нажатии пробела/таба
@@ -480,6 +493,43 @@ logging:
 runtime:
   analysis_threads: 0              # 0 = auto-budget, >0 = фиксированное число на daemon
   max_analysis_threads_per_daemon: 4
+```
+
+Punto не создаёт системную комбинацию: `hotkey` должен совпадать с настройкой
+переключения источника ввода в desktop environment. Для GNOME текущую настройку
+можно проверить командой
+`gsettings get org.gnome.desktop.wm.keybindings switch-input-source`.
+Для дефолта `leftctrl+grave` GNOME должен распознавать именно физическую клавишу
+над Tab. В Mutter/GNOME 46 аппаратно-независимое имя этой клавиши —
+`<Control>Above_Tab` (без завершающего `>`). Не добавляйте
+`<Control>Cyrillic_io`: GNOME 46 считает
+это значение невалидным и не регистрирует его. После изменения binding
+обязательно проверьте два последовательных перехода EN→RU→EN; один успешный
+переход или один лишь readback `gsettings` не доказывает рабочую конфигурацию.
+
+#### GNOME 46 X11: зависание ввода после смены источника
+
+В GNOME Shell 46 на X11 существует воспроизводимый отказ штатного пути смены
+источника: сам источник меняется, но физическая клавиатура остаётся замороженной
+для приложений. Он проявляется и через меню GNOME, то есть не создаётся Punto.
+В более новой реализации GNOME X11-only вызовы freeze/release удалены как
+ненужные. Пакет содержит узкое opt-in расширение, которое применяет ту же
+семантику только к старому callback API GNOME 46 и только в X11-сеансе. Оно не
+выбирает источник, не синтезирует сочетание и не меняет XKB или IBus.
+
+После установки пакета войдите в сеанс заново, затем включите расширение:
+
+```bash
+gnome-extensions enable punto-input-source@antonshalin76
+gnome-extensions info punto-input-source@antonshalin76
+```
+
+На Wayland, другой основной версии Shell, изменённом API или при наличии чужой
+обёртки расширение остаётся неактивным. Отключение восстанавливает исходный
+метод, только если им всё ещё владеет расширение:
+
+```bash
+gnome-extensions disable punto-input-source@antonshalin76
 ```
 
 ### Переключение раскладки
@@ -635,7 +685,7 @@ sudo dpkg -r punto-switcher
 | interception-tools         | любая                     |
 | libsystemd                 | любая                     |
 | libxcb + libxcb-xkb        | любая                     |
-| XFixes + XTest + xkbcommon  | обязательны              |
+| XFixes + XTest + XInput2 + xkbcommon | обязательны        |
 | libyaml-cpp                | 0.8                       |
 | libgtk-3-0                 | любая (tray, опционально) |
 | libayatana-appindicator3-1 | любая (tray, опционально) |
@@ -645,6 +695,54 @@ sudo dpkg -r punto-switcher
 | wamerican-huge             | любая (опционально)       |
 
 ## История изменений
+
+### v2.8.13 (кандидат) — GNOME и rich clipboard hardening
+
+- На подтверждение каждого перехода раскладки отведено до 1 с при непрерывной
+  проверке X11-сеанса, фокуса, указателя, lock-модификаторов и отмены новым
+  вводом. Обычная фаза изменения текста ограничена 300 мс, вся операция —
+  3,5 с. После наблюдаемого transient focus/hotkey Punto ждёт стабилизации
+  клиента до 250 мс; быстрый путь ждёт 5 мс.
+- После промежуточной проверки `leftctrl+space` пользовательский дефолт
+  возвращён к `leftctrl+grave`. Для физической клавиши над Tab GNOME 46
+  использует специальный accelerator `<Control>Above_Tab`; символьный
+  `<Control>Cyrillic_io>` не принимается.
+- Для GNOME 46 X11 добавлен отключённый по умолчанию compatibility shim. Он
+  предотвращает X11-only freeze и удаляет только парный штатный release callback
+  при вызове исходного асинхронного IBus path. Это узкий backport более нового
+  поведения Shell; он не меняет уже существующие keyboard grabs. Persistent
+  source и UI по-прежнему принадлежат GNOME; Wayland и другие версии не патчатся.
+- GUI-выделение в Chromium преобразуется без перезаписи clipboard. Перед вводом
+  Punto 30 мс подтверждает исходное точное выделение; изменение selection или
+  контекста приводит к безопасному отказу. После успешного replay точный receipt
+  допускает следующую word-коррекцию при сохранённом Chromium PRIMARY.
+- GUI-слово сначала выделяется и фиксируется точным PRIMARY receipt.
+  После desktop-перехода тот же receipt проверяется повторно до замены:
+  соседний одинаковый текст не может быть принят за исходный диапазон. XInput2
+  дополнительно подтверждает, что во время перехода прошли только клавиши
+  собственного layout-chord; Chromium, сохранивший stale PRIMARY после внешнего
+  Right, поэтому не получает вставку вместо замены.
+- Mixed-layout хвост печатается через временную внутреннюю XKB-группу. Обязанность
+  восстановить исходную группу регистрируется до отправки XKB-запроса и выполняется
+  на всех выходах в зарезервированном участке общего дедлайна. Перед компенсирующей
+  записью заново проверяются session lease, focus, pointer, locks и текущая группа.
+  Отмена или перехват clipboard не затирают новый пользовательский payload.
+- После первой внутренней XKB-записи обычные replay/ожидания больше не могут
+  продлить работу в 100-миллисекундный резерв восстановления. Если cleanup
+  переподключает XCB, финальный desktop-переход допускается только после новой
+  проверки XTEST и повторной подписки на XInput2 на действующем соединении.
+- Чтение очереди XInput2 ограничено 256 событиями и 5 мс. Переполнение,
+  незавершённая история или ошибка соединения приводят к отказу до replay;
+  посторонняя клавиша завершает проверку сразу.
+- Ошибка XInput2 barrier или XIQueryVersion немедленно прекращает подготовку.
+  После операции, закрывшей XCB-соединение, Punto не обращается к setup или
+  другим XCB API. То же правило действует при повторной подготовке после
+  cleanup/reconnect; восстановленная внутренняя группа при отказе сохраняется.
+- Добавлены реальные GTK и Chromium E2E для медленных desktop-переходов,
+  transient focus/selection, rich/plain clipboard, неопределённого результата
+  XKB-запроса и восстановления после отказа без перезапуска.
+- v2.8.12 оставлен prerelease: установленный артефакт был безопасным при отказе,
+  но реальные задержки GNOME делали исправления периодически недоступными.
 
 ### v2.8.12 — Надёжная смена раскладки через desktop hotkey
 

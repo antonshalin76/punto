@@ -1,6 +1,6 @@
 # Punto Switcher Configuration
 # Путь по умолчанию: /etc/punto/config.yaml
-# Config version: 2.8.12
+# Config version: 2.8.13
 
 # Комбинация, которую runtime отправляет для смены группы. Она должна в точности
 # совпадать с системным hotkey, настроенным средствами desktop environment;

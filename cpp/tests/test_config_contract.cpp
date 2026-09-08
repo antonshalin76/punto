@@ -341,7 +341,12 @@ runtime:
 }
 
 void test_compiled_defaults(TestRunner &runner) {
-  runner.expect(same_config(Config{}, documented_defaults()),
+  const Config compiled;
+  runner.expect(compiled.hotkey.modifier == KEY_LEFTCTRL,
+                "compiled default hotkey modifier is left Control");
+  runner.expect(compiled.hotkey.key == KEY_GRAVE,
+                "compiled default hotkey key is grave");
+  runner.expect(same_config(compiled, documented_defaults()),
                 "compiled defaults match the documented shipped template");
 }
 
@@ -349,6 +354,10 @@ void test_shipped_config(TestRunner &runner) {
   const std::filesystem::path shipped_path =
       std::filesystem::path{PUNTO_SOURCE_DIR} / "config.yaml";
   const ConfigLoadOutcome outcome = punto::load_config_checked(shipped_path);
+  runner.expect(outcome.config.hotkey.modifier == KEY_LEFTCTRL,
+                "shipped config hotkey modifier is left Control");
+  runner.expect(outcome.config.hotkey.key == KEY_GRAVE,
+                "shipped config hotkey key is grave");
   Config expected = documented_defaults();
   expected.config_path = shipped_path;
   expect_ok_contract(runner, "shipped-config", outcome, shipped_path, expected);
@@ -541,6 +550,7 @@ void test_inclusive_valid_boundaries(TestRunner &runner,
   };
 
   Config lower = documented_defaults();
+  lower.hotkey.key = KEY_GRAVE;
   lower.auto_switch.threshold = 0.5;
   lower.auto_switch.min_word_len = 1;
   lower.auto_switch.min_score = 0.0;
@@ -566,6 +576,7 @@ void test_inclusive_valid_boundaries(TestRunner &runner,
       lower);
 
   Config upper = documented_defaults();
+  upper.hotkey.key = KEY_GRAVE;
   upper.auto_switch.threshold = 10.0;
   upper.auto_switch.min_word_len = 10;
   upper.auto_switch.min_score = 20.0;

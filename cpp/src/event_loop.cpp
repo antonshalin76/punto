@@ -32,6 +32,10 @@ namespace punto {
 
 namespace {
 
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+extern "C" void punto_e2e_after_x11_session_commit(const char *session_id);
+#endif
+
 constexpr std::uint64_t kTaskIdFenceStride = 1024;
 constexpr auto kControlPlanePollInterval = std::chrono::seconds{2};
 constexpr auto kRuntimeShutdownDeadline = std::chrono::seconds{3};
@@ -748,20 +752,21 @@ int EventLoop::run() {
     // latest session is re-read after that obsolete work completes.
     request_x11_config_reload();
 
-    {
-      const X11SessionInfo info = x11_session_->info();
-      if (info.observed_keyboard_layout == 0 ||
-          info.observed_keyboard_layout == 1) {
-        current_layout_ = info.observed_keyboard_layout;
-      }
-      std::cerr << "[punto] X11 session: id=" << info.session_id
-                << " user=" << info.username << " display=" << info.display
-                << "\n";
+    const X11SessionInfo info = x11_session_->info();
+    if (info.observed_keyboard_layout == 0 ||
+        info.observed_keyboard_layout == 1) {
+      current_layout_ = info.observed_keyboard_layout;
     }
+    std::cerr << "[punto] X11 session: id=" << info.session_id
+              << " user=" << info.username << " display=" << info.display
+              << "\n";
 
     std::cerr << "[punto] X11 observation refreshed, layout: "
               << (current_layout_ == 0 ? "EN" : "RU") << "\n";
     x11_dependencies_ready_ = true;
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    punto_e2e_after_x11_session_commit(info.session_id.c_str());
+#endif
     wayland_warning_emitted_ = false;
   };
 
@@ -1547,9 +1552,8 @@ IpcResult EventLoop::execute_ipc_command(const IpcRequest &request) {
     if (generation == 0) {
       return {false, "Learning unavailable"};
     }
-    return {true, "EXCLUSIONS SCHEDULED " +
-                      std::to_string(daemon_epoch_) + " " +
-                      std::to_string(generation)};
+    return {true, "EXCLUSIONS SCHEDULED " + std::to_string(daemon_epoch_) +
+                      " " + std::to_string(generation)};
   }
   case IpcVerb::Shutdown:
     return {false, "Shutdown not allowed via IPC"};
@@ -2296,6 +2300,7 @@ void EventLoop::process_pending_word_edit() {
     if (!correction)
       return;
     bool allow_terminal = candidate->allow_terminal;
+    int final_layout = candidate->target_layout;
     for (auto word = candidate; word != word_history_.end(); ++word) {
       const auto &visible = word->visible;
       if (!visible ||
@@ -2306,6 +2311,8 @@ void EventLoop::process_pending_word_edit() {
       replacement +=
           (word == candidate ? *correction : *visible) + word->trailing;
       allow_terminal = allow_terminal && word->allow_terminal;
+      if (word != candidate && word->source_layout >= 0)
+        final_layout = word->source_layout;
     }
     if (!buffer_.current_word().empty()) {
       const auto &visible = active_word_visible_;
@@ -2316,7 +2323,7 @@ void EventLoop::process_pending_word_edit() {
     }
     pending_word_edit_ = WordEditRequest{std::move(expected),
                                          std::move(replacement),
-                                         candidate->target_layout,
+                                         final_layout,
                                          keyboard_observation_->group,
                                          candidate->session_generation,
                                          WordEditOperation::Word,
@@ -2429,7 +2436,7 @@ void EventLoop::process_pending_word_edit() {
   }
   std::string dispatch_log = "[punto] Word edit dispatch status=" +
                              std::to_string(static_cast<int>(outcome.status));
-  if (outcome.status == WordEditStatus::Rejected) {
+  if (outcome.status != WordEditStatus::Dispatched) {
     dispatch_log += " rejection_stage=";
     dispatch_log += outcome.rejection_stage;
   }

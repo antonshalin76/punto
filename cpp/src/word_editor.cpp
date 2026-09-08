@@ -6,6 +6,7 @@
 #include "punto/text_processor.hpp"
 #include "punto/x11_session.hpp"
 
+#include <xcb/xinput.h>
 #include <xcb/xtest.h>
 #if defined(__clang__)
 #pragma clang diagnostic push
@@ -29,6 +30,7 @@
 #include <span>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace punto {
@@ -38,11 +40,30 @@ namespace {
 extern "C" void punto_e2e_after_paste_receipt_arm();
 extern "C" void punto_e2e_after_word_dispatch();
 extern "C" void punto_e2e_before_post_dispatch_wait();
+extern "C" void punto_e2e_after_internal_layout();
+extern "C" void punto_e2e_before_internal_layout_change();
+extern "C" void punto_e2e_before_internal_layout_restore();
+extern "C" void
+punto_e2e_before_internal_layout_work(std::int64_t cleanup_start_ns);
+extern "C" std::int64_t
+punto_e2e_internal_layout_cleanup_start(std::int64_t cleanup_start_ns);
+extern "C" void punto_e2e_before_raw_key_observation();
+extern "C" void punto_e2e_after_raw_key_observation();
+extern "C" void punto_e2e_before_word_replay();
 #endif
 
 using Clock = std::chrono::steady_clock;
 using Deadline = Clock::time_point;
 constexpr auto kClipboardBudget = std::chrono::milliseconds{10};
+constexpr auto kMacroBudget = std::chrono::milliseconds{300};
+constexpr auto kLayoutTransitionBudget = std::chrono::milliseconds{1000};
+constexpr auto kTotalMacroBudget = std::chrono::milliseconds{3500};
+constexpr auto kExtendedLayoutClientSettle = std::chrono::milliseconds{250};
+constexpr auto kFastLayoutClientSettle = std::chrono::milliseconds{5};
+constexpr auto kSelectionClientSettle = std::chrono::milliseconds{30};
+constexpr auto kInternalLayoutCleanupBudget = std::chrono::milliseconds{100};
+constexpr auto kRawKeyObservationBudget = std::chrono::milliseconds{5};
+constexpr std::size_t kMaxRawKeyEvents = 256;
 constexpr std::size_t kMaxCharacters = 128;
 constexpr xcb_keycode_t kShift = KEY_LEFTSHIFT + 8;
 constexpr xcb_keycode_t kLeft = KEY_LEFT + 8;
@@ -54,6 +75,17 @@ constexpr xcb_keycode_t kPaste = KEY_V + 8;
 constexpr xcb_keycode_t kUndo = KEY_Z + 8;
 
 template <typename T> using Reply = std::unique_ptr<T, decltype(&std::free)>;
+
+template <typename Function> class ScopeExit {
+public:
+  explicit ScopeExit(Function function) : function_(std::move(function)) {}
+  ScopeExit(const ScopeExit &) = delete;
+  ScopeExit &operator=(const ScopeExit &) = delete;
+  ~ScopeExit() { function_(); }
+
+private:
+  Function function_;
+};
 
 template <typename T>
 Reply<T> reply(BoundedXcbConnection &connection, unsigned int sequence,
@@ -83,6 +115,7 @@ struct Stroke {
 
 struct KeyboardPlan {
   std::vector<Stroke> alphabet;
+  std::array<std::uint8_t, 256> modifier_masks{};
   std::uint8_t num_lock_mask = 0;
   std::uint8_t caps_lock_mask = 0;
 };
@@ -126,6 +159,13 @@ std::optional<KeyboardPlan> make_keyboard_plan(BoundedXcbConnection &connection,
   KeyboardPlan plan;
   const auto *modifier_keys =
       xcb_get_modifier_mapping_keycodes(modifiers.get());
+  for (unsigned int slot = 0; slot < 8; ++slot) {
+    for (unsigned int i = 0; i < modifiers->keycodes_per_modifier; ++i) {
+      const auto key =
+          modifier_keys[slot * modifiers->keycodes_per_modifier + i];
+      plan.modifier_masks[key] |= static_cast<std::uint8_t>(1U << slot);
+    }
+  }
   bool caps_found = false;
   bool only_caps = true;
   bool shift_found = false;
@@ -413,10 +453,21 @@ struct IdleKeyboardState {
   bool operator==(const IdleKeyboardState &) const = default;
 };
 
+struct KeyboardStateSnapshot {
+  int group;
+  std::uint8_t mods;
+  std::uint8_t base_mods;
+  std::uint8_t latched_mods;
+  std::uint8_t locked_mods;
+  std::int16_t base_group;
+  std::int16_t latched_group;
+  std::uint16_t pointer_buttons;
+};
+
 std::optional<IdleKeyboardState>
 idle_layout(BoundedXcbConnection &connection, std::uint8_t allowed_locks,
-            Deadline deadline,
-            x11_detail::XcbOperationResult *result = nullptr) {
+            Deadline deadline, x11_detail::XcbOperationResult *result = nullptr,
+            KeyboardStateSnapshot *snapshot = nullptr) {
   if (!connection.is_open()) {
     if (result != nullptr) {
       *result = x11_detail::XcbOperationResult::ConnectionFailed;
@@ -427,6 +478,12 @@ idle_layout(BoundedXcbConnection &connection, std::uint8_t allowed_locks,
       connection,
       xcb_xkb_get_state(connection.get(), XCB_XKB_ID_USE_CORE_KBD).sequence,
       deadline, result);
+  if (state && snapshot != nullptr) {
+    *snapshot = KeyboardStateSnapshot{state->group,        state->mods,
+                                      state->baseMods,     state->latchedMods,
+                                      state->lockedMods,   state->baseGroup,
+                                      state->latchedGroup, state->ptrBtnState};
+  }
   if (!state || (state->mods & ~allowed_locks) != 0 || state->baseMods != 0 ||
       state->latchedMods != 0 || (state->lockedMods & ~allowed_locks) != 0 ||
       state->baseGroup != 0 || state->latchedGroup != 0 || state->group > 1 ||
@@ -478,6 +535,18 @@ LayoutHotkeyResult send_layout_hotkey(BoundedXcbConnection &connection,
     }
   }
   return LayoutHotkeyResult::Accepted;
+}
+
+bool set_internal_layout(BoundedXcbConnection &connection, int group,
+                         Deadline deadline) {
+  if (!connection.is_open() || Clock::now() >= deadline) {
+    return false;
+  }
+  return checked(connection,
+                 xcb_xkb_latch_lock_state_checked(
+                     connection.get(), XCB_XKB_ID_USE_CORE_KBD, 0, 0, 1,
+                     static_cast<std::uint8_t>(group), 0, 0, 0),
+                 deadline);
 }
 
 bool tap(BoundedXcbConnection &connection, xcb_keycode_t key, bool shifted,
@@ -627,7 +696,9 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   if (busy() && !native_undo) {
     return outcome;
   }
-  const auto deadline = Clock::now() + std::chrono::milliseconds{300};
+  const auto started = Clock::now();
+  const auto hard_deadline = started + kTotalMacroBudget;
+  auto deadline = started + kMacroBudget;
   outcome.rejection_stage = "macro_lock";
   MacroLock lock;
   MacroLockGuard guard{lock, std::chrono::milliseconds{0}};
@@ -645,18 +716,6 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   if (!connection.is_open()) {
     return outcome;
   }
-  // Generated extension requests otherwise perform a blocking first lookup.
-  outcome.rejection_stage = "xtest";
-  xcb_prefetch_extension_data(connection.get(), &xcb_test_id);
-  auto extension_barrier = reply<xcb_get_input_focus_reply_t>(
-      connection, xcb_get_input_focus(connection.get()).sequence, deadline);
-  if (!extension_barrier || !connection.is_open()) {
-    return outcome;
-  }
-  const auto *xtest = xcb_get_extension_data(connection.get(), &xcb_test_id);
-  if (xtest == nullptr || xtest->present == 0) {
-    return outcome;
-  }
   outcome.rejection_stage = "xkb";
   auto extension = reply<xcb_xkb_use_extension_reply_t>(
       connection, xcb_xkb_use_extension(connection.get(), 1, 0).sequence,
@@ -670,13 +729,21 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     return outcome;
   }
   const auto *setup = xcb_get_setup(connection.get());
+  if (setup == nullptr) {
+    return outcome;
+  }
+  const auto min_keycode = setup->min_keycode;
+  const auto max_keycode = setup->max_keycode;
   const auto hotkey_modifier =
       static_cast<unsigned int>(request.layout_hotkey_modifier) + 8U;
   const auto hotkey_key =
       static_cast<unsigned int>(request.layout_hotkey_key) + 8U;
-  if (hotkey_modifier < setup->min_keycode ||
-      hotkey_modifier > setup->max_keycode || hotkey_key < setup->min_keycode ||
-      hotkey_key > setup->max_keycode) {
+  if (hotkey_modifier < min_keycode || hotkey_modifier > max_keycode ||
+      hotkey_key < min_keycode || hotkey_key > max_keycode) {
+    return outcome;
+  }
+  const auto hotkey_modifier_mask = keyboard->modifier_masks[hotkey_modifier];
+  if (hotkey_modifier_mask == 0) {
     return outcome;
   }
   outcome.rejection_stage = "context";
@@ -731,6 +798,68 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
        (!terminal_text(request.expected) ||
         !terminal_text(request.replacement))) ||
       (word && kind == ActiveWindowKind::Gui && replacement->empty())) {
+    return outcome;
+  }
+  const bool observe_gui_word_transition =
+      word && kind == ActiveWindowKind::Gui && request.target_layout >= 0 &&
+      request.target_layout != request.source_layout;
+  std::uint8_t xinput_opcode = 0;
+  const auto prepare_transition_extensions = [&] {
+    // Generated extension requests otherwise perform a blocking first lookup.
+    outcome.rejection_stage = "xtest";
+    xcb_prefetch_extension_data(connection.get(), &xcb_test_id);
+    auto extension_barrier = reply<xcb_get_input_focus_reply_t>(
+        connection, xcb_get_input_focus(connection.get()).sequence, deadline);
+    if (!extension_barrier || !connection.is_open()) {
+      return false;
+    }
+    const auto *xtest = xcb_get_extension_data(connection.get(), &xcb_test_id);
+    if (xtest == nullptr || xtest->present == 0) {
+      return false;
+    }
+    if (!observe_gui_word_transition) {
+      return true;
+    }
+    outcome.rejection_stage = "xinput";
+    xcb_prefetch_extension_data(connection.get(), &xcb_input_id);
+    auto xinput_barrier = reply<xcb_get_input_focus_reply_t>(
+        connection, xcb_get_input_focus(connection.get()).sequence, deadline);
+    if (!xinput_barrier || !connection.is_open()) {
+      return false;
+    }
+    const auto *xinput =
+        xcb_get_extension_data(connection.get(), &xcb_input_id);
+    if (xinput == nullptr || xinput->present == 0) {
+      return false;
+    }
+    auto xinput_version = reply<xcb_input_xi_query_version_reply_t>(
+        connection, xcb_input_xi_query_version(connection.get(), 2, 0).sequence,
+        deadline);
+    if (!xinput_version || !connection.is_open()) {
+      return false;
+    }
+    struct RawKeyMask {
+      xcb_input_event_mask_t header;
+      std::uint32_t bits;
+    } raw_key_mask{{XCB_INPUT_DEVICE_ALL_MASTER, 1},
+                   XCB_INPUT_XI_EVENT_MASK_RAW_KEY_PRESS |
+                       XCB_INPUT_XI_EVENT_MASK_RAW_KEY_RELEASE};
+    const auto *current_setup = xcb_get_setup(connection.get());
+    if (current_setup == nullptr) {
+      return false;
+    }
+    const auto screen = xcb_setup_roots_iterator(current_setup);
+    if (screen.rem == 0 || !checked(connection,
+                                    xcb_input_xi_select_events_checked(
+                                        connection.get(), screen.data->root, 1,
+                                        &raw_key_mask.header),
+                                    deadline)) {
+      return false;
+    }
+    xinput_opcode = xinput->major_opcode;
+    return true;
+  };
+  if (!prepare_transition_extensions()) {
     return outcome;
   }
   outcome.rejection_stage = "active_client";
@@ -802,6 +931,15 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   outcome.focused_window = *initial_focus;
   int group = initial_state->group;
   bool cancelled = false;
+  auto work_deadline = hard_deadline;
+  const auto renew_budget = [&](auto budget) {
+    const auto now = Clock::now();
+    if (now >= deadline || now >= work_deadline) {
+      return false;
+    }
+    deadline = std::min(work_deadline, now + budget);
+    return true;
+  };
   const auto wait = [&](Deadline until) {
     if (cancelled || Clock::now() >= deadline) {
       return false;
@@ -817,28 +955,44 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     }
     return !cancelled && Clock::now() < deadline;
   };
-  const auto stable_context_matches = [&](bool interrupted_wait_is_safe =
-                                              false) {
+  enum class StableContextFailure {
+    None,
+    Wait,
+    Session,
+    FocusObservation,
+    FocusChanged,
+    PointerObservation,
+    PointerChanged,
+  };
+  StableContextFailure stable_context_failure = StableContextFailure::None;
+  const auto stable_context_matches = [&](bool interrupted_wait_is_safe = false,
+                                          bool allow_focus_transition = false) {
+    stable_context_failure = StableContextFailure::None;
     if (!wait(Clock::now())) {
+      stable_context_failure = StableContextFailure::Wait;
       if (!interrupted_wait_is_safe) {
         invalidate_retained_context();
       }
       return false;
     }
     if (!connection.is_open() || !lease->valid()) {
+      stable_context_failure = StableContextFailure::Session;
       invalidate_retained_context();
       return false;
     }
     x11_detail::XcbOperationResult focus_result{};
     const auto current_focus = focus(connection, deadline, &focus_result);
     if (!current_focus) {
+      stable_context_failure = StableContextFailure::FocusObservation;
       if (observation_failure_invalidates(focus_result,
                                           interrupted_wait_is_safe)) {
         invalidate_retained_context();
       }
       return false;
     }
-    if (current_focus != initial_focus) {
+    const bool focus_changed = current_focus != initial_focus;
+    if (focus_changed && !allow_focus_transition) {
+      stable_context_failure = StableContextFailure::FocusChanged;
       invalidate_retained_context();
       return false;
     }
@@ -853,6 +1007,7 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     // Core pointer state also carries the XKB group. idle_layout validates
     // keyboard state against the group selected by this executor.
     if (!current) {
+      stable_context_failure = StableContextFailure::PointerObservation;
       if (observation_failure_invalidates(pointer_result,
                                           interrupted_wait_is_safe)) {
         invalidate_retained_context();
@@ -863,9 +1018,15 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
                          current->root_y == pointer->root_y &&
                          (current->mask & buttons) == (pointer->mask & buttons);
     if (!matches) {
+      stable_context_failure = StableContextFailure::PointerChanged;
       invalidate_retained_context();
+      return false;
     }
-    return matches;
+    if (focus_changed) {
+      stable_context_failure = StableContextFailure::FocusChanged;
+      return false;
+    }
+    return true;
   };
   const auto context_matches = [&](bool interrupted_wait_is_safe = false) {
     if (!stable_context_matches(interrupted_wait_is_safe)) {
@@ -889,48 +1050,265 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     }
     return matches;
   };
+  enum class HotkeyKeysResult { Clear, OwnChord, Foreign, ObservationFailed };
+  const auto hotkey_keys = [&] {
+    const auto keys = reply<xcb_query_keymap_reply_t>(
+        connection, xcb_query_keymap(connection.get()).sequence, deadline);
+    if (!keys) {
+      return HotkeyKeysResult::ObservationFailed;
+    }
+    bool own_chord_down = false;
+    for (unsigned int key = min_keycode; key <= max_keycode; ++key) {
+      const bool down = (keys->keys[key / 8U] & (1U << (key % 8U))) != 0;
+      if (down && key != hotkey_modifier && key != hotkey_key) {
+        return HotkeyKeysResult::Foreign;
+      }
+      own_chord_down |= down;
+    }
+    return own_chord_down ? HotkeyKeysResult::OwnChord
+                          : HotkeyKeysResult::Clear;
+  };
+  enum class RawKeyHistoryResult { Clear, Foreign, Incomplete, Failed };
+  const auto observe_transition_raw_keys = [&](bool validate) {
+    const auto observation_deadline =
+        std::min(deadline, Clock::now() + kRawKeyObservationBudget);
+    for (std::size_t count = 0; count < kMaxRawKeyEvents; ++count) {
+      if (Clock::now() >= observation_deadline) {
+        return RawKeyHistoryResult::Incomplete;
+      }
+      auto *event = xcb_poll_for_event(connection.get());
+      if (event == nullptr) {
+        return xcb_connection_has_error(connection.get()) == 0
+                   ? RawKeyHistoryResult::Clear
+                   : RawKeyHistoryResult::Failed;
+      }
+      const auto type = static_cast<std::uint8_t>(event->response_type & 0x7fU);
+      bool foreign = false;
+      if (validate && type == XCB_GE_GENERIC) {
+        const auto *generic =
+            reinterpret_cast<const xcb_ge_generic_event_t *>(event);
+        if (generic->extension == xinput_opcode &&
+            (generic->event_type == XCB_INPUT_RAW_KEY_PRESS ||
+             generic->event_type == XCB_INPUT_RAW_KEY_RELEASE)) {
+          const auto *raw =
+              reinterpret_cast<const xcb_input_raw_key_press_event_t *>(event);
+          foreign = raw->detail != hotkey_modifier && raw->detail != hotkey_key;
+        }
+      }
+      std::free(event);
+      if (foreign) {
+        return RawKeyHistoryResult::Foreign;
+      }
+    }
+    return RawKeyHistoryResult::Incomplete;
+  };
+  bool validate_transition_raw_keys = false;
   const auto ensure_layout = [&](int target) {
     if (target == group) {
       return context_matches();
     }
-    if (!context_matches()) {
+    if (!renew_budget(kLayoutTransitionBudget)) {
+      outcome.rejection_stage = "layout_transition_budget";
       return false;
+    }
+    if (!context_matches()) {
+      outcome.rejection_stage = "layout_transition_context_before";
+      return false;
+    }
+    if (validate_transition_raw_keys) {
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+      punto_e2e_before_raw_key_observation();
+#endif
+      const auto history = observe_transition_raw_keys(false);
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+      punto_e2e_after_raw_key_observation();
+#endif
+      if (history != RawKeyHistoryResult::Clear) {
+        outcome.rejection_stage = history == RawKeyHistoryResult::Failed
+                                      ? "layout_transition_raw_key_observation"
+                                      : "layout_transition_raw_key_incomplete";
+        invalidate_retained_context();
+        return false;
+      }
     }
     const auto hotkey =
         send_layout_hotkey(connection, request.layout_hotkey_modifier,
                            request.layout_hotkey_key, deadline);
     if (hotkey != LayoutHotkeyResult::Accepted) {
+      outcome.rejection_stage = "layout_transition_hotkey";
       // A failed checked request may have sent only part of the chord. The
       // retained selection is safe only after a complete chord was accepted
       // and the desktop merely failed to activate it before the macro deadline.
       invalidate_retained_context();
       return false;
     }
+    std::optional<Deadline> target_idle_since;
+    bool extended_client_settle = false;
     for (;;) {
-      if (!stable_context_matches()) {
+      if (Clock::now() + kClipboardBudget >= deadline) {
+        deadline =
+            std::min(hard_deadline, Clock::now() + kSelectionClientSettle);
+        if (!context_matches()) {
+          outcome.rejection_stage = "layout_transition_final_context";
+          return false;
+        }
+        outcome.rejection_stage = "layout_transition_timeout";
+        preserve_previous_context();
         return false;
       }
-      const auto observed = idle_layout(connection, allowed_locks, deadline);
-      if (!observed) {
-        invalidate_retained_context();
+      if (!stable_context_matches(false, true)) {
+        if (stable_context_failure == StableContextFailure::FocusChanged) {
+          extended_client_settle = true;
+          const auto keys = hotkey_keys();
+          if (keys == HotkeyKeysResult::Foreign ||
+              keys == HotkeyKeysResult::ObservationFailed) {
+            outcome.rejection_stage = keys == HotkeyKeysResult::Foreign
+                                          ? "layout_transition_foreign_key"
+                                          : "layout_transition_keymap";
+            invalidate_retained_context();
+            return false;
+          }
+          target_idle_since.reset();
+          if (!wait(Clock::now() + std::chrono::milliseconds{1})) {
+            outcome.rejection_stage = cancelled
+                                          ? "layout_transition_cancelled"
+                                          : "layout_transition_focus_timeout";
+            invalidate_retained_context();
+            return false;
+          }
+          continue;
+        }
+        switch (stable_context_failure) {
+        case StableContextFailure::Wait:
+          outcome.rejection_stage = "layout_transition_context_wait";
+          break;
+        case StableContextFailure::Session:
+          outcome.rejection_stage = "layout_transition_context_session";
+          break;
+        case StableContextFailure::FocusObservation:
+          outcome.rejection_stage = "layout_transition_focus_observation";
+          break;
+        case StableContextFailure::FocusChanged:
+          outcome.rejection_stage = "layout_transition_focus_changed";
+          break;
+        case StableContextFailure::PointerObservation:
+          outcome.rejection_stage = "layout_transition_pointer_observation";
+          break;
+        case StableContextFailure::PointerChanged:
+          outcome.rejection_stage = "layout_transition_pointer_changed";
+          break;
+        case StableContextFailure::None:
+          outcome.rejection_stage = "layout_transition_context_after";
+          break;
+        }
         return false;
+      }
+      x11_detail::XcbOperationResult layout_result{};
+      KeyboardStateSnapshot keyboard_state{};
+      const auto observed = idle_layout(connection, allowed_locks, deadline,
+                                        &layout_result, &keyboard_state);
+      if (!observed) {
+        const bool own_chord_transition =
+            layout_result == x11_detail::XcbOperationResult::Success &&
+            (keyboard_state.group == group || keyboard_state.group == target) &&
+            keyboard_state.mods ==
+                static_cast<std::uint8_t>(initial_state->locked_mods |
+                                          hotkey_modifier_mask) &&
+            keyboard_state.base_mods == hotkey_modifier_mask &&
+            keyboard_state.latched_mods == 0 &&
+            keyboard_state.locked_mods == initial_state->locked_mods &&
+            keyboard_state.base_group == 0 &&
+            keyboard_state.latched_group == 0 &&
+            keyboard_state.pointer_buttons == 0;
+        if (!own_chord_transition) {
+          outcome.rejection_stage =
+              layout_result == x11_detail::XcbOperationResult::Success
+                  ? "layout_transition_not_idle"
+              : layout_result == x11_detail::XcbOperationResult::TimedOut
+                  ? "layout_transition_timeout"
+                  : "layout_transition_observation";
+          invalidate_retained_context();
+          return false;
+        }
+        extended_client_settle = true;
+        const auto keys = hotkey_keys();
+        if (keys == HotkeyKeysResult::Foreign ||
+            keys == HotkeyKeysResult::ObservationFailed) {
+          outcome.rejection_stage = keys == HotkeyKeysResult::Foreign
+                                        ? "layout_transition_foreign_key"
+                                        : "layout_transition_keymap";
+          invalidate_retained_context();
+          return false;
+        }
+        target_idle_since.reset();
+        if (!wait(Clock::now() + std::chrono::milliseconds{1})) {
+          outcome.rejection_stage = cancelled ? "layout_transition_cancelled"
+                                              : "layout_transition_timeout";
+          invalidate_retained_context();
+          return false;
+        }
+        continue;
       }
       if (observed->locked_mods != initial_state->locked_mods) {
+        outcome.rejection_stage = "layout_transition_locks";
         invalidate_retained_context();
         return false;
       }
       if (observed->group == target) {
-        group = target;
-        return true;
+        const auto keys = hotkey_keys();
+        if (keys == HotkeyKeysResult::Foreign ||
+            keys == HotkeyKeysResult::ObservationFailed) {
+          outcome.rejection_stage = keys == HotkeyKeysResult::Foreign
+                                        ? "layout_transition_foreign_key"
+                                        : "layout_transition_keymap";
+          invalidate_retained_context();
+          return false;
+        }
+        if (keys == HotkeyKeysResult::OwnChord) {
+          target_idle_since.reset();
+        } else if (!target_idle_since) {
+          target_idle_since = Clock::now();
+        } else if (Clock::now() - *target_idle_since >=
+                   (extended_client_settle ? kExtendedLayoutClientSettle
+                                           : kFastLayoutClientSettle)) {
+          const auto history = validate_transition_raw_keys
+                                   ? observe_transition_raw_keys(true)
+                                   : RawKeyHistoryResult::Clear;
+          if (history != RawKeyHistoryResult::Clear) {
+            outcome.rejection_stage =
+                history == RawKeyHistoryResult::Foreign
+                    ? "layout_transition_foreign_raw_key"
+                : history == RawKeyHistoryResult::Failed
+                    ? "layout_transition_raw_key_observation"
+                    : "layout_transition_raw_key_incomplete";
+            invalidate_retained_context();
+            return false;
+          }
+          group = target;
+          deadline = std::min(hard_deadline, Clock::now() + kMacroBudget);
+          return true;
+        }
+        if (!wait(Clock::now() + std::chrono::milliseconds{1})) {
+          outcome.rejection_stage = cancelled
+                                        ? "layout_transition_cancelled"
+                                        : "layout_transition_settle_timeout";
+          invalidate_retained_context();
+          return false;
+        }
+        continue;
       }
       if (observed->group != group) {
+        outcome.rejection_stage = "layout_transition_unexpected_group";
         invalidate_retained_context();
         return false;
       }
+      target_idle_since.reset();
       if (!wait(Clock::now() + std::chrono::milliseconds{1})) {
         if (cancelled) {
+          outcome.rejection_stage = "layout_transition_cancelled";
           invalidate_retained_context();
         } else {
+          outcome.rejection_stage = "layout_transition_timeout";
           preserve_previous_context();
         }
         // Reaching the shared deadline here is the sole safe retained retry:
@@ -973,51 +1351,219 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   }
 
   std::optional<SelectionRead> previous_clipboard;
-  if (selection || paste_word) {
+  const auto snapshot_clipboard = [&] {
     outcome.rejection_stage = "clipboard_snapshot_read";
     previous_clipboard = clipboard_->get_text_with_owner(Selection::Clipboard);
     if (!previous_clipboard) {
-      return outcome;
+      return false;
     }
     outcome.rejection_stage = "clipboard_snapshot_budget";
     if (!clipboard_time()) {
-      return outcome;
+      return false;
     }
     outcome.rejection_stage = "clipboard_snapshot_targets";
     if (clipboard_->has_only_text_targets(Selection::Clipboard,
                                           *previous_clipboard) !=
         std::optional<bool>{true}) {
-      return outcome;
+      return false;
     }
+    return true;
+  };
+  if (paste_word && !snapshot_clipboard()) {
+    return outcome;
   }
   const auto cleanup_selection = [&](const SelectionRead &prepared) {
     if (!clipboard_time() || !context_matches()) {
-      return;
+      return false;
     }
     const auto current = clipboard_->get_text_with_owner(Selection::Primary);
     if (current && same_selection(prepared, *current) && context_matches()) {
-      (void)tap(connection, kRight, false, deadline);
+      return tap(connection, kRight, false, deadline);
     }
+    return false;
   };
 
-  const auto shortcut = [&](xcb_keycode_t key, bool shift) {
-    if (!ensure_layout(0)) {
-      return false;
-    }
-    return tap(connection, key, shift, deadline, true);
-  };
   const auto finish_layout = [&] {
     return ensure_layout(outcome.target_layout);
   };
-  const auto paste_selection = [&](const SelectionRead &source, bool terminal) {
-    outcome.rejection_stage = "layout_transition_paste_preflight";
-    if (!ensure_layout(0)) {
-      return;
+  struct InternalLayoutMutation {
+    int original_group;
+    int requested_group;
+  };
+  std::optional<InternalLayoutMutation> internal_layout_mutation;
+  const auto change_internal_layout = [&](int target) {
+    if (target == group) {
+      return context_matches();
     }
+    if (!context_matches()) {
+      return false;
+    }
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    punto_e2e_before_internal_layout_change();
+#endif
+    auto cleanup_reserve_start = hard_deadline - kInternalLayoutCleanupBudget;
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    cleanup_reserve_start = Deadline{
+        std::chrono::nanoseconds{punto_e2e_internal_layout_cleanup_start(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                cleanup_reserve_start.time_since_epoch())
+                .count())}};
+#endif
+    const auto now = Clock::now();
+    if (now >= cleanup_reserve_start) {
+      return false;
+    }
+    if (!internal_layout_mutation) {
+      internal_layout_mutation = InternalLayoutMutation{group, target};
+      work_deadline = std::min(work_deadline, cleanup_reserve_start);
+      deadline = std::min(deadline, work_deadline);
+    } else {
+      internal_layout_mutation->requested_group = target;
+    }
+    if (!set_internal_layout(connection, target,
+                             std::min(deadline, cleanup_reserve_start))) {
+      return false;
+    }
+    group = target;
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    punto_e2e_after_internal_layout();
+    punto_e2e_before_internal_layout_work(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            cleanup_reserve_start.time_since_epoch())
+            .count());
+#endif
+    return context_matches();
+  };
+  const auto restore_internal_layout = [&] {
+    if (!internal_layout_mutation) {
+      return true;
+    }
+    const auto mutation = *internal_layout_mutation;
+    const auto restore_group = mutation.original_group;
+    const auto now = Clock::now();
+    if (now >= hard_deadline || !lease->valid()) {
+      return false;
+    }
+    deadline = std::min(hard_deadline, now + kInternalLayoutCleanupBudget);
+    bool reconnected = false;
+    const auto ensure_cleanup_connection = [&] {
+      if (connection.is_open()) {
+        return true;
+      }
+      connection = lease->open_bounded_connection(deadline);
+      if (connection.is_open()) {
+        reconnected = true;
+        auto cleanup_extension = reply<xcb_xkb_use_extension_reply_t>(
+            connection, xcb_xkb_use_extension(connection.get(), 1, 0).sequence,
+            deadline);
+        if (!cleanup_extension || !cleanup_extension->supported) {
+          connection.close();
+        }
+      }
+      return connection.is_open();
+    };
+    if (!ensure_cleanup_connection()) {
+      return false;
+    }
+    KeyboardStateSnapshot cleanup_state{};
+    auto current_layout = idle_layout(connection, allowed_locks, deadline,
+                                      nullptr, &cleanup_state);
+    while (!current_layout && connection.is_open() &&
+           Clock::now() + std::chrono::milliseconds{1} < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+      current_layout = idle_layout(connection, allowed_locks, deadline, nullptr,
+                                   &cleanup_state);
+    }
+    if (!current_layout || !connection.is_open() || !lease->valid()) {
+      return false;
+    }
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    punto_e2e_before_internal_layout_restore();
+#endif
+    constexpr std::uint16_t buttons = XCB_BUTTON_MASK_1 | XCB_BUTTON_MASK_2 |
+                                      XCB_BUTTON_MASK_3 | XCB_BUTTON_MASK_4 |
+                                      XCB_BUTTON_MASK_5;
+    const auto authorized_layout = [&] {
+      if (!connection.is_open() || !lease->valid()) {
+        return std::optional<IdleKeyboardState>{};
+      }
+      const auto current_focus = focus(connection, deadline);
+      if (!current_focus || !connection.is_open() ||
+          current_focus != initial_focus) {
+        return std::optional<IdleKeyboardState>{};
+      }
+      const auto current_pointer = reply<xcb_query_pointer_reply_t>(
+          connection,
+          xcb_query_pointer(connection.get(), *current_focus).sequence,
+          deadline);
+      if (!current_pointer || !connection.is_open() || !lease->valid()) {
+        return std::optional<IdleKeyboardState>{};
+      }
+      KeyboardStateSnapshot fresh_state{};
+      const auto observed = idle_layout(connection, allowed_locks, deadline,
+                                        nullptr, &fresh_state);
+      if (!observed || !connection.is_open() || !lease->valid() ||
+          (observed->group != group &&
+           observed->group != mutation.requested_group &&
+           observed->group != restore_group) ||
+          fresh_state.locked_mods != initial_state->locked_mods ||
+          current_pointer->root_x != pointer->root_x ||
+          current_pointer->root_y != pointer->root_y ||
+          (current_pointer->mask & buttons) != (pointer->mask & buttons)) {
+        return std::optional<IdleKeyboardState>{};
+      }
+      return observed;
+    };
+    current_layout = authorized_layout();
+    if (!current_layout) {
+      return false;
+    }
+    if (current_layout->group != restore_group &&
+        !set_internal_layout(connection, restore_group, deadline)) {
+      if (!ensure_cleanup_connection()) {
+        return false;
+      }
+    }
+    const auto restored = authorized_layout();
+    if (restored != std::optional{IdleKeyboardState{
+                        restore_group, initial_state->locked_mods}}) {
+      return false;
+    }
+    group = restore_group;
+    internal_layout_mutation.reset();
+    if (reconnected && Clock::now() < work_deadline) {
+      deadline = std::min(deadline, work_deadline);
+      if (!prepare_transition_extensions()) {
+        return false;
+      }
+    }
+    return true;
+  };
+  std::optional<bool> internal_layout_finalization;
+  const auto finalize_internal_layout = [&] {
+    if (!internal_layout_finalization) {
+      internal_layout_finalization = restore_internal_layout();
+    }
+    return *internal_layout_finalization;
+  };
+  ScopeExit internal_layout_scope{[&] {
+    if (!finalize_internal_layout() &&
+        outcome.status == WordEditStatus::Dispatched) {
+      outcome.status = WordEditStatus::PartialFailure;
+    }
+  }};
+  const auto paste_selection = [&](const SelectionRead &source, bool terminal) {
     outcome.rejection_stage = "selection_confirmation";
     auto confirmed = clipboard_->get_text_with_owner(Selection::Primary);
     if (!confirmed || !same_selection(source, *confirmed) ||
         !context_matches()) {
+      return;
+    }
+    outcome.rejection_stage = "paste_internal_layout";
+    if (!change_internal_layout(0)) {
+      return;
+    }
+    if (!renew_budget(kMacroBudget)) {
       return;
     }
     auto pending = std::make_unique<PendingPaste>();
@@ -1066,20 +1612,31 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     invalidate_retained_context();
     pending_ = std::move(pending);
     outcome.status = WordEditStatus::PartialFailure;
-    if (!paste_accepted || !finish_layout()) {
+    if (!paste_accepted) {
       return;
     }
     while (busy() && clipboard_time() &&
            wait(Clock::now() + std::chrono::milliseconds{1})) {
       pump();
     }
-    if (clipboard_ && clipboard_->paste_receipt_seen(*receipt)) {
+    if (!clipboard_ || !clipboard_->paste_receipt_seen(*receipt)) {
+      return;
+    }
+    if (!renew_budget(kMacroBudget) ||
+        !wait(Clock::now() + kExtendedLayoutClientSettle)) {
+      return;
+    }
+    if (!finalize_internal_layout() || !renew_budget(kMacroBudget)) {
+      return;
+    }
+    if (finish_layout()) {
       outcome.status = WordEditStatus::Dispatched;
     }
   };
   if (native_undo) {
     outcome.status = WordEditStatus::PartialFailure;
-    if (shortcut(kUndo, false) && finish_layout()) {
+    if (ensure_layout(0) && renew_budget(kMacroBudget) &&
+        tap(connection, kUndo, false, deadline, true) && finish_layout()) {
       outcome.status = WordEditStatus::Dispatched;
     }
     return outcome;
@@ -1115,12 +1672,99 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     }
     outcome.original = terminal ? std::string{} : source->text;
     outcome.terminal_insert = terminal;
-    outcome.rejection_stage = "layout_transition_selection_target";
-    if (!ensure_layout(outcome.target_layout)) {
+    const auto stable_selection_receipt = [&](const SelectionRead &expected) {
+      std::optional<SelectionRead> stable_selection;
+      std::optional<Deadline> stable_since;
+      while (clipboard_->is_open() &&
+             Clock::now() + std::chrono::milliseconds{30} < deadline &&
+             context_matches()) {
+        (void)clipboard_->pump_events();
+        auto observed = clipboard_->get_text_with_owner(Selection::Primary);
+        const bool authorized = observed && same_selection(expected, *observed);
+        if (!authorized) {
+          stable_selection.reset();
+          stable_since.reset();
+        } else if (!stable_selection ||
+                   !same_selection(*stable_selection, *observed)) {
+          stable_selection = std::move(observed);
+          stable_since = Clock::now();
+        } else if (stable_since &&
+                   Clock::now() - *stable_since >= kSelectionClientSettle) {
+          return stable_selection;
+        }
+        if (!wait(Clock::now() + std::chrono::milliseconds{1})) {
+          break;
+        }
+      }
+      return std::optional<SelectionRead>{};
+    };
+    auto direct_replay =
+        !terminal ? plan_text(outcome.replacement, keyboard->alphabet,
+                              static_cast<std::uint8_t>(outcome.target_layout))
+                  : std::optional<std::vector<Stroke>>{};
+    std::vector<Stroke> no_expected;
+    if (direct_replay &&
+        !resolve_locked_levels(connection, initial_state->locked_mods,
+                               keyboard->num_lock_mask, no_expected,
+                               *direct_replay, deadline)) {
+      direct_replay.reset();
+    }
+    const bool clipboard_restorable = snapshot_clipboard();
+    if (direct_replay &&
+        (!clipboard_restorable ||
+         request.operation == WordEditOperation::SelectionLayout)) {
+      outcome.rejection_stage = "selection_confirmation";
+      auto confirmed = stable_selection_receipt(*source);
+      if (!confirmed || !context_matches()) {
+        return outcome;
+      }
+      if (!renew_budget(kMacroBudget)) {
+        return outcome;
+      }
+      outcome.rejection_stage = "selection_replay";
+      bool replayed = true;
+      for (const auto &stroke : *direct_replay) {
+        if (stroke.group != group && !change_internal_layout(stroke.group)) {
+          replayed = false;
+          break;
+        }
+        if (!context_matches()) {
+          replayed = false;
+          break;
+        }
+        outcome.status = WordEditStatus::PartialFailure;
+        if (!tap(connection, stroke.key, stroke.shifted, deadline)) {
+          replayed = false;
+          break;
+        }
+      }
+      if (replayed && (!renew_budget(kMacroBudget) ||
+                       !wait(Clock::now() + kExtendedLayoutClientSettle) ||
+                       !stable_context_matches())) {
+        replayed = false;
+      }
+      if (!finalize_internal_layout() || !renew_budget(kMacroBudget)) {
+        return outcome;
+      }
+      if (!replayed) {
+        return outcome;
+      }
+      outcome.rejection_stage = "selection_layout_finalize";
+      if (!ensure_layout(outcome.target_layout)) {
+        return outcome;
+      }
+      auto retained = clipboard_->get_text_with_owner(Selection::Primary);
+      if (retained && same_selection(*confirmed, *retained) &&
+          stable_context_matches(true)) {
+        retained_word_selection_ =
+            std::make_unique<RetainedWordSelection>(RetainedWordSelection{
+                *confirmed, *initial_focus, lease->generation()});
+        current_receipt_active = true;
+      }
+      outcome.status = WordEditStatus::Dispatched;
       return outcome;
     }
-    outcome.rejection_stage = "layout_transition_paste_preflight";
-    if (!ensure_layout(0)) {
+    if (!clipboard_restorable) {
       return outcome;
     }
     paste_selection(*source, terminal);
@@ -1129,19 +1773,19 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
 
   outcome.original = request.expected;
   outcome.replacement = request.replacement;
-  outcome.rejection_stage = "layout_transition_preflight";
-  if (!ensure_layout(outcome.target_layout)) {
+  if (!renew_budget(kMacroBudget)) {
     return outcome;
   }
-  if (paste_word && kind == ActiveWindowKind::Gui) {
-    outcome.rejection_stage = "layout_transition_paste_preflight";
-    if (!ensure_layout(0)) {
-      return outcome;
-    }
+  const bool terminal = kind == ActiveWindowKind::Terminal;
+  // A terminal replacement is destructive from its first Backspace and has no
+  // selection receipt that can protect an exact GUI range. Keep the desktop
+  // transition as a preflight there. GUI editors select first and revalidate
+  // that exact receipt after their desktop transition.
+  if (terminal && !finish_layout()) {
+    return outcome;
   }
   invalidate_retained_context();
   outcome.rejection_stage = "selection_prepare";
-  const bool terminal = kind == ActiveWindowKind::Terminal;
   for (std::size_t i = 0; i < expected->size(); ++i) {
     if (!context_matches()) {
       return outcome;
@@ -1155,11 +1799,15 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   xcb_window_t prepared_owner = XCB_WINDOW_NONE;
   std::unique_ptr<RetainedWordSelection> prepared_receipt;
   if (!terminal) {
+    outcome.rejection_stage = "selection_confirmation";
     std::unique_ptr<SelectionRead> confirmed_selection;
     std::unique_ptr<SelectionRead> prepared_selection;
+    Deadline confirmed_since{};
+    bool selection_confirmed = false;
     while (clipboard_->is_open() &&
            Clock::now() + std::chrono::milliseconds{30} < deadline &&
            context_matches()) {
+      (void)clipboard_->pump_events();
       auto observed = clipboard_->get_text_with_owner(Selection::Primary);
       if (observed) {
         SelectionRead current = std::move(observed).value();
@@ -1168,9 +1816,19 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
             prepared_selection = std::make_unique<SelectionRead>(current);
           }
           if (current.text == request.expected) {
-            confirmed_selection =
-                std::make_unique<SelectionRead>(std::move(current));
-            break;
+            if (!confirmed_selection ||
+                !same_selection(*confirmed_selection, current)) {
+              confirmed_selection =
+                  std::make_unique<SelectionRead>(std::move(current));
+              confirmed_since = Clock::now();
+            } else if (Clock::now() - confirmed_since >=
+                       kSelectionClientSettle) {
+              selection_confirmed = true;
+              break;
+            }
+          } else {
+            confirmed_selection.reset();
+            confirmed_since = {};
           }
         }
       }
@@ -1178,16 +1836,16 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
         break;
       }
     }
-    if (!confirmed_selection || !context_matches()) {
+    if (!selection_confirmed || !confirmed_selection || !context_matches()) {
       if (prepared_selection) {
-        cleanup_selection(*prepared_selection);
+        (void)cleanup_selection(*prepared_selection);
       }
       return outcome;
     }
     if (paste_word) {
       paste_selection(*confirmed_selection, false);
       if (outcome.status == WordEditStatus::PreparedNotReplayed) {
-        cleanup_selection(*confirmed_selection);
+        (void)cleanup_selection(*confirmed_selection);
       }
       return outcome;
     }
@@ -1197,22 +1855,65 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
             *confirmed_selection, *initial_focus, lease->generation()});
   }
 
-  for (const auto &stroke : *replacement) {
-    if (!context_matches()) {
+  if (!terminal) {
+    outcome.rejection_stage = "layout_transition_preflight";
+    validate_transition_raw_keys = observe_gui_word_transition;
+    const bool layout_ready = finish_layout();
+    validate_transition_raw_keys = false;
+    if (!layout_ready) {
+      const auto cleanup_started = Clock::now();
+      if (cleanup_started >= hard_deadline) {
+        return outcome;
+      }
+      deadline = std::min(hard_deadline,
+                          cleanup_started + kInternalLayoutCleanupBudget);
+      if (cleanup_selection(prepared_receipt->selection) &&
+          wait(Clock::now() + kSelectionClientSettle) &&
+          context_matches(true)) {
+        retained_word_selection_ = std::move(prepared_receipt);
+        outcome.status = WordEditStatus::Rejected;
+      }
       return outcome;
     }
+    outcome.rejection_stage = "selection_revalidation";
+    (void)clipboard_->pump_events();
+    const auto revalidated =
+        clipboard_->get_text_with_owner(Selection::Primary);
+    if (!revalidated ||
+        !same_selection(prepared_receipt->selection, *revalidated) ||
+        !context_matches()) {
+      return outcome;
+    }
+  }
+
+  outcome.rejection_stage = "replacement_replay";
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+  punto_e2e_before_word_replay();
+#endif
+  bool replacement_replayed = true;
+  for (const auto &stroke : *replacement) {
+    if (!context_matches()) {
+      replacement_replayed = false;
+      break;
+    }
     if (stroke.group != group) {
-      outcome.rejection_stage = "layout_transition_replay";
-      if (!ensure_layout(stroke.group)) {
-        outcome.status = WordEditStatus::PartialFailure;
-        return outcome;
+      outcome.rejection_stage = "internal_layout_replay";
+      if (!change_internal_layout(stroke.group)) {
+        replacement_replayed = false;
+        break;
       }
     }
     outcome.status = WordEditStatus::PartialFailure;
     if (!tap(connection, stroke.key, stroke.shifted, deadline)) {
-      return outcome;
+      replacement_replayed = false;
+      break;
     }
   }
+  if (!finalize_internal_layout() || !replacement_replayed ||
+      !renew_budget(kMacroBudget)) {
+    return outcome;
+  }
+  outcome.rejection_stage = "layout_transition_finalize";
   if (finish_layout()) {
     outcome.status = WordEditStatus::Dispatched;
     retained_word_selection_ = std::move(prepared_receipt);

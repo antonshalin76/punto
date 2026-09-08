@@ -70,6 +70,7 @@ pkg_check_modules(XCB REQUIRED xcb)
 pkg_check_modules(XCB_XKB REQUIRED xcb-xkb)
 pkg_check_modules(XCB_XFIXES REQUIRED xcb-xfixes)
 pkg_check_modules(XCB_XTEST REQUIRED xcb-xtest)
+pkg_check_modules(XCB_XINPUT REQUIRED xcb-xinput)
 pkg_check_modules(XKBCOMMON REQUIRED xkbcommon)
 pkg_check_modules(XAU REQUIRED xau)
 
@@ -151,6 +152,7 @@ function(configure_punto_daemon_target target_name)
         ${XCB_XKB_INCLUDE_DIRS}
         ${XCB_XFIXES_INCLUDE_DIRS}
         ${XCB_XTEST_INCLUDE_DIRS}
+        ${XCB_XINPUT_INCLUDE_DIRS}
         ${XKBCOMMON_INCLUDE_DIRS}
         ${XAU_INCLUDE_DIRS}
         ${HUNSPELL_INCLUDE_DIRS}
@@ -163,6 +165,7 @@ function(configure_punto_daemon_target target_name)
         ${XCB_XKB_LIBRARIES}
         ${XCB_XFIXES_LIBRARIES}
         ${XCB_XTEST_LIBRARIES}
+        ${XCB_XINPUT_LIBRARIES}
         ${XKBCOMMON_LIBRARIES}
         ${XAU_LIBRARIES}
         ${HUNSPELL_LIBRARIES}
@@ -193,6 +196,12 @@ install(TARGETS punto DESTINATION bin)
 install(FILES ${CMAKE_SOURCE_DIR}/../config.yaml
         DESTINATION /etc/punto
         RENAME config.yaml.new)
+install(
+    DIRECTORY
+        ${CMAKE_SOURCE_DIR}/../gnome/punto-input-source@antonshalin76
+    DESTINATION share/gnome-shell/extensions
+    FILES_MATCHING PATTERN "*.js" PATTERN "metadata.json"
+)
 
 # -----------------------------------------------------------------------------
 # Tray-приложение (опционально)
@@ -273,7 +282,15 @@ message(STATUS "")
 include(CTest)
 if(BUILD_TESTING)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    find_program(GJS_EXECUTABLE gjs REQUIRED)
     pkg_check_modules(XCB_XFIXES REQUIRED xcb-xfixes)
+
+    add_test(
+        NAME punto-gnome46-x11-compat
+        COMMAND ${GJS_EXECUTABLE} -m
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_gnome46_x11_compat.mjs
+    )
+    set_tests_properties(punto-gnome46-x11-compat PROPERTIES TIMEOUT 10)
 
     add_executable(punto-tests
         tests/test_main.cpp
@@ -708,7 +725,16 @@ if(BUILD_TESTING)
             "-Wl,--wrap=xcb_query_keymap"
             -Wl,--wrap=xcb_test_fake_input_checked
             -Wl,--wrap=fsync -Wl,--wrap=xcb_xkb_get_map
-            -Wl,--wrap=xcb_xkb_get_state -Wl,--wrap=xcb_poll_for_reply
+            -Wl,--wrap=xcb_xkb_get_state
+            -Wl,--wrap=xcb_xkb_latch_lock_state_checked
+            -Wl,--wrap=xcb_connection_has_error
+            -Wl,--wrap=xcb_poll_for_event
+            -Wl,--wrap=xcb_poll_for_reply
+            -Wl,--wrap=xcb_get_input_focus
+            -Wl,--wrap=xcb_prefetch_extension_data
+            -Wl,--wrap=xcb_input_xi_query_version
+            -Wl,--wrap=xcb_get_setup
+            -Wl,--wrap=xcb_query_pointer
             -Wl,--wrap=xcb_intern_atom
             -Wl,--wrap=xcb_disconnect)
 
@@ -721,7 +747,7 @@ if(BUILD_TESTING)
         set_tests_properties(
             punto-event-loop-gtk-e2e
             PROPERTIES
-                TIMEOUT 90
+                TIMEOUT 120
                 SKIP_RETURN_CODE 77
                 RUN_SERIAL TRUE
         )
@@ -743,7 +769,7 @@ if(BUILD_TESTING)
         )
         set_tests_properties(
             punto-event-loop-chromium-e2e
-            PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+            PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
         )
         if(DEFINED ENV{CI} AND NOT "$ENV{CI}" STREQUAL "")
             set_property(

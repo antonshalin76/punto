@@ -21,4 +21,14 @@ if(EXISTS "${PUNTO_STAGE_DIR}/usr/share/punto-switcher/sounds")
     message(FATAL_ERROR "cmake --install shipped inactive sound payloads")
 endif()
 
+set(PUNTO_EXTENSION_DIR
+    "${PUNTO_STAGE_DIR}/usr/share/gnome-shell/extensions/punto-input-source@antonshalin76")
+foreach(extension_file IN ITEMS compat.js extension.js metadata.json)
+    if(NOT EXISTS "${PUNTO_EXTENSION_DIR}/${extension_file}" OR
+       IS_SYMLINK "${PUNTO_EXTENSION_DIR}/${extension_file}")
+        message(FATAL_ERROR
+            "cmake --install missed GNOME compatibility file: ${extension_file}")
+    endif()
+endforeach()
+
 file(REMOVE_RECURSE "${PUNTO_STAGE_DIR}")

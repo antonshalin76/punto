@@ -1,0 +1,8 @@
+{
+  "uuid": "punto-input-source@antonshalin76",
+  "name": "Punto GNOME 46 X11 Input Source Compatibility",
+  "description": "Prevents GNOME 46 X11 from leaving physical keyboard input frozen after an input-source change.",
+  "shell-version": ["46"],
+  "version": 1,
+  "url": "https://github.com/antonshalin76/punto"
+}

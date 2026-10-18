@@ -3283,6 +3283,11 @@ bool EventLoop::wait_and_buffer(
 #endif
         note_input_event_accepted(event);
         pending_events_.push_back(capture_event(event));
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+        if (pending_events_.size() == kMacroEventCapacity) {
+          std::cerr << "[punto-e2e] macro_event_capacity reached=4096\n";
+        }
+#endif
       } else if (status != ReadEventStatus::Again) {
         macro_input_eof_ = true;
         if (status != ReadEventStatus::Eof)
@@ -3304,6 +3309,9 @@ bool EventLoop::wait_and_buffer(
 void EventLoop::drain_pending_events() {
   if (macro_active_ || held_tab_)
     return;
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+  const bool capacity_drain = pending_events_.size() == kMacroEventCapacity;
+#endif
   while (!pending_events_.empty()) {
     const auto event = pending_events_.front();
     pending_events_.pop_front();
@@ -3338,6 +3346,12 @@ void EventLoop::drain_pending_events() {
       break;
     }
   }
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+  if (capacity_drain) {
+    std::cerr << "[punto-e2e] macro_capacity_drained retained_frame_events="
+              << read_frame_events_.size() << '\n';
+  }
+#endif
   if (macro_input_eof_ && !held_tab_ && pending_events_.empty()) {
     const bool incomplete = input_frame_size_ != 0 ||
                             !input_frame_accepts_.empty() ||

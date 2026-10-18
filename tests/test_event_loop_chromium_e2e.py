@@ -1353,34 +1353,123 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.assertEqual(gtk.process_start_time(daemon_pid), daemon_start)
         self.assertIsNone(self.harness.process.poll())
 
-    def test_new_words_context_refresh_and_idle_do_not_accumulate_state(self):
+    def assert_new_words_lifecycle(self, *, force_timeout=False):
         daemon_pid = self.harness.process.pid
         daemon_start = process_start_time(daemon_pid)
+        browser_start = process_start_time(self.browser.pid)
         self.assertEqual(gtk.ipc_request(b"SET_STATUS 1\n"), b"OK ENABLED\n")
+        clipboard = self.plain_clipboard_snapshot()
         expected = ""
-        cases = (("ghbdtn", "привет"), ("hello", "hello")) * 4
-        for index, (physical, corrected) in enumerate(cases):
-            self.harness.type_word(physical)
+        positives = [0, 0]
+        refusals = recoveries = 0
+        recovery_pending = False
+        for index in range(8):
+            group = self.keyboard_group()
+            physical, corrected = (("ghbdtn", "привет") if group == 0 else ("hello", "hello"))
+            source = "".join(chr(gtk.Gdk.keyval_to_unicode(gtk.Gdk.keyval_from_name(
+                self.lookup_test_keysym(gtk.LETTER_CODES[key], group, self.keyboard_locks()))))
+                for key in physical)
+            self.assertNotEqual(source, corrected, "each fresh occurrence must need correction")
+            offset = len(self.full_diagnostic())
+            attempts, dispatches = self.word_edit_attempts(), self.dispatches()
+            provider = None
+            try:
+                if force_timeout and index == 3:
+                    namespace = os.readlink("/proc/self/ns/pid")
+                    self.assertNotEqual(namespace, os.environ["PUNTO_E2E_OUTER_PID_NAMESPACE"])
+                    self.assertEqual(os.readlink(f"/proc/{self.browser.pid}/ns/pid"), namespace)
+                    self.assertIsNone(self.browser.poll())
+                    self.assertEqual(process_start_time(self.browser.pid), browser_start)
+                    provider = os.pidfd_open(self.browser.pid)
+                    signal.pidfd_send_signal(provider, signal.SIGSTOP, None, 0)
+                self.harness.send_key(gtk.LETTER_CODES[physical[0]])
+                self.pump_until(lambda: re.search(
+                    r"origin_capture_result sequence=\d+ present=[01]\n",
+                    self.full_diagnostic()[offset:]), f"word {index + 1} origin decision")
+            finally:
+                if provider is not None:
+                    try:
+                        signal.pidfd_send_signal(provider, signal.SIGCONT, None, 0)
+                    finally:
+                        os.close(provider)
+            diagnostic = self.full_diagnostic()[offset:]
+            origins = re.findall(r"origin_capture_result sequence=\d+ present=([01])\n",
+                                 diagnostic)
+            self.assertEqual(len(origins), 1, diagnostic)
+            admitted = origins[0] == "1"
+            if force_timeout and index == 3:
+                self.assertFalse(admitted, "paused provider must not authorize the word")
+            self.pump_until(lambda: self.browser_state()[:3] ==
+                            [expected + source[0], len(expected) + 1, len(expected) + 1],
+                            "first physical glyph after bounded origin decision")
+            self.harness.type_word(physical[1:])
             self.harness.send_key(gtk.KEY_SPACE)
-            expected += corrected + " "
+            self.pump_until(lambda: self.word_edit_attempts() > attempts,
+                            f"word {index + 1} terminal edit outcome")
+            self.assertEqual(self.word_edit_attempts(), attempts + 1)
+            diagnostic = self.full_diagnostic()[offset:]
+            if admitted:
+                self.assertIn("Word edit dispatch status=2\n", diagnostic)
+                self.assertEqual(self.dispatches(), dispatches + 1)
+                positives[group] += 1
+                recoveries += int(recovery_pending)
+                recovery_pending = False
+            else:
+                self.assertRegex(diagnostic, r"editor_transport status=1 elapsed_us=\d+")
+                refusal = re.search(r"origin_refused stage=child status=1 elapsed_us=(\d+)",
+                                    diagnostic)
+                self.assertIsNotNone(refusal, diagnostic)
+                self.assertGreater(int(refusal[1]), 0)
+                self.assertIn("Word edit dispatch status=0 rejection_stage=editor_origin_missing",
+                              diagnostic)
+                self.assertEqual(self.dispatches(), dispatches)
+                refusals += 1
+                recovery_pending = True
+            expected += (corrected if admitted else source) + " "
             self.pump_until(
                 lambda expected=expected: self.browser_state()[:3] ==
                 [expected, len(expected), len(expected)],
-                f"new automatic word {index + 1}",
+                f"exact admitted or refused word {index + 1}",
             )
+            self.wait_for_fresh_dom(self.browser_state()[-1], "fresh terminal word DOM")
+            self.assertEqual(self.keyboard_group(), 1 - group if admitted else group)
+            self.assertEqual(self.desktop_source_role(), self.keyboard_group())
+            self.assertEqual(self.plain_clipboard_snapshot(), clipboard)
+            for key in (gtk.KEY_SPACE, gtk.KEY_LEFTCTRL, gtk.KEY_LEFTSHIFT, gtk.KEY_LEFTALT):
+                self.assertFalse(self.key_is_down(key))
+            fields = self.stats_fields()[1]
+            self.assertLessEqual(int(fields["history_words"]), 5)
+            self.assertEqual(fields["analysis_outstanding"], "0")
+            self.assertEqual(fields["input_in_flight"], "0")
             if index == 3:
                 self.publish_active_window(self.browser_window)
                 self.stats_fields()
                 self.pump_for(0.35)
-        self.assertEqual(self.dispatches(), len(cases))
+        self.assertTrue(all(positives), f"missing positive direction: {positives}, refusals={refusals}")
+        self.assertFalse(recovery_pending, "last refused word has no proved fresh-word recovery")
+        if refusals:
+            self.assertGreater(recoveries, 0, "refusals cannot substitute for successful recovery")
+        self.assertEqual(self.dispatches(), sum(positives))
+        self.assertEqual(sum(positives) + refusals, 8)
+        print(f"[punto-e2e] lifecycle positives_en_ru={positives[0]} "
+              f"positives_ru_en={positives[1]} origin_timeouts={refusals} "
+              f"fresh_word_recoveries={recoveries}", file=sys.stderr)
         self.harness.type_word("f")
+        following = "f" if self.keyboard_group() == 0 else "а"
         self.pump_until(
             lambda: self.browser_state()[:3] ==
-            [expected + "f", len(expected) + 1, len(expected) + 1],
+            [expected + following, len(expected) + 1, len(expected) + 1],
             "next physical character after varied-word idle",
         )
         self.assertEqual(self.harness.process.pid, daemon_pid)
         self.assertEqual(process_start_time(daemon_pid), daemon_start)
+        self.assertIsNone(self.harness.process.poll())
+
+    def test_new_words_context_refresh_and_idle_do_not_accumulate_state(self):
+        self.assert_new_words_lifecycle()
+
+    def test_origin_timeout_forwards_word_and_fresh_words_recover(self):
+        self.assert_new_words_lifecycle(force_timeout=True)
 
     def assert_post_dispatch_deadline_preserves_new_receipt(self, marker_name):
         self.first_manual_conversion()

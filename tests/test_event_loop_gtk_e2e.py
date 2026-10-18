@@ -7159,20 +7159,98 @@ class EventLoopGtkE2E(unittest.TestCase):
                 self.layout_shortcut.permit_activation.set()
             writer.join(timeout=1.0)
 
+    def _capture_capacity_snapshot(
+        self,
+        entered: threading.Event,
+        release: threading.Event,
+        events: list[tuple[int, int, int]],
+        baseline: int,
+        minimum_committed_count: int,
+        retained_frame_events: int,
+        description: str,
+    ) -> tuple[list[tuple[int, int, int]], threading.Event,
+               threading.Thread, threading.Thread]:
+        capacity = 4096
+        queued_tab_release_events = 2
+        capacity_marker = (
+            f"[punto-e2e] macro_event_capacity reached={capacity}".encode())
+        self.assertNotIn(capacity_marker, self.harness.stderr)
+        drain_marker = (
+            "[punto-e2e] macro_capacity_drained retained_frame_events="
+            f"{retained_frame_events}\n".encode())
+        self.assertNotIn(drain_marker, self.harness.stderr)
+        prefix_count = capacity - queued_tab_release_events
+        prefix = events[:prefix_count]
+        tail = events[prefix_count:]
+        self.assertEqual(len(prefix), prefix_count)
+        self.assertTrue(tail, "capacity fixture must retain an upstream tail")
+
+        allow_tail = threading.Event()
+        sent = threading.Event()
+        snapshots: list[list[tuple[int, int, int]]] = []
+        errors: list[BaseException] = []
+
+        def send_events() -> None:
+            try:
+                if not entered.wait(timeout=2.0):
+                    raise RuntimeError("Tab edit did not enter the active window")
+                self.harness.send_events(prefix)
+                if not allow_tail.wait(timeout=EVENT_TIMEOUT):
+                    raise RuntimeError("capacity snapshot did not release the upstream tail")
+                self.harness.send_events(tail)
+                sent.set()
+            except BaseException as error:
+                errors.append(error)
+
+        def capture_snapshot() -> None:
+            try:
+                if not entered.wait(timeout=2.0):
+                    raise RuntimeError("Tab edit did not enter the active window")
+                deadline = time.monotonic() + EVENT_TIMEOUT
+                while time.monotonic() < deadline:
+                    if (capacity_marker in self.harness.stderr
+                            and drain_marker in self.harness.stderr):
+                        current = [(kind, code, value)
+                                   for _, kind, code, value
+                                   in self.harness.relay.snapshot()]
+                        if len(current) - baseline >= minimum_committed_count:
+                            # The relay reads one event at a time; a later 4ms
+                            # incomplete-frame flush is not a capacity drain.
+                            snapshots.append(current[:baseline + minimum_committed_count])
+                            return
+                    if self.harness.relay.error is not None:
+                        raise self.harness.relay.error
+                    time.sleep(0.002)
+                raise RuntimeError("capacity output did not commit before the deadline")
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                allow_tail.set()
+                release.set()
+
+        writer = threading.Thread(target=send_events, daemon=True)
+        observer = threading.Thread(target=capture_snapshot, daemon=True)
+        writer.start()
+        observer.start()
+        self.harness.send_key(KEY_TAB)
+        self.pump_until(lambda: bool(snapshots) or bool(errors), description)
+        self.assertFalse(
+            errors, f"{description}: {errors!r}\n{self.harness.diagnostic()}")
+        self.assertIn(capacity_marker, self.harness.stderr)
+        self.assertIn(drain_marker, self.harness.stderr)
+        return snapshots[0], sent, writer, observer
+
     def test_auto_tab_active_window_preserves_mixed_key_lifecycles(self) -> None:
         self.prepare_word_editor()
         entered = threading.Event()
         release = threading.Event()
-        sent = threading.Event()
-        active_started = threading.Event()
         armed = {"value": True}
-        during: list[list[tuple[int, int, int]]] = []
         following: list[tuple[int, int, int]] = []
         following.extend(((EV_KEY, KEY_TAB, 0), (EV_SYN, SYN_REPORT, 0)))
         following.extend(((EV_KEY, KEY_PAUSE, 1), (EV_SYN, SYN_REPORT, 0),
                           (EV_KEY, KEY_PAUSE, 2), (EV_SYN, SYN_REPORT, 0),
                           (EV_KEY, KEY_PAUSE, 0), (EV_SYN, SYN_REPORT, 0)))
-        for _ in range(1023):
+        for _ in range(1020):
             following.extend(((EV_KEY, KEY_LEFT, 1), (EV_SYN, SYN_REPORT, 0),
                               (EV_KEY, KEY_LEFT, 0), (EV_SYN, SYN_REPORT, 0)))
         following.extend(((EV_KEY, KEY_RIGHT, 1), (EV_SYN, SYN_REPORT, 0),
@@ -7185,39 +7263,21 @@ class EventLoopGtkE2E(unittest.TestCase):
             if armed["value"]:
                 armed["value"] = False
                 entered.set()
-                release.wait(timeout=3.0)
-
-        def send_following():
-            if entered.wait(timeout=2.0):
-                deadline = time.monotonic() + 2.0
-                while time.monotonic() < deadline:
-                    if b"r37_tab_edit status=" in self.harness.stderr:
-                        active_started.set()
-                        break
-                    time.sleep(0.002)
-            if active_started.is_set():
-                self.harness.send_events(following[2:])
-                sent.set()
-
-        def sample_window():
-            if entered.wait(timeout=2.0):
-                time.sleep(0.7)
-                during.append([(kind, code, value)
-                               for _, kind, code, value in self.harness.relay.snapshot()])
-                release.set()
+                release.wait(timeout=EVENT_TIMEOUT + 1.0)
 
         self.entry.connect("delete-text", on_delete)
         self.harness.type_word("ghbdtn")
         self.pump_until(lambda: self.entry.get_text() == "ghbdtn", "source word")
         baseline = len(self.harness.relay.snapshot())
-        writer = threading.Thread(target=send_following, daemon=True)
-        observer = threading.Thread(target=sample_window, daemon=True)
-        writer.start()
-        observer.start()
-        self.harness.send_key(KEY_TAB)
-        self.pump_until(lambda: bool(during), "active mixed-key window snapshot")
-        self.assertTrue(active_started.is_set(), "Tab operation never reached ACTIVE")
-        snapshot = during[0][baseline:]
+        during, sent, writer, observer = self._capture_capacity_snapshot(
+            entered, release, following[2:], baseline, 4095, 0,
+            "active mixed-key window snapshot")
+        snapshot = during[baseline:]
+        self.assertEqual(snapshot, [
+            (EV_KEY, KEY_TAB, 1), (EV_SYN, SYN_REPORT, 0),
+            (EV_KEY, KEY_TAB, 0), (EV_SYN, SYN_REPORT, 0),
+            *(event for event in following[2:4096]
+              if event[:2] != (EV_KEY, KEY_PAUSE))])
         self.assertGreaterEqual(len(snapshot), 4000,
                                 "active window never approached its quota")
         rights = [(code, value) for kind, code, value in snapshot
@@ -7231,11 +7291,13 @@ class EventLoopGtkE2E(unittest.TestCase):
                         "mixed sequence flushed", timeout=8.0)
         self.assertEqual(self.output_count(KEY_PAUSE), 0,
                          "active Tab leaked Pause to the native output")
-        delivered = [(kind, code, value) for _, kind, code, value
-                     in self.harness.relay.snapshot()[baseline:]]
         expected = [(EV_KEY, KEY_TAB, 1), (EV_SYN, SYN_REPORT, 0),
                     *(event for event in following
                       if event[:2] != (EV_KEY, KEY_PAUSE))]
+        self.pump_until(lambda: len(self.harness.relay.snapshot()) >= baseline + len(expected),
+                        "complete mixed stream including final SYN")
+        delivered = [(kind, code, value) for _, kind, code, value
+                     in self.harness.relay.snapshot()[baseline:]]
         self.assertEqual(delivered, expected, self.harness.diagnostic())
         self.assertEqual(self.entry.get_text(), "привет", self.harness.diagnostic())
         assert self.harness.process.stdin is not None
@@ -7250,10 +7312,7 @@ class EventLoopGtkE2E(unittest.TestCase):
     def test_auto_tab_active_window_never_splits_syn_frame(self) -> None:
         self.prepare_word_editor()
         entered = threading.Event()
-        active_started = threading.Event()
         release = threading.Event()
-        sent = threading.Event()
-        snapshot: list[list[tuple[int, int, int]]] = []
         armed = {"value": True}
         following: list[tuple[int, int, int]] = []
         for _ in range(1022):
@@ -7268,50 +7327,32 @@ class EventLoopGtkE2E(unittest.TestCase):
             if armed["value"]:
                 armed["value"] = False
                 entered.set()
-                release.wait(timeout=3.0)
-
-        def send_following():
-            if entered.wait(timeout=2.0):
-                deadline = time.monotonic() + 2.0
-                while time.monotonic() < deadline:
-                    if b"r37_tab_edit status=" in self.harness.stderr:
-                        active_started.set()
-                        break
-                    time.sleep(0.002)
-            if active_started.is_set():
-                self.harness.send_events(following)
-                sent.set()
-
-        def sample_window():
-            if entered.wait(timeout=2.0):
-                time.sleep(0.7)
-                snapshot.append([(kind, code, value)
-                                 for _, kind, code, value in self.harness.relay.snapshot()])
-                release.set()
+                release.wait(timeout=EVENT_TIMEOUT + 1.0)
 
         self.entry.connect("delete-text", on_delete)
         self.harness.type_word("ghbdtn")
         self.pump_until(lambda: self.entry.get_text() == "ghbdtn", "source word")
         baseline = len(self.harness.relay.snapshot())
-        writer = threading.Thread(target=send_following, daemon=True)
-        observer = threading.Thread(target=sample_window, daemon=True)
-        writer.start()
-        observer.start()
-        self.harness.send_key(KEY_TAB)
-        self.pump_until(lambda: bool(snapshot), "active frame-boundary snapshot")
-        self.assertTrue(active_started.is_set(), "Tab operation never reached ACTIVE")
-        self.assertGreaterEqual(len(snapshot[0][baseline:]), 4000,
+        snapshot, sent, writer, observer = self._capture_capacity_snapshot(
+            entered, release, following, baseline, 4097, 1,
+            "active frame-boundary snapshot")
+        self.assertGreaterEqual(len(snapshot[baseline:]), 4000,
                                 "active window never approached its quota")
-        self.assertEqual(snapshot[0][-1], (EV_SYN, SYN_REPORT, 0),
+        self.assertEqual(snapshot[baseline:], [
+            (EV_KEY, KEY_TAB, 1), (EV_SYN, SYN_REPORT, 0),
+            (EV_KEY, KEY_TAB, 0), (EV_SYN, SYN_REPORT, 0), *following[:4093]])
+        self.assertEqual(snapshot[-1], (EV_SYN, SYN_REPORT, 0),
                          "active quota split a committed SYN frame")
         self.pump_until(sent.is_set, "upstream frame-boundary sequence sent",
                         timeout=8.0)
         self.pump_until(lambda: self.output_count(KEY_LEFTSHIFT, 0) == 1,
                         "frame-boundary sequence flushed", timeout=8.0)
-        delivered = [(kind, code, value) for _, kind, code, value
-                     in self.harness.relay.snapshot()[baseline:]]
         expected = [(EV_KEY, KEY_TAB, 1), (EV_SYN, SYN_REPORT, 0),
                     (EV_KEY, KEY_TAB, 0), (EV_SYN, SYN_REPORT, 0), *following]
+        self.pump_until(lambda: len(self.harness.relay.snapshot()) >= baseline + len(expected),
+                        "complete frame-boundary stream including final SYN")
+        delivered = [(kind, code, value) for _, kind, code, value
+                     in self.harness.relay.snapshot()[baseline:]]
         self.assertEqual(delivered, expected, self.harness.diagnostic())
         assert self.harness.process.stdin is not None
         self.harness.process.stdin.close()

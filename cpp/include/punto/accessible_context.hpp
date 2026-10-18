@@ -11,6 +11,9 @@
 
 namespace punto {
 
+inline constexpr int kAccessibleRangeCharacters = 4096;
+inline constexpr int kAccessibleRangeBytes = 4096;
+
 enum class AccessibleStatus : std::uint32_t {
   Observed,
   Unavailable,

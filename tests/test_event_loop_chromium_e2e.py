@@ -64,6 +64,7 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
             "test_extensionless_selected_ru_word_with_en_desktop": "привет",
             "test_extensionless_selected_en_word_with_ru_desktop": "ghbdtn",
             "test_extensionless_selected_ru_emoji_with_en_desktop": "привет🙂",
+            "test_extensionless_emoji_selection_refuses_and_recovers": "ghbdtn🙂",
         }
         delimiter_mode = {
             "test_extensionless_delimiter_unchanged_range_refuses_and_recovers": "unchanged",
@@ -89,7 +90,7 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
             "test_extensionless_unrepresentable_selection_preserves_rich_clipboard",
             "real_layout_bridge_paste_retains_payload_during_layout_settle",
         }:
-            first_control = '<input id="a" autofocus value="ghbdtn🙂">'
+            first_control = '<input id="a" autofocus value="ghbdtn☃☃">'
         else:
             first_control = '<input id="a" autofocus>'
         delimiter_script = ""
@@ -459,6 +460,47 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
                         "second native browser correction with retained PRIMARY")
         self.pump_until(lambda: self.dispatches() == 2, "second dispatch receipt")
 
+    def test_selection_hotkeys_without_visible_selection_preserve_receipt(self):
+        self.first_manual_conversion()
+        clipboard = self.plain_clipboard_snapshot()
+        daemon_pid = self.harness.process.pid
+        for modifiers in ((gtk.KEY_LEFTSHIFT,), (gtk.KEY_LEFTALT,),
+                          (gtk.KEY_LEFTCTRL, gtk.KEY_LEFTALT)):
+            with self.subTest(modifiers=modifiers):
+                rejected = self.full_diagnostic().count("rejection_stage=selection_range_empty")
+                self.send_chord(modifiers)
+                self.pump_until(
+                    lambda: self.full_diagnostic().count(
+                        "rejection_stage=selection_range_empty") > rejected,
+                    "selection-only operation rejects retained PRIMARY at collapsed caret",
+                )
+                self.wait_for_fresh_dom(self.browser_state()[-1], "fresh DOM after refusal")
+                self.assertEqual(self.browser_state()[:3], ["привет", 6, 6])
+                self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_PRIMARY), "ghbdtn")
+                self.assertEqual(self.dispatches(), 1)
+                self.assertEqual(self.keyboard_group(), 1)
+                self.assertEqual(self.plain_clipboard_snapshot(), clipboard)
+                for key in (*modifiers, gtk.KEY_PAUSE):
+                    self.assertFalse(self.key_is_down(key))
+        self.harness.send_key(gtk.KEY_PAUSE)
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+                        "safe selection refusal preserves ordinary word reversal")
+        self.pump_until(lambda: self.dispatches() == 2, "word reversal dispatched")
+        self.xdo("key", "ctrl+a")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 0, 6],
+                        "fresh real selection after refusal and word recovery")
+        self.send_chord((gtk.KEY_LEFTSHIFT,))
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет", 6, 6],
+                        "fresh selection remains eligible without restart")
+        self.pump_until(lambda: self.dispatches() == 3, "fresh selection dispatched")
+        self.harness.type_word("f")
+        self.pump_until(lambda: self.browser_state()[:3] == ["привета", 7, 7],
+                        "next ordinary symbol follows the selected target layout")
+        self.assertEqual(self.plain_clipboard_snapshot(), clipboard)
+        self.assertEqual(self.output_count(gtk.KEY_PAUSE), 0)
+        self.assertEqual(self.harness.process.pid, daemon_pid)
+        self.assertIsNone(self.harness.process.poll())
+
     def assert_first_word_in_another_field(self, *, physical_tab=False):
         self.harness.type_word("hELLo")
         self.pump_until(lambda: self.browser_state()[:3] == ["hELLo", 5, 5],
@@ -590,9 +632,68 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
     def test_extensionless_selected_en_word_with_ru_desktop(self):
         self.assert_layout_follows_actual_source("ghbdtn", 1, "привет", 1, selected=True)
 
+    def assert_inconsistent_emoji_selection_refuses_and_recovers(self, source):
+        self.xdo("key", "End", "ctrl+a")
+        self.pump_until(lambda: self.browser_state()[:3] == [source, 0, 8],
+                        "actual selected emoji source before provider observation")
+        clipboard = self.plain_clipboard_snapshot()
+        rejected = self.full_diagnostic().count("rejection_stage=selection_range_empty")
+        self.send_chord((gtk.KEY_LEFTSHIFT,))
+        self.pump_until(lambda: self.full_diagnostic().count(
+            "rejection_stage=selection_range_empty") > rejected,
+            "inconsistent provider range refuses rather than trusting PRIMARY")
+        self.wait_for_fresh_dom(self.browser_state()[-1], "fresh DOM after provider refusal")
+        self.assertEqual(self.browser_state()[:3], [source, 0, 8])
+        self.assertEqual(self.dispatches(), 0)
+        self.assertEqual(self.keyboard_group(), 0)
+        self.assertEqual(self.plain_clipboard_snapshot(), clipboard)
+        self.xdo("type", "--clearmodifiers", "ghbdtn")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+                        "fresh representable source replaces rejected selection")
+        self.xdo("key", "ctrl+a")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 0, 6],
+                        "fresh valid provider range")
+        self.send_chord((gtk.KEY_LEFTSHIFT,))
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет", 6, 6],
+                        "valid fresh selection recovers without restart")
+        self.pump_until(lambda: self.dispatches() == 1, "valid recovery dispatched")
+        self.assertEqual(self.plain_clipboard_snapshot(), clipboard)
+        self.assertEqual(self.output_count(gtk.KEY_PAUSE), 0)
+        for key in (gtk.KEY_LEFTCTRL, gtk.KEY_LEFTSHIFT, gtk.KEY_LEFTALT):
+            self.assertFalse(self.key_is_down(key))
+
     def test_extensionless_selected_ru_emoji_with_en_desktop(self):
-        self.assert_layout_follows_actual_source("привет🙂", 0, "ghbdtn🙂", 0,
-                                                selected=True)
+        self.assert_inconsistent_emoji_selection_refuses_and_recovers("привет🙂")
+
+    def test_extensionless_emoji_selection_refuses_and_recovers(self):
+        self.assert_inconsistent_emoji_selection_refuses_and_recovers("ghbdtn🙂")
+
+    def test_selection_paste_accepts_long_utf8_source_range(self):
+        source = "ф" * 550 + "☃☃"
+        replacement = "a" * 550 + "☃☃"
+        self.assertGreater(len(source.encode("utf-8")), 1024)
+        self.set_selection(gtk.Gdk.SELECTION_CLIPBOARD, source)
+        self.xdo("key", "ctrl+v")
+        self.pump_until(lambda: self.browser_state()[:3] == [source, len(source), len(source)],
+                        "long Unicode source pasted without correction history")
+        self.set_selection(gtk.Gdk.SELECTION_CLIPBOARD, "startup clipboard baseline")
+        clipboard = self.plain_clipboard_snapshot()
+        self.xdo("key", "ctrl+a")
+        self.pump_until(lambda: self.browser_state()[:3] == [source, 0, len(source)],
+                        "long selection exceeds old character and byte proof limits")
+        self.send_chord((gtk.KEY_LEFTSHIFT,))
+        self.pump_until(lambda: self.browser_state()[:3] ==
+                        [replacement, len(replacement), len(replacement)],
+                        "long selected source uses guarded Unicode paste")
+        self.pump_until(lambda: self.dispatches() == 1, "large selected operation dispatched")
+        self.pump_until(lambda: self.external_clipboard_target("UTF8_STRING") == clipboard[2],
+                        "large selected operation restores clipboard text")
+        restored = self.plain_clipboard_snapshot()
+        metadata = {"TARGETS", "TIMESTAMP", "MULTIPLE", "SAVE_TARGETS"}
+        self.assertEqual(set(restored[1]) - metadata, set(clipboard[1]) - metadata)
+        self.assertEqual(restored[2], clipboard[2])
+        self.assertEqual(self.keyboard_group(), 0)
+        self.assertEqual(self.output_count(gtk.KEY_PAUSE), 0)
 
     def test_extensionless_layout_ack_failure_allows_immediate_retry(self):
         daemon_pid = self.harness.process.pid
@@ -687,31 +788,31 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         budget = 512 * 1024 * 1024
         resource.prlimit(self.harness.process.pid, resource.RLIMIT_AS, (budget, budget))
         self.xdo("key", "End")
-        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn🙂", 8, 8],
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn☃☃", 8, 8],
                         "source with a character outside the keyboard map")
         self.xdo("key", "ctrl+a")
-        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn🙂", 0, 8],
-                        "exact application selection including emoji")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn☃☃", 0, 8],
+                        "exact application selection outside the keyboard map")
 
     def test_extensionless_unrepresentable_selection_restores_plain_clipboard(self):
         self.prepare_unrepresentable_selection()
         self.send_chord((gtk.KEY_LEFTSHIFT,))
-        self.pump_until(lambda: self.browser_state()[:3] == ["привет🙂", 8, 8],
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет☃☃", 8, 8],
                         "unrepresentable selection uses guarded clipboard transfer")
         self.pump_until(lambda: self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD)
                         == "startup clipboard baseline",
                         "paste restores previous plain text", timeout=2)
         self.xdo("key", "ctrl+a")
-        self.pump_until(lambda: self.browser_state()[:3] == ["привет🙂", 0, 8],
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет☃☃", 0, 8],
                         "fresh selection for repeated clipboard conversion")
         self.send_chord((gtk.KEY_LEFTSHIFT,))
-        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn🙂", 8, 8],
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn☃☃", 8, 8],
                         "fresh repeated operation after clipboard restoration")
         self.pump_until(lambda: self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD)
                         == "startup clipboard baseline",
                         "repeated paste also restores plain text", timeout=2)
         self.harness.type_word("f")
-        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn🙂f", 9, 9],
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn☃☃f", 9, 9],
                         "ordinary key after repeated clipboard conversion")
         self.assertEqual(self.dispatches(), 2)
 
@@ -740,7 +841,7 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
                         "real delivered paste entered the bounded pumping seam")
         self.assertFalse(markers["punto-e2e-arm-after-paste-delivered"].exists())
         self.pump_until(lambda: self.browser_state()[-1] > before[-1]
-                        and self.browser_state()[:3] == ["привет🙂", 8, 8]
+                        and self.browser_state()[:3] == ["привет☃☃", 8, 8]
                         and self.browser_state()[-2] == [1, 1],
                         "fresh DOM proves the actual paste event and exact replacement")
         self.assertEqual(self.desktop_activation_count(), activations + 1)
@@ -748,7 +849,7 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         payload_owner = self.clipboard_owner()
         self.assertNotEqual(payload_owner, 0)
         self.pump_for(.35)
-        self.assertEqual(self.external_selection_text(), "привет🙂",
+        self.assertEqual(self.external_selection_text(), "привет☃☃",
                          "macro still owns its delivered paste payload after quiet budget")
         self.assertEqual(self.clipboard_owner(), payload_owner)
         self.assertEqual(self.word_edit_attempts(), attempts,
@@ -758,7 +859,7 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.pump_until(lambda: not release.exists(), "delivered-paste seam release consumed")
         self.pump_until(lambda: self.word_edit_attempts() > attempts,
                         "released macro reached its terminal dispatch")
-        self.pump_until(lambda: self.browser_state()[:3] == ["привет🙂", 8, 8],
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет☃☃", 8, 8],
                         "paste completes with the transformed source")
         self.pump_until(lambda: self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD)
                         == "startup clipboard baseline",
@@ -769,7 +870,7 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.assertEqual(self.browser_state()[3:7], before[3:7])
         self.assertEqual(self.browser_state()[-2], [1, 1])
         self.harness.type_word("f")
-        self.pump_until(lambda: self.browser_state()[:3] == ["привет🙂а", 9, 9],
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет☃☃а", 9, 9],
                         "next physical glyph uses the completed RU source")
         self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD),
                          "startup clipboard baseline")
@@ -844,11 +945,11 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
 
         self.xdo("mousemove", str(pointer[0]), str(pointer[1]))
         self.xdo("key", "End", "ctrl+a")
-        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn🙂", 0, 8],
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn☃☃", 0, 8],
                         "fresh application selection after refusal")
-        self.assertEqual(self.external_selection_text("primary"), "ghbdtn🙂")
+        self.assertEqual(self.external_selection_text("primary"), "ghbdtn☃☃")
         self.send_chord((gtk.KEY_LEFTSHIFT,))
-        self.pump_until(lambda: self.browser_state()[:3] == ["привет🙂", 8, 8],
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет☃☃", 8, 8],
                         "fresh correction recovers without restart")
         self.pump_until(lambda: self.external_selection_text() == baseline,
                         "recovered paste restores its admitted plain-text baseline", timeout=2)
@@ -856,7 +957,7 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.assertEqual(self.dispatches(), 1)
         self.assertEqual(self.keyboard_group(), 1)
         self.harness.type_word("f")
-        self.pump_until(lambda: self.browser_state()[:3] == ["привет🙂а", 9, 9],
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет☃☃а", 9, 9],
                         "next ordinary character uses the recovered RU source")
         self.assertEqual(self.harness.process.pid, daemon_pid)
         self.assertIsNone(self.harness.process.poll())
@@ -2814,6 +2915,49 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD),
                          "startup clipboard baseline")
         self.assertEqual(self.dispatches(), 0)
+
+    def test_selection_collapsed_during_layout_rejects_retained_primary(self):
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+                        "source before real user selection")
+        self.xdo("key", "ctrl+a")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 0, 6],
+                        "actual selected source before layout transition")
+        clipboard = self.plain_clipboard_snapshot()
+        markers = {name: pathlib.Path("/run", f"punto-e2e-{name}") for name in
+                   ("arm-after-replay-layout", "after-replay-layout", "release-after-replay-layout")}
+        for marker in markers.values():
+            marker.unlink(missing_ok=True)
+            self.addCleanup(marker.unlink, missing_ok=True)
+        self.addCleanup(markers["release-after-replay-layout"].touch, exist_ok=True)
+        markers["arm-after-replay-layout"].touch(mode=0o600)
+        rejected = self.full_diagnostic().count("Word edit dispatch status=0")
+        self.send_chord((gtk.KEY_LEFTSHIFT,))
+        self.pump_until(markers["after-replay-layout"].exists,
+                        "selection replay awaits actual desktop layout transition")
+        self.xdo("key", "Right")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
+                        "user collapses selection while layout request is awaited")
+        self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_PRIMARY), "ghbdtn")
+        markers["release-after-replay-layout"].touch(mode=0o600)
+        self.pump_until(lambda: self.full_diagnostic().count("Word edit dispatch status=0") > rejected,
+                        "stale selected range refuses before first write")
+        self.assertIn("rejection_stage=selection_source_range", self.full_diagnostic())
+        self.wait_for_fresh_dom(self.browser_state()[-1], "fresh DOM after collapsed-range refusal")
+        self.assertEqual(self.browser_state()[:3], ["ghbdtn", 6, 6])
+        self.assertEqual(self.dispatches(), 0)
+        self.assertEqual(self.plain_clipboard_snapshot(), clipboard)
+        self.xdo("key", "ctrl+a")
+        self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 0, 6],
+                        "fresh recovery selection")
+        self.send_chord((gtk.KEY_LEFTSHIFT,))
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет", 6, 6],
+                        "fresh selection succeeds after layout-time collapse")
+        self.pump_until(lambda: self.dispatches() == 1, "fresh selected operation dispatched")
+        self.assertEqual(self.plain_clipboard_snapshot(), clipboard)
+        self.assertEqual(self.output_count(gtk.KEY_PAUSE), 0)
+        for key in (gtk.KEY_LEFTCTRL, gtk.KEY_LEFTSHIFT, gtk.KEY_LEFTALT):
+            self.assertFalse(self.key_is_down(key))
 
     def real_layout_bridge_selection_ru_to_en_uses_reasserting_desktop_owner(self):
         self.set_selection(gtk.Gdk.SELECTION_CLIPBOARD, "руддщ suffix")

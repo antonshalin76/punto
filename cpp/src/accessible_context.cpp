@@ -17,7 +17,6 @@ constexpr char kText[] = "org.a11y.atspi.Text";
 constexpr char kCollection[] = "org.a11y.atspi.Collection";
 constexpr char kProperties[] = "org.freedesktop.DBus.Properties";
 constexpr std::size_t kReplyBytes = 8192, kApplications = 32;
-constexpr int kRangeCharacters = 256, kRangeBytes = 1024;
 guint64 now() { return static_cast<guint64>(g_get_monotonic_time()); }
 std::string digest(const void *data, gsize size) {
   gchar *value = g_compute_checksum_for_data(
@@ -586,7 +585,7 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
     observation.caret = before.caret;
     observation.selection_start = before.start;
     observation.selection_end = before.end;
-    if (before.end - before.start > kRangeCharacters) {
+    if (before.end - before.start > kAccessibleRangeCharacters) {
       if (request.expected_range) {
         finish(AccessibleStatus::Stale);
         return;
@@ -608,7 +607,7 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
            const gchar *text = nullptr;
            g_variant_get(value, "(&s)", &text);
            const gsize bytes = std::char_traits<char>::length(text);
-           if (bytes > kRangeBytes ||
+           if (bytes > kAccessibleRangeBytes ||
                g_utf8_strlen(text, -1) != before.end - before.start) {
              self->finish(AccessibleStatus::Unknown);
              return;

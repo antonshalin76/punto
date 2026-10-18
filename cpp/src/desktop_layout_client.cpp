@@ -656,7 +656,7 @@ AccessibleObservation DesktopLayoutClient::observe_editor(
       (value.range.start == -1 && value.range.end == -1 &&
        value.range.sha256.empty()) ||
       (value.range.start >= 0 && value.range.end >= value.range.start &&
-       value.range.end - value.range.start <= 256 &&
+       value.range.end - value.range.start <= kAccessibleRangeCharacters &&
        lower_hex(value.range.sha256, 64));
   if (value.provider_pid != provider_pid || value.bus_epoch == 0 ||
       value.focus_generation == 0 ||

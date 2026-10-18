@@ -4866,6 +4866,105 @@ class EventLoopGtkE2E(unittest.TestCase):
         self.pump_until(lambda: self.entry.get_text() == "before привета after",
                         "next typed symbol uses the selected target layout")
 
+    def test_selection_hotkeys_without_visible_selection_preserve_receipt(self) -> None:
+        self.prepare_word_editor()
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn", "physical source word")
+        self.harness.send_key(KEY_PAUSE)
+        self.pump_until(lambda: self.entry.get_text() == "привет", "first word conversion")
+        self.wait_word_dispatches(1, "first word dispatched")
+        clipboard_owner = self.selection_owner("CLIPBOARD")
+        daemon_pid = self.harness.process.pid
+        for modifiers in ((KEY_LEFTSHIFT,), (KEY_LEFTALT,),
+                          (KEY_LEFTCTRL, KEY_LEFTALT)):
+            with self.subTest(modifiers=modifiers):
+                rejected = self.harness.diagnostic().count("rejection_stage=selection_range_empty")
+                self.send_chord(modifiers)
+                self.pump_until(
+                    lambda: self.harness.diagnostic().count(
+                        "rejection_stage=selection_range_empty") > rejected,
+                    "selection-only operation requires a visible nonempty range",
+                )
+                self.assertEqual(self.entry.get_text(), "привет")
+                self.assertEqual(self.entry.get_selection_bounds(), ())
+                self.assertEqual(self.entry.get_position(), 6)
+                self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+                self.assertEqual(self.keyboard_group(), 1)
+                self.assertEqual(self.selection_owner("CLIPBOARD"), clipboard_owner)
+                for key in (*modifiers, KEY_PAUSE):
+                    self.assertFalse(self.key_is_down(key))
+        self.harness.send_key(KEY_PAUSE)
+        self.pump_until(lambda: self.entry.get_text() == "ghbdtn",
+                        "ordinary word reversal survives selection refusal")
+        self.wait_word_dispatches(2, "word reversal dispatched")
+        self.entry.select_region(0, 6)
+        self.pump_until(lambda: self.selection_text(Gdk.SELECTION_PRIMARY) == "ghbdtn",
+                        "fresh real selection after refusal and word recovery")
+        self.send_chord((KEY_LEFTSHIFT,))
+        self.pump_until(lambda: self.entry.get_text() == "привет",
+                        "fresh selection succeeds without restart")
+        self.wait_word_dispatches(3, "fresh selection dispatched")
+        self.harness.type_word("f")
+        self.pump_until(lambda: self.entry.get_text() == "привета",
+                        "next ordinary symbol follows selected target layout")
+        self.assertEqual(self.selection_owner("CLIPBOARD"), clipboard_owner)
+        self.assertEqual(self.selection_text(Gdk.SELECTION_CLIPBOARD), "startup clipboard baseline")
+        self.assertEqual(self.output_count(KEY_PAUSE), 0)
+        self.assertEqual(self.harness.process.pid, daemon_pid)
+        self.assertIsNone(self.harness.process.poll())
+
+    def test_selection_paste_accepts_maximum_utf8_source_range(self) -> None:
+        self.prepare_word_editor()
+        source = "ф" * 2046 + "🙂"
+        replacement = "a" * 2046 + "🙂"
+        self.assertEqual(len(source.encode("utf-8")), 4096)
+        self.entry.set_text("before " + source + " after")
+        self.entry.select_region(7, 7 + len(source))
+        self.pump_until(lambda: self.selection_text(Gdk.SELECTION_PRIMARY) == source,
+                        "maximum-byte Unicode selection exceeds old proof limits")
+        pastes = []
+        handler = self.entry.connect("paste-clipboard", lambda _editor: pastes.append(True))
+        self.addCleanup(self.entry.disconnect, handler)
+        self.send_chord((KEY_LEFTSHIFT,))
+        self.pump_until(lambda: self.entry.get_text() == "before " + replacement + " after",
+                        "maximum-byte selected source uses guarded Unicode paste")
+        self.wait_word_dispatches(1, "large selected operation dispatched")
+        self.assertEqual(len(pastes), 1)
+        self.assertEqual(self.entry.get_selection_bounds(), ())
+        self.assertEqual(self.entry.get_position(), 7 + len(replacement))
+        self.pump_until(lambda: self.selection_text(Gdk.SELECTION_CLIPBOARD)
+                        == "startup clipboard baseline", "large selection restores clipboard")
+        self.harness.type_word("f")
+        self.pump_until(lambda: self.entry.get_text() == "before " + replacement + "f after",
+                        "next physical key follows the large selection's target source")
+        self.assertEqual(self.keyboard_group(), 0)
+        self.assertEqual(self.output_count(KEY_PAUSE), 0)
+        for key in (KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_LEFTALT):
+            self.assertFalse(self.key_is_down(key))
+
+        oversized = source + "x"
+        self.assertEqual(len(oversized.encode("utf-8")), 4097)
+        self.entry.set_text(oversized)
+        self.entry.select_region(0, len(oversized))
+        self.pump_until(lambda: self.selection_text(Gdk.SELECTION_PRIMARY) == oversized,
+                        "one byte beyond the selection proof budget")
+        rejected = self.harness.diagnostic().count("Word edit dispatch status=0")
+        self.send_chord((KEY_LEFTSHIFT,))
+        self.pump_until(lambda: self.harness.diagnostic().count(
+            "Word edit dispatch status=0") > rejected, "over-limit selection refuses")
+        self.assertEqual(self.entry.get_text(), oversized)
+        self.assertEqual(self.entry.get_selection_bounds(), (0, len(oversized)))
+        self.assertEqual(self.stats_fields()[1]["word_dispatches"], "1")
+        self.assertEqual(len(pastes), 1)
+        self.assertEqual(self.selection_text(Gdk.SELECTION_CLIPBOARD), "startup clipboard baseline")
+        self.entry.set_text("ghbdtn")
+        self.entry.select_region(0, 6)
+        self.pump_until(lambda: self.selection_text(Gdk.SELECTION_PRIMARY) == "ghbdtn",
+                        "fresh valid selection after over-limit refusal")
+        self.send_chord((KEY_LEFTSHIFT,))
+        self.pump_until(lambda: self.entry.get_text() == "привет", "post-limit recovery")
+        self.wait_word_dispatches(2, "post-limit recovery dispatched")
+
     def assert_selection_uses_reasserting_desktop_owner(self, source_group: int) -> None:
         self.prepare_word_editor()
         self.set_desktop_layout(source_group)

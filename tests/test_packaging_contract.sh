@@ -1989,8 +1989,8 @@ inspect_artifact() {
         else
             fail "$label daemon-only payload retains tray-specific paths: ${tray_paths//$'\n'/, }"
         fi
-        assert_contains "$relationships" 'libgtk-3-0' \
-            "$label tray-free build retains the GTK editor runtime"
+        assert_not_contains "$relationships" 'libgtk-3-0' \
+            "$label daemon-only relationship fields exclude GTK runtime"
         assert_not_contains "$relationships" 'libayatana-appindicator3-1' \
             "$label daemon-only relationship fields exclude AppIndicator runtime"
     fi

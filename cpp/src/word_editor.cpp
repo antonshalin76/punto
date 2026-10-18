@@ -1284,6 +1284,12 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     }
     outcome.editor_token = observed.token;
     initial_editor = std::move(observed);
+    if (selection &&
+        (initial_editor->range.start < 0 ||
+         initial_editor->range.end <= initial_editor->range.start)) {
+      outcome.rejection_stage = "selection_range_empty";
+      return outcome;
+    }
   }
   const auto editor_child =
       initial_editor
@@ -2367,14 +2373,18 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
       return reject("selection_source_budget");
     if (!context_matches())
       return reject("selection_source_context_before");
-    if (!editor_matches())
-      return reject("selection_source_editor");
     const auto current =
         clipboard_->get_text_with_owner(Selection::Primary, deadline);
     if (!current)
       return reject("selection_source_primary_read");
     if (!same_selection(source, *current))
       return reject("selection_source_primary_identity");
+    if (selection && initial_editor) {
+      if (!editor_matches(initial_editor->range))
+        return reject("selection_source_range");
+    } else if (!editor_matches()) {
+      return reject("selection_source_editor");
+    }
     if (!context_matches())
       return reject("selection_source_context_after");
     return true;
@@ -2605,6 +2615,22 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     if (!source || source->text.empty() || source->text.size() > 4096 ||
         client_of(source->owner) != *active_client || !context_matches()) {
       return outcome;
+    }
+    if (initial_editor) {
+      gchar *hash = g_compute_checksum_for_data(
+          G_CHECKSUM_SHA256,
+          reinterpret_cast<const guchar *>(source->text.data()),
+          source->text.size());
+      const bool exact =
+          initial_editor->range.end - initial_editor->range.start ==
+              g_utf8_strlen(source->text.data(),
+                            static_cast<gssize>(source->text.size())) &&
+          initial_editor->range.sha256 == hash;
+      g_free(hash);
+      if (!exact || !editor_matches(initial_editor->range)) {
+        outcome.rejection_stage = "selection_source_range";
+        return outcome;
+      }
     }
     const bool terminal = kind == ActiveWindowKind::Terminal;
     if (terminal && !terminal_text(source->text)) {

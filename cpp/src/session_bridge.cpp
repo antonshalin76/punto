@@ -1682,9 +1682,11 @@ void SessionBridge::handle_method(GDBusConnection *connection,
           invocation, "org.punto.Switcher.Error.Busy", "call already active");
       return;
     }
-    const bool range_valid = (begin == -1 && end == -1 && sha[0] == '\0') ||
-                             (begin >= 0 && end >= begin &&
-                              end - begin <= 256 && is_lower_hex(sha, 64));
+    const bool range_valid =
+        (begin == -1 && end == -1 && sha[0] == '\0') ||
+        (begin >= 0 && end >= begin &&
+         end - begin <= punto::kAccessibleRangeCharacters &&
+         is_lower_hex(sha, 64));
     const bool current =
         !stopping_ && helper_id_ == helper && pid > 0 &&
         (token[0] == '\0' || is_lower_hex(token, 64)) &&

@@ -9,8 +9,9 @@ correction.
 
 The active checkbox plan is
 [product-delivery-plan-20261017.md](protocol/product-delivery-plan-20261017.md).
-The source remains a dirty2.8.14 candidate based on8f8e24a, not a published
-release. Existing changes are preserved. Work continues without C2C.
+The2.8.14 release source is based on8f8e24a and assembled in an isolated release
+worktree; existing dirty development changes are preserved. The Git tag and
+release provenance identify published source and assets. Work continues without C2C.
 Later user instructions authorized installation and manual relogin. At22:48
 local time, exact DEB250718dd is installed and activated in X11 session11;
 new bridge/helper readiness succeeds, and udevmon/backend/tray are running.
@@ -28,6 +29,24 @@ Release preparation independently verifies the explicit PAT principal as
 antonshalin76/id50358174. It is scoped to release commands; global credentials
 are not switched. Source commit, pre-push review, hosted CI and published asset
 readback remain separate from the installed host evidence above.
+
+The later pre-push review exposed a real stale-PRIMARY defect: Shift+Pause
+without a visible selection could append the previous word. This was reproduced
+on the installed250718dd package; the earlier finite host pass did not cover
+that sequence. Final source requires a nonempty live range matching PRIMARY and
+revalidates it before mutation. All selection operations share this owner;
+safe refusal retains ordinary-word recovery. Accessibility proof bounds match
+the existing4096-byte selection domain instead of imposing a new256-character
+limit. Current Chrome155 can return a collapsed AT-SPI range for a visible
+non-BMP emoji selection; this inconsistent provider result is refused, not
+converted using stale clipboard authority. BMP-unmapped paste and malformed
+provider refusal/recovery have separate behavioral coverage.
+
+Corrected-source checks, final package, backend/helper reinstall and publication
+are recorded as successor evidence under the existing task. The backend-only
+reinstall preserves a fresh quiescent four-file snapshot and exact prior package;
+it does not reuse r2 markers or restart GNOME/IBus. This paragraph does not turn
+pending checks into acceptance or change the historical250718dd results above.
 
 ### Earlier preparation checkpoint (superseded host state)
 

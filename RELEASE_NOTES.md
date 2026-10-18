@@ -6,6 +6,9 @@
   Startup requires typed desktop readiness instead of reporting partial success.
 - Manual Pause conversion, Shift+Pause selection conversion and inverse/undo
   keep focus, text, layout, clipboard and modifier guards aligned.
+- Selection-only commands require a current nonempty editor range matching
+  PRIMARY, including after layout waits. Cached PRIMARY without a visible
+  selection cannot append text; a safe refusal preserves ordinary Pause recovery.
 - Explicit systemd state handling: transitions and failed services no longer
   masquerade as stopped writers. Helper retirement waits for backend shutdown.
 - Session-helper protection permits read-only access to the user session bus.
@@ -39,6 +42,10 @@ These finite checks are not a guarantee that every future failure is impossible.
   correction is refused, clipboard retained, and the original Tab is delivered.
 - Compose/dead-key/AltGr input and arbitrary editor callback atomicity are not
   promised. Unknown focus, selection, clipboard or delivery outcomes fail closed.
+- Current Chrome can report an empty accessibility range for a visible selection
+  containing non-BMP emoji. Punto refuses that inconsistent selection instead of
+  treating cached PRIMARY as permission to edit. Select text with a valid
+  accessibility range to continue; no service restart is required.
 - The current host run is software-pipeline validation, not physical-device
   qualification or a new long-duration idle soak. Historical soak evidence is
   identified separately in RESTORATION.md.

@@ -2,12 +2,6 @@
 set -e
 
 case "${1:-}" in
-    remove|purge)
-        deb-systemd-invoke --user daemon-reload >/dev/null 2>&1 || true
-        ;;
-esac
-
-case "${1:-}" in
     purge)
         runtime_gid=/etc/punto/runtime-gid
         if [ -L "$runtime_gid" ] || [ -f "$runtime_gid" ]; then

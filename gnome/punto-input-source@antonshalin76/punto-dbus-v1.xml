@@ -1,0 +1,202 @@
+<node>
+  <annotation name="org.punto.Switcher.ProtocolVersion" value="1"/>
+  <annotation name="org.punto.Switcher.IdHexLength" value="32"/>
+  <annotation name="org.punto.Switcher.DigestHexLength" value="64"/>
+  <annotation name="org.punto.Switcher.MaxConnections" value="4"/>
+  <annotation name="org.punto.Switcher.MaxMessageBytes" value="1024"/>
+  <annotation name="org.punto.Switcher.MaxClients" value="32"/>
+  <annotation name="org.punto.Switcher.MaxOperations" value="128"/>
+  <annotation name="org.punto.Switcher.SwitchHorizonUs" value="1000000"/>
+  <annotation name="org.punto.Switcher.ClientLeaseUs" value="30000000"/>
+  <annotation name="org.punto.Switcher.ReconnectGraceUs" value="2500000"/>
+  <annotation name="org.punto.Switcher.Outcomes" value="State=0,GnomeStateApplied=1,AlreadyCurrent=2,UnsupportedState=10,StaleState=11,Conflict=12,Expired=13,Capacity=14,Locked=15,Diverged=16,Failed=17,NotFound=18,VersionMismatch=19,HelperStale=20,DeadlineExpired=21,HopUnknown=22"/>
+  <annotation name="org.punto.Switcher.Roles" value="EN=0,RU=1,Unknown=255"/>
+  <annotation name="org.punto.Switcher.DigestFields" value="version,extension_instance,expected_source_generation,expected_state_generation,expected_role,target_role"/>
+  <interface name="org.punto.Switcher.InputSource1">
+    <method name="BindHelper">
+      <arg name="helper_instance" type="s" direction="in"/>
+      <arg name="protocol_version" type="u" direction="in"/>
+      <arg name="deadline_us" type="t" direction="in"/>
+      <arg name="outcome" type="u" direction="out"/>
+      <arg name="extension_instance" type="s" direction="out"/>
+    </method>
+    <method name="GetState">
+      <arg name="helper_instance" type="s" direction="in"/>
+      <arg name="client_instance" type="s" direction="in"/>
+      <arg name="deadline_us" type="t" direction="in"/>
+      <arg name="outcome" type="u" direction="out"/>
+      <arg name="extension_instance" type="s" direction="out"/>
+      <arg name="client_lease_token" type="s" direction="out"/>
+      <arg name="client_lease_expiry_us" type="t" direction="out"/>
+      <arg name="source_generation" type="t" direction="out"/>
+      <arg name="state_generation" type="t" direction="out"/>
+      <arg name="current_role" type="y" direction="out"/>
+    </method>
+    <method name="Switch">
+      <arg name="helper_instance" type="s" direction="in"/>
+      <arg name="extension_instance" type="s" direction="in"/>
+      <arg name="client_instance" type="s" direction="in"/>
+      <arg name="client_lease_token" type="s" direction="in"/>
+      <arg name="sequence" type="t" direction="in"/>
+      <arg name="request_digest" type="s" direction="in"/>
+      <arg name="original_deadline_us" type="t" direction="in"/>
+      <arg name="expected_source_generation" type="t" direction="in"/>
+      <arg name="expected_state_generation" type="t" direction="in"/>
+      <arg name="expected_role" type="y" direction="in"/>
+      <arg name="target_role" type="y" direction="in"/>
+      <arg name="outcome" type="u" direction="out"/>
+      <arg name="result_extension_instance" type="s" direction="out"/>
+      <arg name="result_request_digest" type="s" direction="out"/>
+      <arg name="result_source_generation" type="t" direction="out"/>
+      <arg name="result_state_generation" type="t" direction="out"/>
+      <arg name="result_role" type="y" direction="out"/>
+    </method>
+    <method name="GetOperation">
+      <arg name="helper_instance" type="s" direction="in"/>
+      <arg name="extension_instance" type="s" direction="in"/>
+      <arg name="client_instance" type="s" direction="in"/>
+      <arg name="client_lease_token" type="s" direction="in"/>
+      <arg name="sequence" type="t" direction="in"/>
+      <arg name="request_digest" type="s" direction="in"/>
+      <arg name="query_deadline_us" type="t" direction="in"/>
+      <arg name="outcome" type="u" direction="out"/>
+      <arg name="result_extension_instance" type="s" direction="out"/>
+      <arg name="result_request_digest" type="s" direction="out"/>
+      <arg name="result_source_generation" type="t" direction="out"/>
+      <arg name="result_state_generation" type="t" direction="out"/>
+      <arg name="result_role" type="y" direction="out"/>
+    </method>
+  </interface>
+
+  <interface name="org.punto.Switcher.SessionBridge1">
+    <method name="PrepareEditorOrigin">
+      <arg name="helper_instance" type="s" direction="in"/>
+      <arg name="expected_provider_pid" type="u" direction="in"/>
+      <arg name="deadline_us" type="t" direction="in"/>
+      <arg name="expected_token" type="s" direction="in"/>
+      <arg name="status" type="u" direction="out"/>
+      <arg name="helper_instance" type="s" direction="out"/>
+      <arg name="bus_epoch" type="t" direction="out"/>
+      <arg name="registry_owner" type="s" direction="out"/>
+      <arg name="provider" type="s" direction="out"/>
+      <arg name="object" type="o" direction="out"/>
+      <arg name="focus_generation" type="t" direction="out"/>
+      <arg name="observed_us" type="t" direction="out"/>
+      <arg name="provider_pid" type="u" direction="out"/>
+      <arg name="caret" type="i" direction="out"/>
+      <arg name="selection_start" type="i" direction="out"/>
+      <arg name="selection_end" type="i" direction="out"/>
+      <arg name="range_start" type="i" direction="out"/>
+      <arg name="range_end" type="i" direction="out"/>
+      <arg name="range_sha256" type="s" direction="out"/>
+      <arg name="token" type="s" direction="out"/>
+    </method>
+    <method name="ObserveEditorOrigin">
+      <arg name="helper_instance" type="s" direction="in"/>
+      <arg name="expected_provider_pid" type="u" direction="in"/>
+      <arg name="deadline_us" type="t" direction="in"/>
+      <arg name="expected_token" type="s" direction="in"/>
+      <arg name="status" type="u" direction="out"/>
+      <arg name="helper_instance" type="s" direction="out"/>
+      <arg name="bus_epoch" type="t" direction="out"/>
+      <arg name="registry_owner" type="s" direction="out"/>
+      <arg name="provider" type="s" direction="out"/>
+      <arg name="object" type="o" direction="out"/>
+      <arg name="focus_generation" type="t" direction="out"/>
+      <arg name="observed_us" type="t" direction="out"/>
+      <arg name="provider_pid" type="u" direction="out"/>
+      <arg name="caret" type="i" direction="out"/>
+      <arg name="selection_start" type="i" direction="out"/>
+      <arg name="selection_end" type="i" direction="out"/>
+      <arg name="range_start" type="i" direction="out"/>
+      <arg name="range_end" type="i" direction="out"/>
+      <arg name="range_sha256" type="s" direction="out"/>
+      <arg name="token" type="s" direction="out"/>
+    </method>
+    <method name="ObserveEditor">
+      <arg name="helper_instance" type="s" direction="in"/>
+      <arg name="expected_provider_pid" type="u" direction="in"/>
+      <arg name="deadline_us" type="t" direction="in"/>
+      <arg name="expected_token" type="s" direction="in"/>
+      <arg name="expected_range_start" type="i" direction="in"/>
+      <arg name="expected_range_end" type="i" direction="in"/>
+      <arg name="expected_range_sha256" type="s" direction="in"/>
+      <arg name="status" type="u" direction="out"/>
+      <arg name="helper_instance" type="s" direction="out"/>
+      <arg name="bus_epoch" type="t" direction="out"/>
+      <arg name="registry_owner" type="s" direction="out"/>
+      <arg name="provider" type="s" direction="out"/>
+      <arg name="object" type="o" direction="out"/>
+      <arg name="focus_generation" type="t" direction="out"/>
+      <arg name="observed_us" type="t" direction="out"/>
+      <arg name="provider_pid" type="u" direction="out"/>
+      <arg name="caret" type="i" direction="out"/>
+      <arg name="selection_start" type="i" direction="out"/>
+      <arg name="selection_end" type="i" direction="out"/>
+      <arg name="range_start" type="i" direction="out"/>
+      <arg name="range_end" type="i" direction="out"/>
+      <arg name="range_sha256" type="s" direction="out"/>
+      <arg name="token" type="s" direction="out"/>
+    </method>
+    <method name="GetState">
+      <arg name="client_instance" type="s" direction="in"/>
+      <arg name="deadline_us" type="t" direction="in"/>
+      <arg name="outcome" type="u" direction="out"/>
+      <arg name="helper_instance" type="s" direction="out"/>
+      <arg name="extension_instance" type="s" direction="out"/>
+      <arg name="client_lease_token" type="s" direction="out"/>
+      <arg name="client_lease_expiry_us" type="t" direction="out"/>
+      <arg name="source_generation" type="t" direction="out"/>
+      <arg name="state_generation" type="t" direction="out"/>
+      <arg name="current_role" type="y" direction="out"/>
+    </method>
+    <method name="Switch">
+      <arg name="helper_instance" type="s" direction="in"/>
+      <arg name="extension_instance" type="s" direction="in"/>
+      <arg name="client_instance" type="s" direction="in"/>
+      <arg name="client_lease_token" type="s" direction="in"/>
+      <arg name="sequence" type="t" direction="in"/>
+      <arg name="request_digest" type="s" direction="in"/>
+      <arg name="original_deadline_us" type="t" direction="in"/>
+      <arg name="expected_source_generation" type="t" direction="in"/>
+      <arg name="expected_state_generation" type="t" direction="in"/>
+      <arg name="expected_role" type="y" direction="in"/>
+      <arg name="target_role" type="y" direction="in"/>
+      <arg name="outcome" type="u" direction="out"/>
+      <arg name="result_extension_instance" type="s" direction="out"/>
+      <arg name="result_request_digest" type="s" direction="out"/>
+      <arg name="result_source_generation" type="t" direction="out"/>
+      <arg name="result_state_generation" type="t" direction="out"/>
+      <arg name="result_role" type="y" direction="out"/>
+    </method>
+    <method name="GetOperation">
+      <arg name="helper_instance" type="s" direction="in"/>
+      <arg name="extension_instance" type="s" direction="in"/>
+      <arg name="client_instance" type="s" direction="in"/>
+      <arg name="client_lease_token" type="s" direction="in"/>
+      <arg name="sequence" type="t" direction="in"/>
+      <arg name="request_digest" type="s" direction="in"/>
+      <arg name="query_deadline_us" type="t" direction="in"/>
+      <arg name="outcome" type="u" direction="out"/>
+      <arg name="result_extension_instance" type="s" direction="out"/>
+      <arg name="result_request_digest" type="s" direction="out"/>
+      <arg name="result_source_generation" type="t" direction="out"/>
+      <arg name="result_state_generation" type="t" direction="out"/>
+      <arg name="result_role" type="y" direction="out"/>
+    </method>
+  </interface>
+  <!-- Non-mutating layout observation. One internal helper client uses the
+       existing 32-client lease capacity; no token or lease expiry is exposed.
+       deadline_us bounds the whole read, including caller authentication. -->
+  <interface name="org.punto.Switcher.DesktopObserver1">
+    <method name="ReadState">
+      <arg name="deadline_us" type="t" direction="in"/>
+      <arg name="outcome" type="u" direction="out"/>
+      <arg name="helper_instance" type="s" direction="out"/>
+      <arg name="extension_instance" type="s" direction="out"/>
+      <arg name="source_generation" type="t" direction="out"/>
+      <arg name="state_generation" type="t" direction="out"/>
+      <arg name="current_role" type="y" direction="out"/>
+    </method>
+  </interface>
+</node>

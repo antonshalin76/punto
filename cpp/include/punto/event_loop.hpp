@@ -24,6 +24,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "punto/analysis_worker_pool.hpp"
 #include "punto/config.hpp"
@@ -35,8 +36,9 @@
 #include "punto/runtime_health.hpp"
 #include "punto/runtime_tuning.hpp"
 #include "punto/types.hpp"
-#include "punto/x11_session.hpp"
 #include "punto/word_editor.hpp"
+#include "punto/x11_session.hpp"
+#include "punto/xorg_input_transport.hpp"
 
 namespace punto {
 
@@ -93,6 +95,9 @@ public:
 
   /// Передаёт read-end self-pipe для корректной обработки SIGINT/SIGTERM.
   void set_stop_signal_fd(int fd) noexcept;
+  bool set_ingress_transport(std::unique_ptr<XorgInputTransport> transport,
+                             int ready_fd, std::string display,
+                             std::uint32_t desktop_uid) noexcept;
 
   /**
    * @brief Запускает главный цикл
@@ -110,8 +115,23 @@ private:
   /// Обрабатывает входящее событие
   void handle_event(const input_event &ev);
 
+  struct CapturedEvent : input_event {
+    std::uint32_t source_index = 0;
+  };
+  [[nodiscard]] CapturedEvent capture_event(const input_event &ev) noexcept;
+  void handle_captured_event(const CapturedEvent &ev);
+  void emit_captured_event(const CapturedEvent &ev);
+  void emit_private_pause(int value);
+
   /// Writes an input event to stdout, including partial-write handling.
   void emit_passthrough_event(const input_event &ev);
+  void capture_typing_context();
+  void warm_editor_context();
+  void complete_word_edit(const WordEditRequest &request,
+                          const WordEditOutcome &outcome, bool undo,
+                          std::optional<std::uint64_t> task_id,
+                          const std::string &exclusion_key,
+                          bool exact_inverse = true);
 
   /// Обновляет состояние модификаторов
   void update_modifier_state(ScanCode code, bool pressed);
@@ -125,6 +145,11 @@ private:
       const X11Session::KeyboardObservation *observation = nullptr);
   void process_word_observation(bool input_idle = false);
   void process_pending_word_edit();
+  void process_held_tab();
+  void process_pending_learning();
+  void release_held_tab();
+  void dispatch_read_frame();
+  void flush_unfinished_read_frame();
   bool wait_and_buffer(std::chrono::steady_clock::time_point deadline);
   void drain_pending_events();
   void clear_word_history();
@@ -132,8 +157,7 @@ private:
   [[nodiscard]] HotkeyAction determine_hotkey_action() const;
 
   /// Сбрасывает async state и выставляет новый barrier для task_id.
-  void reset_async_state(bool bump_task_barrier = true,
-                         bool preserve_completed_selection = false);
+  void reset_async_state(bool bump_task_barrier = true);
 
   void note_input_event_accepted(const input_event &event);
   void note_input_event_committed(const input_event &event);
@@ -218,8 +242,16 @@ private:
   std::bitset<KEY_CNT> held_keys_;
   InputBuffer buffer_;
   struct RawWordCandidate {
-    enum class Kind { Automatic, ManualLayout, ManualCase, SelectionLayout,
-                      SelectionCase, SelectionTranslit, Undo, Tail };
+    enum class Kind {
+      Automatic,
+      ManualLayout,
+      ManualCase,
+      SelectionLayout,
+      SelectionCase,
+      SelectionTranslit,
+      Undo,
+      Tail
+    };
     Kind kind;
     std::uint64_t request_id;
     std::vector<KeyEntry> word;
@@ -233,11 +265,15 @@ private:
     std::uint64_t input_sequence = 0;
     bool analyze = true;
     bool allow_correction = true;
+    std::optional<X11Session::KeyboardObservation> history_context =
+        std::nullopt;
+    std::string editor_token = {};
   };
   std::optional<RawWordCandidate> raw_word_candidate_;
   std::deque<RawWordCandidate> queued_word_candidates_;
   std::uint64_t next_word_observation_id_ = 0;
   struct TrackedWord {
+    enum class Lifecycle { AwaitingObservation, AwaitingAnalysis, Complete };
     std::uint64_t id;
     std::vector<KeyEntry> word;
     std::string trailing;
@@ -248,27 +284,63 @@ private:
     int source_layout = -1;
     std::uint64_t session_generation = 0;
     std::uint32_t focus_window = 0;
-    bool eligible = true;
+    Lifecycle lifecycle = Lifecycle::AwaitingObservation;
+    bool correction_eligible = true;
     bool allow_terminal = true;
-    ScanCode layout_hotkey_modifier = 0;
-    ScanCode layout_hotkey_key = 0;
+    std::uint8_t retry_attempts_remaining = 1;
+    std::optional<std::uint64_t> retry_after_input_sequence = std::nullopt;
+    std::optional<std::uint64_t> retry_after_word_id = std::nullopt;
+    std::string editor_token = {};
   };
   std::deque<TrackedWord> word_history_;
+  std::size_t max_word_history_size_ = 0;
   std::uint64_t next_word_id_ = 0;
   std::optional<std::string> active_word_visible_;
   bool active_word_manually_edited_ = false;
   std::optional<X11Session::KeyboardObservation> keyboard_observation_;
+  std::optional<X11Session::KeyboardObservation> input_history_observation_;
+  std::string input_history_editor_token_;
+  std::chrono::steady_clock::time_point last_editor_warm_at_{};
+  std::optional<std::uint64_t> idle_observation_id_;
+  std::chrono::steady_clock::time_point last_keyboard_observation_at_{};
   std::optional<WordEditRequest> pending_word_edit_;
   bool pending_is_undo_ = false;
   std::optional<WordEditRequest> undo_request_;
   std::chrono::steady_clock::time_point undo_applied_at_{};
   std::uint64_t user_input_sequence_ = 0;
+  // Scheduling fence only. It never authorizes a selection or text mutation.
+  std::uint64_t text_input_sequence_ = 0;
   std::uint64_t undo_input_sequence_ = 0;
+  std::string learning_editor_token_;
+  std::vector<std::chrono::steady_clock::time_point> learning_backspaces_;
   bool swallow_z_until_release_ = false;
   std::unique_ptr<WordEditor> word_editor_;
   std::unique_ptr<SoundManager> sound_manager_;
   std::unique_ptr<UndoDetector> undo_detector_;
-  std::deque<input_event> pending_events_;
+  std::deque<CapturedEvent> pending_events_;
+  std::vector<CapturedEvent> read_frame_events_;
+  std::chrono::steady_clock::time_point read_frame_started_at_{};
+  bool read_frame_passthrough_ = false;
+  struct HeldTabFrame {
+    std::vector<CapturedEvent> events;
+    std::uint64_t word_id = 0;
+    std::chrono::steady_clock::time_point accepted_at;
+    std::chrono::steady_clock::time_point deadline;
+  };
+  std::optional<HeldTabFrame> held_tab_;
+  std::uint64_t input_frame_sequence_ = 0;
+  std::uint32_t next_capture_source_index_ = 0;
+  std::optional<std::uint32_t> current_source_index_;
+  std::optional<OrderedIngressFrame> ingress_frame_;
+  std::unique_ptr<XorgInputTransport> ingress_transport_;
+  std::uint64_t ingress_frame_sequence_ = 1;
+  std::uint64_t ingress_request_sequence_ = 0;
+  std::uint64_t ingress_pause_request_ = 0;
+  std::uint64_t ingress_pause_deadline_ns_ = 0;
+  std::uint32_t ingress_pause_action_ = 0;
+  std::uint32_t ingress_pause_modifiers_ = 0;
+  int ingress_ready_fd_ = -1;
+  bool defer_frame_output_ = false;
   bool macro_active_ = false;
   bool macro_input_eof_ = false;
   std::chrono::steady_clock::time_point last_key_event_at_{};

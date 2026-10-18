@@ -1,38 +1,553 @@
 # Product restoration
 
-This document records the source restoration through the 2.8.13 candidate.
+This document records the source restoration through the 2.8.14 candidate.
 Source tests, package validation, publication and machine installation are
 separate evidence gates; runtime health alone is not proof of an editor
 correction.
+
+## Current implementation checkpoint, 2026-10-18
+
+The active checkbox plan is
+[product-delivery-plan-20261017.md](protocol/product-delivery-plan-20261017.md).
+The source remains a dirty2.8.14 candidate based on8f8e24a, not a published
+release. Existing changes are preserved. Work continues without C2C.
+Later user instructions authorized installation and manual relogin. At22:48
+local time, exact DEB250718dd is installed and activated in X11 session11;
+new bridge/helper readiness succeeds, and udevmon/backend/tray are running.
+Owned GTK/Chrome critical checks pass: both manual directions, selection,
+next glyph, empty recovery, auto Space, clipboard and released modifiers.
+Current Chromium private clipboard targets cause documented safe Tab refusal;
+no positive host Tab pass is claimed. Positive portable Tab coverage is reused
+only from the qualified private suite. Events entered an existing installed
+daemon input pipe, not physical human keys. Live Sound menu opens sound-only.
+Independent payload/topology/data postflight passes; all4 config/learning files
+retain bytes+uid/gid/mode/mtime. The r2 accepted marker is exact and its timer
+is disabled. Backups remain private. No forced session/GNOME/IBus/GDM restart.
+Host acceptance evidence: `.cache/punto-product-20261017.WqYT4f/deploy-20261018-r2/host-acceptance.md`.
+Release preparation independently verifies the explicit PAT principal as
+antonshalin76/id50358174. It is scoped to release commands; global credentials
+are not switched. Source commit, pre-push review, hosted CI and published asset
+readback remain separate from the installed host evidence above.
+
+### Earlier preparation checkpoint (superseded host state)
+
+The exact installed2.8.13 package has been repacked and its three executables
+compared byte-for-byte. A separate private archive preserves host configuration,
+learning/reset data, permissions and service/extension files. An isolated
+old-install -> candidate-upgrade -> exact-old-rollback rehearsal passes13/13,
+including unchanged configuration/learning and removal of the candidate helper.
+The archive is preparatory: live writers require refreshing and rechecking it
+after quiescence in a future authorized cutover window. Host data stays private.
+
+Earlier read-only host inspection found installed2.8.13, three per-device daemons,
+an absent session-helper binary/unit and a loaded compatibility-v1 GNOME
+extension without the required InputSource1 API. A source-CLI start correctly
+refuses with `ERROR bridge-unavailable` without changing the daemon, GNOME
+or IBus process identities. No package installation or session restart occurred.
+
+The current batch uses bounded CMake parallelism, explicit OpenSSL build
+dependencies, a native nonmutating helper readiness probe, and CLI-owned helper
+startup before backend mutation. Test-only corrections restore protected
+maintainer fixtures and make the private PTY test independent of its caller cwd.
+Exact systemd ActiveState replaces the unsafe rc3-to-inactive assumption;
+transitions and failed services require a command and bounded settlement.
+The helper unit now uses ProtectHome=read-only: paired readonly transient-unit
+probes fail with the old true policy and pass with read-only. Runtime/state
+directories stay writable, home config does not. This establishes the namespace
+access correction, not actual helper/bridge activation in the current session.
+The active plan retains fresh results and unresolved review findings; the
+historical package/installed counts below must not be promoted to these new bytes.
+
+## Historical autonomous checkpoint, 2026-10-05
+
+The user switched this work to autonomous Codex execution without C2C.
+Historical R52 records below remain evidence, not current execution authority.
+The delivery spine and safety gates are in
+[product-delivery-plan-20261017.md](protocol/product-delivery-plan-20261017.md).
+
+### Practical delivery checkpoint, 2026-10-05 10:17 UTC
+
+Work is now feature-sized implementation and practical acceptance, not new
+diagnostic campaigns or per-helper planning cycles. The existing installed
+collector passes a separate base20 and then a fresh base20+200-operation soak
+on the unchanged final DEB `d95f8a88650d6dc409c735626485583b0adc9c25ba38962040c18ea172bbd378`.
+The fresh soak lasts1802.791s: three active blocks68/68/64 and two300s idle
+intervals. All220 attempts are unique PASS; cleanup errors are absent. All140
+source pins match at completion. Later documentation updates are checkpoint
+successors, not a claim that those historical document hashes still match.
+
+The final postflight independently checks unchanged six runtime writers and
+GNOME/IBus, matching live daemon/helper binaries, original config bytes/mode/
+owner/mtime, enabled status, absent learning/reset files, settled work queues,
+released keys and retired GTK/Chromium/clipboard-reader observers. All six
+clipboard representations match before retiring the intentionally finite
+external fixture publisher; no six-format guarantee after its retirement is
+claimed. The native owned-browser-reopen case also passes1/1 with unchanged
+daemon/helper. Current observer dry tests pass221/221.
+
+Independent audit accepts finite installed behavior/stability using the prior
+78 completed product cases plus fresh220, since package, runtime and relevant
+dependencies match. The failed prior packets stay failed. The earlier
+first-auto refusal remains causally unexplained; successful repetitions do not
+prove it fixed or establish that all potential defects are absent.
+
+Evidence: `.cache/punto-delivery-final-20261005.WvlORX/final-base20-current-utf8worker01/`
+and `final-soak-current-utf8worker01/`; soak summary SHA256
+`97d1fd86bedb60bb078841ebfea8997c664c15e9ac8a5ead00ee4144b4def369`.
+The exact postflight successor is `postflight-authority-exact-raw.json`,
+SHA256 `d30674291f55220ea39bcc5b77158ef553305da4ad6778f5a74c43f19f66abcc`.
+The earlier supplemental receipt rounded uint64 epoch/ns values and is retained
+but superseded. Receipt producers must transfer Python JSON as raw text and
+verify exact integer readback; JavaScript-number or jq numeric reserialization
+is not admissible for those identifiers. Primary collector records already use
+Python-native JSON. No product operation was repeated for this receipt fix.
+After acceptance, only the admitted fixture unit
+`punto-final-package-clipboard3-wvlorx.service` was stopped: MainPID732006
+became0/inactive and the PID retired. The owned UTF8 sentinel remained readable;
+six-format fidelity after publisher retirement is not asserted. A subsequent
+maintained-facts readback again confirms unchanged pipeline/helper/tray/core,
+configuration hashes, learning absence and enabled status.
+No host installation, session restart, commit or publication is claimed.
+Host activation still needs the current layout bridge loaded safely; GitHub
+CLI remains the wrong principal, not authorized `antonshalin76`.
+
+### Historical installed-package checkpoint, 2026-10-05 09:01 UTC
+
+The final2.8.14 package was built once from the dirty-inclusive source snapshot:
+SHA256 `d95f8a88650d6dc409c735626485583b0adc9c25ba38962040c18ea172bbd378`.
+Its fresh installation passes on the disposable guest, including six old
+writer deaths, package/conffile absence, exact config preservation and verified
+new pipeline/helper/tray. GNOME Shell and IBus are unchanged. Host installation
+and release remain gated by installed product/update/rollback acceptance.
+
+The subsequent exact2.8.5 baseline is independently running and admitted.
+Its incorrect status decoder and kernel-thread executable scan are corrected
+and reviewed. The archived editor comparison remains NOT_VERIFIED: after its
+first Pause the strict clipboard TIMESTAMP conversion is unavailable. The
+archive is not modified, and current-package clipboard checks are not relaxed.
+The retained failed comparison is not a legacy input PASS.
+
+The real candidate starts before the deliberate failure42; rollback then
+restores exact archived package/files, all legacy writers, original enabled
+status and unchanged core. Normal upgrade on the same final artifact exits0
+and verifies fresh candidate pipeline/helper/tray. These prove lifecycle and
+restoration, not legacy GTK16 or final-package78/soak. Evidence is under
+`.cache/punto-delivery-final-20261005.WvlORX/`. The complete installed attempt
+finishes78 integrated operations (20 base,34 features,24 lifecycle including8
+terminal) and six soak operations. The seventh soak Pause is dispatched, but
+its post-Pause snapshot fails with GIO cancellation inside the100ms desktop
+observation owner. The exact cancelled D-Bus method was not retained; product
+causality is unproven. The failed summary remains failed, not overall PASS.
+Original enabled status is independently restored, and separate readback
+confirms final installed payload/pipeline, config hashes and unchanged core.
+Complete original-state closure and a fresh1800s/200-operation soak remain
+required. No host package or session was changed.
+
+### Prior source/product checks, 2026-10-05 07:30 UTC
+
+The current candidate uses the existing admitted UTF8 clipboard transport for
+counted terminal word/case/inverse edits. Receipt admission precedes deletion;
+same-generation clipboard retirement is required before success under the
+original macro deadline. The distinct real-layout VTE profile passes16/16 on
+daemon3ff460ee, WordEditor1058d21b and GTK testsbc32d771. Terminal Insert
+admission does not constrain GUI word/case/selection operations.
+
+Actual GNOME Terminal rejected the earlier CtrlShiftV after a desktop hop,
+despite embedded VTE passing. The native VTE CtrlShiftInsert CLIPBOARD binding
+now produces the expected terminal text, caret and desktop layout. All six
+original clipboard representations are independently observed. The installed
+candidate now passes all8 real terminal word/case/undo/refusal/automatic cases
+and10 learning/reset/persistence cases. Exact-payload restoration permits the
+existing fixture to reassert ownership before intentional Punto lifecycle
+transitions; it does not imply manager-less publisher persistence.
+
+The first sound observation missed players forked by SoundManager's worker
+thread because it searched only the leader TID's children. Reusing the existing
+process snapshot's kernel PPID projection fixes this demonstrated evidence
+gap without changing playback. A real thread/fork regression has causal
+RED/GREEN; the subsequent installed16 run passes10 learning cases and all6
+ON/OFF/ON audio cases. ON records one exact daemon-child player and one nonzero
+PCM stream; OFF records neither. Original files, absence, metadata, enabled
+status and unchanged core identities are restored. This is partial installed
+evidence, not complete78 or final-package acceptance.
+Historical344 evidence below does not qualify these changed C++ bytes.
+
+Current source gates pass Release34/34, ASan/UBSan Debug35/35 and Debug GTK
+clipboard1/1. Canonical352 passes352/352 across13 packets, zero errors/skips/
+omissions/retries/waivers and all165 inputs matching
+(run-20261005T071607Z-166945a2). Strict static2 combines with29 unchanged
+qualified units: only those modules include the changed header; other source/
+header hashes and database61e805 match. The final collector suite passes419/419.
+The complete installed attempt passed72 text/terminal/learning cases but
+failed on sound-dialog mapping; a later sound subset passed12 cases but
+repeated full system scans exhausted the original Save acknowledgement budget.
+Both failed runs and independent original-state restoration are retained.
+Bounded mapping and existing PID/epoch-bound public stats now have causal
+RED/GREEN and independent source review; no playback implementation changed.
+The next integrated78 acceptance will exercise the single final package,
+including its1800s/200-operation soak, rather than repeat raw overlay78 after
+each checker-only correction. Scoped product evidence is not package acceptance.
+
+### Current bounded-observation recovery boundary
+
+The formatted publication owner926266c2 passed current source/private gates,
+but its complete native run459c8072 ended342/344 PASS, two failures, zero
+errors/skips. Both failures reached the original layout deadline inside a focus
+reply instead of the ordinary Wait path. Deterministic genuine focus/pointer
+reply controls fail both stage assertions on unchanged WordEditor4d76e3ae.
+
+Classification-only sourcea95bd804 then passes both stage assertions, but the
+pointer/Tab case exposes a later automatic recovery failure. Its typed timeout
+revokes prepared lineage, unlike Wait expiry; actual same-owner PRIMARY NONE
+therefore cannot authorize the next fresh word. This failed partial GREEN
+23243089 remains retained, not qualified as success.
+
+WordEditor79c768f8 aligns only healthy, retained, uncancelled expiry with Wait
+retirement before revocation. Known focus movement, real drift, transport and
+session failures still refuse; exact cleanup/range/identity and fresh physical
+input remain recovery authority. Final causal GREEN2/2 passes all refusal and
+recovery tails in5.775s (34fe63a4). Independent BDD/mapping/SRP, actual final
+source and GREEN reviews PASS. Runtime delta+31/-9, no new module/framework.
+The combined known-focus-drift/pointer-timeout branch is source-verified only.
+
+Current Release34/34 and ASan/UBSan Debug35/35 pass82.37s/96.97s; unchanged
+DebugGTK1/1 is reused on exact ELF. Strict static31 combines current WordEditor1,
+unchanged current CM1 and29 unchanged qualified translation units, with exact
+compile database and43 unchanged headers. Native344 on these final bytes
+passes344/344, all13 packets exit0, no errors/skips/omissions/drift/OOM or
+retries/waivers. Receipt824ae290 ends01:22:58UTC; independent complete-log,
+165-input and64-ELF terminal audit PASS. Installed78 and package/host/release
+acceptance remain pending.
+
+### Current conditional-publication boundary
+
+The subsequent installed78 attempt passed33 operations, then the first GTK
+literalTab refused at clipboard_ownership with642ms remaining. Text stayed
+ghbdtn; the literal delimiter was absent. All eight original process identities,
+configuration/enrollment and enabled status were independently verified after
+the failed run. No lifecycle isolation or package phase began.
+
+Real-X controls reproduce two ordinary-reader publication refusals on e7592e83:
+guarded publication with an existing owner, and timestamp preparation for absent
+CLIPBOARD while PRIMARY is locally owned. Initially reviewed a13e3426 keeps one shared
+64-event budget and original deadline, serves OLD-generation reads outside the
+guard, then refences the original owner before its single publication write.
+Three causal controls and the complete publication-guard selector pass;
+independent source/SRP review e4a3cd78 finds no blocker. Runtime delta is
+66 additions/37 removals, with no new runtime module. Witness, INCR and
+post-submission uncertainty remain unchanged. Formatted final926266c2 has
+69 additions/37 removals; full ordinary/static gates passed on those bytes.
+The subsequent342/344 failure led to the WordEditor correction above; current
+native acceptance is receipt824ae290, not the preceding publication-owner run.
+
+The corrected collector distinguishes a deadline expired before request dispatch
+from an admitted pipe-write timeout. Complete affected private controls390/390
+pass in39.757s. These controls do not accept installed behavior. The package
+source closure covers the missing sealed helper unit and known legacy metadata;
+its private validation and actual package acceptance remain separate.
+
+### Retained clipboard read boundary
+
+The preceding exact source/binaries passed Release34, Debug35 with ASan/UBSan/
+LSan, strict static31 and native344/344 (receipt2311c4e9,21:20:39UTC). Actual
+installed78 stopped after34PASS on the first GTK TextView literalTab; source
+text and clipboard stayed intact and original enabled status was independently
+restored. Its observer timeout/cleanup failure remains recorded.
+
+Real-X causal controls expose two shared ClipboardManager read fences that
+mistake ordinary peer requests for incomplete identity history: origin capture
+and post-notify header retirement. Only those fences finish bounded queued
+history; original deadlines, saturation/ABA/owner checks and grabbed-publication
+Yield remained unchanged at that snapshot. Its source/native acceptance completed: Release34,
+Debug35 with ASan/UBSan/LSan, strict static31 and344/344 all pass. Actual
+receipt753ffc58 ended2026-10-04 22:19:22UTC; independent audit83acd9a2 verifies
+all165 frozen inputs,64 ELF identities and13 actual packet logs. Zero failures,
+errors/skips/unfinished cases/drift/OOM events. Installed78 acceptance is open.
+Evidence and the finite delivery route remain linked in the checkbox plan;
+earlier passes do not accept changed binaries or the final package.
+
+### Retained preparation-admission checkpoint
+
+Preparation admission now yields only to actual
+observation at the existing AccessibleContext single-flight owner. Explicit
+private preparation intent does not carry cached-origin authority. Causal old
+code refuses the working read; corrected actual helper controls pass2/2,
+including retired-peer close and a late provider reply. Affected GTK10/10 and
+Chromium5/5 pass. Current Release34/34 passes76.39s; ASan/UBSan Debug35/35 with
+LSan enabled passes85.00s. Current daemon is `a98e4f7a`, helper `a03233d3`;
+installed guest bytes are unchanged.
+
+The preceding final339 completed336PASS/3FAIL/zero errors or skips. Its failures
+and all preceding evidence remain retained. Strict31 static passes with all87
+fresh input pins matching; additional Debug GTK clipboard1/1 passes under its
+existing no-LSan fixture property. The complete341 inventory, retaining all339
+selectors plus two admission controls, passes341/341 with zero failures/errors/
+skips/unstarted/unfinished/retries/waivers and all165 source/Release input pins
+matching. Independent source/SRP/terminal review accepts the P1 technical gate;
+receipt `c93e79d1` ended2026-10-04 17:11:29UTC, no OOM/PID-limit events.
+Installed78, final-DEB lifecycle/soak, host and release remain unaccepted.
+
+### Retained effective-status checkpoint
+
+The 2026-10-04 trace-enabled complete336 run
+finished335 PASS/one diagnostic-only GTK failure, with zero errors, skips or
+unfinished cases. The retained input assertions passed; test-only empty-state
+logs evicted an early fallback marker. Its unchanged focused test now passes
+after bounding those prints to meaningful word/token state.
+
+A separate causal Chromium test proves acknowledged redundant SET_STATUS1
+cleared a successfully captured six-character word origin before Tab. A paired
+primary/secondary configuration acknowledgement isolates the equivalent GTK
+failure. Both owning transitions now reset only for an actual effective value
+change (secondary forced initialization still resets). Publication/durability,
+configuration and active-macro cancellation remain unchanged. Real Chromium
+controls pass5/5; GTK controls pass8/8, including actual OFF and fresh ON recovery.
+That snapshot passed Release34/34 and ASan/UBSan Debug35/35. Its subsequently
+completed expanded339 native/legacy inventory failed three cases as recorded
+above; those results do not qualify the changed preparation-priority candidate.
+The earlier cold-Tab failure is not attributed to this cause without evidence.
+Final current-source/native acceptance and installed product acceptance remain
+open. The earlier source results below are historical, not a PASS for a changed
+candidate; P2/P3/host publication have not been executed in this checkpoint.
+
+The earlier local source acceptance is in
+[s2-g13-final-owner-integration.md](platform/evidence/autonomous-20261002/s2-g13-final-owner-integration.md):
+GTK/VTE221/221 and Chromium115/115, Release34/34, Debug35/35 with ASan/UBSan
+and the LSan negative control, strict static31/31. GTK evidence is reused only
+because its fixture and product bytes still match; Chromium was revalidated
+after clarifying the hundred-operation fault antecedent. Earlier331/336 and
+335/336 failures remain separate evidence. No production guard was weakened.
+
+The earlier G13 integrated owner checkpoint is in
+[s2-g13-integrated-owner-checkpoint.md](platform/evidence/autonomous-20261002/s2-g13-integrated-owner-checkpoint.md).
+The current native GTK/VTE feature packet passes26/26, including terminal word
+conversion, repeated transformations, inverse undo and exact following PTY
+input. Partial Backspace and consecutive words preserve their captured child
+origin. Raw clipboard tests pass, including INCR, full portable payload recovery,
+peer death and lost Set/Release acknowledgements with foreign-copy controls.
+Quiet waiting no longer destroys the publisher through a remote heartbeat.
+Peer responses consume both checked cookies, and known-dead requestors receive
+no redundant cleanup write. Independent final source SRP review passes the
+current ClipboardManager; this does not accept S2/S3 or the complete product.
+
+The private GNOME endpoint and pre-enabled private accessibility bus are fixture
+conditions, not cold installed-provider proof. Package fresh install, exact2.8.5
+upgrade/rollback, installed tray/audio and1800s/200-operation sustained operation
+remain open. The host Punto package and graphical session have not been changed.
+Only the missing build prerequisite libxcb-res0-dev1.15-1ubuntu2 was installed;
+its res.h is identical to the private validation SDK. These downstream gates
+precede reversible host installation and publication.
+
+The retained platform prerequisites now pass: a fresh consumer build completed
+16/16 compilation and 12/12 link/ELF checks; final integrated Q is 40/40 and
+its loaded-object classifier controls are 9/9. All 348 retained library hashes
+and 13124 recorded modes are unchanged. These are transport checks, not product
+acceptance.
+
+The ordinary GTK build no longer requires patched GDK/Xlib/XCB recipient APIs.
+Mixed native identities and missing/stale native ABI are rejected; real matched
+native modules and stock-mode recovery load successfully. Build checks are 5/5
+without skips on the explicitly selected native SDK. The ordinary Release
+build completed 218/218 steps. Isolated contracts are 32/32 after correcting
+the hello test fixture to supply its mandatory nonzero stream epoch; production
+validation was not weakened.
+
+The user chose no mandatory browser extension or GTK editor adapter. The
+ordinary GUI path now selects and confirms a fresh application-native PRIMARY
+range, then uses bounded X11 replay. Manual current-word commands no longer
+derive their range from window-scoped typing history. Automatic correction and
+undo still require exact expected text; held automatic Tab pastes one complete
+plaintext payload after desktop/range preflight, then releases the original
+Tab once. Generic commands retain bounded direct replay. This is an X11
+compatibility capability, not an atomic editor-acknowledged CAS transaction.
+The existing GNOME desktop-source extension/bridge is a separate layout owner
+and has not been removed or restarted.
+
+The immutable G11 full-matrix checkpoint is GTK 192/196 and Chromium 111/112,
+without skips; Release 34/34, Debug 35/35 and all 30 static units pass on those
+recorded bytes. G12 corrects three shared owners: expired cleanup after a healthy
+read timeout, foreground fixture IPC starving the real GTK PRIMARY provider,
+and conditional clipboard publication/restoration overwriting newer ownership.
+The latter uses one bounded same-connection server grab, exact owner/epoch/history
+validation and checked ungrab before request serving; uncertain acknowledgements
+disconnect without blind retry. NONE snapshots use the same guarded path.
+
+Fresh G12 evidence is full CM contract PASS, post-review ownership controls 9/9,
+real Chromium product controls 5/5 and GTK 8/8. Earlier cleanup controls 16/16 and
+foreground IPC controls 5/5 have their own source/command lineage. Independent
+causal/source/SRP reviews pass. These focused results do not replace full-matrix
+acceptance. The [G12 checkpoint](platform/evidence/autonomous-20261002/s2-g12-owner-checkpoint.md)
+records intermediate fixture/build failures separately from causal product REDs.
+True reader-disconnect preparation recovery, VTE unfinished-input correction,
+rich/custom automatic Tab and literal-Tab undo/learning/sound remain unresolved;
+S2/S3 and release gates are not accepted.
+
+The G12 current source gates pass separately: Release contracts 34/34, Debug
+35/35 with the LSan negative control, and all 30 exact-CI static units. Its frozen
+source/runtime identities are recorded in
+[the G12 manifest](platform/evidence/autonomous-20261002/s3-source-manifest-g12.json).
+The linked graph is blocked at the remaining product contract, not at C2C or
+tool availability. The host is still `punto-switcher 2.8.13`, with active udevmon.
+
+The historical 188/191 GTK and 111/111 Chromium snapshots are superseded, not
+current acceptance. The complete G9 GTK run is 191/193: original positive VTE
+and intermittent cleanup recovery failures remain recorded. G9 passes ordinary
+Release 34/34, Debug 35/35 and all 30 exact-CI static units. Its source/binary
+identity is preserved in the [G9 manifest](platform/evidence/autonomous-20261002/s3-source-manifest-g9.json).
+Do not add passing isolated repeats to those matrix counts.
+
+G10's causal control uses the original GTK connection to reassert the same
+PRIMARY window with a changed server timestamp; a stale Pause witnesses actual
+NONE without selecting or writing. Fresh input fails on unchanged G9 runtime.
+ClipboardManager now reports explicit rejection separately from healthy
+timeout. WordEditor admits fresh range preparation only through the existing
+same-owner/connection and focus/session lineage, using the current unreadable
+identity as baseline. Old payload is not replay authority. Normal exact manual
+retries are retained. Independent BDD/SRP and causal RED reviews pass; rebuilt
+focused GTK 6/6, Chromium 7/7 and complete original-UID clipboard 1/1 are GREEN.
+The complete G10 matrices, sanitizer/static gates and final audit remain
+separate. S2 is not accepted; positive VTE and arbitrary rich/custom automatic
+Tab disposition cannot be replaced by safe refusals.
+
+Default CMake/deb sources no longer build, ship or auto-load the GTK editor
+module. A separately selected matched-native SDK retains its experimental
+adapter. Default/native graph checks pass 5/5; maintainer and dpkg-ownership
+fixtures pass 20/20. The latter remove locally modified predecessor-owned
+adapter files while preserving a foreign sentinel, not an installed candidate.
+The ordinary clang-tidy inventory now selects 30 sources; the explicit native
+profile selects 31, including xorg_recipient.cpp with a clean scoped analyzer
+check. Inventory controls pass 5/5. G9's complete static PASS is historical for
+G10, which changes a shared header and requires its own complete source run.
+Source/fixture checks do not establish a candidate archive. Host, guest and
+retained platform libraries are untouched.
+
+Full feature, VTE, guest lifecycle, soak and installed-runtime acceptance remain
+open. No candidate package, host update, commit or release publication was
+performed. The host remains on 2.8.13; GNOME Shell and IBus were not restarted.
+Current scenarios and uncertainty limits are in the
+[extensionless contract](platform/evidence/autonomous-20261002/s2-extensionless-contract.md);
+the [owner audit packet](platform/evidence/autonomous-20261002/s2-extensionless-review-packet.md)
+keeps exact source/binary evidence separate from deployment readiness. Earlier
+adapter-path REDs remain in the historical
+[S2 checkpoint](platform/evidence/autonomous-20261002/s2-checkpoint.md).
+
+## Historical integrated G0–G5 checkpoint (R52)
+
+The single feature/owner/oracle inventory is locally complete (G0 only).
+G1/GTK is RED: a source-aligned isolated two-Entry test focuses the second
+field without a delimiter, types its first word, and gets a safe
+`editor_prepare/range_unavailable` rejection instead of its first correction.
+The earlier `selection_confirmation` result came from a stale driver without
+the GTK adapter and is not evidence for the current CompareApply path. The
+earlier installed Entry-to-TextView direct-switch failure is independent
+real-input evidence of the same missing editor-context boundary. See
+`protocol/c2c-bfdc-i7-r52-evidence/g1-gtk-context-red.md`.
+
+The R52 editor-origin amendment is stopped at G1, before a production patch.
+The present daemon-to-adapter request can overtake the key frame it describes:
+the adapter has no acknowledgement that its widget processed that frame before
+returning a snapshot. Adding editor identity to an immediate socket response
+would not establish that ordering. The separate reparent test is retained but
+not run as a substitute for the two-precreated-field RED. See
+`protocol/c2c-bfdc-i7-r52-evidence/g1-origin-order-blocked.md` for the exact
+source/binary lineage and counter-schedule. This is a protocol design blocker,
+not an approval to install, publish or reduce the documented feature scope.
+
+G3 has isolated transaction and exact-2.8.5 preflight checks, but no new
+guest upgrade or input-verified rollback on the current sources. The working
+guest remains on 2.8.5; the host is untouched. In particular, timeout is
+now an unresolved operation, not a reason to terminate dpkg and start a new
+transaction. The historical deployment-wrapper description below records an
+older implementation and must not be read as this R52 contract. See
+`protocol/c2c-bfdc-i7-r52-evidence/g3-delivery-preparation.md`.
+
+Chromium/VTE product owners, the remaining documented functions, a joint
+immutable candidate, installed acceptance and soak remain open. No source,
+package or release PASS follows from G0 or the isolated G3 checks.
 
 Version 2.8.12 was marked prerelease after live GNOME validation exposed valid
 layout transitions taking longer than its 300 ms macro deadline. It remains
 available as historical evidence, but is not the stable release candidate.
 
-## 2.8.13 product verification matrix
+## 2.8.14 product verification matrix
 
-This matrix binds each shipped capability to its production owner and real test
-seam. Results describe the final source candidate; package publication and the
-installed runtime remain separate release gates.
+This matrix binds the documented capabilities to their current production
+owners and required real test seams. Status is the autonomous 2026-10-03
+checkpoint, not a claim of a final source candidate; publication and installed
+runtime acceptance remain separate. Historical R52 evidence below is not
+attributed to the current extensionless source.
 
 | Capability | Production owner | Verification seam | Candidate result / limit |
 | --- | --- | --- | --- |
-| Manual word layout and case | `EventLoop` + `WordEditor` | Native GTK and Chromium editor text, four consecutive `Pause` operations | PASS; X11 US/RU only |
-| Automatic correction | analyzer/sequencer + `EventLoop` + `WordEditor` | Native GTK/Chromium consecutive corrections, punctuation, Tab and younger-tail cases | PASS; unknown dictionary words remain unchanged |
-| Selection layout, case and transliteration | `WordEditor` + `ClipboardManager` | Native GTK, Chromium and VTE selection/paste cases | PASS; GUI rich clipboard uses direct keyboard replay when representable; terminal uses paste |
-| Desktop layout transition | `WordEditor` + configured desktop `hotkey` | Independent desktop-source fixture, lock/modifier lifecycle and negative XKB-only control | PASS; Punto does not create the desktop binding |
-| Undo and learning | `EventLoop` + `UndoDetector` | Immediate/expired undo, invalidation, exclusion persistence and reset across restart | PASS; Punto undo window is 2.5 seconds |
-| Clipboard ownership and recovery | `ClipboardManager` | Late receipt, foreign copy, post-arm rejection, timeout and context-change cases | PASS; clipboard delivery is not an editor transaction |
-| Terminal safety | `WordEditor` terminal policy | Native VTE/PTY word and selection cases, scrollback and stalled-paste recovery | PASS; unsupported control payloads fail closed |
-| Runtime control and reload | IPC + CLI + tray | Native IPC/tray contracts, config races, 5315 CLI checks | PASS; mutating commands may cancel pending edits |
-| Service and package lifecycle | systemd/udevmon scripts + Debian package | 837 isolated install/upgrade/purge checks and ShellCheck | PASS for candidate; live installation is a separate gate |
-| Diagnostics | runtime health + `STATS` + journald | Native health contracts and rejection-stage assertions | PASS; no typed text, clipboard payload or window id is logged |
+| Manual word layout and case | `EventLoop` + `WordEditor` | Native GTK and Chromium editor text, repeated `Pause`, actual source versus desktop source, next input | PARTIAL: current GTK/Chromium cross-field, range, direction and recovery checks pass; installed acceptance and terminal word owner remain open |
+| Automatic correction | analyzer/sequencer + `EventLoop` + `WordEditor` | Native GTK/Chromium consecutive corrections, punctuation, Tab and younger-tail cases | PARTIAL: G10 GTK 194/195, original positive VTE only; nested-delete and cleanup recovery pass. Rich/custom automatic Tab and successful-Tab consumers remain open |
+| Selection layout, case and transliteration | `WordEditor` guarded replay/plaintext paste | Native GTK, Chromium and VTE selection cases | PARTIAL: current range/clipboard/case/translit checks pass, including bounded printable single-line VTE selection; terminal current-word/auto/undo remain unaccepted |
+| Desktop layout transition | `DesktopLayoutClient` + session bridge + GNOME extension | Desktop-source fixture, helper lifecycle, lock/modifier lifecycle and negative XKB-only control | PARTIAL: isolated contracts and read-only host probe; installed bridge transition unaccepted |
+| Undo and learning | `EventLoop` + `UndoDetector` | Immediate/expired undo, invalidation, exclusion persistence and reset across restart | PARTIAL: ordinary path covered; successful held Tab bypasses registration and requires a same-editor identity boundary; installed acceptance open |
+| Correction sound | `EventLoop` consumer + `SoundManager` async launcher | Real invocation on layout-changing correction, disabled/no-change/refused negatives; launcher contracts | PARTIAL: launcher/settings owners covered, but held Tab skips EventLoop sound consumer |
+| Clipboard ownership and recovery | `ClipboardManager` transport + `WordEditor` operation lifetime | Late receipt, foreign copy, publication/arm/context/chord refusal and fresh recovery | PARTIAL: current full browser/local boundaries pass; installed gates remain open |
+| Terminal safety | `WordEditor` terminal policy | Native VTE/PTY word and selection cases, scrollback and stalled-paste recovery | PARTIAL: bounded single-line selection path passes real PTY checks; terminal word/auto/undo still reject at `terminal_range_unverified`, not removed from scope |
+| Runtime control and reload | IPC + CLI + tray | Native IPC/tray contracts, config races and CLI checks | PARTIAL: local contracts; installed lifecycle gate open |
+| Service and package lifecycle | systemd/udevmon scripts + Debian package | Isolated package build/install/direct 2.8.5 upgrade/rollback, ShellCheck | PARTIAL: prior full package contract 949/949; disposable guest upgraded from 2.8.5 and rolled back with input restored, but conffile prompt and manual job migration block unattended delivery |
+| Diagnostics | runtime health + `STATS` + journald | Native health contracts and rejection-stage assertions | PARTIAL: local contracts; installed diagnostic acceptance open |
+
+## R52 installed-guest checkpoint, 2026-09-26
+
+The prior full package contract finished 949/949 with no skips. Its complete
+log is in `protocol/c2c-bfdc-i7-r52-evidence/package-contract-949.log`.
+That temporary package no longer exists; its PASS is not attributed to the
+later installed candidate. The guest-tested package has SHA-256
+`ca2714e87a4854def05162059ed503285c330179d36ac53ad6c74b72942ecd03`.
+The exact archived 2.8.5 package has SHA-256
+`80c977e4b195f73bdbf89c9e2ba8b1c4162a6c318ea74142fedd6010d222ebd4`.
+
+In the disposable `punto-r23-native` VM, package installation placed the GTK
+module and descriptor correctly but the running GNOME XSettings initially
+continued publishing only `canberra-gtk-module`. GNOME 46's directory monitor
+compares whole-second mtimes; a second metadata update made the Punto module
+visible without restarting GNOME Shell or IBus. A focused regression failed
+against the original candidate and passed 97/97 after `postinst` ensured a
+later directory mtime. The fixed package was tested through an actual 2.8.5
+upgrade; XSettings then published `punto-gtk-editor-adapter` automatically.
+
+The 2.8.5 `prerm` stopped `udevmon` as expected. Plain noninteractive
+`dpkg -i` then stopped at the legacy tray-autostart conffile prompt and left
+the new package unpacked but unconfigured, with input interception inactive.
+After inspecting that terminal transaction, the guest was configured with
+`--force-confdef --force-confold`, preserving the config. Only the exact
+archived Punto job and tray file were migrated using verified hashes; no
+foreign interception job was replaced. Explicit activation produced one
+`interception → /usr/bin/punto-daemon → uinput` chain. The observed outage
+from upgrade start to activation was 2 minutes 14 seconds, including diagnosis
+and controlled recovery, not package-script execution time.
+
+A fresh GTK Entry launched without `GTK_MODULES`, `GTK_PATH`, or `LD_PRELOAD`
+mapped the installed module and exposed an abstract socket whose peer PID/UID
+matched that editor process. Physical input `ghbdtn` became `привет` on Pause,
+with RU selected, clipboard unchanged, and all modifiers released. A direct
+fresh TextView attempt after closing that Entry kept `руддщ` unchanged:
+`editor_prepare` rejected at `range_unavailable`. With a physical Enter
+separator, the same TextView path converted `руддщ` to `hello` and selected EN.
+This isolates a cross-editor word-buffer boundary defect; the direct-switch
+case remains a product blocker.
+
+Rollback to the exact 2.8.5 package completed through real `dpkg` and its
+`postinst`. The old job, tray file and config matched their archived hashes;
+one `/usr/local/bin/punto-daemon` pipeline and a physical `f` into GTK Entry
+confirmed restored input. GNOME Shell and IBus were not restarted. The host
+package and service were not changed. The VM has a verified cold-image
+checkpoint; `protocol/c2c-bfdc-i7-r52-evidence/guest-recovery-runbook.md`
+records the controls. This guest slice does not clear Chromium/VTE, the GTK
+focus defect, source gates, host acceptance, soak, or release review.
 
 ## Desktop-owned layout transition contract
 
-Persistent desktop-source transitions are requested through the configured
-`hotkey` chord and are accepted only after the target group is observed with
-the same session, focus, pointer position and lock modifiers. During mapped GUI
+Persistent desktop-source transitions are requested through the authenticated
+`DesktopLayoutClient` → `punto-session-bridge` → GNOME Shell extension chain
+and are accepted only after the target source and group are observed with the
+same session, focus, pointer position and lock modifiers. The configured
+`hotkey` only identifies physical user-driven layout events to EventLoop; Punto
+does not synthesize that chord in production. During mapped GUI
 word or selection replay and paste, WordEditor may lock an internal XKB group
 temporarily.
 It restores the exact source group within 100 ms before requesting the final
@@ -42,16 +557,17 @@ temporary or source group. Ordinary work uses a 300 ms phase budget.
 A required desktop transition gets up to 1 s, then the ordinary budget is
 renewed; a 3.5 s hard deadline bounds the complete operation. A synchronous
 client must hold the target group for 5 ms. After an observed focus return or
-the release of Punto's own desktop chord, the settle interval is 250 ms. The
+an authenticated physical desktop source transition, the settle interval is
+250 ms. The
 original GUI selection receipt must remain stable for 30 ms; equal text in
 the same client is not accepted as a recreated range. Word paths confirm the
 exact prepared suffix, perform the desktop transition, and revalidate that same
 receipt before replay. GUI selection paths replace the confirmed range before
 any desktop transition can disturb it. If a later transition fails after an editor action was
 actually queued, the result is a partial failure rather than a successful
-dispatch; no blind undo or compensating toggle is attempted. An ungrabbed
-desktop chord remains ordinary application input and is therefore outside
-Punto's mutation rollback guarantee.
+dispatch; no blind undo or compensating toggle is attempted. The desktop owns
+and applies its configured shortcut; Punto only authenticates the resulting
+physical source transition and never synthesizes that chord.
 
 GUI selection conversion does not flatten the clipboard. If the replacement
 can be mapped to supported XKB strokes, WordEditor confirms the original exact
@@ -62,21 +578,22 @@ replay would insert at the prompt rather than replace scrollback selection;
 completion depends on the paste receipt and bounded client settlement, not on
 PRIMARY changing identity.
 
-The shipped default is `leftctrl+grave`, restored as the user-facing contract.
-The setting remains a contract with the desktop environment, not a binding
-managed by Punto. Mutter/GNOME 46 names the physical key above Tab
+The shipped default is `leftctrl+grave`, restored as the physical-event
+contract. The setting remains a binding identity observed by Punto, not a
+binding managed or synthesized by Punto. Mutter/GNOME 46 names the key above Tab
 `Above_Tab`, so its accelerator is `<Control>Above_Tab` without a trailing
 angle bracket. GNOME 46 rejects `<Control>Cyrillic_io` as invalid. Binding
 readback is insufficient: release
 acceptance requires two consecutive physical transitions in opposite
 directions with the same persistent desktop source and XKB state.
 
-EventLoop transports the same immutable hotkey configuration that admitted the
-word candidate, including delayed automatic correction and undo. A physical
-press of that exact configured chord clears pending word/history state but keeps
-only a completed Chromium selection receipt, allowing the next correction after
-the desktop changes its active source. Other control chords and all runtime,
-configuration, session and focus resets continue to invalidate that receipt.
+EventLoop uses the immutable hotkey snapshot to recognize the physical user
+transition associated with the admitted word candidate, including delayed
+automatic correction and undo. That authenticated transition clears pending
+word/history state but keeps only a completed Chromium selection receipt,
+allowing the next correction after the desktop changes its active source. Other
+control chords and all runtime, configuration, session and focus resets continue
+to invalidate that receipt.
 
 Native Xvfb tests use a desktop-shortcut stand-in whose source index changes
 from its own state and is never derived from XKB at activation time. A negative
@@ -1357,3 +1874,470 @@ clang-format, whitespace checks and the GJS compatibility contract passed.
 | Release EventLoop driver | `268d859f53b2034273f0aa00ed58e5c39154f14dee9aa18ef4fd7621c962a6ad` |
 | Debug daemon | `aba7d0c660fad5930820233a2a342362f91fe65c2c20535337889b37efc5e1c7` |
 | Debug EventLoop driver | `efd4400ef7993546163efbf8a07133fbd7969d705ec266380dbc08662d8140e3` |
+
+## Iteration 15: bounded recovery after a collapsed Chromium receipt
+
+The installed 2.8.13 runtime remained alive while manual and automatic word
+correction stopped. Journald tied the repeated
+`retained_selection_context` and `layout_transition_timeout` rejections to one
+daemon PID, excluding a restart or competing-daemon explanation for the
+observed failure chain. The liveness loss was inside the editor admission
+state: a reset discarded the only trusted receipt for Chromium's retained
+PRIMARY, and every later correction then failed closed with no safe way to
+establish a new baseline.
+
+WordEditor now demotes that receipt instead of forgetting it. A later word can
+cross the untrusted state only with a strictly newer textual-input sequence in
+the same focus and X11 session. Function keys and Punto's own hotkey do not
+advance this fence. The candidate must still prepare and confirm the exact
+current suffix before replacement, so an immediate retry, a foreign focus,
+another selection identity, pointer or lock drift, or a changed session remains
+non-mutating. Safe failures before text replacement advertise a typed
+`AfterFreshInput` retry policy; EventLoop grants an automatic candidate one
+retry only after a later completed word. The word id and textual-input fence
+prevent tight loops and replay after the budget is consumed.
+
+Native Chromium regressions cover wrong modifier sides, extra modifiers,
+layout-send failure followed by 26 rejected attempts and same-process recovery,
+automatic retry success and exhaustion, and a late desktop transition followed
+by a successful new word. The separate soak performs 100 alternating manual
+conversions with three injected layout-shortcut failure/recovery cycles and
+read-only `STATS` polling. Native GTK covers the same late-transition recovery
+without restarting the daemon.
+
+Final source validation used the current candidate at base HEAD
+`8f8e24aefede115754c9ce5fefa5905ab9f43f8a`. Release passed 28/28 CTest
+targets in 281.69 seconds, including the 100-conversion soak. Debug passed all
+28 non-clipboard-GTK targets in 288.34 seconds with ASan, UBSan and
+LeakSanitizer; the separate GTK clipboard target passed 1/1 in 0.28 seconds
+with only the documented external GTK leak exception. CLI passed 5315/5315.
+The exact CI clang-tidy profile passed all 23 production translation units;
+ShellCheck, Python compilation, clang-format and whitespace checks passed.
+
+| Artifact | SHA256 |
+| --- | --- |
+| Release daemon | `b0dde815e2476c425e3f76c7a2f12c6a8fa93ab4cf82c771e3370afa80cfdaca` |
+| Release EventLoop driver | `585eeba562d07997bcb028ce39194563c3d4262ec1dbb3bdecb8e5aefa3beae5` |
+| Debug daemon | `fdad492136c8998f4540ecb544f036d75d82fe093059614786bfc0933bfb273c` |
+| Debug EventLoop driver | `8ff8cf7ecac9aeba921b421051bbf6b16510181f08c89eb49edcdd508fe09f9c` |
+
+## Iteration 16: identity-bound selection and late-transition convergence
+
+Iteration 15's fresh-input demotion mechanism was removed after independent
+review found that later typing in the same Chromium client did not prove that
+the retained PRIMARY still described the active word. A reset now invalidates
+the receipt. A payload-less collapsed Chromium selection is accepted only while
+its XFixes owner, selection timestamp and owner generation remain identical to
+the receipt created by Punto; a readable PRIMARY must still match its exact
+payload. A new selection in another field is rejected before any editor event,
+even when its text matches.
+
+The result of a desktop layout request now records whether the request was not
+made, remains unresolved, or its target group was observed. Cleanup performs a
+bounded reconciliation of an unresolved request only while session, focus,
+pointer, locks, source/target group, released chord, raw input history and the
+prepared PRIMARY remain stable. EventLoop consumes a trusted observed group
+even when replay is rejected, so transitions immediately before, during and
+after cleanup converge without a manual layout toggle. A mismatch between the
+desktop source and XKB remains non-mutating.
+
+History rollover no longer finalizes a word that is still awaiting its X11
+observation. It evicts only completed or ineligible prefix entries, preventing
+every `(max_rollback_words + 1)`th automatic word from being silently lost.
+Native regressions cover strict preflight and cleanup oracles, 26 consecutive
+failures from zero dispatches followed by recovery, varied automatic words,
+100 manual conversions, exact modifier-side rejection, GTK/VTE recovery and
+the three deterministic cleanup transition phases.
+
+The installed v2.8.13 runtime was deliberately left unchanged during this
+source review. A true host-session candidate recovery test therefore remains a
+post-review installation gate; the native tests run in isolated X11 sessions
+and do not modify the user's documents or clipboard.
+
+The final Release matrix passed all 33 targets: four fresh-session GTK shards
+covering 128 tests passed in 98.59 seconds, and the other 29 targets passed in
+239.84 seconds. Debug passed the same four GTK shards in 100.85 seconds and all
+29 non-GTK-clipboard targets in 245.02 seconds with ASan, UBSan and
+LeakSanitizer; the separate GTK clipboard target passed 1/1 in 0.30 seconds
+with only the documented external GTK leak exception. The two GTK cases that
+had failed after long-lived shared-fixture runs passed 10/10 focused fresh-
+session repetitions before sharding. CLI passed 5315/5315 and packaging passed
+837/837. The source manifest was generated after this documentation snapshot.
+The exact CI clang-tidy profile passed all 23 production translation units;
+ShellCheck, Python compilation, clang-format and whitespace checks passed.
+
+| Artifact | SHA256 |
+| --- | --- |
+| Release daemon | `0ca79a9f3e31bdc46715f84d793464706fe57b3f8f1137cbdfaf36f51a6e76fa` |
+| Release EventLoop driver | `c405601b76fd8135c806747b35dd3b414d6b95e1935752df0d580138841f5ee7` |
+| Debug daemon | `b9195f76d8749b4939899f8d0955772c4c00a5a3a9f1c18f6026dfb4fcfeb112` |
+| Debug EventLoop driver | `6cd8333c940c3c09e8569c10bd9c37e72a25d49c9a3b65ce44c875953dd50323` |
+
+## Iteration 17: bounded history and complete cleanup authority
+
+`TrackedWord` now separates observation/analysis lifecycle from correction
+eligibility. The rollback deque is hard-bounded after every admitted word;
+late analysis for an evicted record becomes a no-op, while its independent raw
+candidate continues and the newest `(max_rollback_words + 1)`th word remains
+correctable. The active raw candidate is non-cancellable; its waiting deque
+keeps at most `max_rollback_words` newest candidates, so the total raw bound is
+`max_rollback_words + 1`. History and raw-queue counters exist only in the E2E
+driver. The production `STATS` response retains its exact 39-token schema. A
+process contract starts the real daemon and feeds its response to the real CLI
+parser and tray IPC client.
+
+Native GTK regressions run 64 consecutive `NoCorrection` words at limits 1 and
+5, then verify a real correction, caret position and the next physical symbol.
+Held-X11-observation floods at both limits enqueue 33 words without waiting for
+analysis, assert both bounds, release the old observation, and prove that the
+newest word still corrects. Late work for an evicted word cannot mutate text.
+
+Cleanup reconciliation now covers the complete Right press/release lifecycle
+and the final receipt decision. The raw XI2 fence accepts exactly one ordered
+Right pair emitted by this cleanup in addition to the configured layout chord;
+an extra Right or any foreign raw key remains unsafe. A deterministic phase-3
+barrier after Right proves late target-layout convergence in Chromium without a
+manual toggle or daemon restart. Controls at the same barrier reject a foreign
+key, an extra Right, pointer or lock drift, focus change, a replacement X11
+session and a new same-text selection. Foreign keys are injected over a second
+X11 connection before the barrier is released; the test also observes the
+resulting Chromium key event. A positive/negative retention oracle proves that
+only the unchanged cleanup path stores the prepared selection receipt.
+
+`SelectionRead` also carries the ClipboardManager connection generation.
+Identity checks revalidate the connection after each event pump and return
+false before issuing XCB work when a pump fails closed. The clipboard contract
+injects an X11 error in the initial identity pump, records that no owner query
+occurred after disconnect, rejects a receipt across close/open, rejects a
+receipt whose connection generation alone is stale, and accepts a new receipt
+captured on the replacement connection.
+
+The two GTK cases that previously failed only in an aged X11 fixture now run as
+an explicit 20-case alternating sequence inside one sandbox. This continuous
+session contract complements the four sharded suites instead of replacing them
+with fresh-process repetitions.
+
+The iteration kept causal RED evidence. The real daemon/consumer contract first
+rejected the expanded production `STATS` response. A held observation with
+`max_rollback_words=1` exposed 32 waiting raw candidates. Replacing the final
+cleanup check with the former `context_matches(true)` path made the independent
+F8 injection miss `layout_cleanup_foreign_raw_key`. Each focused check passed
+after its owning fix, including the generation-only clipboard negative control.
+
+Final candidate validation used the same production source snapshot. Release
+passed 34/34 CTest targets in 361.92 seconds; Debug passed 35/35 in 378.08
+seconds with the configured ASan, UBSan and LeakSanitizer gates. CLI passed
+5315/5315 and package
+validation passed 837/837. The exact CI clang-tidy profile passed all 23
+production translation units. ShellCheck, Python compilation, clang-format,
+whitespace checks and `lintian --fail-on error` passed.
+
+The final test-only cleanup removed a version hardcode, generated the 20-case
+sequence from one CMake list, and changed the held old candidate to a real
+wrong-layout word. Those exact deltas passed the daemon/shared-session targets
+2/2 and raw-bound cases 2/2 in both Release and Debug profiles.
+
+| Candidate artifact | SHA256 |
+| --- | --- |
+| Release daemon | `7f2e11716faee0a7f5b83f3dbb7c5a6450786db6452ea115fe1b372ac5f558fe` |
+| Release EventLoop driver | `8cc68a0ad730bcfe742de8c30657e98be6c5a7835787aa139ce5abe275909438` |
+| Debug daemon | `6b0c8c9c7838c38f309ae4735290286dd9b2366b470a11a59da329627ca46b12` |
+| Debug EventLoop driver | `667278be43f8f003f6365027e30156078dfbf1aefdce3dc9aabb153fc5d6eee9` |
+| Debian package | `29b650a20a87988ffd5d215646bedfd20cb6772e47f853d9a14ba19164f65301` |
+
+The installed v2.8.13 runtime remains unchanged until source, sanitizer,
+packaging, independent review and live candidate gates finish. Isolated native
+X11 tests are evidence for the candidate, not a substitute for final validation
+in the target GNOME session.
+
+## Iteration 18: fenced selection identity and causal cleanup controls
+
+An XFixes receipt is no longer accepted after two merely bounded event pumps.
+The owner reply now forms an explicit X11 observation fence. ClipboardManager
+then consumes only events already queued before that reply and rejects the
+identity as unknown if the 64-event or caller-deadline bound is exhausted. It
+also rejects a selection request encountered in that scan. The scan never
+waits for later socket traffic and never starts a new WordEditor deadline.
+
+The contract reproduces the old false positive with one real PRIMARY owner,
+160 `PropertyNotify` events and a later same-owner XFixes timestamp. On the old
+implementation the stale receipt matched. The fixed implementation rejects it,
+then accepts a fresh receipt without reconnecting. Existing pump-budget,
+close/open and connection-generation cases remain green.
+
+The initial event pump shares the caller's absolute deadline as well. A causal
+regression queues a real selection request, stops the X server and gives the
+identity check 5 ms while the manager's ordinary request timeout is 100 ms. The
+check rejects within the caller bound instead of silently starting a new
+request budget.
+
+The unreadable-PRIMARY caller path is covered separately. A first real
+Chromium correction creates a retained receipt; a new same-text selection then
+has its next PRIMARY conversion made unreadable. The request stops at
+`retained_selection_unreadable`, before Shift+Left, replay or clipboard
+mutation. Browser text and selection, PRIMARY contents and native dispatch
+count remain unchanged.
+
+Receipt retention after cleanup now requires three independent facts after the
+Right press/release: the 30 ms settle completed, the actual write lease is
+still valid, and the prepared PRIMARY identity still matches at the same
+caller deadline. Rejections report `layout_cleanup_settle_timeout`,
+`layout_cleanup_session` or `layout_cleanup_selection_identity`; tests require
+the intended reason and reject a timeout substitute.
+
+The same-text control creates a new real selection while preserving focus,
+window, pointer and locks. The session control revokes the actual held test
+lease from an independent driver path, then lets the real replacement session
+commit after the macro. Test-only phase time is excluded from the product
+cleanup budget but remains subject to the hard macro deadline. Mutation
+controls that bypass exactly the identity check or lease revocation retain the
+receipt and therefore make their respective negative tests fail, proving that
+the tests depend on the intended authority checks.
+
+Release passed all 34 CTest targets in 365.38 seconds. Debug initially reported
+34/35 because the existing punctuation-undo/restart case stopped at
+`selection_confirmation`; that exact test passed in isolation, its complete
+shard passed, and a 10-run isolated soak passed 10/10. A clean non-concurrent
+Debug rerun on the final source passed 35/35 in 381.44 seconds with the configured sanitizer
+gates. Packaging passed 837/837. The installed v2.8.13 runtime remains
+unchanged pending independent source review and the final target-GNOME live
+correction gate. CLI passed 5315/5315. The exact CI clang-tidy profile passed
+all 23 production translation units; ShellCheck, Python compilation, formatting
+of all 11 changed C++ files and `git diff --check` passed. A repository-wide
+format probe still finds pre-existing violations in untouched files such as
+`asm_utils.hpp` and `undo_detector.cpp`; they are outside this correction and
+were not rewritten.
+
+| Iteration 18 candidate | SHA256 |
+| --- | --- |
+| Code/test diff (`cpp`, `tests`, scripts and packaging metadata) | `a7fd11f7f03525ea2b1e03e4730ac00391eeecc3ac6b9aa7dac9d8c49ca1aa1d` |
+| Release daemon | `d74336f6bcf61154e722577f86b42a8e92b913c9fd126509bcafae894235d901` |
+| Release EventLoop driver | `90a124b0bb555136991b4ec091c285da54fb0b7729a302062a4b7032880850a1` |
+| Debug daemon | `ca1e16a65309155ae23f39683aba15e215d3c8e99a622af16dd755e5f0ee2c52` |
+| Debug EventLoop driver | `8068d92b92e50574b0df7a76c49291c2521d5225971de23c03e8ce93a87832e6` |
+| Debian candidate | `c91e0bf1cf9cf749866f20e0efaf81dac4368b12a6579f96b27221e7a9ad6170` |
+
+The complete scoped branch diff is 2,337 additions and 183 deletions across 17
+files. Product headers and sources account for 499 additions and 85 deletions;
+the larger remainder is regression coverage and the restoration record. No new
+production file or parallel state owner was added.
+
+## Iteration 19: authenticated GNOME layout authority and final 2.8.14 gates
+
+Programmatic layout correction no longer synthesizes the configured desktop
+hotkey. `DesktopLayoutClient` discovers a UID-bound descriptor below
+`/run/user/<uid>/punto`, connects to the private peer D-Bus socket and admits an
+operation only through a live lease. `punto-session-bridge` is the constrained
+user-session proxy; the GNOME Shell 46 X11 extension owns exact `us`/`ru` source
+activation, operation idempotency and source/XKB convergence. Missing helpers,
+unsupported source maps, variants, locked sessions, stale generations and
+transport uncertainty fail closed. The configured `hotkey` remains the identity
+of a physical user action that invalidates stale EventLoop context.
+
+Selection confirmation now uses a causal XFixes observation fence and a
+separate cleanup budget inside the 3.5-second hard deadline. Cleanup starts at
+the first queued synthetic mutation, retains a receipt only after a valid lease
+and exact selection identity, and reconnects only after reinitializing XKB and
+XInput state. A paste payload with no client receipt remains available for a
+late real request for up to two seconds, then restores the exact original
+generation and releases the pending operation. It blocks ordinary clipboard-
+independent word correction for only 500 ms; physical Ctrl+Z then remains application input instead of
+creating a synthetic Punto undo. The first expected-client text request begins
+a 250 ms quiet-grace rather than immediately restoring the old clipboard.
+Further text targets renew that grace within a one-second absolute cap, so a
+multi-target paste keeps the replacement without allowing continuous probes to
+retain ownership forever. A foreign owner during either phase is never
+overwritten. Expected-client identity uses the X11 resource-id base; the
+absolute receipt cap bounds the residual ambiguity if an X server reuses a
+disconnected client's base during that window.
+
+The final production source passed all 36 Release CTest targets in 454.04
+seconds and all 37 Debug sanitizer targets in 471.31 seconds. The separately
+isolated GTK clipboard sanitizer target passed 1/1. CLI passed 5315/5315,
+packaging passed 919/919, and the exact CI clang-tidy selector passed all 25
+production translation units. `git diff --check`, Python compilation,
+ShellCheck, formatting of every changed C++ file, the Node bridge contract and
+the GJS uint64 contract passed. The canonical full package passed lintian's
+error gate; its remaining warnings are the documented manual-page and native-
+package changelog naming debt.
+
+| Iteration 19 candidate | SHA256 |
+| --- | --- |
+| `cpp/src/word_editor.cpp` | `4c9e932d110e79d05fea3822942e659fe677138a5ffbf9283a0e801d86452cd2` |
+| `cpp/src/clipboard_manager.cpp` | `e603c917453eaf10fe2638a4324fd29a8d5f9d231a9778e8ea87c69118e8f3de` |
+| `cpp/src/event_loop.cpp` | `dc6a2b73fdb5cb37e34f16378773befaa03e4d81cc13254061f5669521cb6d69` |
+| `cpp/src/desktop_layout_client.cpp` | `9504a5f7b7cffa0984f071509c4acfff32e96e4d1aef96b411e2558981a11352` |
+| `cpp/src/session_bridge.cpp` | `22782c0aba76cfdc39eee90d82930cff2621adc95dc38bdef29dea8fa63faec8` |
+| Release daemon | `06f40edf81b288a7c977f23101b42a9a59ed07f6ae137c0b2e051e76c8199742` |
+| Release session bridge | `5a4d644c8779f88ace760958f9373d4a5216da02019084cd10e1310e8e87ab48` |
+| Release EventLoop driver | `5eb1d6ee55e75ac4f46a46ea7f159f5d5194703f8921f0305a235432c640cbfb` |
+| Debug daemon | `b206a131d7908d5f41dc7642aa3a218dcfe2fdfa72e35fb6b5831b57cb2915d0` |
+| Debug session bridge | `fae719eb70489b732e0f817efe3a5afc44bc7238d631a2ef2e2aee97df8c28d4` |
+| Debug EventLoop driver | `935d4afd300b06b2405382c704f19f24ec317e771152ebf5a9108b6381665f7a` |
+The canonical Debian checksum is published separately in `SHA256SUMS`, avoiding
+a recursive package-hash claim inside a document embedded in that package.
+These isolated gates bind the production binaries to the tested sources.
+Enabling the extension, starting the user-session bridge, installing
+the package and proving two real GNOME source transitions plus editor text are
+separate host-session gates performed only after publication readiness.
+
+## Iteration 20: fail-closed bridge recovery
+
+Three faults found during the iteration-19 review were fixed without changing
+the ownership model. After a confirmed desktop transition, failure to refresh
+the XKB keyboard plan now stops before XInput2 observation. The collector also
+rejects a closed XCB connection on entry. A retained failure lineage can be
+used only once, after fresh text input, and is rejected when PRIMARY identifies
+a new readable selection or its transport fails.
+
+`DesktopLayoutClient` opens the user-runtime descriptor with `O_NONBLOCK`, then
+retains the regular-file, owner, mode, link-count and size checks. A FIFO with
+no writer is rejected before any extension call, and the same client succeeds
+after the valid descriptor is restored. Its D-Bus pump processes at most 32
+messages per slice and checks completion, cancellation and the deadline between
+messages. Recovery preserves the original operation identity and never sends a
+second `Switch`.
+
+The unchanged source manifest passed 36/36 Release CTest targets in 481.97
+seconds. Debug registers 37 unique targets. The main CI lane excluding the GTK
+clipboard contract initially passed 35/36; one GTK shard reported a clipboard
+callback timeout after successful product dispatch and without a sanitizer
+diagnostic. That complete shard then passed 1/1, while its isolated VTE case
+passed 10/10. The separate GTK clipboard ASan/UBSan lane passed 1/1 with only
+the documented `detect_leaks=0` exception. The resulting unique target coverage
+is 37/37; the ten reproductions are not counted as extra targets.
+
+CLI contracts passed 5315/5315, clang-tidy passed all 25 selected production
+commands, and the static, formatting, Python, Node, GJS and whitespace checks
+passed. The local architect and corrective critic reported no unresolved
+P0-P2. C2C PLAN revision 2 records Grok and GLM as
+`INCONCLUSIVE_PROVIDER_UNAVAILABLE`, without treating either as approval, and
+makes those two verdicts optional for this candidate. Independent C2C review of
+the rebuilt package remains mandatory before commit, publication or installation.
+
+| Iteration 20 source and tested binary | SHA256 |
+| --- | --- |
+| `cpp/src/word_editor.cpp` | `052a7e89de7e00a012f4f992454959731418f0e22008516a61bb6ab3b727c350` |
+| `cpp/src/clipboard_manager.cpp` | `e603c917453eaf10fe2638a4324fd29a8d5f9d231a9778e8ea87c69118e8f3de` |
+| `cpp/src/event_loop.cpp` | `a181f2cacd080efd24381b96bf74adce44407d33248e34b4e17860563bd938d6` |
+| `cpp/src/desktop_layout_client.cpp` | `2892e398b40b1946aa61f2f3106ed97e750607d84d701b0483f75aa886d267ff` |
+| `cpp/src/session_bridge.cpp` | `22782c0aba76cfdc39eee90d82930cff2621adc95dc38bdef29dea8fa63faec8` |
+| Release daemon | `117bc6ed317c138de4647ab5d9f5a674cfaff6beefad7f88cb7f5ae8c37b222f` |
+| Release session bridge | `5a4d644c8779f88ace760958f9373d4a5216da02019084cd10e1310e8e87ab48` |
+| Release EventLoop driver | `7b3433b8dfdee8dec3ba35ccd00891ac3b2a2451b1defa92aa84e6afc076f8ee` |
+| Debug daemon | `ed464d169742458f4e1ec1484523ed7b3e4deaa14623db1b9d15757527d928b4` |
+| Debug session bridge | `3687b04f22d5a59dd768fd96b157c2ed84252155e980754228cbd0326151e3ac` |
+| Debug EventLoop driver | `f73f32f5d0f286ba37a20992da41b72023675d37e0d8ca3c415c6be9a7c0fc72` |
+
+The package checksum stays in `SHA256SUMS` and the C2C execution evidence. It is
+not embedded here because changing this document changes the package itself.
+
+## Iteration 21: production GJS D-Bus dispatch and provenance
+
+The GNOME extension's D-Bus transport is now isolated in `dbusAdapter.js`.
+`InputSourceBridgeCore` remains the only owner of helper authorization, leases,
+operation identity, source validation and activation policy; the adapter only
+normalizes the callback argument representation and encodes protocol replies.
+This separation also allows the shipped handler implementation to run outside
+GNOME Shell resources without replacing it with a fake.
+
+A bounded `dbus-run-session` regression exports that same adapter with
+`Gio.DBusExportedObject.wrapJSObject` and calls `BindHelper`, `GetState`,
+`Switch` and `GetOperation` through real Gio dispatch. The pre-fix reproduction
+showed that GJS supplies an already-unpacked value array, so the former
+unconditional `parameters.deepUnpack()` rejected a valid call. The focused
+post-fix CTest passes successful replies, version and digest rejections, exact
+`uint64` fields, stored operation identity and one activation across replay.
+
+Revision-3 provenance freezes both independently consumed protocol files,
+the production adapter, its dispatch regression and the package/install
+contracts. The revision-2 Debian checksum is intentionally stale after this
+payload change. Complete Release, Debug sanitizer, static and package results
+are recorded in the C2C/checklist evidence bound to the revision-3 manifest;
+installation and real GTK/Chromium acceptance remain later, separately
+authorized gates and must precede stable publication.
+
+## Iteration 22: GNOME user-manager session attribution
+
+The first controlled 2.8.14 activation exposed a native logind topology that
+the original bridge rejected: GNOME Shell is owned by the correct session-bus
+UID, but its user-manager process has no direct `sd_pid_get_session()` mapping.
+The helper therefore exited with `TEMPFAIL` before `BindHelper` even though one
+active, local X11 user session existed on `seat0`. Both controlled attempts were
+rolled back to the exact official 2.8.13 package; no candidate daemon entered
+the keyboard pipeline and GTK/Chromium live acceptance was not run.
+
+Session attribution now authenticates the Shell unique D-Bus owner, PID and
+Unix UID independently. A valid direct PID mapping remains preferred. Only
+`-ENODATA` permits native per-UID logind inventory, and admission requires one
+distinct active, nonremote, X11, class `user`, `seat0` session after filtering.
+Unknown metadata errors, zero matches and ambiguity fail closed. The pinned
+owner, PID and exact session decision are revalidated after binding, before
+descriptor publication and before every forwarded request; an existing helper
+never retargets to another session.
+
+The production resolver is shared by the bridge, its injected native-query
+contracts and a read-only host probe. The probe neither owns the bridge name nor
+calls `BindHelper`/`Switch`; on the affected host it reports the authenticated
+UID match and `user-inventory` selection of session 111. A production-shaped
+private-bus test preserves the old exit-75 RED at
+`pid-session-enodata-before-bind`, then runs the fixed helper through the shipped
+GJS adapter/core and proves one activation across an identical replay.
+
+Deployment preparation now uses a closed-stdin `dpkg` transaction with both
+`--force-confdef` and `--force-confold`; downgrade also uses
+`--force-downgrade`. An isolated user-namespace rehearsal performs a real
+upgrade and downgrade of deliberately divergent conffiles, preserves the local
+configuration and learned-data sentinel, reaches `ii` after both directions,
+and rejects a missing rollback package boundedly. This is local preparation,
+not authorization to replace the active host wrapper or install 2.8.14.
+
+The final deployment wrapper validates both candidate and rollback artifacts
+before the first package mutation. Activation is limited to a validated
+1–120-second interval (60 seconds by default), receives `TERM` first and has a
+two-second forced-stop grace. The package transaction similarly gives `dpkg`
+30 seconds followed by a five-second forced-stop grace. The rehearsal proves
+that an absent rollback artifact leaves the old package untouched and that a
+genuinely hanging activation exits 124, invokes downgrade, restores a
+configured old package, and preserves both the local conffile and learned-data
+hash. This does not eliminate the residual risk of an interrupted real `dpkg`;
+the controlled host activation remains a separate authorization gate.
+
+The production-shaped old-code regression records
+`OLD_RED stage=pid-session-enodata-before-bind exit=75`. The same private-bus
+fixture then passes with the new test-seam helper and one activation across a
+replayed `Switch`. The read-only production resolver probe reports an
+authenticated Shell UID, route `user-inventory`, stage `inventory-selected`,
+and session 111 without binding, switching, publishing an endpoint, or changing
+the host. Startup coverage additionally replaces the Shell owner on a distinct
+D-Bus connection between binding and publication. Runtime coverage separately
+revokes authority for ambiguity, inactivity and a disappeared session, then
+starts a fresh helper without retargeting the old identity.
+
+After the final review fixes, Release passed all 40 registered targets in
+481.60 seconds. The first complete Debug main run exposed one transient
+one-shot `STATS` read timeout after the layout recovery had already produced
+the expected text with the same daemon PID. That failure remains recorded; it
+was not silently retried. The test's final asynchronous telemetry assertion now
+uses the existing bounded exact-count oracle instead of one 500 ms socket read.
+The focused Debug layout test passed 1/1 and then 10/10 consecutive runs. The
+complete final Debug main lane passed 40/40 in 502.50 seconds with
+`ASAN_OPTIONS=detect_leaks=1:halt_on_error=1` and
+`UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1`; the isolated GTK clipboard
+lane passed 1/1 in 0.28 seconds with the documented `detect_leaks=0` exception.
+CLI contracts passed 5315/5315 and package contracts passed 921/921.
+
+The exact CI clang-tidy selector covers all 27 production translation units.
+ShellCheck, Python compilation, changed-file clang-format, Node syntax and
+`git diff --check` pass. Separate Codex architecture and corrective reviewers
+first rejected incomplete owner/session race coverage and an unbounded rollback
+orchestrator; both gave PASS with no remaining P0–P3 after the causal tests,
+artifact preflight, bounded activation and graceful package timeout were added.
+These are local review gates, not substitutes for the independent C2C review.
+
+Both Chromium shards, soak and failure-soak passed on the final Release and
+Debug runs without a retry. The earlier correction-32 rejection remains part of
+the historical evidence and is not reclassified as fixture-only. The new source
+manifest, deployment-wrapper digests and rebuilt Debian provenance are kept in
+the iteration-7 revision-5 C2C evidence. The Debian checksum is not embedded in
+this packaged document because doing so would change the package recursively.

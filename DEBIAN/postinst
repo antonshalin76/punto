@@ -4,69 +4,6 @@ set -e
 PKG_VERSION="@PUNTO_VERSION@"
 : "$PKG_VERSION"
 
-update_user_tray() {
-    case "${1:-}" in
-        reload|restart|stop) punto_tray_action=$1 ;;
-        *) return 0 ;;
-    esac
-    # init-system-helpers 1.66 accumulates the restart list across user
-    # managers. Use systemd's per-manager atomic try-restart instead: an
-    # inactive static unit stays inactive. One hard deadline covers policy,
-    # reload, discovery and actions so no user bus can stall dpkg configuration.
-    # shellcheck disable=SC2016  # The inner shell expands these variables.
-    timeout --signal=KILL 3s /bin/sh -c '
-        punto_tray_action=$1
-        punto_restart_allowed=true
-        if [ "$punto_tray_action" = restart ] &&
-           [ -x /usr/sbin/policy-rc.d ]; then
-            if /usr/sbin/policy-rc.d punto-tray.service restart \
-                >/dev/null 2>&1; then
-                punto_policy_rc=0
-            else
-                punto_policy_rc=$?
-            fi
-            case "$punto_policy_rc" in
-                0|104) ;;
-                101) punto_restart_allowed=false ;;
-                *)
-                    echo "punto-switcher: policy-rc.d returned $punto_policy_rc; continuing bounded tray refresh" >&2
-                    ;;
-            esac
-        fi
-
-        if [ "$punto_tray_action" = stop ]; then
-            deb-systemd-invoke --user stop punto-tray.service \
-                >/dev/null 2>&1 || true
-        fi
-        deb-systemd-invoke --user daemon-reload >/dev/null 2>&1 || true
-        if [ "$punto_tray_action" != restart ] ||
-           [ "$punto_restart_allowed" != true ]; then
-            exit 0
-        fi
-
-        systemctl --system --no-legend --plain --state=active \
-            --type=service list-units '\''user@*.service'\'' |
-        while IFS=" " read -r punto_manager _; do
-            case "$punto_manager" in
-                user@*.service) ;;
-                *) continue ;;
-            esac
-            punto_user=${punto_manager#user@}
-            punto_user=${punto_user%.service}
-            case "$punto_user" in
-                ""|*[!0-9]*) continue ;;
-            esac
-            case "$punto_user" in
-                0|[1-9]*) ;;
-                *) continue ;;
-            esac
-            systemctl --quiet --no-block --user \
-                --machine="${punto_user}@" try-restart -- \
-                punto-tray.service >/dev/null 2>&1 || true
-        done
-    ' punto-tray-lifecycle "$punto_tray_action" >/dev/null || true
-}
-
 case "${1:-}" in
     configure)
         if ! getent group punto >/dev/null 2>&1; then
@@ -88,26 +25,61 @@ case "${1:-}" in
                 ;;
         esac
 
-        if [ ! -d /etc/punto ] || [ -L /etc/punto ]; then
-            echo "punto-switcher: /etc/punto is not a trusted directory" >&2
-            exit 1
-        fi
-        punto_dir_state=$(stat -c '%u:%g:%a' /etc/punto 2>/dev/null || true)
-        punto_dir_owner=${punto_dir_state%%:*}
-        punto_dir_remainder=${punto_dir_state#*:}
-        punto_dir_group=${punto_dir_remainder%%:*}
-        punto_dir_mode=${punto_dir_remainder#*:}
-        case "$punto_dir_mode" in
-            ''|*[!0-7]*)
-                echo "punto-switcher: /etc/punto has invalid metadata" >&2
+        # Admission precedes all permission changes. Maintscripts also run in
+        # chroots without /proc, so secure parents before revalidating children.
+        for punto_ancestor in / /etc /usr /usr/share; do
+            punto_access=$(LC_ALL=C /usr/bin/ls -ld -- "$punto_ancestor") || exit 1
+            punto_access=${punto_access%% *}
+            if [ ! -d "$punto_ancestor" ] || [ -L "$punto_ancestor" ] ||
+               [ "$(stat -c '%u:%g:%a' "$punto_ancestor")" != 0:0:755 ] ||
+               [ "${#punto_access}" != 10 ]; then
+                echo "punto-switcher: directory ancestor is not protected" >&2
                 exit 1
-                ;;
-        esac
-        if [ "$punto_dir_owner" != 0 ] || [ "$punto_dir_group" != 0 ] ||
-           [ $((0$punto_dir_mode & 0022)) -ne 0 ]; then
-            echo "punto-switcher: /etc/punto is not root-owned and protected" >&2
-            exit 1
-        fi
+            fi
+        done
+        punto_directories=
+        for punto_target in /etc/punto /usr/share/punto-switcher /usr/share/punto-switcher/sounds; do
+            if [ ! -d "$punto_target" ] || [ -L "$punto_target" ]; then
+                echo "punto-switcher: package directory is not trusted" >&2
+                exit 1
+            fi
+            punto_access=$(LC_ALL=C /usr/bin/ls -ld -- "$punto_target") || exit 1
+            punto_access=${punto_access%% *}
+            punto_dir_state=$(stat -c '%d:%i:%u:%g:%a' "$punto_target") || exit 1
+            if [ "${#punto_access}" != 10 ]; then
+                echo "punto-switcher: alternate directory access is not admitted" >&2
+                exit 1
+            fi
+            case "$punto_dir_state" in
+                *:0:0:755) ;;
+                *:0:0:775)
+                    if [ "$punto_target" = /etc/punto ] && [ "${2:-}" != 2.8.5 ]; then
+                        echo "punto-switcher: unrecognized /etc/punto migration" >&2
+                        exit 1
+                    fi
+                    ;;
+                *) echo "punto-switcher: package directory metadata is not admitted" >&2; exit 1 ;;
+            esac
+            punto_directories="${punto_directories}${punto_directories:+
+}$punto_target|$punto_dir_state"
+        done
+        printf '%s\n' "$punto_directories" | while IFS='|' read -r punto_target punto_dir_state; do
+            punto_access=$(LC_ALL=C /usr/bin/ls -ld -- "$punto_target") || exit 1
+            punto_access=${punto_access%% *}
+            if [ -L "$punto_target" ] || [ "${#punto_access}" != 10 ] ||
+               [ "$(stat -c '%d:%i:%u:%g:%a' "$punto_target")" != "$punto_dir_state" ]; then
+                echo "punto-switcher: directory changed before permission normalization" >&2
+                exit 1
+            fi
+            if [ "${punto_dir_state##*:}" = 775 ]; then
+                chmod 0755 "$punto_target" || exit 1
+            fi
+            if [ -L "$punto_target" ] ||
+               [ "$(stat -c '%d:%i:%u:%g:%a' "$punto_target")" != "${punto_dir_state%:*}:755" ]; then
+                echo "punto-switcher: cannot secure package directory" >&2
+                exit 1
+            fi
+        done
 
         # Older releases created learned exclusions with the default 0644
         # mode. Only secure this exact trusted inode; never rewrite its words
@@ -157,16 +129,8 @@ case "${1:-}" in
             trap - 0 HUP INT TERM
         fi
 
-        # Static user units are started by XDG autostart, not globally from a
-        # root maintainer script. A daemon-only replacement must stop an
-        # earlier full-package tray.
-        if [ ! -x /usr/bin/punto-tray ]; then
-            update_user_tray stop
-        elif [ -n "${2:-}" ]; then
-            update_user_tray restart
-        else
-            update_user_tray reload
-        fi
+        # Static user units are discovered at the next graphical login. Package
+        # configuration must not contact or mutate any active user manager.
 
         ;;
 esac

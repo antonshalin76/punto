@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the restored executor link boundary and exclude the obsolete injector."""
+"""Check the active executor link boundary and exclude obsolete transports."""
 
 from __future__ import annotations
 
@@ -11,10 +11,12 @@ import sys
 
 FORBIDDEN_SOURCES = {
     "src/key_injector.cpp",
+    "src/editor_transaction_client.cpp",
 }
 
 FORBIDDEN_SYMBOLS = (
     "punto::KeyInjector",
+    "punto::EditorTransactionClient",
 )
 
 

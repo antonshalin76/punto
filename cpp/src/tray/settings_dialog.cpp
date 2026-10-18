@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 #include <glib.h>
 
@@ -160,29 +161,68 @@ static void on_any_setting_changed(GtkWidget *widget, gpointer user_data) {
   return settings;
 }
 
-[[nodiscard]] bool merge_settings(const SettingsData &settings,
-                                  Config &config) {
-  const auto modifier = key_name_to_code(settings.modifier);
-  const auto key = key_name_to_code(settings.key);
-  if (!modifier || !key) {
-    return false;
+[[nodiscard]] bool merge_settings(const SettingsData &settings, Config &config,
+                                  const std::optional<SettingsData> &initial) {
+  const auto should_apply = [&](auto member) {
+    if (!initial) {
+      return true;
+    }
+    const auto &value = settings.*member;
+    const auto &previous = (*initial).*member;
+    if constexpr (std::is_floating_point_v<
+                      std::remove_cvref_t<decltype(value)>>) {
+      return !nearly_equal_double(value, previous);
+    } else {
+      return value != previous;
+    }
+  };
+  if (should_apply(&SettingsData::modifier)) {
+    const auto modifier = key_name_to_code(settings.modifier);
+    if (!modifier) {
+      return false;
+    }
+    config.hotkey.modifier = *modifier;
+  }
+  if (should_apply(&SettingsData::key)) {
+    const auto key = key_name_to_code(settings.key);
+    if (!key) {
+      return false;
+    }
+    config.hotkey.key = *key;
   }
 
-  config.hotkey.modifier = *modifier;
-  config.hotkey.key = *key;
-  config.auto_switch.enabled = settings.auto_enabled;
-  config.auto_switch.threshold = settings.threshold;
-  config.auto_switch.min_word_len =
-      static_cast<std::size_t>(settings.min_word_len);
-  config.auto_switch.min_score = settings.min_score;
-  config.auto_switch.max_rollback_words =
-      static_cast<std::size_t>(settings.max_rollback_words);
-  config.auto_switch.typo_correction_enabled = settings.typo_correction_enabled;
-  config.auto_switch.max_typo_diff =
-      static_cast<std::size_t>(settings.max_typo_diff);
-  config.auto_switch.sticky_shift_correction_enabled =
-      settings.sticky_shift_correction_enabled;
-  config.sound.enabled = settings.sound_enabled;
+  if (should_apply(&SettingsData::auto_enabled)) {
+    config.auto_switch.enabled = settings.auto_enabled;
+  }
+  if (should_apply(&SettingsData::threshold)) {
+    config.auto_switch.threshold = settings.threshold;
+  }
+  if (should_apply(&SettingsData::min_word_len)) {
+    config.auto_switch.min_word_len =
+        static_cast<std::size_t>(settings.min_word_len);
+  }
+  if (should_apply(&SettingsData::min_score)) {
+    config.auto_switch.min_score = settings.min_score;
+  }
+  if (should_apply(&SettingsData::max_rollback_words)) {
+    config.auto_switch.max_rollback_words =
+        static_cast<std::size_t>(settings.max_rollback_words);
+  }
+  if (should_apply(&SettingsData::typo_correction_enabled)) {
+    config.auto_switch.typo_correction_enabled =
+        settings.typo_correction_enabled;
+  }
+  if (should_apply(&SettingsData::max_typo_diff)) {
+    config.auto_switch.max_typo_diff =
+        static_cast<std::size_t>(settings.max_typo_diff);
+  }
+  if (should_apply(&SettingsData::sticky_shift_correction_enabled)) {
+    config.auto_switch.sticky_shift_correction_enabled =
+        settings.sticky_shift_correction_enabled;
+  }
+  if (should_apply(&SettingsData::sound_enabled)) {
+    config.sound.enabled = settings.sound_enabled;
+  }
   return validate_config(config);
 }
 
@@ -266,9 +306,10 @@ SettingsData SettingsDialog::load_settings() {
   return settings_from_config(loaded.config);
 }
 
-bool SettingsDialog::save_settings(const SettingsData &settings) {
+bool SettingsDialog::save_settings(const SettingsData &settings,
+                                   std::optional<SettingsData> initial) {
   Config validation_candidate;
-  if (!merge_settings(settings, validation_candidate)) {
+  if (!merge_settings(settings, validation_candidate, initial)) {
     return false;
   }
   if (!ensure_user_config()) {
@@ -286,7 +327,7 @@ bool SettingsDialog::save_settings(const SettingsData &settings) {
   }
 
   Config merged = loaded.config;
-  if (!merge_settings(settings, merged)) {
+  if (!merge_settings(settings, merged, initial)) {
     return false;
   }
   const std::optional<std::string> contents = serialize_config(merged);
@@ -508,14 +549,16 @@ bool SettingsDialog::show(GtkWidget *parent, Section section) {
 
     const bool dirty = non_hotkey_changed(new_settings, initial_settings);
     if (dirty) {
-      saved = save_settings(new_settings);
+      saved = save_settings(new_settings, initial_settings);
       if (!saved) {
         GtkWidget *error = gtk_message_dialog_new(
             GTK_WINDOW(dialog), GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR,
-            GTK_BUTTONS_CLOSE, "%s", "Не удалось подтвердить сохранение настроек.");
+            GTK_BUTTONS_CLOSE, "%s",
+            "Не удалось подтвердить сохранение настроек.");
         gtk_message_dialog_format_secondary_text(
             GTK_MESSAGE_DIALOG(error), "%s",
-            "Сервису не отправлена команда применения. Откройте настройки повторно, "
+            "Сервису не отправлена команда применения. Откройте настройки "
+            "повторно, "
             "чтобы проверить сохранённые значения.");
         (void)gtk_dialog_run(GTK_DIALOG(error));
         gtk_widget_destroy(error);

@@ -64,6 +64,7 @@ class SandboxContract(unittest.TestCase):
             before = (marker.read_bytes(), marker.stat().st_mode)
             command = [
                 "bwrap", "--unshare-all", "--die-with-parent", "--ro-bind", "/", "/",
+                "--ro-bind", str(DRIVER), "/bin/false",
                 "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/etc",
             ]
             for name in ("fonts", "X11", "ld.so.cache", "ld.so.conf", "ld.so.conf.d",
@@ -75,7 +76,8 @@ class SandboxContract(unittest.TestCase):
             command.extend((
                 "--remount-ro", "/etc", "--setenv", "PUNTO_REQUIRE_EVENT_LOOP_E2E", "1",
                 "--setenv", "PUNTO_EVENT_LOOP_E2E_TEST", "test_initial_user_config_sets_auto_default",
-                sys.executable, str(pathlib.Path(__file__).resolve()), "--outer", str(DRIVER),
+                sys.executable, str(pathlib.Path(__file__).resolve()), "--outer",
+                "/bin/false",
             ))
             result = subprocess.run(command, capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

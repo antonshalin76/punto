@@ -479,10 +479,11 @@ NestedXServer start_nested_xvfb(bool disable_xfixes = false) {
     (void)::close(descriptors[1]);
     if (disable_xfixes) {
       ::execl("/usr/bin/Xvfb", "Xvfb", "-displayfd", "1", "-ac", "-nolisten",
-              "tcp", "-extension", "XFIXES", static_cast<char *>(nullptr));
+              "tcp", "-extension", "GLX", "-extension", "XFIXES",
+              static_cast<char *>(nullptr));
     } else {
       ::execl("/usr/bin/Xvfb", "Xvfb", "-displayfd", "1", "-ac", "-nolisten",
-              "tcp", static_cast<char *>(nullptr));
+              "tcp", "-extension", "GLX", static_cast<char *>(nullptr));
     }
     _exit(127);
   }
@@ -520,8 +521,8 @@ NestedXServer start_authenticated_xvfb(const TempAuthority &server_authority) {
       (void)::close(null_descriptor);
     }
     ::execl("/usr/bin/Xvfb", "Xvfb", "-displayfd", "1", "-auth",
-            server_authority.path.c_str(), "-nolisten", "tcp",
-            static_cast<char *>(nullptr));
+            server_authority.path.c_str(), "-nolisten", "tcp", "-extension",
+            "GLX", static_cast<char *>(nullptr));
     _exit(127);
   }
 
@@ -1043,6 +1044,27 @@ void test_bounded_transport_and_linearizable_write_gate() {
                  punto::x11_detail::XcbOperationResult::Success,
          "checked void request completes behind a bounded barrier");
 
+  const auto expired_read = xcb_get_input_focus(connection.get());
+  punto::x11_detail::XcbOperationResult expired_read_result{};
+  void *expired_reply = connection.wait_for_read_reply(
+      expired_read.sequence, std::chrono::steady_clock::now(),
+      expired_read_result);
+  std::free(expired_reply);
+  expect(expired_read_result ==
+                 punto::x11_detail::XcbOperationResult::TimedOut &&
+             connection.is_open(),
+         "read-only timeout discards only its reply and retains connection");
+  const auto followup_read = xcb_get_input_focus(connection.get());
+  punto::x11_detail::XcbOperationResult followup_read_result{};
+  void *followup_reply = connection.wait_for_read_reply(
+      followup_read.sequence, std::chrono::steady_clock::now() + 500ms,
+      followup_read_result);
+  expect(followup_reply != nullptr &&
+             followup_read_result ==
+                 punto::x11_detail::XcbOperationResult::Success,
+         "connection remains usable after discarded read-only reply");
+  std::free(followup_reply);
+
   server.stop();
   const auto reply_cookie = xcb_get_input_focus(connection.get());
   punto::x11_detail::XcbOperationResult reply_result{};
@@ -1108,10 +1130,21 @@ void test_keyboard_observation_ownership_and_authority_generation() {
   auto candidate = real_candidate(server, authority);
   candidate.observed_keyboard_layout = 0;
   unsigned int discovery_calls = 0;
+  std::atomic<bool> hold_discovery{false};
+  std::atomic<bool> discovery_captured{false};
+  std::atomic<bool> release_discovery{false};
   punto::X11Session session{[&] {
     ++discovery_calls;
+    const auto snapshot = candidate;
+    if (hold_discovery.exchange(false, std::memory_order_acq_rel)) {
+      discovery_captured.store(true, std::memory_order_release);
+      const auto deadline = std::chrono::steady_clock::now() + 1s;
+      while (!release_discovery.load(std::memory_order_acquire) &&
+             std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    }
     return punto::x11_detail::ProbeResult{
-        punto::x11_detail::ProbeStatus::Healthy, candidate};
+        punto::x11_detail::ProbeStatus::Healthy, snapshot};
   }};
   expect(session.initialize(), "observation fixture session initializes");
   auto fixture_lease = session.acquire_write_lease();
@@ -1208,6 +1241,80 @@ void test_keyboard_observation_ownership_and_authority_generation() {
   expect(second.group == 0 && second.focus_window == observed_window &&
              second.locked_mods == XCB_MOD_MASK_LOCK,
          "next observation captures changed locks without a session refresh");
+
+  // Discovery owns session health, not permission to replace a newer keyboard
+  // sample with a group captured before that sample completed.
+  candidate.observed_keyboard_layout = 1;
+  hold_discovery.store(true, std::memory_order_release);
+  expect(session.start_background_refresh(),
+         "old discovery starts before the newer keyboard observation");
+  const auto capture_deadline = std::chrono::steady_clock::now() + 1s;
+  while (!discovery_captured.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < capture_deadline)
+    std::this_thread::yield();
+  expect(discovery_captured.load(std::memory_order_acquire),
+         "old discovery captured its independent group before release");
+  expect(session.start_background_keyboard_observation(5),
+         "keyboard observation remains available during held discovery");
+  const auto newer_keyboard = collect(5);
+  expect(newer_keyboard.group == 0 && newer_keyboard.live_current &&
+             session.info().observed_keyboard_layout == 0,
+         "real Xvfb keyboard observation publishes the newer group");
+  release_discovery.store(true, std::memory_order_release);
+  std::optional<punto::X11Session::RefreshResult> late_discovery;
+  const auto release_deadline = std::chrono::steady_clock::now() + 1s;
+  while (!late_discovery &&
+         std::chrono::steady_clock::now() < release_deadline) {
+    late_discovery = session.poll_refresh_result();
+    std::this_thread::yield();
+  }
+  expect(late_discovery == punto::X11Session::RefreshResult::HealthyUnchanged,
+         "late same-session discovery still publishes its health result");
+  const int after_late_discovery = session.info().observed_keyboard_layout;
+  expect(generation() == first_generation,
+         "layout publication never revokes the session write generation");
+
+  // An exact request may still need its historical sample, but consuming that
+  // completion must not overwrite a newer live discovery observation.
+  expect(session.start_background_keyboard_observation(6),
+         "historical keyboard request starts before newer discovery");
+  expect(session.refresh() ==
+             punto::X11Session::RefreshResult::HealthyUnchanged,
+         "newer discovery remains in the same session");
+  expect(session.info().observed_keyboard_layout == 1,
+         "newer discovery publishes its current group");
+  const auto historical_keyboard = collect(6);
+  const int after_late_keyboard = session.info().observed_keyboard_layout;
+  std::cerr << "layout publication witnesses: discovery="
+            << after_late_discovery << " keyboard=" << after_late_keyboard
+            << " historical=" << historical_keyboard.group << '\n';
+  expect(historical_keyboard.group == 0 && !historical_keyboard.live_current &&
+             historical_keyboard.session_generation == first_generation,
+         "exact historical sample remains readable under its session");
+  expect(after_late_discovery == 0,
+         "late discovery cannot overwrite a newer keyboard observation");
+  expect(after_late_keyboard == 1,
+         "late keyboard completion cannot overwrite newer live discovery");
+  expect(!session.publish_keyboard_layout(-1, first_generation) &&
+             !session.publish_keyboard_layout(2, first_generation) &&
+             !session.publish_keyboard_layout(0, first_generation + 1) &&
+             session.info().observed_keyboard_layout == 1,
+         "invalid layout or session authority cannot publish a keyboard fact");
+  expect(session.start_background_keyboard_observation(7),
+         "keyboard request starts before a proven foreground fact");
+  expect(session.publish_keyboard_layout(1, first_generation),
+         "verified same-group foreground fact retires earlier reads");
+  const auto before_foreground = collect(7);
+  expect(before_foreground.group == 0 && !before_foreground.live_current &&
+             session.info().observed_keyboard_layout == 1,
+         "historical request cannot supersede the foreground publication");
+  expect(session.start_background_keyboard_observation(8),
+         "fresh observation remains available after a stale completion");
+  const auto after_foreground = collect(8);
+  expect(after_foreground.group == 0 && after_foreground.live_current &&
+             session.info().observed_keyboard_layout == 0 &&
+             generation() == first_generation,
+         "new real observation recovers without resetting session authority");
 
   candidate.observed_keyboard_layout = 1;
   expect(session.refresh() ==

@@ -1,15 +1,8 @@
 #!/bin/sh
 set -e
 
-# The host input service is foreign and may contain unrelated pipelines. Only
-# the package-owned user unit is stopped on final removal. Normal upgrades do
-# not interrupt active desktop sessions; daemon-only replacement is handled by
-# the new package's postinst after its tray payload is absent.
-case "${1:-}" in
-    remove|deconfigure)
-        deb-systemd-invoke --user stop punto-tray.service \
-            >/dev/null 2>&1 || true
-        ;;
-esac
+# User services are owned by the graphical login lifecycle. Package removal
+# never contacts an active user manager or interrupts the desktop session.
+: "${1:-}"
 
 exit 0

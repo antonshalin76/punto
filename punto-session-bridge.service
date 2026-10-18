@@ -1,0 +1,28 @@
+[Unit]
+Description=Punto desktop input-source bridge
+PartOf=graphical-session.target
+After=graphical-session.target
+# The extension can legitimately be unavailable for longer than a short
+# Shell-reload window. Keep retries rate-bounded by RestartSec without ever
+# requiring a logout or a manual reset of the user manager's start limit.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+ExecStart=/usr/libexec/punto-session-bridge
+RuntimeDirectory=punto
+RuntimeDirectoryMode=0700
+StateDirectory=punto-session-bridge
+StateDirectoryMode=0700
+UMask=0077
+TimeoutStartSec=5s
+TimeoutStopSec=3s
+KillMode=control-group
+Restart=on-failure
+RestartPreventExitStatus=64
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX

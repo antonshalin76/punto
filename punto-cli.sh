@@ -4,6 +4,7 @@ set -u -o pipefail
 
 TRAY=${PUNTO_TRAY:-/usr/bin/punto-tray}
 TRAY_UNIT=${PUNTO_TRAY_UNIT:-punto-tray.service}
+SESSION_BRIDGE=${PUNTO_SESSION_BRIDGE:-/usr/libexec/punto-session-bridge}
 UDEVMON_SERVICE=${PUNTO_UDEVMON_SERVICE:-udevmon}
 SOCKET=${PUNTO_SOCKET:-/var/run/punto.sock}
 VERSION_FILE=${PUNTO_VERSION_FILE:-/usr/share/punto-switcher/VERSION}
@@ -344,20 +345,31 @@ wait_for_runtime_ready() {
     done
 }
 
-backend_active() {
-    local rc
+unit_active() {
+    local unit=$1 state rc
+    shift
     BACKEND_ERROR=""
-    timeout --signal=TERM --kill-after="$TIMEOUT_KILL_AFTER" \
-        "$IPC_DURATION" systemctl is-active --quiet -- "$UDEVMON_SERVICE" \
-        >/dev/null 2>&1
+    state=$(timeout --signal=TERM --kill-after="$TIMEOUT_KILL_AFTER" \
+        "$IPC_DURATION" systemctl "$@" show --property=ActiveState --value -- "$unit" \
+        2>/dev/null)
     rc=$?
     case $rc in
-        0) return 0 ;;
-        3) return 1 ;;
+        0)
+            case $state in
+                inactive) return 1 ;;
+                active|reloading|refreshing) return 0 ;;
+                activating|deactivating|failed) return 3 ;;
+                *) BACKEND_ERROR=service-error ;;
+            esac
+            ;;
         124|137) BACKEND_ERROR=service-timeout ;;
         *) BACKEND_ERROR=service-error ;;
     esac
     return 2
+}
+
+backend_active() {
+    unit_active "$UDEVMON_SERVICE"
 }
 
 run_mutation_worker() {
@@ -550,6 +562,46 @@ ensure_tray_stopped() {
     run_tray_manager_command stop && wait_for_tray_inactive
 }
 
+ensure_bridge_started() {
+    local now remaining duration
+    [[ -x $SESSION_BRIDGE ]] && start_deadline || return 1
+    timeout --signal=TERM --kill-after="$TIMEOUT_KILL_AFTER" \
+        "$COMMAND_DURATION" systemctl --user daemon-reload >/dev/null 2>&1 || return 1
+    timeout --signal=TERM --kill-after="$TIMEOUT_KILL_AFTER" \
+        "$COMMAND_DURATION" systemctl --user start -- punto-session-bridge.service \
+        >/dev/null 2>&1 || return 1
+    while :; do
+        now=$(date +%s%3N) || return 1
+        remaining=$((START_DEADLINE - 10#$now))
+        ((remaining > 0)) || return 1
+        ((remaining <= 10#$IPC_TIMEOUT_MS)) || remaining=$((10#$IPC_TIMEOUT_MS))
+        format_seconds "$remaining" duration
+        if timeout --signal=TERM --kill-after="$TIMEOUT_KILL_AFTER" \
+            "$duration" "$SESSION_BRIDGE" --check-ready >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep "$POLL_DURATION"
+    done
+}
+
+ensure_bridge_stopped() {
+    local started now deadline rc
+    timeout --signal=TERM --kill-after="$TIMEOUT_KILL_AFTER" \
+        "$COMMAND_DURATION" systemctl --user stop -- punto-session-bridge.service \
+        >/dev/null 2>&1 || return 1
+    started=$(date +%s%3N) || return 1
+    deadline=$((10#$started + 10#$STOP_TIMEOUT_MS))
+    while :; do
+        unit_active punto-session-bridge.service --user
+        rc=$?
+        ((rc == 1)) && return 0
+        ((rc == 0 || rc == 3)) || return 1
+        now=$(date +%s%3N) || return 1
+        ((10#$now < deadline)) || return 1
+        sleep "$POLL_DURATION"
+    done
+}
+
 report_tray_warning() {
     printf 'WARN %s\n' "${TRAY_ERROR:-tray-unavailable}"
 }
@@ -573,6 +625,14 @@ start_service() {
 
     backend_active
     backend_rc=$?
+    if ((backend_rc == 2)); then
+        emit_error "$BACKEND_ERROR"
+        return 1
+    fi
+    if ! ensure_bridge_started; then
+        emit_error bridge-unavailable
+        return 1
+    fi
     if ((backend_rc == 0)); then
         if ! start_deadline || ! wait_for_runtime_ready "$START_DEADLINE"; then
             emit_error "$IPC_ERROR"
@@ -580,7 +640,7 @@ start_service() {
         fi
         ensure_tray_started || report_tray_warning
         return 0
-    elif ((backend_rc == 1)); then
+    elif ((backend_rc == 1 || backend_rc == 3)); then
         if ! run_service_command start "$UDEVMON_SERVICE"; then
             emit_error "$COMMAND_ERROR"
             return 1
@@ -604,6 +664,10 @@ start_service() {
 }
 
 restart_service() {
+    if ! ensure_bridge_started; then
+        emit_error bridge-unavailable
+        return 1
+    fi
     if ! run_service_command restart "$UDEVMON_SERVICE"; then
         emit_error "$COMMAND_ERROR"
         return 1
@@ -676,7 +740,10 @@ stop_service() {
     ensure_tray_stopped || report_tray_warning
     backend_active
     backend_rc=$?
-    ((backend_rc == 1)) && return 0
+    if ((backend_rc == 1)); then
+        ensure_bridge_stopped || { emit_error bridge-unavailable; return 1; }
+        return 0
+    fi
     if ((backend_rc == 2)); then
         emit_error "$BACKEND_ERROR"
         return 1
@@ -688,7 +755,10 @@ stop_service() {
     fi
     wait_for_service_inactive
     inactive_rc=$?
-    ((inactive_rc == 0)) && return 0
+    if ((inactive_rc == 0)); then
+        ensure_bridge_stopped || { emit_error bridge-unavailable; return 1; }
+        return 0
+    fi
     if ((inactive_rc == 2)); then
         emit_error "$BACKEND_ERROR"
         return 1
@@ -697,16 +767,17 @@ stop_service() {
         emit_error "$COMMAND_ERROR"
         return 1
     fi
-    backend_active
-    backend_rc=$?
-    if ((backend_rc == 0)); then
-        emit_error service-error
+    wait_for_service_inactive
+    inactive_rc=$?
+    if ((inactive_rc != 0)); then
+        if ((inactive_rc == 2)); then
+            emit_error "$BACKEND_ERROR"
+        else
+            emit_error service-error
+        fi
         return 1
     fi
-    if ((backend_rc == 2)); then
-        emit_error "$BACKEND_ERROR"
-        return 1
-    fi
+    ensure_bridge_stopped || { emit_error bridge-unavailable; return 1; }
 }
 
 show_help() {

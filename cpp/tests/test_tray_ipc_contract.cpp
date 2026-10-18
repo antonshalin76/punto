@@ -388,12 +388,11 @@ void test_runtime_capability_schema_is_exact() {
   const auto modern =
       replace(replace(legacy, "text_mutation=disabled", "text_mutation=x11"),
               "corrections=0", "corrections=0 word_dispatches=7");
-  const auto previous_without_control =
-      replace(modern, " daemon_epoch=1", "");
-  const auto previous_release = previous_without_control.substr(
-                                    0, previous_without_control.find(
-                                           " avg_macro_payload_bytes=")) +
-                                " avg_tail_len=0";
+  const auto previous_without_control = replace(modern, " daemon_epoch=1", "");
+  const auto previous_release =
+      previous_without_control.substr(
+          0, previous_without_control.find(" avg_macro_payload_bytes=")) +
+      " avg_tail_len=0";
   const auto exchange = [](const std::string &payload) {
     OneShotServer server{[&](int fd) {
       require(read_request(fd) == "STATS\n",
@@ -421,8 +420,7 @@ void test_runtime_capability_schema_is_exact() {
             "experimental capability is independent of runtime enabled");
   }
   result = exchange(previous_release);
-  require(result.ok() &&
-              result.capability == punto::MutationCapability::X11 &&
+  require(result.ok() && result.capability == punto::MutationCapability::X11 &&
               result.status == punto::ServiceStatus::Disabled &&
               result.runtime_ready,
           "v2.8.10 daemon remains controllable during package upgrade");
@@ -488,10 +486,9 @@ void test_auto_status_command_and_acknowledgement_are_exact() {
 }
 
 void test_reload_acknowledgement_is_exact() {
-  for (const auto &response : {std::string{"OK Scheduled\n"},
-                               std::string{"OK\n"},
-                               std::string{"OK Reloaded\n"},
-                               std::string{"ERROR Rejected\n"}}) {
+  for (const auto &response :
+       {std::string{"OK Scheduled\n"}, std::string{"OK\n"},
+        std::string{"OK Reloaded\n"}, std::string{"ERROR Rejected\n"}}) {
     OneShotServer server{[&](int fd) {
       require(read_request(fd) == "RELOAD /tmp/punto/config.yaml\n",
               "reload submits the exact config path command");
@@ -651,7 +648,21 @@ void test_diagnostic_fallback_listing_is_explicit_and_sorted() {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc == 3 && std::string_view{argv[1]} == "--probe-runtime") {
+    const auto result = punto::IpcClient::diagnose_runtime_socket(argv[2]);
+    if (!result.ok()) {
+      std::cerr << "runtime probe failed: " << static_cast<int>(result.error)
+                << '\n';
+      return 1;
+    }
+    std::cout << result.response << '\n';
+    return 0;
+  }
+  if (argc != 1) {
+    std::cerr << "usage: punto-tray-ipc-contract [--probe-runtime SOCKET]\n";
+    return 2;
+  }
   struct TestCase {
     const char *name;
     void (*run)();

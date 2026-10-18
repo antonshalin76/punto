@@ -193,7 +193,7 @@ PREVIOUS_RELEASE_STATS+=' avg_tail_len=11'
 ERROR_CATEGORIES=(
     unavailable denied timeout protocol-error daemon-error service-error
     service-timeout tray-error invalid-configuration usage-error not-ready
-    learning-error learning-timeout
+    learning-error learning-timeout bridge-unavailable
 )
 
 pass() {
@@ -403,7 +403,7 @@ fi
 tmp_root=$(mktemp -d /tmp/punto-cli-contract.XXXXXX)
 mkdir -p "$tmp_root/bin" "$tmp_root/execve" "$tmp_root/home" "$tmp_root/run"
 chmod 0777 "$tmp_root" "$tmp_root/home" "$tmp_root/run"
-for file in calls.log requests.log timeline.log response.bin service.state \
+for file in calls.log requests.log timeline.log response.bin service.state bridge.state \
     tray.state tray.pid tray.owner tray.real tray.ready tray.session harness.cleanup \
     clock.ms euid.log cli.session \
     sentinel.ready sentinel.signals hang.pid; do
@@ -413,6 +413,7 @@ done
 mkfifo "$tmp_root/tray.wait"
 chmod 0666 "$tmp_root/tray.wait"
 printf 'inactive\n' >"$tmp_root/service.state"
+printf 'inactive\n' >"$tmp_root/bridge.state"
 printf 'inactive\n' >"$tmp_root/tray.state"
 printf '0\n' >"$tmp_root/clock.ms"
 printf '0\n' >"$tmp_root/sentinel.signals"
@@ -571,14 +572,38 @@ hang_forever() {
 log "$@"
 if [[ ${1:-} == --user ]]; then
     action=${2:-}
+    if [[ $# -eq 6 && $action == show && ${3:-} == --property=ActiveState &&
+          ${4:-} == --value && ${5:-} == -- &&
+          ${6:-} == punto-session-bridge.service ]]; then
+        /bin/cat "$TEST_BRIDGE_STATE"
+        exit 0
+    fi
+    if [[ $# -eq 5 && $action == is-active && ${3:-} == --quiet &&
+          ${4:-} == -- && ${5:-} == punto-session-bridge.service ]]; then
+        [[ $(<"$TEST_BRIDGE_STATE") == active ]] && exit 0
+        exit 3
+    fi
+    if [[ ${4:-} == punto-session-bridge.service &&
+          $# -eq 4 && ${3:-} == -- &&
+          ( $action == start || $action == stop ) ]]; then
+        if [[ $action == start ]]; then
+            printf 'active\n' >"$TEST_BRIDGE_STATE"
+        else
+            printf 'inactive\n' >"$TEST_BRIDGE_STATE"
+        fi
+        exit 0
+    fi
     case $action in
         daemon-reload)
             if [[ $# -ne 2 ]]; then
                 printf 'MUTATION invalid-tray-reload-argv\n' >>"$TEST_CALLS"
                 exit 97
             fi
-            [[ ${TEST_TRAY_MODE:-ok} == manager-fail ]] && exit 5
-            [[ ${TEST_TRAY_MODE:-ok} == manager-hang ]] && hang_forever
+            # The first reload belongs to the required bridge, not the optional tray.
+            if [[ $(<"$TEST_BRIDGE_STATE") == active ]]; then
+                [[ ${TEST_TRAY_MODE:-ok} == manager-fail ]] && exit 5
+                [[ ${TEST_TRAY_MODE:-ok} == manager-hang ]] && hang_forever
+            fi
             exit 0
             ;;
         start|restart|stop)
@@ -616,6 +641,15 @@ if [[ ${1:-} == --user ]]; then
 fi
 action=${1:-}
 case $action in
+    show)
+        if [[ $# -ne 5 || ${2:-} != --property=ActiveState ||
+              ${3:-} != --value || ${4:-} != -- ||
+              ${5:-} != "${TEST_SERVICE:?}" ]]; then
+            printf 'MUTATION invalid-show-argv\n' >>"$TEST_CALLS"
+            exit 97
+        fi
+        /bin/cat "$TEST_SERVICE_STATE"
+        ;;
     is-active)
         if [[ $# -ne 4 || ${2:-} != --quiet || ${3:-} != -- ||
               ${4:-} != "${TEST_SERVICE:?}" ]]; then
@@ -662,6 +696,12 @@ case $action in
         exit 97
         ;;
 esac
+SPY
+
+cat >"$tmp_root/bin/punto-session-bridge-fixture" <<'SPY'
+#!/usr/bin/env bash
+[[ $# -eq 1 && $1 == --check-ready ]] || exit 97
+[[ $(<"$TEST_BRIDGE_STATE") == active ]] || exit 75
 SPY
 
 cat >"$tmp_root/bin/sudo" <<'SPY'
@@ -1080,6 +1120,7 @@ reset_case() {
     : >"$tmp_root/euid.log"
     : >"$tmp_root/cli.session"
     printf 'inactive\n' >"$tmp_root/service.state"
+    printf 'inactive\n' >"$tmp_root/bridge.state"
     printf 'inactive\n' >"$tmp_root/tray.state"
     : >"$tmp_root/tray.pid"
     : >"$tmp_root/tray.owner"
@@ -1158,6 +1199,7 @@ run_cli() {
         --setenv TEST_TIMELINE "$tmp_root/timeline.log" --setenv TEST_SERVICE "$SERVICE" \
         --setenv TEST_NC_REAL "$tmp_root/bin/nc-real" \
         --setenv TEST_SERVICE_STATE "$tmp_root/service.state" \
+        --setenv TEST_BRIDGE_STATE "$tmp_root/bridge.state" \
         --setenv TEST_SYSTEMCTL_MODE "$SYSTEMCTL_MODE" --setenv TEST_TRAY_MODE "$TRAY_MODE" \
         --setenv TEST_TRAY_STATE "$tmp_root/tray.state" --setenv TEST_CLOCK "$tmp_root/clock.ms" \
         --setenv TEST_TRAY_OWNER_FILE "$tmp_root/tray.owner" \
@@ -1185,6 +1227,7 @@ run_cli() {
         --setenv PUNTO_UDEVMON_SERVICE "$SERVICE" \
         --setenv PUNTO_DAEMON "$tmp_root/bin/punto-daemon-fixture" \
         --setenv PUNTO_TRAY "$TRAY_PATH" --setenv PUNTO_SOCKET "$tmp_root/run/punto.sock" \
+        --setenv PUNTO_SESSION_BRIDGE "$tmp_root/bin/punto-session-bridge-fixture" \
         --setenv PUNTO_TRAY_PID_FILE "$tmp_root/tray.pid" \
         --setenv PUNTO_VERSION_FILE "$tmp_root/VERSION" \
         --setenv PUNTO_IPC_TIMEOUT_MS "$IPC_TIMEOUT_MS" \
@@ -1861,7 +1904,7 @@ run_start_success_and_idempotency() {
     assert_timeline_before "SYSTEMCTL start $SERVICE" 'IPC STATS' \
         "B26 start checks readiness after service transition"
     assert_timeline_before 'IPC STATS' \
-        'SYSTEMCTL --user daemon-reload' \
+        'SYSTEMCTL --user start -- punto-tray.service' \
         "B26 start launches tray only after daemon readiness"
     assert_service_state active "B26 start success"
     assert_tray_state active "B26 start success"
@@ -2103,7 +2146,7 @@ run_restart_matrix() {
     assert_timeline_before "SYSTEMCTL restart $SERVICE" 'IPC STATS' \
         "B26 restart checks readiness after transition"
     assert_timeline_before 'IPC STATS' \
-        'SYSTEMCTL --user daemon-reload' \
+        'SYSTEMCTL --user restart -- punto-tray.service' \
         "B26 restart preserves tray lifecycle until backend is ready"
     assert_service_state active "B26 restart success"
     assert_tray_state active "B26 restart success"
@@ -2177,7 +2220,7 @@ run_restart_matrix() {
     assert_tray_stop_count 1 "B26 restart tray failure"
     assert_tray_start_count 1 "B26 restart tray failure"
     assert_timeline_before 'IPC STATS' \
-        'SYSTEMCTL --user daemon-reload' \
+        'SYSTEMCTL --user restart -- punto-tray.service' \
         "B26 restart tray replacement starts only after readiness"
     assert_service_state active "B26 restart tray failure"
     assert_tray_state active "B26 restart tray failure preserves manager state"
@@ -2738,6 +2781,7 @@ controlled_providers = {
     "journalctl": "systemd",
     "punto-daemon-fixture": "controlled-fixture",
     "punto-tray-fixture": "controlled-fixture",
+    "punto-session-bridge-fixture": "controlled-fixture",
 }
 host_directories = {pathlib.Path("/bin"), pathlib.Path("/usr/bin"), pathlib.Path("/usr/sbin")}
 observed = set()

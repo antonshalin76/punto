@@ -7,16 +7,19 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <xcb/xcbext.h>
 #include <xcb/xinput.h>
@@ -51,7 +54,17 @@ bool consume_private_fault_marker(const char *path) {
 
 std::mutex keyboard_query_mutex;
 std::optional<std::pair<xcb_connection_t *, unsigned int>> keyboard_query;
+thread_local std::uint64_t keyboard_request_id = 0;
+thread_local bool fixture_session_query = false;
+
+extern "C" void
+punto_e2e_keyboard_observation_request(std::uint64_t request_id) {
+  keyboard_request_id = request_id;
+}
+std::unordered_map<xcb_connection_t *, unsigned int> server_time_queries;
+std::unordered_map<xcb_connection_t *, xcb_atom_t> server_time_properties;
 std::optional<std::pair<xcb_connection_t *, unsigned int>> failed_keymap_query;
+std::optional<std::pair<xcb_connection_t *, unsigned int>> failed_xkb_map_query;
 std::optional<std::pair<xcb_connection_t *, unsigned int>> failed_xtest_request;
 std::optional<std::pair<xcb_connection_t *, unsigned int>> failed_focus_query;
 std::optional<std::pair<xcb_connection_t *, unsigned int>> failed_pointer_query;
@@ -59,27 +72,53 @@ std::optional<std::pair<xcb_connection_t *, unsigned int>>
     failed_xinput_version_query;
 std::optional<std::pair<xcb_connection_t *, unsigned int>>
     injected_layout_query;
+std::optional<std::pair<xcb_connection_t *, unsigned int>>
+    withheld_layout_query;
+struct WithheldContextQuery {
+  xcb_connection_t *connection;
+  std::int64_t deadline_ns;
+  bool pointer;
+  std::optional<unsigned int> sequence;
+  bool captured = false;
+};
+std::optional<WithheldContextQuery> withheld_context_query;
 xcb_connection_t *injected_layout_connection = nullptr;
 int injected_layout_state = 0;
 std::optional<std::pair<xcb_connection_t *, unsigned int>>
     injected_keymap_query;
+std::optional<std::pair<xcb_connection_t *, unsigned int>>
+    mutated_xkb_map_query;
 xcb_connection_t *injected_keymap_connection = nullptr;
+std::atomic<bool> mutate_next_xkb_map{false};
+std::atomic<bool> fail_next_xkb_map{false};
+std::atomic<xcb_connection_t *> failed_clipboard_connection{nullptr};
+std::atomic<xcb_connection_t *> delayed_primary_read_barrier{nullptr};
+std::atomic<xcb_connection_t *> withheld_primary_read_barrier{nullptr};
+std::optional<std::pair<xcb_connection_t *, unsigned int>>
+    withheld_primary_read_query;
+std::optional<std::pair<xcb_connection_t *, unsigned int>> utf8_atom_query;
+std::atomic<xcb_atom_t> observed_utf8_atom{XCB_ATOM_NONE};
+struct ObservedSelectionRequest {
+  xcb_connection_t *connection;
+  xcb_window_t requestor;
+  xcb_atom_t selection;
+  xcb_atom_t target;
+  xcb_atom_t property;
+};
+std::optional<ObservedSelectionRequest> completed_primary_read;
+std::atomic<int> mutate_xkb_map_after_queries{-1};
+xcb_connection_t *layout_connection = nullptr;
 std::atomic<std::int64_t> layout_settle_not_before_ns{0};
 std::atomic<int> xtest_requests_until_failure{0};
 std::atomic<bool> macro_ipc_hold{false};
 std::atomic<bool> macro_ipc_admitted{false};
 std::atomic<bool> fail_next_focus_query{false};
+std::atomic<bool> override_next_cleanup_focus{false};
 std::atomic<bool> fail_next_pointer_query{false};
 std::atomic<bool> focus_failure_pending{false};
-std::atomic<bool> observe_internal_restore_write{false};
-std::atomic<bool> fail_internal_restore_barrier{false};
 std::atomic<int> injected_raw_events{0};
 std::atomic<bool> slow_injected_raw_events{false};
 std::atomic<int> failed_raw_event_observation{0};
-std::atomic<std::int64_t> ordinary_work_cutoff_ns{0};
-std::atomic<xcb_connection_t *> restore_failed_connection{nullptr};
-std::atomic<bool> restore_reprepare_pending{false};
-std::atomic<bool> restore_xinput_pending{false};
 std::atomic<int> pending_xinput_barrier_fault{0};
 std::atomic<int> pending_xinput_version_fault{0};
 int failed_focus_fault = 0;
@@ -91,10 +130,6 @@ const char *xinput_fault_consumed_marker(int fault) noexcept {
     return "/run/punto-e2e-initial-xinput-barrier-fault-consumed";
   case 2:
     return "/run/punto-e2e-initial-xinput-version-fault-consumed";
-  case 3:
-    return "/run/punto-e2e-reconnect-xinput-barrier-fault-consumed";
-  case 4:
-    return "/run/punto-e2e-reconnect-xinput-version-fault-consumed";
   default:
     return nullptr;
   }
@@ -114,20 +149,211 @@ void observe_admitted_macro_ipc() noexcept {
     macro_ipc_admitted.store(true, std::memory_order_release);
   }
 }
+
+bool hold_private_paste_boundary(const char *arm, const char *reached,
+                                 const char *release) {
+  if (!consume_private_fault_marker(arm)) {
+    return false;
+  }
+  mark_private_macro_event(reached);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  while (std::chrono::steady_clock::now() < deadline &&
+         !consume_private_fault_marker(release)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  return true;
+}
 } // namespace
 
+extern "C" void punto_e2e_before_paste_publication() {
+  macro_ipc_admitted.store(false, std::memory_order_relaxed);
+  macro_ipc_hold.store(true, std::memory_order_release);
+  (void)hold_private_paste_boundary(
+      "/run/punto-e2e-arm-before-paste-publication",
+      "/run/punto-e2e-before-paste-publication",
+      "/run/punto-e2e-release-before-paste-publication");
+  macro_ipc_hold.store(false, std::memory_order_release);
+  if (consume_private_fault_marker(
+          "/run/punto-e2e-expire-before-paste-publication")) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{350});
+  }
+}
+
+extern "C" void punto_e2e_before_paste_receipt_arm() {
+  (void)hold_private_paste_boundary(
+      "/run/punto-e2e-arm-before-paste-receipt",
+      "/run/punto-e2e-before-paste-receipt",
+      "/run/punto-e2e-release-before-paste-receipt");
+}
+
 extern "C" void punto_e2e_after_paste_receipt_arm() {
-  if (!consume_private_fault_marker("/run/punto-e2e-arm-after-paste-receipt")) {
+  (void)hold_private_paste_boundary(
+      "/run/punto-e2e-arm-after-paste-receipt",
+      "/run/punto-e2e-after-paste-receipt",
+      "/run/punto-e2e-release-after-paste-receipt");
+}
+
+extern "C" std::int64_t punto_e2e_after_paste_delivered(void (*pump)(void *),
+                                                        void *owner) {
+  if (!consume_private_fault_marker(
+          "/run/punto-e2e-arm-after-paste-delivered")) {
+    return 0;
+  }
+  const auto started = std::chrono::steady_clock::now();
+  const auto deadline = started + std::chrono::seconds{2};
+  mark_private_macro_event("/run/punto-e2e-after-paste-delivered");
+  while (std::chrono::steady_clock::now() < deadline &&
+         !consume_private_fault_marker(
+             "/run/punto-e2e-release-after-paste-delivered")) {
+    pump(owner);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now() - started)
+      .count();
+}
+
+extern "C" void punto_e2e_before_paste_chord() {
+  if (hold_private_paste_boundary(
+          "/run/punto-e2e-arm-before-paste-chord",
+          "/run/punto-e2e-before-paste-chord",
+          "/run/punto-e2e-release-before-paste-chord")) {
+    if (consume_private_fault_marker(
+            "/run/punto-e2e-paste-chord-without-expiry")) {
+      return;
+    }
+    // Exercise the real tap deadline without replacing its return value.
+    std::this_thread::sleep_for(std::chrono::milliseconds{350});
+  }
+}
+
+extern "C" void punto_e2e_before_editor_compare_apply() {
+  if (!consume_private_fault_marker(
+          "/run/punto-e2e-arm-before-editor-compare-apply")) {
     return;
   }
-  mark_private_macro_event("/run/punto-e2e-after-paste-receipt");
+  mark_private_macro_event("/run/punto-e2e-editor-compare-apply-blocked");
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds{2};
   while (std::chrono::steady_clock::now() < deadline &&
          !consume_private_fault_marker(
-             "/run/punto-e2e-release-after-paste-receipt")) {
+             "/run/punto-e2e-release-editor-compare-apply")) {
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
+}
+
+extern "C" void
+punto_e2e_before_clipboard_payload_transfer(std::uint64_t receipt_id) {
+  if (receipt_id == 0 || !consume_private_fault_marker(
+                             "/run/punto-e2e-arm-delay-clipboard-payload")) {
+    return;
+  }
+  mark_private_macro_event("/run/punto-e2e-clipboard-payload-blocked");
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  while (std::chrono::steady_clock::now() < deadline &&
+         !consume_private_fault_marker(
+             "/run/punto-e2e-release-clipboard-payload")) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+}
+
+extern "C" int punto_e2e_desktop_layout_switch(int source_layout,
+                                               int target_layout) {
+  if (source_layout == target_layout)
+    return 2;
+  if (consume_private_fault_marker("/run/punto-e2e-force-layout-bridge-reject"))
+    return 0;
+  if (consume_private_fault_marker(
+          "/run/punto-e2e-force-layout-bridge-unresolved"))
+    return 3;
+  xcb_connection_t *connection = layout_connection;
+  if (connection == nullptr || xcb_connection_has_error(connection) != 0) {
+    return 0;
+  }
+  if (std::getenv("PUNTO_E2E_DIRECT_LAYOUT_SWITCH") != nullptr) {
+    const auto cookie = xcb_xkb_latch_lock_state_checked(
+        connection, XCB_XKB_ID_USE_CORE_KBD, 0, 0, 1,
+        static_cast<std::uint8_t>(target_layout), 0, 0, 0);
+    xcb_generic_error_t *error = xcb_request_check(connection, cookie);
+    const bool accepted = error == nullptr && xcb_flush(connection) > 0;
+    std::free(error);
+    return accepted ? 1 : 3;
+  }
+  std::uint8_t modifier = KEY_LEFTCTRL + 8U;
+  std::uint8_t trigger = KEY_GRAVE + 8U;
+  if (const char *config_home = std::getenv("XDG_CONFIG_HOME")) {
+    std::ifstream config{std::filesystem::path{config_home} / "punto" /
+                         "config.yaml"};
+    const std::string contents{std::istreambuf_iterator<char>{config}, {}};
+    if (contents.find("modifier: leftalt") != std::string::npos)
+      modifier = KEY_LEFTALT + 8U;
+    if (contents.find("key: rightctrl") != std::string::npos)
+      trigger = KEY_RIGHTCTRL + 8U;
+    else if (contents.find("key: backslash") != std::string::npos)
+      trigger = KEY_BACKSLASH + 8U;
+  }
+  const std::array<std::pair<std::uint8_t, std::uint8_t>, 4> events{{
+      {XCB_KEY_PRESS, modifier},
+      {XCB_KEY_PRESS, trigger},
+      {XCB_KEY_RELEASE, trigger},
+      {XCB_KEY_RELEASE, modifier},
+  }};
+  bool accepted = true;
+  for (const auto &[type, key] : events) {
+    const auto cookie = xcb_test_fake_input_checked(
+        connection, type, key, XCB_CURRENT_TIME, XCB_WINDOW_NONE, 0, 0, 0);
+    xcb_generic_error_t *error = xcb_request_check(connection, cookie);
+    bool acknowledged = error == nullptr;
+    std::free(error);
+    {
+      std::lock_guard lock{keyboard_query_mutex};
+      if (failed_xtest_request ==
+          std::optional{std::pair{connection, cookie.sequence}}) {
+        failed_xtest_request.reset();
+        acknowledged = false;
+        mark_private_macro_event(
+            "/run/punto-e2e-layout-hotkey-ack-fault-consumed");
+      }
+    }
+    accepted = accepted && acknowledged;
+  }
+  accepted = accepted && xcb_flush(connection) > 0;
+  return accepted ? 1 : 3;
+}
+
+extern "C" void punto_e2e_after_layout_applied(std::int64_t deadline_ns) {
+  const bool withhold_focus =
+      consume_private_fault_marker("/run/punto-e2e-withhold-post-bridge-focus");
+  const bool withhold_pointer = consume_private_fault_marker(
+      "/run/punto-e2e-withhold-post-bridge-pointer");
+  if (withhold_focus || withhold_pointer) {
+    std::lock_guard lock{keyboard_query_mutex};
+    if (layout_connection == nullptr || withheld_context_query ||
+        (withhold_focus && withhold_pointer))
+      std::abort();
+    withheld_context_query = WithheldContextQuery{
+        layout_connection, deadline_ns, withhold_pointer, std::nullopt};
+  }
+  if (consume_private_fault_marker(
+          "/run/punto-e2e-expire-before-layout-context")) {
+    const auto layout_deadline = std::chrono::steady_clock::time_point{
+        std::chrono::nanoseconds{deadline_ns}};
+    std::this_thread::sleep_until(layout_deadline +
+                                  std::chrono::milliseconds{2});
+    mark_private_macro_event(
+        "/run/punto-e2e-expire-before-layout-context-consumed");
+  }
+  if (consume_private_fault_marker(
+          "/run/punto-e2e-mutate-xkb-identity-after-layout"))
+    mutate_next_xkb_map.store(true, std::memory_order_release);
+  if (consume_private_fault_marker("/run/punto-e2e-fail-post-bridge-xkb-map"))
+    fail_next_xkb_map.store(true, std::memory_order_release);
+}
+
+extern "C" void punto_e2e_set_layout_connection(xcb_connection_t *connection) {
+  layout_connection = connection;
 }
 
 extern "C" void punto_e2e_after_x11_session_commit(const char *session_id) {
@@ -163,92 +389,35 @@ extern "C" void punto_e2e_before_post_dispatch_wait() {
   }
 }
 
-extern "C" void punto_e2e_after_internal_layout() {
+extern "C" void punto_e2e_after_replay_layout(std::int64_t deadline_ns) {
+  if (consume_private_fault_marker("/run/punto-e2e-fail-after-replay-layout")) {
+    xtest_requests_until_failure.store(1, std::memory_order_release);
+  } else if (consume_private_fault_marker(
+                 "/run/punto-e2e-fail-after-first-replay-stroke")) {
+    xtest_requests_until_failure.store(3, std::memory_order_release);
+  }
   if (consume_private_fault_marker(
-          "/run/punto-e2e-expire-after-internal-layout")) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{350});
+          "/run/punto-e2e-expire-after-replay-layout")) {
+    const auto phase_deadline = std::chrono::steady_clock::time_point{
+        std::chrono::nanoseconds{deadline_ns}};
+    std::this_thread::sleep_until(phase_deadline +
+                                  std::chrono::milliseconds{2});
     return;
   }
-  if (!consume_private_fault_marker(
-          "/run/punto-e2e-arm-after-internal-layout")) {
+  if (!consume_private_fault_marker("/run/punto-e2e-arm-after-replay-layout")) {
     return;
   }
   macro_ipc_admitted.store(false, std::memory_order_relaxed);
   macro_ipc_hold.store(true, std::memory_order_release);
-  mark_private_macro_event("/run/punto-e2e-after-internal-layout");
+  mark_private_macro_event("/run/punto-e2e-after-replay-layout");
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds{2};
   while (std::chrono::steady_clock::now() < deadline &&
          !consume_private_fault_marker(
-             "/run/punto-e2e-release-after-internal-layout")) {
+             "/run/punto-e2e-release-after-replay-layout")) {
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
   macro_ipc_hold.store(false, std::memory_order_release);
-}
-
-extern "C" void punto_e2e_before_internal_layout_change() {
-  if (consume_private_fault_marker(
-          "/run/punto-e2e-expire-before-internal-layout")) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{3450});
-  }
-}
-
-extern "C" void punto_e2e_before_internal_layout_restore() {
-  if (consume_private_fault_marker("/run/punto-e2e-fail-cleanup-focus")) {
-    fail_next_focus_query.store(true, std::memory_order_release);
-    focus_failure_pending.store(true, std::memory_order_release);
-  }
-  if (consume_private_fault_marker("/run/punto-e2e-fail-cleanup-pointer")) {
-    fail_next_pointer_query.store(true, std::memory_order_release);
-  }
-  observe_internal_restore_write.store(
-      consume_private_fault_marker(
-          "/run/punto-e2e-arm-observe-internal-restore"),
-      std::memory_order_release);
-  fail_internal_restore_barrier.store(
-      consume_private_fault_marker(
-          "/run/punto-e2e-fail-internal-restore-barrier"),
-      std::memory_order_release);
-  if (!consume_private_fault_marker(
-          "/run/punto-e2e-arm-before-internal-restore")) {
-    return;
-  }
-  mark_private_macro_event("/run/punto-e2e-before-internal-restore");
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds{2};
-  while (std::chrono::steady_clock::now() < deadline &&
-         !consume_private_fault_marker(
-             "/run/punto-e2e-release-before-internal-restore")) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-}
-
-extern "C" std::int64_t
-punto_e2e_internal_layout_cleanup_start(std::int64_t cleanup_start_ns) {
-  if (consume_private_fault_marker(
-          "/run/punto-e2e-arm-cleanup-reserve-boundary")) {
-    cleanup_start_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            (std::chrono::steady_clock::now() + std::chrono::milliseconds{50})
-                .time_since_epoch())
-            .count();
-    ordinary_work_cutoff_ns.store(cleanup_start_ns, std::memory_order_release);
-  }
-  return cleanup_start_ns;
-}
-
-extern "C" void
-punto_e2e_before_internal_layout_work(std::int64_t cleanup_start_ns) {
-  if (ordinary_work_cutoff_ns.load(std::memory_order_acquire) == 0) {
-    return;
-  }
-  const auto cutoff = std::chrono::steady_clock::time_point{
-      std::chrono::nanoseconds{cleanup_start_ns}};
-  const auto release_at = cutoff + std::chrono::milliseconds{2};
-  while (std::chrono::steady_clock::now() < release_at) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  mark_private_macro_event("/run/punto-e2e-cleanup-reserve-boundary-reached");
 }
 
 extern "C" void punto_e2e_before_raw_key_observation() {
@@ -286,6 +455,192 @@ extern "C" void punto_e2e_before_word_replay() {
                                : "/run/punto-e2e-layout-settle-observed");
 }
 
+extern "C" void punto_e2e_cleanup_receipt_retained() {
+  if (consume_private_fault_marker(
+          "/run/punto-e2e-arm-cleanup-receipt-retained")) {
+    mark_private_macro_event("/run/punto-e2e-cleanup-receipt-retained");
+  }
+}
+
+std::atomic<bool> revoke_cleanup_lease{false};
+
+extern "C" bool punto_e2e_revoke_cleanup_lease() {
+  if (!revoke_cleanup_lease.exchange(false, std::memory_order_acq_rel)) {
+    return false;
+  }
+  if (consume_private_fault_marker(
+          "/run/punto-e2e-bypass-cleanup-lease-revocation")) {
+    return false;
+  }
+  mark_private_macro_event("/run/punto-e2e-cleanup-lease-revoked");
+  return true;
+}
+
+extern "C" bool punto_e2e_bypass_cleanup_selection_identity() {
+  return consume_private_fault_marker(
+      "/run/punto-e2e-bypass-cleanup-selection-identity");
+}
+
+extern "C" void punto_e2e_cleanup_authority_rejected(const char *reason) {
+  if (reason == nullptr) {
+    return;
+  }
+  const std::string marker =
+      "/run/punto-e2e-cleanup-authority-" + std::string{reason};
+  mark_private_macro_event(marker.c_str());
+}
+
+bool inject_private_x11_key(xcb_keycode_t key) {
+  int screen = 0;
+  xcb_connection_t *connection = xcb_connect(nullptr, &screen);
+  if (connection == nullptr || xcb_connection_has_error(connection) != 0) {
+    if (connection != nullptr) {
+      xcb_disconnect(connection);
+    }
+    return false;
+  }
+  const auto send = [&](std::uint8_t type) {
+    const auto cookie = xcb_test_fake_input_checked(
+        connection, type, key, XCB_CURRENT_TIME, XCB_WINDOW_NONE, 0, 0, 0);
+    xcb_generic_error_t *error = xcb_request_check(connection, cookie);
+    const bool accepted = error == nullptr;
+    std::free(error);
+    return accepted;
+  };
+  const bool accepted =
+      send(XCB_KEY_PRESS) && send(XCB_KEY_RELEASE) && xcb_flush(connection) > 0;
+  xcb_disconnect(connection);
+  return accepted;
+}
+
+extern "C" std::int64_t punto_e2e_layout_cleanup_phase(int phase) {
+  const auto started = std::chrono::steady_clock::now();
+  const std::string arm =
+      "/run/punto-e2e-arm-layout-cleanup-phase-" + std::to_string(phase);
+  if (!consume_private_fault_marker(arm.c_str())) {
+    return 0;
+  }
+  if (phase == 3) {
+    const std::pair<const char *, xcb_keycode_t> injections[]{
+        {"f8", static_cast<xcb_keycode_t>(KEY_F8 + 8)},
+        {"right", static_cast<xcb_keycode_t>(KEY_RIGHT + 8)},
+    };
+    for (const auto &[name, key] : injections) {
+      const std::string inject =
+          "/run/punto-e2e-inject-layout-cleanup-" + std::string{name};
+      if (consume_private_fault_marker(inject.c_str()) &&
+          inject_private_x11_key(key)) {
+        const std::string delivered = inject + "-delivered";
+        mark_private_macro_event(delivered.c_str());
+      }
+    }
+  }
+  const std::string reached = "/run/punto-e2e-layout-cleanup-phase-" +
+                              std::to_string(phase) + "-reached";
+  const std::string release =
+      "/run/punto-e2e-release-layout-cleanup-phase-" + std::to_string(phase);
+  mark_private_macro_event(reached.c_str());
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  while (std::chrono::steady_clock::now() < deadline &&
+         !consume_private_fault_marker(release.c_str())) {
+    if (phase == 3 &&
+        consume_private_fault_marker("/run/punto-e2e-revoke-cleanup-lease")) {
+      revoke_cleanup_lease.store(true, std::memory_order_release);
+      mark_private_macro_event(
+          "/run/punto-e2e-cleanup-lease-revocation-commanded");
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now() - started)
+      .count();
+}
+
+extern "C" void punto_e2e_delay_layout_cleanup() {
+  if (consume_private_fault_marker(
+          "/run/punto-e2e-exhaust-layout-cleanup-budget")) {
+    mark_private_macro_event("/run/punto-e2e-layout-cleanup-budget-exhausting");
+    std::this_thread::sleep_for(std::chrono::milliseconds{3500});
+    mark_private_macro_event("/run/punto-e2e-layout-cleanup-budget-exhausted");
+    return;
+  }
+  if (consume_private_fault_marker(
+          "/run/punto-e2e-change-desktop-cleanup-focus-once")) {
+    override_next_cleanup_focus.store(true, std::memory_order_release);
+    mark_private_macro_event(
+        "/run/punto-e2e-desktop-cleanup-focus-change-armed");
+  }
+  if (!consume_private_fault_marker(
+          "/run/punto-e2e-delay-layout-cleanup-150ms")) {
+    return;
+  }
+  mark_private_macro_event("/run/punto-e2e-layout-cleanup-delay-150ms-reached");
+  std::this_thread::sleep_for(std::chrono::milliseconds{150});
+}
+
+extern "C" xcb_window_t punto_e2e_observed_cleanup_focus(xcb_window_t focus) {
+  return override_next_cleanup_focus.exchange(false, std::memory_order_acq_rel)
+             ? XCB_NONE
+             : focus;
+}
+
+extern "C" void punto_e2e_before_selection_revalidation() {
+  if (!consume_private_fault_marker(
+          "/run/punto-e2e-arm-fail-selection-revalidation")) {
+    return;
+  }
+  mark_private_macro_event("/run/punto-e2e-fail-next-primary-payload-read");
+  mark_private_macro_event("/run/punto-e2e-selection-revalidation-fault-armed");
+}
+
+extern "C" void punto_e2e_before_completed_selection_read() {
+  if (consume_private_fault_marker(
+          "/run/punto-e2e-arm-completed-primary-read-observation")) {
+    mark_private_macro_event("/run/punto-e2e-observe-completed-primary-read");
+  }
+}
+
+extern "C" std::int64_t
+punto_e2e_prepared_cleanup_hard_deadline(std::int64_t deadline_ns) {
+  if (!consume_private_fault_marker(
+          "/run/punto-e2e-expire-prepared-cleanup-hard-deadline")) {
+    return deadline_ns;
+  }
+  mark_private_macro_event(
+      "/run/punto-e2e-prepared-cleanup-hard-deadline-expired");
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             (std::chrono::steady_clock::now() - std::chrono::milliseconds{1})
+                 .time_since_epoch())
+      .count();
+}
+
+extern "C" std::int64_t
+punto_e2e_selection_confirmation_deadline(std::int64_t deadline_ns) {
+  if (!consume_private_fault_marker(
+          "/run/punto-e2e-age-selection-confirmation-budget")) {
+    return deadline_ns;
+  }
+  mark_private_macro_event("/run/punto-e2e-selection-confirmation-budget-aged");
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             (std::chrono::steady_clock::now() - std::chrono::milliseconds{1})
+                 .time_since_epoch())
+      .count();
+}
+
+extern "C" std::int64_t
+punto_e2e_selection_observed_deadline(std::int64_t deadline_ns) {
+  if (!consume_private_fault_marker(
+          "/run/punto-e2e-expire-selection-confirmation-after-observation")) {
+    return deadline_ns;
+  }
+  mark_private_macro_event("/run/punto-e2e-selection-confirmation-expired");
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             (std::chrono::steady_clock::now() - std::chrono::milliseconds{1})
+                 .time_since_epoch())
+      .count();
+}
+
 extern "C" decltype(xcb_intern_atom) __real_xcb_intern_atom;
 extern "C" xcb_intern_atom_cookie_t
 __wrap_xcb_intern_atom(xcb_connection_t *connection,
@@ -313,7 +668,17 @@ __wrap_xcb_intern_atom(xcb_connection_t *connection,
     }
     macro_ipc_hold.store(false, std::memory_order_release);
   }
-  return __real_xcb_intern_atom(connection, only_if_exists, length, name);
+  const auto cookie =
+      __real_xcb_intern_atom(connection, only_if_exists, length, name);
+  if (std::string_view{name, length} == "PUNTO_SERVER_TIME") {
+    std::lock_guard lock{keyboard_query_mutex};
+    server_time_queries[connection] = cookie.sequence;
+  }
+  if (std::string_view{name, length} == "UTF8_STRING") {
+    std::lock_guard lock{keyboard_query_mutex};
+    utf8_atom_query = std::pair{connection, cookie.sequence};
+  }
+  return cookie;
 }
 
 extern "C" decltype(xcb_xkb_get_state) __real_xcb_xkb_get_state;
@@ -345,12 +710,16 @@ extern "C" xcb_void_cookie_t __wrap_xcb_test_fake_input_checked(
     std::int16_t root_y, std::uint8_t device_id) {
   const auto cookie = __real_xcb_test_fake_input_checked(
       connection, type, detail, time, root, root_x, root_y, device_id);
-  const auto cutoff = ordinary_work_cutoff_ns.load(std::memory_order_acquire);
-  if (cutoff != 0 && std::chrono::duration_cast<std::chrono::nanoseconds>(
-                         std::chrono::steady_clock::now().time_since_epoch())
-                             .count() >= cutoff) {
-    mark_private_macro_event(
-        "/run/punto-e2e-ordinary-write-in-cleanup-reserve");
+  if (consume_private_fault_marker(
+          "/run/punto-e2e-fail-first-selection-stroke-request")) {
+    std::lock_guard lock{keyboard_query_mutex};
+    failed_xtest_request = std::pair{connection, cookie.sequence};
+  } else if (type == XCB_KEY_RELEASE && detail == KEY_LEFT + 8U &&
+             consume_private_fault_marker(
+                 "/run/punto-e2e-fail-middle-selection-stroke-request")) {
+    // Bind the error to the native selection chord, not a global request count.
+    std::lock_guard lock{keyboard_query_mutex};
+    failed_xtest_request = std::pair{connection, cookie.sequence};
   }
   const auto requests_until_failure =
       xtest_requests_until_failure.load(std::memory_order_acquire);
@@ -359,7 +728,8 @@ extern "C" xcb_void_cookie_t __wrap_xcb_test_fake_input_checked(
     std::lock_guard lock{keyboard_query_mutex};
     failed_xtest_request = std::pair{connection, cookie.sequence};
   }
-  if (type == XCB_KEY_PRESS && detail == KEY_LEFTCTRL + 8U &&
+  if (connection == layout_connection && type == XCB_KEY_PRESS &&
+      detail == KEY_LEFTCTRL + 8U &&
       consume_private_fault_marker("/run/punto-e2e-arm-layout-settle-window")) {
     const auto not_before =
         std::chrono::steady_clock::now() + std::chrono::milliseconds{200};
@@ -369,20 +739,29 @@ extern "C" xcb_void_cookie_t __wrap_xcb_test_fake_input_checked(
             .count(),
         std::memory_order_release);
   }
-  if (type == XCB_KEY_PRESS && detail == KEY_LEFTCTRL + 8U &&
+  if (connection == layout_connection && type == XCB_KEY_PRESS &&
+      detail == KEY_LEFTCTRL + 8U &&
       consume_private_fault_marker(
           "/run/punto-e2e-inject-own-layout-modifier-state")) {
     std::lock_guard lock{keyboard_query_mutex};
     injected_layout_connection = connection;
     injected_layout_state = 1;
-  } else if (type == XCB_KEY_PRESS && detail == KEY_LEFTCTRL + 8U &&
+  } else if (connection == layout_connection && type == XCB_KEY_PRESS &&
+             detail == KEY_LEFTCTRL + 8U &&
              consume_private_fault_marker(
                  "/run/punto-e2e-inject-foreign-layout-modifier-state")) {
     std::lock_guard lock{keyboard_query_mutex};
     injected_layout_connection = connection;
     injected_layout_state = 2;
+  } else if (connection == layout_connection && type == XCB_KEY_PRESS &&
+             detail == KEY_LEFTCTRL + 8U &&
+             consume_private_fault_marker(
+                 "/run/punto-e2e-withhold-post-bridge-xkb-reply")) {
+    std::lock_guard lock{keyboard_query_mutex};
+    injected_layout_connection = connection;
+    injected_layout_state = 3;
   }
-  if (type == XCB_KEY_PRESS &&
+  if (connection == layout_connection && type == XCB_KEY_PRESS &&
       consume_private_fault_marker("/run/punto-e2e-fail-layout-hotkey-send")) {
     std::lock_guard lock{keyboard_query_mutex};
     failed_xtest_request = std::pair{connection, cookie.sequence};
@@ -401,34 +780,66 @@ extern "C" xcb_void_cookie_t __wrap_xcb_xkb_latch_lock_state_checked(
   const auto cookie = __real_xcb_xkb_latch_lock_state_checked(
       connection, device, affect_mod_locks, mod_locks, lock_group, group_lock,
       affect_mod_latches, latch_group, group_latch);
-  if (consume_private_fault_marker(
-          "/run/punto-e2e-fail-internal-layout-barrier")) {
-    fail_next_focus_query.store(true, std::memory_order_release);
-  }
-  if (observe_internal_restore_write.exchange(false,
-                                              std::memory_order_acq_rel)) {
-    mark_private_macro_event("/run/punto-e2e-internal-restore-written");
-  }
-  if (fail_internal_restore_barrier.exchange(false,
-                                             std::memory_order_acq_rel)) {
-    std::lock_guard lock{keyboard_query_mutex};
-    failed_xtest_request = std::pair{connection, cookie.sequence};
-    restore_failed_connection.store(connection, std::memory_order_release);
-    mark_private_macro_event("/run/punto-e2e-internal-restore-barrier-failed");
-  }
-  if (consume_private_fault_marker(
-          "/run/punto-e2e-fail-after-internal-layout")) {
-    xtest_requests_until_failure.store(1, std::memory_order_release);
-  } else if (consume_private_fault_marker(
-                 "/run/punto-e2e-fail-after-first-replay-stroke")) {
-    xtest_requests_until_failure.store(3, std::memory_order_release);
-  }
   return cookie;
+}
+
+static xcb_generic_event_t *observe_polled_event(xcb_connection_t *connection,
+                                                 xcb_generic_event_t *event) {
+  if (event != nullptr &&
+      (event->response_type & 0x7fU) == XCB_SELECTION_NOTIFY) {
+    const auto &notify =
+        *reinterpret_cast<xcb_selection_notify_event_t *>(event);
+    std::lock_guard lock{keyboard_query_mutex};
+    if (completed_primary_read &&
+        completed_primary_read->connection == connection &&
+        completed_primary_read->requestor == notify.requestor &&
+        completed_primary_read->selection == notify.selection &&
+        completed_primary_read->target == notify.target &&
+        completed_primary_read->property == notify.property &&
+        notify.property != XCB_ATOM_NONE) {
+      mark_private_macro_event("/run/punto-e2e-completed-primary-read-replied");
+      completed_primary_read.reset();
+    }
+  }
+  if (event != nullptr &&
+      (event->response_type & 0x7fU) == XCB_PROPERTY_NOTIFY) {
+    const auto &property =
+        *reinterpret_cast<xcb_property_notify_event_t *>(event);
+    std::lock_guard lock{keyboard_query_mutex};
+    const auto atom = server_time_properties.find(connection);
+    if (atom != server_time_properties.end() && atom->second == property.atom &&
+        property.state == XCB_PROPERTY_NEW_VALUE &&
+        property.time != XCB_CURRENT_TIME &&
+        consume_private_fault_marker(
+            "/run/punto-e2e-drop-rollback-timestamp")) {
+      mark_private_macro_event("/run/punto-e2e-rollback-timestamp-dropped");
+      std::free(event);
+      return nullptr;
+    }
+  }
+  return event;
+}
+
+extern "C" decltype(xcb_poll_for_queued_event) __real_xcb_poll_for_queued_event;
+extern "C" xcb_generic_event_t *
+__wrap_xcb_poll_for_queued_event(xcb_connection_t *connection) {
+  for (;;) {
+    auto *event = __real_xcb_poll_for_queued_event(connection);
+    if (event == nullptr)
+      return nullptr;
+    if (auto *observed = observe_polled_event(connection, event))
+      return observed;
+  }
 }
 
 extern "C" decltype(xcb_poll_for_event) __real_xcb_poll_for_event;
 extern "C" xcb_generic_event_t *
 __wrap_xcb_poll_for_event(xcb_connection_t *connection) {
+  if (connection == nullptr) {
+    mark_private_macro_event(
+        "/run/punto-e2e-unsafe-raw-event-poll-on-closed-xcb");
+    return nullptr;
+  }
   int expected_failure = 1;
   if (failed_raw_event_observation.compare_exchange_strong(
           expected_failure, 2, std::memory_order_acq_rel)) {
@@ -452,11 +863,66 @@ __wrap_xcb_poll_for_event(xcb_connection_t *connection) {
     }
     return event;
   }
-  return __real_xcb_poll_for_event(connection);
+  for (;;) {
+    auto *event = __real_xcb_poll_for_event(connection);
+    if (event == nullptr)
+      return nullptr;
+    if (auto *observed = observe_polled_event(connection, event))
+      return observed;
+  }
+}
+
+extern "C" decltype(xcb_convert_selection_checked)
+    __real_xcb_convert_selection_checked;
+extern "C" xcb_void_cookie_t __wrap_xcb_convert_selection_checked(
+    xcb_connection_t *connection, xcb_window_t requestor, xcb_atom_t selection,
+    xcb_atom_t target, xcb_atom_t property, xcb_timestamp_t time) {
+  if (selection == XCB_ATOM_PRIMARY &&
+      consume_private_fault_marker(
+          "/run/punto-e2e-fail-next-primary-transport")) {
+    failed_clipboard_connection.store(connection, std::memory_order_release);
+    return xcb_no_operation_checked(connection);
+  }
+  if (selection == XCB_ATOM_PRIMARY &&
+      consume_private_fault_marker(
+          "/run/punto-e2e-fail-next-primary-payload-read")) {
+    mark_private_macro_event("/run/punto-e2e-primary-payload-read-failed");
+    return xcb_no_operation_checked(connection);
+  }
+  const auto cookie = __real_xcb_convert_selection_checked(
+      connection, requestor, selection, target, property, time);
+  if (selection == XCB_ATOM_PRIMARY &&
+      target == observed_utf8_atom.load(std::memory_order_acquire) &&
+      consume_private_fault_marker(
+          "/run/punto-e2e-observe-completed-primary-read")) {
+    std::lock_guard lock{keyboard_query_mutex};
+    completed_primary_read = ObservedSelectionRequest{
+        connection, requestor, selection, target, property};
+    mark_private_macro_event("/run/punto-e2e-completed-primary-read-submitted");
+  }
+  if (selection == XCB_ATOM_PRIMARY &&
+      target == observed_utf8_atom.load(std::memory_order_acquire) &&
+      consume_private_fault_marker(
+          "/run/punto-e2e-delay-primary-conversion-barrier")) {
+    delayed_primary_read_barrier.store(connection, std::memory_order_release);
+    mark_private_macro_event("/run/punto-e2e-primary-conversion-submitted");
+  }
+  if (selection == XCB_ATOM_PRIMARY &&
+      target == observed_utf8_atom.load(std::memory_order_acquire) &&
+      consume_private_fault_marker(
+          "/run/punto-e2e-withhold-primary-conversion-barrier")) {
+    withheld_primary_read_barrier.store(connection, std::memory_order_release);
+    mark_private_macro_event("/run/punto-e2e-primary-conversion-submitted");
+  }
+  return cookie;
 }
 
 extern "C" decltype(xcb_connection_has_error) __real_xcb_connection_has_error;
 extern "C" int __wrap_xcb_connection_has_error(xcb_connection_t *connection) {
+  if (connection == nullptr)
+    return XCB_CONN_ERROR;
+  if (failed_clipboard_connection.load(std::memory_order_acquire) == connection)
+    return XCB_CONN_ERROR;
   int expected_failure = 2;
   if (failed_raw_event_observation.compare_exchange_strong(
           expected_failure, 0, std::memory_order_acq_rel)) {
@@ -469,6 +935,36 @@ extern "C" decltype(xcb_get_input_focus) __real_xcb_get_input_focus;
 extern "C" xcb_get_input_focus_cookie_t
 __wrap_xcb_get_input_focus(xcb_connection_t *connection) {
   const auto cookie = __real_xcb_get_input_focus(connection);
+  {
+    std::lock_guard lock{keyboard_query_mutex};
+    if (withheld_context_query &&
+        withheld_context_query->connection == connection &&
+        !withheld_context_query->pointer && !withheld_context_query->sequence)
+      withheld_context_query->sequence = cookie.sequence;
+  }
+  auto expected = connection;
+  if (delayed_primary_read_barrier.compare_exchange_strong(
+          expected, nullptr, std::memory_order_acq_rel)) {
+    if (xcb_flush(connection) <= 0) {
+      std::abort();
+    }
+    mark_private_macro_event(
+        "/run/punto-e2e-primary-conversion-barrier-submitted");
+    std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    mark_private_macro_event(
+        "/run/punto-e2e-primary-conversion-barrier-delay-complete");
+  }
+  expected = connection;
+  if (withheld_primary_read_barrier.compare_exchange_strong(
+          expected, nullptr, std::memory_order_acq_rel)) {
+    if (xcb_flush(connection) <= 0) {
+      std::abort();
+    }
+    std::lock_guard lock{keyboard_query_mutex};
+    withheld_primary_read_query = std::pair{connection, cookie.sequence};
+    mark_private_macro_event(
+        "/run/punto-e2e-primary-conversion-barrier-submitted");
+  }
   const int xinput_fault =
       pending_xinput_barrier_fault.exchange(0, std::memory_order_acq_rel);
   if (xinput_fault != 0) {
@@ -488,30 +984,13 @@ extern "C" decltype(xcb_prefetch_extension_data)
     __real_xcb_prefetch_extension_data;
 extern "C" void __wrap_xcb_prefetch_extension_data(xcb_connection_t *connection,
                                                    xcb_extension_t *extension) {
-  if (extension == &xcb_test_id &&
-      restore_reprepare_pending.exchange(false, std::memory_order_acq_rel)) {
-    restore_xinput_pending.store(true, std::memory_order_release);
-    mark_private_macro_event("/run/punto-e2e-internal-restore-reconnected");
-  }
   if (extension == &xcb_input_id) {
-    const bool reconnect =
-        restore_xinput_pending.exchange(false, std::memory_order_acq_rel);
-    if (reconnect) {
-      mark_private_macro_event(
-          "/run/punto-e2e-reconnect-xinput-preparation-entered");
-    }
-    const char *barrier = reconnect
-                              ? "/run/punto-e2e-fail-reconnect-xinput-barrier"
-                              : "/run/punto-e2e-fail-initial-xinput-barrier";
-    const char *version = reconnect
-                              ? "/run/punto-e2e-fail-reconnect-xinput-version"
-                              : "/run/punto-e2e-fail-initial-xinput-version";
+    const char *barrier = "/run/punto-e2e-fail-initial-xinput-barrier";
+    const char *version = "/run/punto-e2e-fail-initial-xinput-version";
     if (consume_private_fault_marker(barrier)) {
-      pending_xinput_barrier_fault.store(reconnect ? 3 : 1,
-                                         std::memory_order_release);
+      pending_xinput_barrier_fault.store(1, std::memory_order_release);
     } else if (consume_private_fault_marker(version)) {
-      pending_xinput_version_fault.store(reconnect ? 4 : 2,
-                                         std::memory_order_release);
+      pending_xinput_version_fault.store(2, std::memory_order_release);
     }
   }
   __real_xcb_prefetch_extension_data(connection, extension);
@@ -554,6 +1033,13 @@ __wrap_xcb_query_pointer(xcb_connection_t *connection, xcb_window_t window) {
         "/run/punto-e2e-unsafe-pointer-after-focus-failure");
   }
   const auto cookie = __real_xcb_query_pointer(connection, window);
+  {
+    std::lock_guard lock{keyboard_query_mutex};
+    if (withheld_context_query &&
+        withheld_context_query->connection == connection &&
+        withheld_context_query->pointer && !withheld_context_query->sequence)
+      withheld_context_query->sequence = cookie.sequence;
+  }
   if (fail_next_pointer_query.exchange(false, std::memory_order_acq_rel)) {
     std::lock_guard lock{keyboard_query_mutex};
     failed_pointer_query = std::pair{connection, cookie.sequence};
@@ -566,7 +1052,8 @@ __wrap_xcb_xkb_get_state(xcb_connection_t *connection,
                          xcb_xkb_device_spec_t device) {
   const auto cookie = __real_xcb_xkb_get_state(connection, device);
   std::lock_guard lock{keyboard_query_mutex};
-  if (consume_private_fault_marker("/run/punto-e2e-arm-keyboard-observation")) {
+  if (!fixture_session_query &&
+      consume_private_fault_marker("/run/punto-e2e-arm-keyboard-observation")) {
     keyboard_query = std::pair{connection, cookie.sequence};
   }
   if (injected_layout_state != 0 && injected_layout_connection == connection) {
@@ -580,13 +1067,27 @@ extern "C" int __wrap_xcb_poll_for_reply(xcb_connection_t *connection,
                                          unsigned int sequence, void **reply,
                                          xcb_generic_error_t **error) {
   bool inject_protocol_error = false;
+  bool inject_xkb_map_error = false;
   int consumed_xinput_fault = 0;
   {
     std::lock_guard lock{keyboard_query_mutex};
     const auto request = std::optional{std::pair{connection, sequence}};
+    if (withheld_layout_query == request ||
+        withheld_primary_read_query == request ||
+        (withheld_context_query && withheld_context_query->captured &&
+         withheld_context_query->connection == connection &&
+         withheld_context_query->sequence == sequence)) {
+      *reply = nullptr;
+      *error = nullptr;
+      return 0;
+    }
     if (failed_keymap_query == request) {
       failed_keymap_query.reset();
       inject_protocol_error = true;
+    } else if (failed_xkb_map_query == request) {
+      failed_xkb_map_query.reset();
+      inject_protocol_error = true;
+      inject_xkb_map_error = true;
     } else if (failed_xtest_request == request) {
       failed_xtest_request.reset();
       inject_protocol_error = true;
@@ -607,6 +1108,8 @@ extern "C" int __wrap_xcb_poll_for_reply(xcb_connection_t *connection,
     }
   }
   if (inject_protocol_error) {
+    if (inject_xkb_map_error)
+      mark_private_macro_event("/run/punto-e2e-xkb-map-error-consumed");
     if (const auto *marker =
             xinput_fault_consumed_marker(consumed_xinput_fault)) {
       mark_private_macro_event(marker);
@@ -626,8 +1129,56 @@ extern "C" int __wrap_xcb_poll_for_reply(xcb_connection_t *connection,
   bool observed = false;
   int injected = 0;
   bool inject_foreign_key = false;
+  bool withhold_context = false;
+  bool context_pointer = false;
+  {
+    std::lock_guard lock{keyboard_query_mutex};
+    if (withheld_context_query &&
+        withheld_context_query->connection == connection &&
+        withheld_context_query->sequence == sequence && result != 0) {
+      const auto now_ns =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count();
+      if (reply == nullptr || *reply == nullptr ||
+          (error != nullptr && *error != nullptr) ||
+          now_ns >= withheld_context_query->deadline_ns)
+        std::abort();
+      context_pointer = withheld_context_query->pointer;
+      if (!context_pointer) {
+        const auto *focus = static_cast<xcb_get_input_focus_reply_t *>(*reply);
+        if (focus->focus == XCB_WINDOW_NONE ||
+            focus->focus == XCB_INPUT_FOCUS_POINTER_ROOT)
+          std::abort();
+      }
+      withheld_context_query->captured = true;
+      withhold_context = true;
+    }
+  }
+  if (withhold_context) {
+    std::free(*reply);
+    *reply = nullptr;
+    *error = nullptr;
+    mark_private_macro_event(
+        context_pointer ? "/run/punto-e2e-post-bridge-pointer-reply-withheld"
+                        : "/run/punto-e2e-post-bridge-focus-reply-withheld");
+    return 0;
+  }
   if (result != 0 && reply != nullptr && *reply != nullptr) {
     std::lock_guard lock{keyboard_query_mutex};
+    if (utf8_atom_query == std::optional{std::pair{connection, sequence}}) {
+      utf8_atom_query.reset();
+      observed_utf8_atom.store(
+          static_cast<xcb_intern_atom_reply_t *>(*reply)->atom,
+          std::memory_order_release);
+    }
+    const auto time_query = server_time_queries.find(connection);
+    if (time_query != server_time_queries.end() &&
+        time_query->second == sequence) {
+      server_time_queries.erase(time_query);
+      server_time_properties[connection] =
+          static_cast<xcb_intern_atom_reply_t *>(*reply)->atom;
+    }
     if (keyboard_query == std::optional{std::pair{connection, sequence}}) {
       keyboard_query.reset();
       observed = true;
@@ -638,6 +1189,9 @@ extern "C" int __wrap_xcb_poll_for_reply(xcb_connection_t *connection,
       injected_layout_connection = nullptr;
       injected = injected_layout_state;
       injected_layout_state = 0;
+      if (injected == 3) {
+        withheld_layout_query = std::pair{connection, sequence};
+      }
     }
     if (injected_keymap_query ==
         std::optional{std::pair{connection, sequence}}) {
@@ -645,6 +1199,29 @@ extern "C" int __wrap_xcb_poll_for_reply(xcb_connection_t *connection,
       injected_keymap_connection = nullptr;
       inject_foreign_key = true;
     }
+    if (mutated_xkb_map_query ==
+        std::optional{std::pair{connection, sequence}}) {
+      mutated_xkb_map_query.reset();
+      auto *map = static_cast<xcb_xkb_get_map_reply_t *>(*reply);
+      xcb_xkb_get_map_map_t contents{};
+      xcb_xkb_get_map_map_unpack(
+          xcb_xkb_get_map_map(map), map->nTypes, map->nKeySyms,
+          map->nKeyActions, map->totalActions, map->totalKeyBehaviors,
+          map->virtualMods, map->totalKeyExplicit, map->totalModMapKeys,
+          map->totalVModMapKeys, map->present, &contents);
+      auto types = xcb_xkb_get_map_map_types_rtrn_iterator(map, &contents);
+      if (types.rem <= 0)
+        std::abort();
+      types.data->mods_mask ^= XCB_MOD_MASK_5;
+      mark_private_macro_event("/run/punto-e2e-xkb-map-identity-mutated");
+    }
+  }
+  if (injected == 3) {
+    std::free(*reply);
+    *reply = nullptr;
+    *error = nullptr;
+    mark_private_macro_event("/run/punto-e2e-post-bridge-xkb-reply-withheld");
+    return 0;
   }
   if (injected != 0) {
     auto *state = static_cast<xcb_xkb_get_state_reply_t *>(*reply);
@@ -670,6 +1247,10 @@ extern "C" int __wrap_xcb_poll_for_reply(xcb_connection_t *connection,
         ::open("/run/punto-e2e-keyboard-observed",
                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (marker >= 0) {
+      const auto request = std::to_string(keyboard_request_id) + "\n";
+      if (::write(marker, request.data(), request.size()) !=
+          static_cast<ssize_t>(request.size()))
+        std::abort();
       (void)::close(marker);
     }
     // Test-only delayed delivery of an already captured reply, not a server
@@ -687,17 +1268,39 @@ extern "C" int __wrap_xcb_poll_for_reply(xcb_connection_t *connection,
 
 extern "C" decltype(xcb_disconnect) __real_xcb_disconnect;
 extern "C" void __wrap_xcb_disconnect(xcb_connection_t *connection) {
-  if (restore_failed_connection.exchange(nullptr, std::memory_order_acq_rel) ==
-      connection) {
-    restore_reprepare_pending.store(true, std::memory_order_release);
+  {
+    std::lock_guard lock{keyboard_query_mutex};
+    if (completed_primary_read &&
+        completed_primary_read->connection == connection) {
+      completed_primary_read.reset();
+    }
+    if (withheld_primary_read_query &&
+        withheld_primary_read_query->first == connection) {
+      withheld_primary_read_query.reset();
+    }
+    if (withheld_context_query &&
+        withheld_context_query->connection == connection) {
+      withheld_context_query.reset();
+    }
+    if (utf8_atom_query && utf8_atom_query->first == connection) {
+      utf8_atom_query.reset();
+    }
   }
+  xcb_connection_t *failed_clipboard = connection;
+  (void)failed_clipboard_connection.compare_exchange_strong(
+      failed_clipboard, nullptr, std::memory_order_acq_rel);
   {
     std::lock_guard lock{keyboard_query_mutex};
     if (keyboard_query && keyboard_query->first == connection) {
       keyboard_query.reset();
     }
+    server_time_queries.erase(connection);
+    server_time_properties.erase(connection);
     if (failed_keymap_query && failed_keymap_query->first == connection) {
       failed_keymap_query.reset();
+    }
+    if (failed_xkb_map_query && failed_xkb_map_query->first == connection) {
+      failed_xkb_map_query.reset();
     }
     if (failed_xtest_request && failed_xtest_request->first == connection) {
       failed_xtest_request.reset();
@@ -720,6 +1323,9 @@ extern "C" void __wrap_xcb_disconnect(xcb_connection_t *connection) {
       injected_layout_connection = nullptr;
       injected_layout_query.reset();
       injected_layout_state = 0;
+    }
+    if (withheld_layout_query && withheld_layout_query->first == connection) {
+      withheld_layout_query.reset();
     }
     if (injected_keymap_connection == connection) {
       injected_keymap_connection = nullptr;
@@ -757,11 +1363,28 @@ extern "C" xcb_xkb_get_map_cookie_t __wrap_xcb_xkb_get_map(
   if (consume_private_fault_marker("/run/punto-e2e-fail-xkb-map")) {
     return {};
   }
-  return __real_xcb_xkb_get_map(
+  const auto cookie = __real_xcb_xkb_get_map(
       connection, device, full, partial, first_type, types, first_symbol,
       symbols, first_action, actions, first_behavior, behaviors,
       virtual_modifiers, first_explicit, explicit_count, first_modifier,
       modifiers, first_virtual_modifier, virtual_modifier_count);
+  if (fail_next_xkb_map.exchange(false, std::memory_order_acq_rel)) {
+    std::lock_guard lock{keyboard_query_mutex};
+    failed_xkb_map_query = std::pair{connection, cookie.sequence};
+  }
+  if (consume_private_fault_marker("/run/punto-e2e-mutate-resolve-xkb-map"))
+    mutate_xkb_map_after_queries.store(1, std::memory_order_release);
+  const int delayed_mutation =
+      mutate_xkb_map_after_queries.load(std::memory_order_acquire);
+  const bool mutate_delayed =
+      delayed_mutation >= 0 &&
+      mutate_xkb_map_after_queries.fetch_sub(1, std::memory_order_acq_rel) == 0;
+  if (mutate_next_xkb_map.exchange(false, std::memory_order_acq_rel) ||
+      mutate_delayed) {
+    std::lock_guard lock{keyboard_query_mutex};
+    mutated_xkb_map_query = std::pair{connection, cookie.sequence};
+  }
+  return cookie;
 }
 
 namespace {
@@ -870,6 +1493,28 @@ punto::x11_detail::ProbeResult probe_test_session() {
     }
   }
 
+  if (std::getenv("PUNTO_E2E_DYNAMIC_LAYOUT") == nullptr &&
+      std::getenv("PUNTO_E2E_OBSERVED_LAYOUT") == nullptr &&
+      std::getenv("PUNTO_E2E_PROBE_DISPLAY") == nullptr) {
+    struct ScopedSessionQuery {
+      bool previous = fixture_session_query;
+      ScopedSessionQuery() { fixture_session_query = true; }
+      ~ScopedSessionQuery() { fixture_session_query = previous; }
+    } query;
+    punto::X11Session observer{[&info] {
+      return punto::x11_detail::ProbeResult{
+          punto::x11_detail::ProbeStatus::Healthy, info};
+    }};
+    if (!observer.initialize())
+      return {punto::x11_detail::ProbeStatus::Failed, {}};
+    const int group = observer.get_current_keyboard_layout();
+    if (group != 0 && group != 1)
+      return {punto::x11_detail::ProbeStatus::Failed, {}};
+    info.observed_keyboard_layout = group;
+  }
+
+  std::cerr << "[fixture] session_snapshot group="
+            << info.observed_keyboard_layout << "\n";
   return {punto::x11_detail::ProbeStatus::Healthy, std::move(info)};
 }
 

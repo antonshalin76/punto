@@ -4,11 +4,15 @@
  */
 
 #include "punto/event_loop.hpp"
+
 #include "punto/key_entry_text.hpp"
 #include "punto/logger.hpp"
 #include "punto/scancode_map.hpp"
 #include "punto/sound_manager.hpp"
 #include "punto/undo_detector.hpp"
+#include <glib.h>
+
+#include <glib.h>
 
 #include <algorithm>
 #include <cctype>
@@ -41,7 +45,15 @@ constexpr auto kControlPlanePollInterval = std::chrono::seconds{2};
 constexpr auto kRuntimeShutdownDeadline = std::chrono::seconds{3};
 constexpr auto kOutputWriteTimeout = std::chrono::seconds{2};
 constexpr std::size_t kMacroEventCapacity = 4096;
+constexpr auto kFrameCoalesceBudget = std::chrono::milliseconds{4};
 constexpr auto kUndoWindow = std::chrono::milliseconds{2500};
+
+#if defined(PUNTO_DELIVERED_TRIGGER_PROTOTYPE)
+bool is_source_private_control(const input_event &event) noexcept {
+  return event.type == EV_MSC && event.code == MSC_SERIAL &&
+         (static_cast<std::uint32_t>(event.value) & 0xffff0000U) == 0x50550000U;
+}
+#endif
 
 std::string word_exclusion_key(std::span<const KeyEntry> word) {
   std::string key;
@@ -55,6 +67,15 @@ std::string word_exclusion_key(std::span<const KeyEntry> word) {
     key += character;
   }
   return key;
+}
+
+bool same_typing_context(const X11Session::KeyboardObservation &history,
+                         const X11Session::KeyboardObservation &current) {
+  return history.session_generation == current.session_generation &&
+         history.focus_window == current.focus_window &&
+         history.pointer_x == current.pointer_x &&
+         history.pointer_y == current.pointer_y &&
+         history.pointer_buttons == current.pointer_buttons;
 }
 
 KeyEntry normalize_caps(KeyEntry key, int layout, bool caps) {
@@ -441,6 +462,47 @@ EventLoop::~EventLoop() { shutdown_runtime(); }
 
 void EventLoop::set_stop_signal_fd(int fd) noexcept { stop_signal_fd_ = fd; }
 
+bool EventLoop::set_ingress_transport(
+    std::unique_ptr<XorgInputTransport> transport, int ready_fd,
+    std::string display, std::uint32_t desktop_uid) noexcept {
+  if (!transport || ready_fd < 0 ||
+      !x11_session_->constrain_to_target(std::move(display), desktop_uid)) {
+    return false;
+  }
+  ingress_transport_ = std::move(transport);
+  ingress_ready_fd_ = ready_fd;
+  return true;
+}
+
+EventLoop::CapturedEvent
+EventLoop::capture_event(const input_event &event) noexcept {
+  CapturedEvent captured{};
+  static_cast<input_event &>(captured) = event;
+  captured.source_index = next_capture_source_index_;
+  if (next_capture_source_index_ == UINT32_MAX) {
+    fail_input_pipeline();
+  } else if (event.type == EV_SYN && event.code == SYN_REPORT) {
+    next_capture_source_index_ = 0;
+  } else {
+    ++next_capture_source_index_;
+  }
+  return captured;
+}
+
+void EventLoop::handle_captured_event(const CapturedEvent &event) {
+  const auto previous = current_source_index_;
+  current_source_index_ = event.source_index;
+  handle_event(event);
+  current_source_index_ = previous;
+}
+
+void EventLoop::emit_captured_event(const CapturedEvent &event) {
+  const auto previous = current_source_index_;
+  current_source_index_ = event.source_index;
+  emit_passthrough_event(event);
+  current_source_index_ = previous;
+}
+
 bool EventLoop::start_config_loader() noexcept {
   if (config_loader_thread_.joinable()) {
     return true;
@@ -646,8 +708,14 @@ bool EventLoop::initialize() {
 
   // Session/account discovery may enter NSS. It always starts on the bounded
   // background refresh lane; keyboard passthrough and shutdown stay live.
-  x11_refresh_pending_ = x11_session_->start_background_refresh();
-  x11_health_.degrade();
+  if (ingress_transport_) {
+    // The authenticated producer can be ready on a private fixture server.
+    // No desktop observation or write lease is inferred from that transport.
+    x11_health_.degrade();
+  } else {
+    x11_refresh_pending_ = x11_session_->start_background_refresh();
+    x11_health_.degrade();
+  }
 
   const bool control_plane_lease_acquired = control_plane_lease_.try_acquire();
   const bool control_plane_ready = control_plane_lease_acquired &&
@@ -720,8 +788,26 @@ void EventLoop::request_stop() noexcept {
 
 int EventLoop::run() {
   if (!initialize()) {
+    if (ingress_ready_fd_ >= 0) {
+      ::close(ingress_ready_fd_);
+      ingress_ready_fd_ = -1;
+    }
     std::cerr << "[punto] Failed to initialize event loop\n";
     return exit_code_ != 0 ? exit_code_ : 2;
+  }
+
+  if (ingress_transport_) {
+    constexpr char kReady = 'R';
+    const bool ready =
+        ingress_ready_fd_ >= 0 && ::write(ingress_ready_fd_, &kReady, 1) == 1;
+    if (ingress_ready_fd_ >= 0)
+      ::close(ingress_ready_fd_);
+    ingress_ready_fd_ = -1;
+    if (!ready) {
+      fail_input_pipeline();
+      shutdown_runtime();
+      return 3;
+    }
   }
 
   std::cerr << "[punto] Startup layout group: " << current_layout_ << "\n";
@@ -784,6 +870,11 @@ int EventLoop::run() {
 
   // Главный цикл: проверяем флаг остановки на каждой итерации
   while (!stop_requested_.load(std::memory_order_relaxed)) {
+    if (ingress_transport_ && ingress_transport_->terminal_failure()) {
+      std::cerr << "[punto] ingress server terminal outcome or disconnect\n";
+      fail_input_pipeline();
+      break;
+    }
     drain_pending_events();
     poll_dictionary_load_completion();
     poll_config_load_completion();
@@ -825,7 +916,7 @@ int EventLoop::run() {
       }
 
       // Запускаем фоновый refresh если пришло время и нет активного
-      if (!x11_refresh_pending_ &&
+      if (!ingress_transport_ && !x11_refresh_pending_ &&
           now - last_x11_check_time >= kX11CheckInterval) {
         x11_refresh_pending_ = x11_session_->start_background_refresh();
       }
@@ -902,13 +993,27 @@ int EventLoop::run() {
     // Drain completed analysis even while input is idle so health and
     // diagnostic counters stay current.
     process_ready_results();
+    flush_unfinished_read_frame();
+    process_held_tab();
+    process_pending_learning();
     if (stop_requested_.load(std::memory_order_relaxed)) {
       break;
+    }
+    // Drain the captured prefix before admitting new stdin bytes after a macro.
+    if (!held_tab_ && !pending_events_.empty()) {
+      continue;
     }
 
     std::array<pollfd, 2> pfds{};
     nfds_t nfds = 1;
-    pfds[0] = pfd;
+    pfds[0] = pollfd{STDIN_FILENO, POLLIN, 0};
+    if (macro_input_eof_ ||
+        (held_tab_ && pending_events_.size() >= kMacroEventCapacity)) {
+      // Stop accepting upstream bytes until the held frame is released.
+      // The kernel pipe provides bounded backpressure; do not drop a frame.
+      pfds[0].fd = -1;
+      pfds[0].events = 0;
+    }
     if (stop_signal_fd_ >= 0) {
       pfds[1] = pollfd{stop_signal_fd_, POLLIN, 0};
       nfds = 2;
@@ -932,46 +1037,77 @@ int EventLoop::run() {
       if ((pfd.revents & (POLLERR | POLLNVAL)) && !(pfd.revents & POLLIN)) {
         fail_input_pipeline();
         exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
+        if (held_tab_)
+          release_held_tab();
+        drain_pending_events();
         std::cerr << "[punto] stdin poll failure (revents=0x" << std::hex
                   << pfd.revents << std::dec << ")\n";
         break;
       }
       if ((pfd.revents & POLLHUP) && !(pfd.revents & POLLIN)) {
-        if (input_frame_size_ != 0 || !input_frame_accepts_.empty()) {
-          fail_input_pipeline();
-          exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
-          std::cerr << "[punto] stdin closed with an incomplete input frame\n";
-        } else {
-          std::cerr << "[punto] stdin closed, exiting gracefully\n";
+        macro_input_eof_ = true;
+        if (held_tab_) {
+          release_held_tab();
+          reset_async_state();
+          buffer_.reset_all();
         }
-        break;
+        drain_pending_events();
+        continue;
       }
 
       if (pfd.revents & POLLIN) {
         switch (read_input_event(STDIN_FILENO, ev, input_frame_bytes_,
                                  input_frame_size_)) {
-        case ReadEventStatus::Ok:
+        case ReadEventStatus::Ok: {
+#if defined(PUNTO_DELIVERED_TRIGGER_PROTOTYPE)
+          if (is_source_private_control(ev))
+            continue;
+#endif
           note_input_event_accepted(ev);
-          handle_event(ev);
-          note_input_event_committed(ev);
+          const auto captured = capture_event(ev);
+          if (held_tab_) {
+            pending_events_.push_back(captured);
+          } else if (read_frame_passthrough_) {
+            handle_captured_event(captured);
+            if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+              ++input_frame_sequence_;
+              note_input_event_committed(ev);
+              read_frame_passthrough_ = false;
+            }
+          } else {
+            if (read_frame_events_.empty()) {
+              read_frame_started_at_ = std::chrono::steady_clock::now();
+            }
+            read_frame_events_.push_back(captured);
+            if (read_frame_events_.size() > kMacroEventCapacity) {
+              fail_input_pipeline();
+              request_stop();
+              break;
+            }
+            if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+              dispatch_read_frame();
+            }
+          }
           process_ready_results();
           continue;
+        }
         case ReadEventStatus::Again:
           continue;
         case ReadEventStatus::Eof:
-          if (!input_frame_accepts_.empty()) {
-            fail_input_pipeline();
-            exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
-            std::cerr
-                << "[punto] stdin closed with an incomplete input frame\n";
-          } else {
-            std::cerr << "[punto] stdin closed, exiting gracefully\n";
+          macro_input_eof_ = true;
+          if (held_tab_) {
+            release_held_tab();
+            reset_async_state();
+            buffer_.reset_all();
           }
-          stop_requested_.store(true, std::memory_order_relaxed);
+          drain_pending_events();
           continue;
         case ReadEventStatus::Truncated:
           fail_input_pipeline();
           exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
+          if (held_tab_)
+            release_held_tab();
+          drain_pending_events();
           std::cerr << "[punto] stdin closed with an incomplete input_event\n";
           stop_requested_.store(true, std::memory_order_relaxed);
           continue;
@@ -979,6 +1115,9 @@ int EventLoop::run() {
         default:
           fail_input_pipeline();
           exit_code_ = (exit_code_ == 0) ? 3 : exit_code_;
+          if (held_tab_)
+            release_held_tab();
+          drain_pending_events();
           std::cerr << "[punto] stdin read failed: " << std::strerror(errno)
                     << "\n";
           stop_requested_.store(true, std::memory_order_relaxed);
@@ -988,8 +1127,11 @@ int EventLoop::run() {
     }
 
     if (ret == 0) {
+      flush_unfinished_read_frame();
       process_word_observation(/*input_idle=*/true);
+      process_held_tab();
       process_pending_word_edit();
+      warm_editor_context();
       continue; // timeout
     }
 
@@ -1011,6 +1153,44 @@ int EventLoop::run() {
 }
 
 void EventLoop::emit_passthrough_event(const input_event &ev) {
+  // Pause controls Punto and must never reach the virtual keyboard, even
+  // while another edit owns the input window.
+  if (ev.type == EV_KEY && ev.code == KEY_PAUSE) {
+    return;
+  }
+  if (defer_frame_output_) {
+    return;
+  }
+  if (ingress_transport_) {
+    if (!current_source_index_ || !ingress_frame_sequence_) {
+      fail_input_pipeline();
+      return;
+    }
+    if (!ingress_frame_)
+      ingress_frame_.emplace(ingress_transport_->stream_epoch(),
+                             ingress_frame_sequence_);
+    if (!ingress_frame_->append_input(ev, *current_source_index_)) {
+      std::cerr << "[punto] ingress rejected an unencodable source event\n";
+      fail_input_pipeline();
+      return;
+    }
+    if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
+      auto packet = ingress_frame_->finish();
+      ingress_frame_.reset();
+      if (!packet ||
+          !ingress_transport_->submit(*packet, std::chrono::milliseconds{50})) {
+        std::cerr << "[punto] ingress frame outcome is not accepted\n";
+        fail_input_pipeline();
+        return;
+      }
+      if (ingress_frame_sequence_ == UINT64_MAX) {
+        fail_input_pipeline();
+        return;
+      }
+      ++ingress_frame_sequence_;
+    }
+    return;
+  }
   const auto *next = reinterpret_cast<const std::uint8_t *>(&ev);
   std::size_t remaining = sizeof(ev);
   const auto deadline = std::chrono::steady_clock::now() + kOutputWriteTimeout;
@@ -1054,6 +1234,192 @@ void EventLoop::emit_passthrough_event(const input_event &ev) {
   }
 }
 
+void EventLoop::emit_private_pause(int value) {
+  if (!ingress_transport_)
+    return;
+  if (!current_source_index_ || defer_frame_output_) {
+    fail_input_pipeline();
+    return;
+  }
+  if (value == 1 && !pause_down_) {
+    if (ingress_request_sequence_ == UINT64_MAX) {
+      fail_input_pipeline();
+      return;
+    }
+    const auto action = determine_hotkey_action();
+    switch (action) {
+    case HotkeyAction::InvertLayoutWord:
+      ingress_pause_action_ = PUNTO_ACTION_LAYOUT_WORD;
+      break;
+    case HotkeyAction::InvertLayoutSelection:
+      ingress_pause_action_ = PUNTO_ACTION_LAYOUT_SELECTION;
+      break;
+    case HotkeyAction::InvertCaseWord:
+      ingress_pause_action_ = PUNTO_ACTION_CASE_WORD;
+      break;
+    case HotkeyAction::InvertCaseSelection:
+      ingress_pause_action_ = PUNTO_ACTION_CASE_SELECTION;
+      break;
+    case HotkeyAction::TranslitSelection:
+      ingress_pause_action_ = PUNTO_ACTION_TRANSLIT_SELECTION;
+      break;
+    case HotkeyAction::NoAction:
+      fail_input_pipeline();
+      return;
+    }
+    ingress_pause_request_ = ++ingress_request_sequence_;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds{1000};
+    ingress_pause_deadline_ns_ = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            deadline.time_since_epoch())
+            .count());
+    ingress_pause_modifiers_ =
+        (held_keys_.test(KEY_LEFTSHIFT)
+             ? static_cast<std::uint32_t>(PUNTO_MOD_LEFT_SHIFT)
+             : 0U) |
+        (held_keys_.test(KEY_RIGHTSHIFT)
+             ? static_cast<std::uint32_t>(PUNTO_MOD_RIGHT_SHIFT)
+             : 0U) |
+        (held_keys_.test(KEY_LEFTCTRL)
+             ? static_cast<std::uint32_t>(PUNTO_MOD_LEFT_CTRL)
+             : 0U) |
+        (held_keys_.test(KEY_RIGHTCTRL)
+             ? static_cast<std::uint32_t>(PUNTO_MOD_RIGHT_CTRL)
+             : 0U) |
+        (held_keys_.test(KEY_LEFTALT)
+             ? static_cast<std::uint32_t>(PUNTO_MOD_LEFT_ALT)
+             : 0U) |
+        (held_keys_.test(KEY_RIGHTALT)
+             ? static_cast<std::uint32_t>(PUNTO_MOD_RIGHT_ALT)
+             : 0U) |
+        (held_keys_.test(KEY_LEFTMETA)
+             ? static_cast<std::uint32_t>(PUNTO_MOD_LEFT_META)
+             : 0U) |
+        (held_keys_.test(KEY_RIGHTMETA)
+             ? static_cast<std::uint32_t>(PUNTO_MOD_RIGHT_META)
+             : 0U);
+  } else if (!ingress_pause_request_ || (value != 0 && value != 2)) {
+    return;
+  }
+  if (!ingress_frame_)
+    ingress_frame_.emplace(ingress_transport_->stream_epoch(),
+                           ingress_frame_sequence_);
+  if (!ingress_frame_->append_pause(
+          *current_source_index_, value, ingress_pause_action_,
+          ingress_pause_modifiers_, ingress_pause_request_,
+          ingress_pause_deadline_ns_)) {
+    std::cerr << "[punto] ingress rejected a private Pause record\n";
+    fail_input_pipeline();
+  }
+  if (value == 0) {
+    ingress_pause_request_ = 0;
+    ingress_pause_deadline_ns_ = 0;
+  }
+}
+
+void EventLoop::dispatch_read_frame() {
+  if (read_frame_events_.empty()) {
+    return;
+  }
+  ++input_frame_sequence_;
+  read_frame_started_at_ = {};
+  const auto trigger =
+      std::find_if(read_frame_events_.begin(), read_frame_events_.end(),
+                   [](const input_event &event) {
+                     return event.type == EV_KEY && event.code == KEY_TAB &&
+                            event.value == 1;
+                   });
+  const bool single_tab_press =
+      trigger != read_frame_events_.end() &&
+      std::count_if(
+          read_frame_events_.begin(), read_frame_events_.end(),
+          [](const input_event &event) { return event.type == EV_KEY; }) == 1;
+  const bool eligible =
+      !ingress_transport_ && single_tab_press && !held_tab_ &&
+      !held_keys_.any() && !modifiers_.any_ctrl() && !modifiers_.any_alt() &&
+      !modifiers_.any_meta() && !modifiers_.any_shift() &&
+      runtime_auto_enabled_ && analysis_pool_ && word_editor_ &&
+      !buffer_.current_word().empty() && x11_session_->is_valid() &&
+      !x11_session_->is_wayland_session() && !config_load_pending_;
+  if (trigger != read_frame_events_.end()) {
+    std::cerr << "[punto] r37_tab_frame eligible=" << eligible
+              << " keys=" << held_keys_.any()
+              << " word_size=" << buffer_.current_word().size()
+              << " auto=" << runtime_auto_enabled_ << '\n';
+  }
+  if (!eligible) {
+    for (const auto &event : read_frame_events_) {
+      handle_captured_event(event);
+    }
+    note_input_event_committed(read_frame_events_.back());
+    read_frame_events_.clear();
+    return;
+  }
+  const auto accepted = input_frame_accepts_.empty()
+                            ? std::chrono::steady_clock::now()
+                            : input_frame_accepts_.front();
+  HeldTabFrame held;
+  held.accepted_at = accepted;
+  held.deadline = accepted + std::chrono::milliseconds{1000};
+  held.events = std::move(read_frame_events_);
+  read_frame_events_.clear();
+  const auto previous_word_id = next_word_id_;
+  defer_frame_output_ = true;
+  for (const auto &event : held.events) {
+    handle_captured_event(event);
+  }
+  defer_frame_output_ = false;
+  held.word_id = next_word_id_;
+  held_tab_ = std::move(held);
+  std::cerr << "[punto] r37_tab_held word_id=" << held_tab_->word_id
+            << " previous=" << previous_word_id << '\n';
+  if (held_tab_->word_id == previous_word_id) {
+    release_held_tab();
+  }
+}
+
+void EventLoop::flush_unfinished_read_frame() {
+  if (held_tab_ || read_frame_passthrough_ || read_frame_events_.empty() ||
+      read_frame_started_at_.time_since_epoch().count() == 0 ||
+      std::chrono::steady_clock::now() - read_frame_started_at_ <
+          (ingress_transport_ ? std::chrono::seconds{2}
+                              : kFrameCoalesceBudget)) {
+    return;
+  }
+  if (ingress_transport_) {
+    std::cerr << "[punto] ingress source frame ended without SYN_REPORT\n";
+    fail_input_pipeline();
+    return;
+  }
+  // A stream may pause before SYN indefinitely. Release accepted events
+  // promptly, but deny Tab correction once part of that frame has escaped.
+  read_frame_passthrough_ = true;
+  for (const auto &event : read_frame_events_) {
+    handle_captured_event(event);
+  }
+  read_frame_events_.clear();
+  read_frame_started_at_ = {};
+}
+
+void EventLoop::release_held_tab() {
+  if (!held_tab_) {
+    return;
+  }
+  auto events = std::move(held_tab_->events);
+  std::cerr << "[punto] r37_tab_release event_count=" << events.size() << '\n';
+  held_tab_.reset();
+  for (const auto &event : events) {
+    emit_captured_event(event);
+    if (stop_requested_.load(std::memory_order_relaxed)) {
+      break;
+    }
+  }
+  if (!events.empty() && !stop_requested_.load(std::memory_order_relaxed)) {
+    note_input_event_committed(events.back());
+  }
+}
+
 void EventLoop::note_input_event_accepted(const input_event &event) {
   if (!input_read_frame_started_) {
     const auto accepted_at = std::chrono::steady_clock::now();
@@ -1091,6 +1457,8 @@ void EventLoop::fail_input_pipeline() noexcept {
   input_health_.fail();
   if (exit_code_ == 0)
     exit_code_ = 3;
+  if (ingress_transport_)
+    request_stop();
 }
 
 void EventLoop::handle_event(const input_event &ev) {
@@ -1111,9 +1479,27 @@ void EventLoop::handle_event(const input_event &ev) {
   // Execution is deferred until all modifiers and physical frames are released.
   if (code == KEY_PAUSE) {
     if (ev.value == 1 && !pause_down_) {
-      queue_manual_word_edit(determine_hotkey_action());
+      if (ingress_transport_) {
+        emit_private_pause(ev.value);
+      } else {
+#if defined(PUNTO_DELIVERED_TRIGGER_PROTOTYPE)
+        // Only the private relay understands this record. The installed uinput
+        // stream is compiled without this branch and never receives it.
+        input_event request{};
+        request.type = EV_MSC;
+        request.code = MSC_SERIAL;
+        request.value =
+            0x50550000 | static_cast<int>(determine_hotkey_action());
+        emit_passthrough_event(request);
+#else
+        queue_manual_word_edit(determine_hotkey_action());
+#endif
+      }
       pause_down_ = true;
+    } else if (is_repeat && pause_down_) {
+      emit_private_pause(ev.value);
     } else if (is_release) {
+      emit_private_pause(ev.value);
       pause_down_ = false;
     }
     return;
@@ -1126,7 +1512,7 @@ void EventLoop::handle_event(const input_event &ev) {
         exact_modifier_active(modifiers_, cfg->hotkey.modifier);
     if (!is_release && !is_repeat) {
       for (auto &word : word_history_)
-        word.eligible = false;
+        word.correction_eligible = false;
       if (raw_word_candidate_ &&
           raw_word_candidate_->kind == RawWordCandidate::Kind::Automatic) {
         raw_word_candidate_->allow_correction = false;
@@ -1139,8 +1525,7 @@ void EventLoop::handle_event(const input_event &ev) {
     }
     update_modifier_state(code, !is_release);
     if (layout_hotkey) {
-      reset_async_state(/*bump_task_barrier=*/true,
-                        /*preserve_completed_selection=*/true);
+      reset_async_state();
       buffer_.reset_all();
     }
     emit_passthrough_event(ev);
@@ -1157,7 +1542,7 @@ void EventLoop::handle_event(const input_event &ev) {
       !modifiers_.any_meta() && undo_request_ &&
       user_input_sequence_ == undo_input_sequence_ &&
       std::chrono::steady_clock::now() - undo_applied_at_ <= kUndoWindow &&
-      word_editor_ && !word_editor_->busy()) {
+      word_editor_ && !word_editor_->has_pending_paste()) {
     finalize_queued_words();
     raw_word_candidate_ = RawWordCandidate{RawWordCandidate::Kind::Undo,
                                            ++next_word_observation_id_,
@@ -1182,6 +1567,8 @@ void EventLoop::handle_event(const input_event &ev) {
        raw_word_candidate_->kind == RawWordCandidate::Kind::Undo);
   if (undo_detector_ && (code != KEY_BACKSPACE || cancelled_undo)) {
     undo_detector_->on_key_typed();
+    learning_editor_token_.clear();
+    learning_backspaces_.clear();
   }
   if (raw_word_candidate_ &&
       raw_word_candidate_->kind != RawWordCandidate::Kind::Automatic) {
@@ -1194,8 +1581,7 @@ void EventLoop::handle_event(const input_event &ev) {
       code == cfg->hotkey.key &&
       exact_modifier_active(modifiers_, cfg->hotkey.modifier);
   if (layout_hotkey) {
-    reset_async_state(/*bump_task_barrier=*/true,
-                      /*preserve_completed_selection=*/true);
+    reset_async_state();
     buffer_.reset_all();
     emit_passthrough_event(ev);
     return;
@@ -1208,11 +1594,23 @@ void EventLoop::handle_event(const input_event &ev) {
     return;
   }
 
+  if (code == KEY_BACKSPACE || code == KEY_SPACE || code == KEY_TAB ||
+      code == KEY_DOT || code == KEY_COMMA || code == KEY_SEMICOLON ||
+      code == KEY_APOSTROPHE || code == KEY_SLASH || code == KEY_MINUS ||
+      is_letter_key(code)) {
+    ++text_input_sequence_;
+  }
+
   if (code == KEY_BACKSPACE) {
     if (undo_detector_) {
-      (void)undo_detector_->on_backspace(std::chrono::steady_clock::now());
+      if (learning_editor_token_.empty()) {
+        (void)undo_detector_->on_backspace(std::chrono::steady_clock::now());
+      } else if (learning_backspaces_.size() < 3) {
+        learning_backspaces_.push_back(std::chrono::steady_clock::now());
+      }
     }
     auto visible = std::move(active_word_visible_);
+    auto origin = std::move(input_history_editor_token_);
     const bool manually_edited = active_word_manually_edited_;
     const bool removed = buffer_.pop_char();
     finalize_queued_words();
@@ -1220,21 +1618,35 @@ void EventLoop::handle_event(const input_event &ev) {
     if (!removed || buffer_.current_word().empty()) {
       // Removing a separator invalidates the last-word suffix coordinates.
       buffer_.reset_all();
-    } else if (visible && !visible->empty()) {
-      std::size_t last = visible->size() - 1;
-      while (last > 0 &&
-             (static_cast<unsigned char>((*visible)[last]) & 0xc0U) == 0x80U) {
-        --last;
+    } else {
+      input_history_editor_token_ = std::move(origin);
+      if (visible && !visible->empty()) {
+        std::size_t last = visible->size() - 1;
+        while (last > 0 && (static_cast<unsigned char>((*visible)[last]) &
+                            0xc0U) == 0x80U) {
+          --last;
+        }
+        visible->resize(last);
+        active_word_visible_ = std::move(visible);
+        active_word_manually_edited_ = manually_edited;
       }
-      visible->resize(last);
-      active_word_visible_ = std::move(visible);
-      active_word_manually_edited_ = manually_edited;
     }
     emit_passthrough_event(ev);
     return;
   }
 
+  if (code == KEY_TAB && (is_release || is_repeat)) {
+    emit_passthrough_event(ev);
+    return;
+  }
+
   if (code == KEY_SPACE || code == KEY_TAB) {
+    if (code == KEY_TAB && (read_frame_passthrough_ || !defer_frame_output_)) {
+      reset_async_state();
+      buffer_.reset_all();
+      emit_passthrough_event(ev);
+      return;
+    }
     const auto full_word = buffer_.current_word();
     std::span<const KeyEntry> analysis_word = full_word;
     while (!analysis_word.empty()) {
@@ -1270,8 +1682,7 @@ void EventLoop::handle_event(const input_event &ev) {
     word_history_.push_back(TrackedWord{
         word_id, std::vector<KeyEntry>{full_word.begin(), full_word.end()},
         trailing, active_word_visible_});
-    word_history_.back().layout_hotkey_modifier = cfg->hotkey.modifier;
-    word_history_.back().layout_hotkey_key = cfg->hotkey.key;
+    word_history_.back().editor_token = input_history_editor_token_;
     RawWordCandidate candidate{
         RawWordCandidate::Kind::Automatic,
         ++next_word_observation_id_,
@@ -1283,32 +1694,45 @@ void EventLoop::handle_event(const input_event &ev) {
     candidate.word_id = word_id;
     candidate.visible = std::move(active_word_visible_);
     candidate.input_sequence = user_input_sequence_;
+    candidate.history_context = input_history_observation_;
+    candidate.editor_token = input_history_editor_token_;
     candidate.analyze =
         analysis_pool_ && runtime_auto_enabled_ &&
         analysis_word.size() >= candidate.config->auto_switch.min_word_len;
     candidate.allow_correction = !active_word_manually_edited_;
     active_word_visible_.reset();
     active_word_manually_edited_ = false;
-    if (!raw_word_candidate_)
-      raw_word_candidate_ = std::move(candidate);
-    else
-      queued_word_candidates_.push_back(std::move(candidate));
     const auto limit =
         std::max<std::size_t>(1, config_->auto_switch.max_rollback_words);
-    if (word_history_.size() > limit) {
-      // Eviction never discards an unadmitted diagnostic task.
-      finalize_queued_words();
-      while (word_history_.size() > limit)
-        word_history_.pop_front();
+    if (!raw_word_candidate_) {
+      raw_word_candidate_ = std::move(candidate);
+    } else {
+      queued_word_candidates_.push_back(std::move(candidate));
+      while (queued_word_candidates_.size() > limit) {
+        queued_word_candidates_.pop_front();
+      }
     }
+    // Raw candidates own observation/analysis completion independently. The
+    // rollback history therefore keeps the newest words only; dropping an old
+    // in-flight record makes its late result a harmless no-op while preserving
+    // the current (limit + 1)th candidate.
+    while (word_history_.size() > limit) {
+      word_history_.pop_front();
+    }
+    max_word_history_size_ =
+        std::max(max_word_history_size_, word_history_.size());
     return;
   }
 
   if (code == KEY_DOT || code == KEY_COMMA || code == KEY_SEMICOLON ||
       code == KEY_APOSTROPHE || code == KEY_SLASH || code == KEY_MINUS) {
+    if (buffer_.current_word().empty())
+      capture_typing_context();
     emit_passthrough_event(ev);
     if (buffer_.current_word().empty()) {
-      active_word_visible_.reset();
+      active_word_visible_ = input_history_observation_
+                                 ? std::optional{std::string{}}
+                                 : std::nullopt;
       active_word_manually_edited_ = false;
     }
     const bool was_overflowed = buffer_.current_overflowed();
@@ -1338,7 +1762,10 @@ void EventLoop::handle_event(const input_event &ev) {
 
   if (is_letter_key(code)) {
     if (buffer_.current_word().empty()) {
-      active_word_visible_.reset();
+      capture_typing_context();
+      active_word_visible_ = input_history_observation_
+                                 ? std::optional{std::string{}}
+                                 : std::nullopt;
       active_word_manually_edited_ = false;
     }
     const bool was_overflowed = buffer_.current_overflowed();
@@ -1369,11 +1796,13 @@ void EventLoop::handle_event(const input_event &ev) {
   }
 
   if (is_function_key(code)) {
+    buffer_.reset_all();
+    reset_async_state();
     emit_passthrough_event(ev);
     return;
   }
 
-  buffer_.reset_current();
+  buffer_.reset_all();
   reset_async_state();
   emit_passthrough_event(ev);
 }
@@ -1408,14 +1837,23 @@ void EventLoop::update_modifier_state(ScanCode code, bool pressed) {
   }
 }
 
-void EventLoop::reset_async_state(bool bump_task_barrier,
-                                  bool preserve_completed_selection) {
+void EventLoop::reset_async_state(bool bump_task_barrier) {
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+  if (!input_history_editor_token_.empty() || !buffer_.current_word().empty()) {
+    std::cerr << "[punto-e2e] origin_reset sequence=" << user_input_sequence_
+              << " present=" << !input_history_editor_token_.empty()
+              << " word_size=" << buffer_.current_word().size()
+              << " bump=" << bump_task_barrier << '\n';
+  }
+#endif
   pending_word_edit_.reset();
   pending_is_undo_ = false;
   undo_request_.reset();
+  learning_editor_token_.clear();
+  learning_backspaces_.clear();
   if (undo_detector_)
     undo_detector_->on_key_typed();
-  if (word_editor_ && !macro_active_ && !preserve_completed_selection) {
+  if (word_editor_ && !macro_active_) {
     word_editor_->reset();
   }
   if (analysis_pool_) {
@@ -1441,9 +1879,17 @@ void EventLoop::reset_async_state(bool bump_task_barrier,
 }
 
 void EventLoop::clear_word_history() {
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+  if (!input_history_editor_token_.empty() || !buffer_.current_word().empty()) {
+    std::cerr << "[punto-e2e] origin_clear sequence=" << user_input_sequence_
+              << " present=" << !input_history_editor_token_.empty()
+              << " word_size=" << buffer_.current_word().size() << '\n';
+  }
+#endif
   word_history_.clear();
   active_word_visible_.reset();
   active_word_manually_edited_ = false;
+  input_history_editor_token_.clear();
 }
 
 void EventLoop::finalize_queued_words() {
@@ -1532,9 +1978,11 @@ IpcResult EventLoop::execute_ipc_command(const IpcRequest &request) {
     if (publication == ControlPlanePublicationResult::NotPublished) {
       return {false, "Status not published"};
     }
+    const bool status_changed = runtime_auto_enabled_ != next_enabled;
     runtime_auto_enabled_ = next_enabled;
     runtime_status_established_ = true;
-    reset_async_state();
+    if (status_changed)
+      reset_async_state();
     if (publication == ControlPlanePublicationResult::PublishedNotDurable) {
       return {false, "Status published but durability not confirmed"};
     }
@@ -1868,7 +2316,8 @@ void EventLoop::sync_control_plane_from_shared_state(bool force) {
 
   // A bad config path must not prevent a peer from applying an OFF command.
   if (status_changed) {
-    reset_async_state();
+    if (force || runtime_auto_enabled_ != next.enabled)
+      reset_async_state();
     runtime_auto_enabled_ = next.enabled;
     runtime_status_established_ = true;
     std::lock_guard<std::mutex> lock(control_plane_mutex_);
@@ -2009,13 +2458,10 @@ HotkeyAction EventLoop::determine_hotkey_action() const {
 }
 
 void EventLoop::queue_manual_word_edit(HotkeyAction action) {
-  using Kind = RawWordCandidate::Kind;
-  const bool selection = action == HotkeyAction::InvertLayoutSelection ||
-                         action == HotkeyAction::InvertCaseSelection ||
-                         action == HotkeyAction::TranslitSelection;
-  const auto word = buffer_.get_active_word();
-  if (!selection && (word.empty() || buffer_.current_overflowed()))
+  if (ingress_transport_)
     return;
+  using Kind = RawWordCandidate::Kind;
+  const auto word = buffer_.get_active_word();
   std::string trailing;
   if (buffer_.current_word().empty()) {
     for (const ScanCode code : buffer_.trailing()) {
@@ -2025,12 +2471,22 @@ void EventLoop::queue_manual_word_edit(HotkeyAction action) {
     }
   }
   std::optional<std::string> visible = active_word_visible_;
+  const auto history_context = input_history_observation_;
+  const auto editor_token = input_history_editor_token_;
+  const bool manually_edited = active_word_manually_edited_;
+  const bool preserve_active_word = !buffer_.current_word().empty() &&
+                                    (action == HotkeyAction::InvertLayoutWord ||
+                                     action == HotkeyAction::InvertCaseWord);
   if (buffer_.current_word().empty() && !word_history_.empty()) {
     visible = word_history_.back().visible;
   }
   // Queue replacement cancels pending analysis, not the completed editor edit.
-  reset_async_state(/*bump_task_barrier=*/true,
-                    /*preserve_completed_selection=*/true);
+  reset_async_state();
+  if (preserve_active_word) {
+    input_history_editor_token_ = editor_token;
+    active_word_visible_ = visible;
+    active_word_manually_edited_ = manually_edited;
+  }
   const Kind kind =
       action == HotkeyAction::InvertLayoutSelection ? Kind::SelectionLayout
       : action == HotkeyAction::InvertCaseSelection ? Kind::SelectionCase
@@ -2047,6 +2503,10 @@ void EventLoop::queue_manual_word_edit(HotkeyAction action) {
                        std::atomic_load(&config_)};
   raw_word_candidate_->visible = std::move(visible);
   raw_word_candidate_->input_sequence = user_input_sequence_;
+  if (!word.empty()) {
+    raw_word_candidate_->history_context = history_context;
+    raw_word_candidate_->editor_token = editor_token;
+  }
 }
 
 void EventLoop::finish_word_candidate(
@@ -2107,32 +2567,38 @@ void EventLoop::finish_word_candidate(
                                            observation->focus_window,
                                            observation->locked_mods,
                                            true,
-                                           candidate.config->hotkey.modifier,
-                                           candidate.config->hotkey.key};
+                                           0,
+                                           std::nullopt};
       return;
     }
     const auto source =
         candidate.visible
             ? candidate.visible
             : key_entries_to_visible_text_checked(candidate.word, layout);
-    if (!source || source->empty())
-      return;
     const bool change_case =
         candidate.kind == RawWordCandidate::Kind::ManualCase;
-    pending_word_edit_ = WordEditRequest{
-        *source + candidate.trailing,
-        (change_case ? invert_case(*source) : invert_layout(*source)) +
-            candidate.trailing,
-        change_case ? layout : 1 - layout,
-        layout,
-        observation->session_generation,
-        WordEditOperation::Word,
-        observation->focus_window,
-        observation->locked_mods,
-        true,
-        candidate.config->hotkey.modifier,
-        candidate.config->hotkey.key};
-    active_word_visible_ = *source;
+    const auto &history = candidate.history_context;
+    const bool terminal_history =
+        history && same_typing_context(*history, *observation);
+    pending_word_edit_ =
+        WordEditRequest{source.value_or("") + candidate.trailing,
+                        {},
+                        change_case ? layout : 1 - layout,
+                        layout,
+                        observation->session_generation,
+                        change_case ? WordEditOperation::CurrentWordCase
+                                    : WordEditOperation::CurrentWordLayout,
+                        observation->focus_window,
+                        observation->locked_mods,
+                        terminal_history,
+                        0,
+                        std::nullopt};
+    if (terminal_history)
+      pending_word_edit_->expected_editor_token = candidate.editor_token;
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    std::cerr << "[punto-e2e] manual_prepared id=" << candidate.request_id
+              << "\n";
+#endif
     return;
   }
 
@@ -2141,9 +2607,10 @@ void EventLoop::finish_word_candidate(
                                return entry.id == candidate.word_id;
                              });
   if (record != word_history_.end()) {
-    record->eligible = fresh && observation->focus_window > 1 &&
-                       candidate.analyze && candidate.allow_correction &&
-                       runtime_auto_enabled_;
+    record->lifecycle = TrackedWord::Lifecycle::AwaitingAnalysis;
+    record->correction_eligible =
+        fresh && observation->focus_window > 1 && candidate.analyze &&
+        candidate.allow_correction && runtime_auto_enabled_;
     if (fresh) {
       record->visible =
           candidate.visible
@@ -2153,7 +2620,11 @@ void EventLoop::finish_word_candidate(
       record->source_layout = layout;
       record->session_generation = observation->session_generation;
       record->focus_window = observation->focus_window;
-      record->allow_terminal = candidate.input_sequence == user_input_sequence_;
+      record->editor_token = candidate.editor_token;
+      const auto &history = candidate.history_context;
+      record->allow_terminal =
+          candidate.input_sequence == user_input_sequence_ && history &&
+          same_typing_context(*history, *observation);
     }
   }
   if (!candidate.analyze || !analysis_pool_) {
@@ -2164,6 +2635,8 @@ void EventLoop::finish_word_candidate(
     result.layout_at_boundary = layout;
     ready_results_[next_task_id_] = result;
     analysis_accepted_at_[next_task_id_] = std::chrono::steady_clock::now();
+    if (record != word_history_.end())
+      record->task_id = next_task_id_;
     ++next_task_id_;
     refresh_analysis_health_head();
     return;
@@ -2176,6 +2649,10 @@ void EventLoop::finish_word_candidate(
   task.cfg = candidate.config->auto_switch;
   const AnalysisAdmission admission = analysis_pool_->submit(std::move(task));
   if (!admission.accepted) {
+    if (record != word_history_.end()) {
+      record->lifecycle = TrackedWord::Lifecycle::Complete;
+      record->correction_eligible = false;
+    }
     return;
   }
   analysis_accepted_at_[next_task_id_] = admission.accepted_at;
@@ -2185,12 +2662,117 @@ void EventLoop::finish_word_candidate(
   refresh_analysis_health_head();
 }
 
+void EventLoop::capture_typing_context() {
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+  std::cerr << "[punto-e2e] origin_capture_entry sequence="
+            << user_input_sequence_
+            << " present=" << !input_history_editor_token_.empty() << '\n';
+#endif
+  input_history_observation_.reset();
+  input_history_editor_token_.clear();
+  const bool session_valid = x11_session_->is_valid();
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+  std::cerr << "[punto-e2e] origin_capture_gate sequence="
+            << user_input_sequence_ << " session_valid=" << session_valid
+            << " config_pending=" << config_load_pending_ << '\n';
+#endif
+  if (!session_valid || config_load_pending_)
+    return;
+  // Observe before the first physical character is forwarded. A timeout only
+  // disables terminal history admission; it cannot stop ordinary input.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds{20};
+  process_word_observation(false);
+  const auto id = ++next_word_observation_id_;
+  bool started = x11_session_->start_background_keyboard_observation(id);
+  const auto origin =
+      word_editor_ ? word_editor_->editor_context(deadline) : std::nullopt;
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+  std::cerr << "[punto-e2e] origin_capture_result sequence="
+            << user_input_sequence_ << " present=" << origin.has_value()
+            << '\n';
+#endif
+  std::optional<X11Session::KeyboardObservation> observation;
+  for (;;) {
+    // Child identity does not depend on a free keyboard worker. Harvest once
+    // even if that independent read used the remaining admission budget.
+    process_word_observation(false);
+    if (started && keyboard_observation_ &&
+        keyboard_observation_->request_id == id) {
+      observation = keyboard_observation_;
+      break;
+    }
+    if (std::chrono::steady_clock::now() >= deadline)
+      break;
+    if (!started)
+      started = x11_session_->start_background_keyboard_observation(id);
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  if (origin && !word_history_.empty() &&
+      word_history_.back().editor_token != *origin)
+    reset_async_state();
+  input_history_observation_ = std::move(observation);
+  if (origin)
+    input_history_editor_token_ = *origin;
+}
+
+void EventLoop::warm_editor_context() {
+  const auto now = std::chrono::steady_clock::now();
+  if (!word_editor_ || macro_active_ || held_tab_ || raw_word_candidate_ ||
+      pending_word_edit_ || !queued_word_candidates_.empty() ||
+      !pending_events_.empty() || !word_history_.empty() ||
+      !buffer_.current_word().empty() || input_frame_size_ != 0 ||
+      !read_frame_events_.empty() || held_keys_.any() || config_load_pending_ ||
+      !keyboard_observation_ ||
+      now - last_editor_warm_at_ < std::chrono::milliseconds{100})
+    return;
+  pollfd input{STDIN_FILENO, POLLIN, 0};
+  if (::poll(&input, 1, 0) != 0)
+    return;
+  last_editor_warm_at_ = now;
+  // Preparation only: no idle reply may populate an already started word.
+  // Incoming input cancels the read instead of waiting for its hard deadline.
+  const auto warmed = word_editor_->editor_context(
+      now + std::chrono::milliseconds{100}, {},
+      [this](auto deadline) {
+        if (stop_requested_.load(std::memory_order_relaxed) ||
+            std::chrono::steady_clock::now() >= deadline)
+          return false;
+        pollfd input{STDIN_FILENO, POLLIN, 0};
+        return ::poll(&input, 1, 1) == 0;
+      },
+      true);
+  if (warmed) {
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    std::cerr << "[punto-e2e] editor_warmed\n";
+#endif
+  }
+}
+
 void EventLoop::process_word_observation(bool input_idle) {
   if (const auto observation = x11_session_->poll_keyboard_observation()) {
-    if (observation->group == 0 || observation->group == 1) {
+    if (idle_observation_id_ == observation->request_id)
+      idle_observation_id_.reset();
+    if (observation->live_current &&
+        (observation->group == 0 || observation->group == 1)) {
+      last_keyboard_observation_at_ = std::chrono::steady_clock::now();
+      if (input_history_observation_ &&
+          !same_typing_context(*input_history_observation_, *observation)) {
+        clear_word_history();
+        buffer_.reset_all();
+        input_history_observation_.reset();
+        undo_request_.reset();
+        if (undo_detector_)
+          undo_detector_->on_key_typed();
+      }
       current_layout_ = observation->group;
       keyboard_observation_ = *observation;
     }
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    std::cerr << "[punto-e2e] keyboard_completed id=" << observation->request_id
+              << " group=" << observation->group
+              << " current=" << current_layout_ << "\n";
+#endif
     if (raw_word_candidate_ &&
         raw_word_candidate_->request_id == observation->request_id) {
       finish_word_candidate(&*observation);
@@ -2212,6 +2794,14 @@ void EventLoop::process_word_observation(bool input_idle) {
                                            config_};
   }
   if (!raw_word_candidate_ || raw_word_candidate_->observing) {
+    if (!raw_word_candidate_ && input_idle && !idle_observation_id_ &&
+        x11_session_->is_valid() && !config_load_pending_ &&
+        std::chrono::steady_clock::now() - last_keyboard_observation_at_ >=
+            std::chrono::milliseconds{100}) {
+      const auto id = ++next_word_observation_id_;
+      if (x11_session_->start_background_keyboard_observation(id))
+        idle_observation_id_ = id;
+    }
     return;
   }
   if (!x11_session_->is_valid() || x11_session_->is_wayland_session() ||
@@ -2219,24 +2809,38 @@ void EventLoop::process_word_observation(bool input_idle) {
     finish_word_candidate();
     return;
   }
-  if (input_idle && input_frame_size_ == 0 && input_frame_accepts_.empty()) {
+  if (input_idle && input_frame_size_ == 0 &&
+      (input_frame_accepts_.empty() || held_tab_)) {
     raw_word_candidate_->observing =
         x11_session_->start_background_keyboard_observation(
             raw_word_candidate_->request_id);
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    if (raw_word_candidate_->observing &&
+        raw_word_candidate_->kind == RawWordCandidate::Kind::Automatic)
+      std::cerr << "[punto-e2e] automatic_boundary id="
+                << raw_word_candidate_->request_id << "\n";
+#endif
   }
 }
 
 void EventLoop::queue_auto_word_edit(const WordResult &result) {
+  if (ingress_transport_)
+    return;
   auto found = std::find_if(
       word_history_.begin(), word_history_.end(),
       [&result](const auto &word) { return word.task_id == result.task_id; });
-  if (found == word_history_.end() || !found->eligible ||
-      result.terminal_status != WordTerminalStatus::Completed ||
-      result.correction_type == CorrectionType::NoCorrection ||
-      !runtime_auto_enabled_) {
+  if (found == word_history_.end()) {
     return;
   }
   auto &candidate = *found;
+  candidate.lifecycle = TrackedWord::Lifecycle::Complete;
+  if (!candidate.correction_eligible ||
+      result.terminal_status != WordTerminalStatus::Completed ||
+      result.correction_type == CorrectionType::NoCorrection ||
+      !runtime_auto_enabled_) {
+    candidate.correction_eligible = false;
+    return;
+  }
   if (result.analysis_len == 0 || result.analysis_len > candidate.word.size()) {
     return;
   }
@@ -2260,7 +2864,179 @@ void EventLoop::queue_auto_word_edit(const WordResult &result) {
   }
 }
 
+void EventLoop::process_held_tab() {
+  if (!held_tab_) {
+    return;
+  }
+  if (ingress_transport_ || stop_requested_.load(std::memory_order_relaxed) ||
+      !word_editor_ || !runtime_auto_enabled_ ||
+      std::chrono::steady_clock::now() >= held_tab_->deadline ||
+      pending_events_.size() >= kMacroEventCapacity) {
+    std::cerr << "[punto] r37_tab_fallback deadline_or_capacity\n";
+    release_held_tab();
+    reset_async_state();
+    buffer_.reset_all();
+    return;
+  }
+  auto word = std::find_if(word_history_.begin(), word_history_.end(),
+                           [this](const TrackedWord &candidate) {
+                             return candidate.id == held_tab_->word_id;
+                           });
+  if (word == word_history_.end()) {
+    std::cerr << "[punto] r37_tab_fallback word_missing\n";
+    release_held_tab();
+    return;
+  }
+  if (raw_word_candidate_ || !queued_word_candidates_.empty() ||
+      word->lifecycle != TrackedWord::Lifecycle::Complete) {
+    return;
+  }
+  const auto &correction = word->correction;
+  const auto &visible = word->visible;
+  if (!word->correction_eligible || !correction || !visible ||
+      word->source_layout < 0 || word->target_layout < 0 ||
+      word->session_generation == 0 || word->focus_window <= 1 ||
+      !keyboard_observation_ ||
+      keyboard_observation_->session_generation != word->session_generation ||
+      keyboard_observation_->focus_window != word->focus_window) {
+    std::cerr << "[punto] r37_tab_fallback no_correction lifecycle="
+              << static_cast<int>(word->lifecycle)
+              << " eligible=" << word->correction_eligible
+              << " correction=" << word->correction.has_value()
+              << " visible=" << word->visible.has_value() << '\n';
+    release_held_tab();
+    reset_async_state();
+    buffer_.reset_all();
+    return;
+  }
+  if (!undo_detector_ || !undo_detector_->ready() ||
+      undo_detector_->is_excluded(word_exclusion_key(word->word))) {
+    release_held_tab();
+    reset_async_state();
+    buffer_.reset_all();
+    return;
+  }
+  WordEditRequest request;
+  request.expected = *visible;
+  request.replacement = *correction;
+  request.target_layout = word->target_layout;
+  request.source_layout = word->source_layout;
+  request.session_generation = word->session_generation;
+  request.operation = WordEditOperation::Word;
+  request.expected_focus = word->focus_window;
+  request.source_locked_mods = keyboard_observation_->locked_mods;
+  request.allow_terminal = false;
+  request.text_input_sequence = text_input_sequence_;
+  request.held_tab_deadline = held_tab_->deadline;
+  request.expected_editor_token = word->editor_token;
+  const auto corrected_task = word->task_id;
+  const auto corrected_key = word_exclusion_key(word->word);
+  macro_active_ = true;
+  WordEditOutcome outcome = word_editor_->execute(request);
+  macro_active_ = false;
+  std::cerr << "[punto] r37_tab_edit status="
+            << static_cast<int>(outcome.status)
+            << " stage=" << outcome.rejection_stage << '\n';
+  // All replay strokes are submitted before the original Tab. No asynchronous
+  // editor command may outlive this return and authorize a destination edit.
+  release_held_tab();
+  // Discard old analysis/history; WordEditor separately owns PRIMARY identity.
+  reset_async_state();
+  buffer_.reset_all();
+  complete_word_edit(request, outcome, false, corrected_task, corrected_key);
+  if (outcome.status == WordEditStatus::Dispatched && undo_request_) {
+    // The original Tab can be literal only in this same child. Field movement
+    // revokes the opaque token before this counted inverse is admitted.
+    undo_request_->expected += '\t';
+    undo_request_->replacement += '\t';
+  }
+}
+
+void EventLoop::process_pending_learning() {
+  if (learning_backspaces_.size() != 3 || learning_editor_token_.empty() ||
+      macro_active_ || held_tab_ || !word_editor_ || !undo_detector_)
+    return;
+  pollfd input{STDIN_FILENO, POLLIN, 0};
+  if (::poll(&input, 1, 0) != 0)
+    return;
+  macro_active_ = true;
+  const auto proof = word_editor_->editor_context(
+      std::chrono::steady_clock::now() + std::chrono::milliseconds{100},
+      learning_editor_token_);
+  macro_active_ = false;
+  if (proof) {
+    for (const auto timestamp : learning_backspaces_)
+      (void)undo_detector_->on_backspace(timestamp);
+  } else {
+    undo_detector_->on_key_typed();
+  }
+  learning_editor_token_.clear();
+  learning_backspaces_.clear();
+}
+
+void EventLoop::complete_word_edit(const WordEditRequest &request,
+                                   const WordEditOutcome &outcome, bool undo,
+                                   std::optional<std::uint64_t> task_id,
+                                   const std::string &exclusion_key,
+                                   bool exact_inverse) {
+  const int layout_before_edit = current_layout_;
+  const int observed_layout =
+      outcome.observed_layout >= 0                   ? outcome.observed_layout
+      : outcome.status == WordEditStatus::Dispatched ? outcome.target_layout
+                                                     : -1;
+  if (x11_session_->publish_keyboard_layout(observed_layout,
+                                            outcome.session_generation)) {
+    current_layout_ = observed_layout;
+    if (keyboard_observation_ &&
+        keyboard_observation_->session_generation ==
+            outcome.session_generation &&
+        keyboard_observation_->focus_window == outcome.focused_window) {
+      keyboard_observation_->group = observed_layout;
+    }
+  }
+  if (outcome.status != WordEditStatus::Dispatched)
+    return;
+  ++word_dispatches_;
+  if (undo && undo_detector_) {
+    if (exact_inverse)
+      undo_detector_->on_undo();
+    else
+      undo_detector_->on_key_typed();
+  }
+  if (sound_manager_ && current_layout_ != layout_before_edit)
+    sound_manager_->play_for_layout(current_layout_);
+  if (!undo) {
+    undo_request_ = WordEditRequest{outcome.replacement,
+                                    outcome.terminal_insert ? std::string{}
+                                                            : outcome.original,
+                                    outcome.source_layout,
+                                    outcome.target_layout,
+                                    outcome.session_generation,
+                                    WordEditOperation::Word,
+                                    outcome.focused_window,
+                                    request.source_locked_mods,
+                                    true,
+                                    0,
+                                    std::nullopt,
+                                    outcome.editor_token};
+    undo_applied_at_ = std::chrono::steady_clock::now();
+    undo_input_sequence_ = user_input_sequence_;
+  }
+  if (task_id && undo_detector_) {
+    undo_detector_->on_correction_applied(*task_id, exclusion_key);
+    learning_editor_token_ = outcome.editor_token;
+    learning_backspaces_.clear();
+  }
+}
+
 void EventLoop::process_pending_word_edit() {
+  // Private ingress occurrences require native editor admission. The legacy
+  // socket editor cannot establish that boundary, even with matching text.
+  if (ingress_transport_) {
+    pending_word_edit_.reset();
+    pending_is_undo_ = false;
+    return;
+  }
   if (!word_editor_ || word_editor_->busy() || pause_down_ ||
       modifiers_.any_ctrl() || modifiers_.any_shift() || modifiers_.any_alt() ||
       modifiers_.any_meta() || held_keys_.any() || input_frame_size_ != 0 ||
@@ -2286,13 +3062,20 @@ void EventLoop::process_pending_word_edit() {
         (!buffer_.current_word().empty() && !active_word_visible_))
       return;
     auto candidate = std::find_if(
-        word_history_.begin(), word_history_.end(),
-        [](const auto &word) { return word.eligible && word.correction; });
+        word_history_.begin(), word_history_.end(), [&](const auto &word) {
+          return word.lifecycle == TrackedWord::Lifecycle::Complete &&
+                 word.correction_eligible && word.correction &&
+                 (!word.retry_after_input_sequence ||
+                  (text_input_sequence_ > *word.retry_after_input_sequence &&
+                   word.retry_after_word_id &&
+                   next_word_id_ > *word.retry_after_word_id &&
+                   buffer_.current_word().empty()));
+        });
     if (candidate == word_history_.end())
       return;
     corrected_original_key = word_exclusion_key(candidate->word);
     if (undo_detector_->is_excluded(corrected_original_key)) {
-      candidate->eligible = false;
+      candidate->correction_eligible = false;
       return;
     }
     std::string expected, replacement;
@@ -2305,7 +3088,8 @@ void EventLoop::process_pending_word_edit() {
       const auto &visible = word->visible;
       if (!visible ||
           word->session_generation != candidate->session_generation ||
-          word->focus_window != candidate->focus_window)
+          word->focus_window != candidate->focus_window ||
+          word->editor_token != candidate->editor_token)
         return;
       expected += *visible + word->trailing;
       replacement +=
@@ -2316,10 +3100,17 @@ void EventLoop::process_pending_word_edit() {
     }
     if (!buffer_.current_word().empty()) {
       const auto &visible = active_word_visible_;
-      if (!visible)
+      if (!visible || input_history_editor_token_ != candidate->editor_token)
         return;
       expected += *visible;
       replacement += *visible;
+      allow_terminal =
+          allow_terminal && input_history_observation_ &&
+          same_typing_context(*input_history_observation_,
+                              *keyboard_observation_) &&
+          input_history_observation_->session_generation ==
+              candidate->session_generation &&
+          input_history_observation_->focus_window == candidate->focus_window;
     }
     pending_word_edit_ = WordEditRequest{std::move(expected),
                                          std::move(replacement),
@@ -2330,17 +3121,20 @@ void EventLoop::process_pending_word_edit() {
                                          candidate->focus_window,
                                          keyboard_observation_->locked_mods,
                                          allow_terminal,
-                                         candidate->layout_hotkey_modifier,
-                                         candidate->layout_hotkey_key};
+                                         0,
+                                         std::nullopt,
+                                         candidate->editor_token};
     corrected_word = candidate->id;
   }
   WordEditRequest request = std::move(*pending_word_edit_);
   pending_word_edit_.reset();
+  request.text_input_sequence = text_input_sequence_;
   const bool undo = pending_is_undo_;
   pending_is_undo_ = false;
   macro_active_ = true;
   const auto macro_started_at = std::chrono::steady_clock::now();
-  const WordEditOutcome outcome = word_editor_->execute(request);
+  WordEditOutcome outcome = word_editor_->execute(request);
+  bool exact_inverse = true;
   const auto macro_us = std::chrono::duration_cast<std::chrono::microseconds>(
                             std::chrono::steady_clock::now() - macro_started_at)
                             .count();
@@ -2361,72 +3155,78 @@ void EventLoop::process_pending_word_edit() {
                              keyboard_observation_->focus_window,
                              keyboard_observation_->locked_mods,
                              true,
-                             request.layout_hotkey_modifier,
-                             request.layout_hotkey_key};
-    (void)word_editor_->execute(fallback);
+                             0,
+                             std::nullopt};
+    fallback.expected_editor_token = request.expected_editor_token;
+    outcome = word_editor_->execute(fallback);
+    exact_inverse = false;
   }
   macro_active_ = false;
+  std::optional<std::uint64_t> corrected_task;
+  if (corrected_word) {
+    const auto record = std::find_if(
+        word_history_.begin(), word_history_.end(),
+        [&](const auto &word) { return word.id == *corrected_word; });
+    if (record != word_history_.end())
+      corrected_task = record->task_id;
+  }
+  complete_word_edit(request, outcome, undo, corrected_task,
+                     corrected_original_key, exact_inverse);
   if (outcome.status == WordEditStatus::Dispatched) {
-    ++word_dispatches_;
-    if (undo && undo_detector_)
-      undo_detector_->on_undo();
-    const int previous_layout = current_layout_;
-    if (outcome.target_layout >= 0) {
-      current_layout_ = outcome.target_layout;
-      if (keyboard_observation_)
-        keyboard_observation_->group = outcome.target_layout;
-    }
-    if (sound_manager_ && current_layout_ != previous_layout) {
-      sound_manager_->play_for_layout(current_layout_);
-    }
-    if (!undo) {
-      undo_request_ = WordEditRequest{
-          outcome.replacement,
-          outcome.terminal_insert ? std::string{} : outcome.original,
-          outcome.source_layout,
-          outcome.target_layout,
-          outcome.session_generation,
-          WordEditOperation::Word,
-          outcome.focused_window,
-          request.source_locked_mods,
-          true,
-          request.layout_hotkey_modifier,
-          request.layout_hotkey_key};
-      undo_applied_at_ = std::chrono::steady_clock::now();
-      undo_input_sequence_ = user_input_sequence_;
-    }
     if (corrected_word) {
       auto record = std::find_if(
           word_history_.begin(), word_history_.end(),
           [&](const auto &word) { return word.id == *corrected_word; });
       if (record != word_history_.end()) {
-        if (const auto task_id = record->task_id; undo_detector_ && task_id) {
-          undo_detector_->on_correction_applied(*task_id,
-                                                corrected_original_key);
-        }
         record->visible = std::move(record->correction);
         record->correction.reset();
-        record->eligible = false;
+        record->correction_eligible = false;
       }
-    } else if (!undo && request.operation == WordEditOperation::Word) {
+    } else if (outcome.terminal_history ||
+               (!undo && request.operation == WordEditOperation::Word)) {
+      if (undo && outcome.terminal_history)
+        clear_word_history();
       std::string visible = outcome.replacement;
       const auto trailing =
           buffer_.current_word().empty() ? buffer_.trailing_length() : 0;
       if (visible.size() >= trailing)
         visible.resize(visible.size() - trailing);
+      if (undo && outcome.terminal_history) {
+        const auto characters =
+            g_utf8_strlen(visible.data(), static_cast<gssize>(visible.size()));
+        const auto wanted =
+            static_cast<glong>(buffer_.get_active_word().size());
+        if (characters > wanted)
+          visible.erase(0, static_cast<std::size_t>(
+                               g_utf8_offset_to_pointer(visible.data(),
+                                                        characters - wanted) -
+                               visible.data()));
+      }
       active_word_visible_ = std::move(visible);
       active_word_manually_edited_ = true;
     } else {
       clear_word_history();
       buffer_.reset_all();
+      active_word_manually_edited_ =
+          request.operation == WordEditOperation::CurrentWordLayout ||
+          request.operation == WordEditOperation::CurrentWordCase;
     }
   } else {
     if (undo && undo_detector_)
       undo_detector_->on_key_typed();
     if (corrected_word) {
       for (auto &word : word_history_)
-        if (word.id == *corrected_word)
-          word.eligible = false;
+        if (word.id == *corrected_word) {
+          if (outcome.status == WordEditStatus::Rejected &&
+              outcome.retry_policy == WordEditRetryPolicy::AfterFreshInput &&
+              word.retry_attempts_remaining > 0) {
+            --word.retry_attempts_remaining;
+            word.retry_after_input_sequence = text_input_sequence_;
+            word.retry_after_word_id = next_word_id_;
+          } else {
+            word.correction_eligible = false;
+          }
+        }
     }
     if (outcome.status != WordEditStatus::Rejected) {
       clear_word_history();
@@ -2439,6 +3239,8 @@ void EventLoop::process_pending_word_edit() {
   if (outcome.status != WordEditStatus::Dispatched) {
     dispatch_log += " rejection_stage=";
     dispatch_log += outcome.rejection_stage;
+    dispatch_log += " retry_policy=";
+    dispatch_log += std::to_string(static_cast<int>(outcome.retry_policy));
   }
   std::cerr << dispatch_log + '\n';
   drain_pending_events();
@@ -2475,8 +3277,12 @@ bool EventLoop::wait_and_buffer(
       const auto status = read_input_event(
           STDIN_FILENO, event, input_frame_bytes_, input_frame_size_);
       if (status == ReadEventStatus::Ok) {
+#if defined(PUNTO_DELIVERED_TRIGGER_PROTOTYPE)
+        if (is_source_private_control(event))
+          continue;
+#endif
         note_input_event_accepted(event);
-        pending_events_.push_back(event);
+        pending_events_.push_back(capture_event(event));
       } else if (status != ReadEventStatus::Again) {
         macro_input_eof_ = true;
         if (status != ReadEventStatus::Eof)
@@ -2487,6 +3293,8 @@ bool EventLoop::wait_and_buffer(
       fail_input_pipeline();
       return false;
     }
+    if (word_editor_)
+      word_editor_->pump();
   }
   return !stop_requested_.load(std::memory_order_relaxed) &&
          !macro_input_eof_ && pending_events_.size() < kMacroEventCapacity &&
@@ -2494,20 +3302,57 @@ bool EventLoop::wait_and_buffer(
 }
 
 void EventLoop::drain_pending_events() {
-  if (macro_active_)
+  if (macro_active_ || held_tab_)
     return;
   while (!pending_events_.empty()) {
     const auto event = pending_events_.front();
     pending_events_.pop_front();
-    handle_event(event);
+    if (read_frame_passthrough_) {
+      handle_captured_event(event);
+      if (event.type == EV_SYN && event.code == SYN_REPORT) {
+        ++input_frame_sequence_;
+        note_input_event_committed(event);
+        read_frame_passthrough_ = false;
+      }
+      if (exit_code_ != 0 && stop_requested_.load(std::memory_order_relaxed)) {
+        break;
+      }
+      continue;
+    }
+    if (read_frame_events_.empty()) {
+      read_frame_started_at_ = std::chrono::steady_clock::now();
+    }
+    read_frame_events_.push_back(event);
+    if (read_frame_events_.size() > kMacroEventCapacity) {
+      fail_input_pipeline();
+      request_stop();
+      break;
+    }
+    if (event.type == EV_SYN && event.code == SYN_REPORT) {
+      dispatch_read_frame();
+    }
     if (exit_code_ != 0 && stop_requested_.load(std::memory_order_relaxed)) {
       break;
     }
-    note_input_event_committed(event);
+    if (held_tab_) {
+      break;
+    }
   }
-  if (macro_input_eof_) {
-    if (input_frame_size_ != 0 || !input_frame_accepts_.empty())
+  if (macro_input_eof_ && !held_tab_ && pending_events_.empty()) {
+    const bool incomplete = input_frame_size_ != 0 ||
+                            !input_frame_accepts_.empty() ||
+                            !read_frame_events_.empty();
+    for (const auto &event : read_frame_events_) {
+      if (!ingress_transport_)
+        emit_captured_event(event);
+    }
+    read_frame_events_.clear();
+    if (incomplete) {
       fail_input_pipeline();
+      std::cerr << "[punto] stdin closed with an incomplete input frame\n";
+    } else {
+      std::cerr << "[punto] stdin closed, exiting gracefully\n";
+    }
     request_stop();
   }
 }
@@ -2578,12 +3423,25 @@ IpcResult EventLoop::stats_report() const {
                std::memory_order_relaxed));
   stats += " corrections=" + std::to_string(word_dispatches_);
   stats += " word_dispatches=" + std::to_string(word_dispatches_);
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+  stats += " history_words=" + std::to_string(word_history_.size());
+  stats += " history_max_words=" + std::to_string(max_word_history_size_);
+  stats +=
+      " raw_candidates=" +
+      std::to_string(raw_word_candidate_ ? queued_word_candidates_.size() + 1U
+                                         : queued_word_candidates_.size());
+  stats += " raw_queued_candidates=" +
+           std::to_string(queued_word_candidates_.size());
+#endif
   stats += " pending_words=";
   stats += raw_word_candidate_ || !queued_word_candidates_.empty() ||
                    pending_word_edit_ ||
                    std::any_of(word_history_.begin(), word_history_.end(),
                                [](const auto &word) {
-                                 return word.eligible && word.correction;
+                                 return word.lifecycle ==
+                                            TrackedWord::Lifecycle::Complete &&
+                                        word.correction_eligible &&
+                                        word.correction;
                                })
                ? "1"
                : "0";
@@ -2599,6 +3457,11 @@ IpcResult EventLoop::stats_report() const {
   stats += " control_plane=";
   stats += control_plane_primary_.load(std::memory_order_acquire) ? "primary"
                                                                   : "secondary";
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+  stats += " status_generation=" + std::to_string(applied_status_generation_);
+  stats += " applied_config_generation=" +
+           std::to_string(applied_config_generation_);
+#endif
   stats +=
       " queued_tasks=" +
       std::to_string(analysis_pool_ ? analysis_pool_->pending_task_count() : 0);

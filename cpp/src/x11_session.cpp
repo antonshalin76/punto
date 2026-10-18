@@ -48,6 +48,11 @@
 
 namespace punto {
 
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+extern "C" void
+punto_e2e_keyboard_observation_request(std::uint64_t request_id);
+#endif
+
 struct X11Session::WriteGate {
   mutable std::recursive_mutex mutex;
   bool enabled = false;
@@ -1035,7 +1040,8 @@ void BoundedXcbConnection::close() noexcept {
 
 void *BoundedXcbConnection::poll_reply(
     std::uint32_t sequence, std::chrono::steady_clock::time_point deadline,
-    bool allow_null_reply, x11_detail::XcbOperationResult &result) noexcept {
+    bool allow_null_reply, bool retain_on_timeout,
+    x11_detail::XcbOperationResult &result) noexcept {
   result = x11_detail::XcbOperationResult::ConnectionFailed;
   if (!is_open() || sequence == 0) {
     close();
@@ -1043,7 +1049,11 @@ void *BoundedXcbConnection::poll_reply(
   }
   if (std::chrono::steady_clock::now() >= deadline) {
     result = x11_detail::XcbOperationResult::TimedOut;
-    close();
+    if (retain_on_timeout) {
+      ::xcb_discard_reply(connection_, sequence);
+    } else {
+      close();
+    }
     return nullptr;
   }
   if (::xcb_flush(connection_) <= 0) {
@@ -1088,14 +1098,24 @@ void *BoundedXcbConnection::poll_reply(
   }
 
   result = x11_detail::XcbOperationResult::TimedOut;
-  close();
+  if (retain_on_timeout) {
+    ::xcb_discard_reply(connection_, sequence);
+  } else {
+    close();
+  }
   return nullptr;
 }
 
 void *BoundedXcbConnection::wait_for_reply(
     std::uint32_t sequence, std::chrono::steady_clock::time_point deadline,
     x11_detail::XcbOperationResult &result) noexcept {
-  return poll_reply(sequence, deadline, false, result);
+  return poll_reply(sequence, deadline, false, false, result);
+}
+
+void *BoundedXcbConnection::wait_for_read_reply(
+    std::uint32_t sequence, std::chrono::steady_clock::time_point deadline,
+    x11_detail::XcbOperationResult &result) noexcept {
+  return poll_reply(sequence, deadline, false, true, result);
 }
 
 bool BoundedXcbConnection::check_request(
@@ -1110,7 +1130,7 @@ bool BoundedXcbConnection::check_request(
   const auto barrier = ::xcb_get_input_focus(connection_);
   x11_detail::XcbOperationResult barrier_result{};
   void *barrier_reply =
-      poll_reply(barrier.sequence, deadline, false, barrier_result);
+      poll_reply(barrier.sequence, deadline, false, false, barrier_result);
   std::free(barrier_reply);
   if (barrier_result != x11_detail::XcbOperationResult::Success) {
     result = barrier_result;
@@ -1184,6 +1204,17 @@ x11_detail::retry_delay_after_failure(std::size_t failure_count) noexcept {
 
 X11Session::~X11Session() { (void)shutdown_background_refresh(); }
 
+bool X11Session::constrain_to_target(std::string display, std::uint32_t uid) {
+  std::unique_lock<std::recursive_mutex> write_lock{write_gate_->mutex};
+  if (initialized_.load(std::memory_order_acquire) ||
+      !x11_detail::is_valid_local_display(display) || uid == 0) {
+    return false;
+  }
+  required_display_ = std::move(display);
+  required_uid_ = uid;
+  return true;
+}
+
 X11Session::X11Session(ProbeFunction probe_function,
                        RetryWaitFunction retry_wait_function)
     : generation_clock_{std::make_shared<std::atomic<std::uint64_t>>(0)},
@@ -1199,15 +1230,20 @@ bool X11Session::initialize() {
 
 X11Session::RefreshResult X11Session::refresh() {
   std::uint64_t generation = 0;
+  std::uint64_t keyboard_revision = 0;
   {
     std::lock_guard<std::mutex> lock{refresh_mutex_};
     generation = generation_clock_->fetch_add(1, std::memory_order_acq_rel) + 1;
+    std::unique_lock<std::recursive_mutex> write_lock{write_gate_->mutex};
+    std::lock_guard<std::mutex> snapshot_lock{mu_};
+    keyboard_revision = keyboard_revision_;
   }
   try {
-    return commit_probe(generation,
+    return commit_probe(generation, keyboard_revision,
                         probe_function_ ? probe_function_() : probe_once());
   } catch (...) {
-    return commit_probe(generation, {x11_detail::ProbeStatus::Failed, {}});
+    return commit_probe(generation, keyboard_revision,
+                        {x11_detail::ProbeStatus::Failed, {}});
   }
 }
 
@@ -1320,6 +1356,9 @@ void X11Session::run_background_probe(
     int group = -1;
     std::uint8_t locked_mods = 0;
     std::uint32_t focus_window = 0;
+    std::int16_t pointer_x = 0;
+    std::int16_t pointer_y = 0;
+    std::uint16_t pointer_buttons = 0;
     if (!state->cancel_requested.load(std::memory_order_acquire)) {
       const auto deadline =
           std::chrono::steady_clock::now() + std::chrono::milliseconds{250};
@@ -1339,6 +1378,23 @@ void X11Session::run_background_probe(
             group = -1;
           }
           std::free(reply);
+          if (group >= 0 && focus_window > 1) {
+            const auto pointer_cookie =
+                xcb_query_pointer(connection.get(), focus_window);
+            auto *pointer = static_cast<xcb_query_pointer_reply_t *>(
+                connection.wait_for_reply(pointer_cookie.sequence, deadline,
+                                          result));
+            if (result == x11_detail::XcbOperationResult::Success && pointer &&
+                pointer->same_screen && connection.is_open()) {
+              pointer_x = pointer->root_x;
+              pointer_y = pointer->root_y;
+              pointer_buttons =
+                  static_cast<std::uint16_t>(pointer->mask & 0x1f00U);
+            } else {
+              group = -1;
+            }
+            std::free(pointer);
+          }
         }
       }
     }
@@ -1346,6 +1402,9 @@ void X11Session::run_background_probe(
     state->keyboard.group = group;
     state->keyboard.focus_window = focus_window;
     state->keyboard.locked_mods = locked_mods;
+    state->keyboard.pointer_x = pointer_x;
+    state->keyboard.pointer_y = pointer_y;
+    state->keyboard.pointer_buttons = pointer_buttons;
     state->done = true;
     state->cv.notify_all();
     return;
@@ -1418,6 +1477,11 @@ bool X11Session::start_background_refresh() {
   auto state = std::make_shared<BackgroundState>();
   state->generation =
       generation_clock_->fetch_add(1, std::memory_order_acq_rel) + 1;
+  {
+    std::unique_lock<std::recursive_mutex> write_lock{write_gate_->mutex};
+    std::lock_guard<std::mutex> snapshot_lock{mu_};
+    state->keyboard_revision = keyboard_revision_;
+  }
   state->probe_function = probe_function_;
   state->retry_wait_function = retry_wait_function_;
   state->write_gate = write_gate_;
@@ -1443,12 +1507,23 @@ bool X11Session::start_background_keyboard_observation(
   state->generation = generation_clock_->load(std::memory_order_acquire);
   state->keyboard = KeyboardObservation{request_id, lease->generation(), -1};
   state->keyboard_session = lease->info();
+  {
+    std::lock_guard<std::mutex> snapshot_lock{mu_};
+    state->keyboard_revision = keyboard_revision_;
+  }
   pending_keyboard_ = state;
   // The immutable snapshot travels to the worker; no desktop write lease is
   // held during observation I/O, including a stalled connection handshake.
   lease.reset();
-  keyboard_thread_ =
-      std::thread{[state] { X11Session::run_background_probe(state); }};
+  keyboard_thread_ = std::thread{[state] {
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    punto_e2e_keyboard_observation_request(state->keyboard.request_id);
+#endif
+    X11Session::run_background_probe(state);
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    punto_e2e_keyboard_observation_request(0);
+#endif
+  }};
   return true;
 }
 
@@ -1475,10 +1550,27 @@ X11Session::poll_keyboard_observation() {
   }
   if (observation.group >= 0) {
     std::lock_guard<std::mutex> snapshot_lock{mu_};
-    info_.observed_keyboard_layout = observation.group;
+    if (pending_keyboard_->keyboard_revision == keyboard_revision_) {
+      info_.observed_keyboard_layout = observation.group;
+      ++keyboard_revision_;
+      observation.live_current = true;
+    }
   }
   pending_keyboard_.reset();
   return observation;
+}
+
+bool X11Session::publish_keyboard_layout(int group,
+                                         std::uint64_t session_generation) {
+  if (group < 0 || group > 1)
+    return false;
+  auto lease = acquire_write_lease();
+  if (!lease || lease->generation() != session_generation)
+    return false;
+  std::lock_guard<std::mutex> snapshot_lock{mu_};
+  info_.observed_keyboard_layout = group;
+  ++keyboard_revision_;
+  return true;
 }
 
 std::optional<X11Session::RefreshResult> X11Session::poll_refresh_result() {
@@ -1489,19 +1581,21 @@ std::optional<X11Session::RefreshResult> X11Session::poll_refresh_result() {
   }
   x11_detail::ProbeResult probe;
   std::uint64_t generation = 0;
+  std::uint64_t keyboard_revision = 0;
   {
     std::lock_guard<std::mutex> state_lock{pending_refresh_->mu};
     if (!pending_refresh_->done) {
       return std::nullopt;
     }
     generation = pending_refresh_->generation;
+    keyboard_revision = pending_refresh_->keyboard_revision;
     probe = std::move(pending_refresh_->probe);
   }
   if (refresh_thread_.joinable()) {
     refresh_thread_.join();
   }
   pending_refresh_.reset();
-  return commit_probe(generation, std::move(probe));
+  return commit_probe(generation, keyboard_revision, std::move(probe));
 }
 
 bool X11Session::shutdown_background_refresh(
@@ -1562,10 +1656,17 @@ bool X11Session::shutdown_background_refresh(
 
 X11Session::RefreshResult
 X11Session::commit_probe(std::uint64_t generation,
+                         std::uint64_t keyboard_revision,
                          x11_detail::ProbeResult probe) {
   std::unique_lock<std::recursive_mutex> write_lock{write_gate_->mutex};
   if (generation != generation_clock_->load(std::memory_order_acquire)) {
     return RefreshResult::Failed;
+  }
+  if (!required_display_.empty() &&
+      (probe.status != x11_detail::ProbeStatus::Healthy ||
+       probe.info.display != required_display_ ||
+       probe.info.uid != required_uid_)) {
+    probe = {x11_detail::ProbeStatus::Failed, {}};
   }
   if (probe.status == x11_detail::ProbeStatus::Healthy) {
     bool changed = false;
@@ -1573,6 +1674,13 @@ X11Session::commit_probe(std::uint64_t generation,
       std::lock_guard<std::mutex> lock{mu_};
       changed = !initialized_.load(std::memory_order_relaxed) ||
                 !same_session_info(info_, probe.info);
+      if (!changed && keyboard_revision != keyboard_revision_) {
+        // Same-session health remains useful; its captured group does not
+        // supersede a keyboard fact published while discovery was in flight.
+        probe.info.observed_keyboard_layout = info_.observed_keyboard_layout;
+      } else {
+        ++keyboard_revision_;
+      }
       info_ = std::move(probe.info);
     }
     initialized_.store(true, std::memory_order_release);
@@ -1606,6 +1714,7 @@ void X11Session::reset() noexcept {
   write_gate_->enabled = false;
   std::lock_guard<std::mutex> lock{mu_};
   info_ = {};
+  ++keyboard_revision_;
 }
 
 bool X11Session::is_valid() const noexcept {
@@ -1641,6 +1750,15 @@ const X11SessionInfo &X11Session::WriteLease::info() const noexcept {
 std::uint64_t X11Session::WriteLease::generation() const noexcept {
   return generation_;
 }
+
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+void X11Session::WriteLease::revoke_for_testing() noexcept {
+  if (lock_.owns_lock()) {
+    lock_.unlock();
+  }
+  gate_.reset();
+}
+#endif
 
 BoundedXcbConnection X11Session::WriteLease::open_bounded_connection(
     std::chrono::steady_clock::time_point deadline) const {

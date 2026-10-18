@@ -10,5 +10,5 @@ Description: automatic and manual EN/RU keyboard corrections for X11
  Punto Switcher processes keyboard input through interception-tools and corrects
  layout, case and spelling with guarded X11 operations. It supports selection
  transformations, immediate undo, learned exclusions and optional layout sounds.
- The package includes a command-line control client. The default artifact includes
- a GTK system-tray client; the explicit daemon-only flavor does not.
+ The package includes a command-line control client. The default artifact
+ includes a GTK system-tray client; the explicit daemon-only flavor does not.

@@ -1,0 +1,21 @@
+{
+  "name": "punto-c2c-bfdc-i7-product-recovery-r10",
+  "task_id": "c2c_bfdc",
+  "iteration": 7,
+  "plan_revision": 10,
+  "next_available_step": "authoritative_behavior_contract:c2c_review",
+  "nodes": [
+    {"id":"freeze_and_reframe","needs":[],"status":"DONE_ACCEPTED","evidence":"revision-7 freeze plus unchanged revision-5-9 manifests","done":"Frozen candidate, baseline and recovery identities remain byte-identical; no product or host bytes changed"},
+    {"id":"authoritative_behavior_contract","needs":["freeze_and_reframe"],"status":"LOCAL_GREEN_AWAITING_C2C_REVIEW","evidence":"revision-10 signed correction-confirmation anchor, adversarial RED/GREEN, 89/89 offline tests, independent code review PASS and architecture audit PASS","done":"F2 undo and learning relations use trusted correction-completion evidence with conservative interval verdicts; package-wide replay is fail-closed without invalid-record poisoning; F1/F3/F4 remain green"},
+    {"id":"baseline_2_8_5_probe","needs":["authoritative_behavior_contract"],"status":"BLOCKED_ENVIRONMENT","evidence":"no authorized isolated physical GNOME/X11 target","done":"Exact embedded baseline runs on an isolated target; blocked or synthetic evidence is not PASS"},
+    {"id":"candidate_2_8_14_probe","needs":["authoritative_behavior_contract"],"status":"BLOCKED_ENVIRONMENT","evidence":"no authorized isolated physical GNOME/X11 target","done":"Exact candidate runs on the same target with visible text, selection, focus, layout and following-input oracles"},
+    {"id":"architecture_route_decision","needs":["baseline_2_8_5_probe","candidate_2_8_14_probe"],"status":"WAITING_DEPENDENCIES","evidence":"none yet","done":"C2C-reviewed salvage-or-recover decision is based on comparable live product evidence"},
+    {"id":"manual_word_vertical_slice","needs":["architecture_route_decision"],"status":"WAITING_DEPENDENCIES","evidence":"none yet","done":"Repeated EN/RU Pause behavior and persistent layout pass real target oracles"},
+    {"id":"automatic_vertical_slice","needs":["manual_word_vertical_slice"],"status":"WAITING_DEPENDENCIES","evidence":"none yet","done":"Space/Tab correction, negatives, focus and rapid tails pass real target oracles"},
+    {"id":"remaining_capabilities","needs":["automatic_vertical_slice"],"status":"WAITING_DEPENDENCIES","evidence":"none yet","done":"Selection, case, transliteration, undo, learning, tray, typo, sticky shift, CLI and terminal promises pass"},
+    {"id":"source_and_architecture_gate","needs":["remaining_capabilities"],"status":"WAITING_DEPENDENCIES","evidence":"none yet","done":"Frozen source passes deterministic checks, sanitizers, static analysis and architecture review with no unresolved P0-P2 finding"},
+    {"id":"reversible_candidate_install","needs":["source_and_architecture_gate"],"status":"WAITING_DEPENDENCIES","evidence":"none yet","done":"Exact candidate is installed with verified rollback and without desktop restart or reboot"},
+    {"id":"real_target_acceptance_and_soak","needs":["reversible_candidate_install"],"status":"WAITING_DEPENDENCIES","evidence":"none yet","done":"Real-session matrix and soak pass without lost input, clipboard damage or stuck modifiers"},
+    {"id":"release_review_and_publication","needs":["real_target_acceptance_and_soak"],"status":"WAITING_DEPENDENCIES","evidence":"none yet","done":"C2C accepts exact source/package/live evidence; commit, tag, publication and installed smoke match the accepted bytes"}
+  ]
+}

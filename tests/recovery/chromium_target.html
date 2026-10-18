@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Punto recovery scratch target</title>
+  <style>
+    body { font: 18px sans-serif; margin: 2rem; }
+    label { display: block; margin-bottom: 1.5rem; }
+    input, textarea { box-sizing: border-box; display: block; font: inherit; margin-top: .5rem; width: 100%; }
+    textarea { min-height: 8rem; }
+  </style>
+</head>
+<body>
+  <label>Scratch input <input id="scratch-input" autocomplete="off" spellcheck="false"></label>
+  <label>Scratch textarea <textarea id="scratch-textarea" spellcheck="false"></textarea></label>
+  <label>Tab sentinel <input id="tab-sentinel" autocomplete="off" spellcheck="false"></label>
+  <script>
+    (() => {
+      "use strict";
+      let observationId = 0;
+      let stateGeneration = 0;
+      let activeBinding = null;
+      const observerInstanceId = `chromium-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const keys = {tab_down: 0, tab_up: 0, z_down: 0, z_up: 0};
+      for (const [event, phase] of [["keydown", "down"], ["keyup", "up"]]) {
+        document.addEventListener(event, e => {
+          if (e.code === "Tab" || e.code === "KeyZ") keys[`${e.code === "Tab" ? "tab" : "z"}_${phase}`] += 1;
+        }, true);
+      }
+      const targets = {
+        input: document.querySelector("#scratch-input"),
+        textarea: document.querySelector("#scratch-textarea"),
+        sentinel: document.querySelector("#tab-sentinel"),
+      };
+
+      for (const element of Object.values(targets)) {
+        for (const event of ["input", "select", "focus", "blur"]) {
+          element.addEventListener(event, () => { stateGeneration += 1; });
+        }
+      }
+
+      function focusTarget() {
+        if (document.activeElement === targets.input) return "chromium_input";
+        if (document.activeElement === targets.textarea) return "chromium_textarea";
+        if (document.activeElement === targets.sentinel) return "tab_sentinel";
+        return "none";
+      }
+
+      window.puntoProbe = Object.freeze({
+        observerIdentity() {
+          return {observer_id: "chromium", observer_instance_id: observerInstanceId};
+        },
+        prepare(target, text) {
+          if (activeBinding) throw new Error("active case; preparation is forbidden");
+          const element = targets[target];
+          if (!element) throw new Error(`unknown target: ${target}`);
+          element.value = text;
+          element.setSelectionRange(text.length, text.length);
+          element.focus();
+          stateGeneration += 1;
+          return { state_generation: stateGeneration };
+        },
+        arm(runId, caseId, attemptId, clockMapping) {
+          if (activeBinding) throw new Error("a case is already active");
+          if (!runId || !caseId || !attemptId) throw new Error("run_id, case_id and attempt_id are required");
+          if (!clockMapping || clockMapping.observer_domain !== "performance_now_ns" ||
+              clockMapping.observer_id !== "chromium" ||
+              clockMapping.collector_domain !== "collector_monotonic_ns" ||
+              clockMapping.observer_instance_id !== observerInstanceId ||
+              !Number.isInteger(clockMapping.offset_ns) || !clockMapping.mapping_id ||
+              !clockMapping.calibration ||
+              clockMapping.calibration.source !== "collector_handshake" ||
+              !clockMapping.calibration.calibration_id) {
+            throw new Error("invalid observer clock mapping");
+          }
+          activeBinding = {
+            run_id: runId,
+            case_id: caseId,
+            attempt_id: attemptId,
+            clock_mapping: {...clockMapping},
+          };
+          return { armed: true, state_generation: stateGeneration, ...activeBinding };
+        },
+        snapshot(target) {
+          if (!activeBinding) throw new Error("no active case");
+          const element = targets[target];
+          if (!element) throw new Error(`unknown target: ${target}`);
+          observationId += 1;
+          const observerNs = Math.round(performance.now() * 1000000);
+          const collectorNs = observerNs + activeBinding.clock_mapping.offset_ns;
+          return {
+            observation_id: observationId,
+            observer_id: "chromium",
+            observer_instance_id: observerInstanceId,
+            state_generation: stateGeneration,
+            captured_monotonic_ns: collectorNs,
+            run_id: activeBinding.run_id,
+            case_id: activeBinding.case_id,
+            attempt_id: activeBinding.attempt_id,
+            clock: {
+              ...activeBinding.clock_mapping,
+              observer_ns: observerNs,
+              collector_ns: collectorNs,
+            },
+            state: {
+              text: element.value,
+              selection: [element.selectionStart, element.selectionEnd],
+              focus_target: focusTarget(),
+              following_text: target === "input" ? targets.textarea.value : targets.input.value,
+              sentinel_input: targets.sentinel.value,
+              keys: {...keys},
+            },
+          };
+        },
+        complete() {
+          if (!activeBinding) throw new Error("no active case");
+          activeBinding = null;
+          return { armed: false, state_generation: stateGeneration };
+        },
+      });
+    })();
+  </script>
+</body>
+</html>

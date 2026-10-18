@@ -12,6 +12,7 @@
 #include "punto/config.hpp"
 #include "punto/event_loop.hpp"
 #include "punto/logger.hpp"
+#include "punto/xorg_input_transport.hpp"
 
 #include <cerrno>
 #include <cstdlib>
@@ -20,6 +21,9 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <iostream>
+#include <limits>
+#include <charconv>
+#include <optional>
 #include <signal.h>
 #include <stdexcept>
 #include <string_view>
@@ -27,6 +31,13 @@
 #include <utility>
 
 namespace {
+
+#ifndef PUNTO_POLICY_HASH
+#define PUNTO_POLICY_HASH 0
+#endif
+#ifndef PUNTO_BUILD_ID
+#define PUNTO_BUILD_ID 0
+#endif
 
 volatile sig_atomic_t g_stop_pipe_write_fd = -1;
 
@@ -47,6 +58,20 @@ void print_version() {
   std::cout << "Punto Switcher " PUNTO_VERSION " (C++20)\n"
             << "Высокопроизводительный плагин для interception-tools\n"
             << "https://github.com/antonshalin76/punto\n";
+}
+
+std::optional<int> inherited_fd(const char *name) {
+  const char *raw = std::getenv(name);
+  if (!raw || !*raw)
+    return std::nullopt;
+  errno = 0;
+  char *end = nullptr;
+  const long value = std::strtol(raw, &end, 10);
+  if (errno != 0 || *end != '\0' || value < 3 ||
+      value > std::numeric_limits<int>::max() ||
+      ::fcntl(static_cast<int>(value), F_GETFD) < 0)
+    return std::nullopt;
+  return static_cast<int>(value);
 }
 
 void print_usage(std::ostream &output, const char *argv0) {
@@ -72,12 +97,15 @@ int main(int argc, char *argv[]) {
   try {
     bool show_help = false;
     bool show_version = false;
+    bool xorg_ingress = false;
     for (int i = 1; i < argc; ++i) {
       const std::string_view arg = argv[i];
       if (arg == "-h" || arg == "--help") {
         show_help = true;
       } else if (arg == "-v" || arg == "--version") {
         show_version = true;
+      } else if (arg == "--xorg-ingress") {
+        xorg_ingress = true;
       } else {
         std::cerr << "[punto] Unknown option: " << arg << "\n";
         print_usage(std::cerr, argv[0]);
@@ -154,6 +182,45 @@ int main(int argc, char *argv[]) {
     auto config = std::move(loaded_config.config);
     punto::update_log_level(config.logging.level);
 
+    std::unique_ptr<punto::XorgInputTransport> ingress_transport;
+    int ingress_ready_fd = -1;
+    std::string ingress_display;
+    std::uint32_t ingress_desktop_uid = 0;
+    if (xorg_ingress) {
+      const auto bootstrap_fd = inherited_fd("PUNTO_INGRESS_BOOTSTRAP_FD");
+      const auto ready_fd = inherited_fd("PUNTO_INGRESS_READY_FD");
+      const char *socket_path = std::getenv("PUNTO_INGRESS_SOCKET");
+      const char *display = std::getenv("PUNTO_INGRESS_TARGET_DISPLAY");
+      const char *uid_text = std::getenv("PUNTO_INGRESS_DESKTOP_UID");
+      if (display && uid_text) {
+        ingress_display = display;
+        const char *end = uid_text + std::strlen(uid_text);
+        auto parsed = std::from_chars(uid_text, end, ingress_desktop_uid);
+        if (parsed.ec != std::errc{} || parsed.ptr != end) {
+          ingress_desktop_uid = 0;
+        }
+      }
+      if (!bootstrap_fd || !ready_fd || *bootstrap_fd == *ready_fd ||
+          !socket_path || !*socket_path || ingress_display.empty() ||
+          ingress_desktop_uid == 0 || PUNTO_POLICY_HASH == 0 ||
+          PUNTO_BUILD_ID == 0) {
+        std::cerr << "[punto] ingress pre-capture configuration refused\n";
+        punto::shutdown_logging();
+        return 2;
+      }
+      ingress_transport = punto::XorgInputTransport::connect_authenticated(
+          socket_path, *bootstrap_fd, PUNTO_POLICY_HASH, PUNTO_BUILD_ID,
+          std::chrono::milliseconds{1000});
+      ::close(*bootstrap_fd);
+      if (!ingress_transport) {
+        std::cerr << "[punto] ingress pre-capture authentication refused\n";
+        ::close(*ready_fd);
+        punto::shutdown_logging();
+        return 2;
+      }
+      ingress_ready_fd = *ready_fd;
+    }
+
     // Логирование настроек auto_switch для отладки
     std::cerr << "[punto] auto_switch: enabled=" << config.auto_switch.enabled
               << ", threshold=" << config.auto_switch.threshold
@@ -168,6 +235,15 @@ int main(int argc, char *argv[]) {
       // process-wide logger is torn down.
       punto::EventLoop loop{std::move(config)};
       loop.set_stop_signal_fd(stop_pipe[0]);
+      if (ingress_transport &&
+          !loop.set_ingress_transport(std::move(ingress_transport),
+                                      ingress_ready_fd,
+                                      std::move(ingress_display),
+                                      ingress_desktop_uid)) {
+        std::cerr << "[punto] ingress target binding refused\n";
+        ::close(ingress_ready_fd);
+        return 2;
+      }
       result = loop.run();
     }
 

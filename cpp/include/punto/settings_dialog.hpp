@@ -6,6 +6,7 @@
 #pragma once
 
 #include <gtk/gtk.h>
+#include <optional>
 #include <string>
 
 namespace punto {
@@ -46,13 +47,16 @@ public:
    * @param parent Родительское окно (может быть nullptr)
    * @return true если настройки были сохранены
    */
-  static bool show(GtkWidget *parent = nullptr, Section section = Section::General);
+  static bool show(GtkWidget *parent = nullptr,
+                   Section section = Section::General);
 
   /// Загружает настройки из файла (используется также tray меню)
   static SettingsData load_settings();
 
   /// Сохраняет настройки в файл (используется также tray меню)
-  static bool save_settings(const SettingsData &settings);
+  /// Initial limits the merge to fields edited since opening the dialog.
+  static bool save_settings(const SettingsData &settings,
+                            std::optional<SettingsData> initial = std::nullopt);
 
   /// Путь к user config (~/.config/punto/config.yaml)
   static std::string get_user_config_path();

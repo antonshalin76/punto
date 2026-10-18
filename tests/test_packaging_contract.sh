@@ -16,16 +16,17 @@ checks=0
 tmp_root=""
 
 REQUIRED_PACKAGES=(
-    build-essential cmake pkg-config libhunspell-dev libyaml-cpp-dev
-    libsystemd-dev libxcb1-dev libxcb-xkb-dev libxau-dev
-    libxcb-xfixes0-dev libxcb-xtest0-dev libxcb-xinput-dev libxkbcommon-dev
+    build-essential cmake pkg-config libglib2.0-dev libhunspell-dev libyaml-cpp-dev
+    libjson-glib-dev libsystemd-dev libxcb1-dev libxcb-xkb-dev libxau-dev
+    libxcb-xfixes0-dev libxcb-xtest0-dev libxcb-xinput-dev libxcb-res0-dev libxkbcommon-dev
+    libgtk-3-dev libssl-dev
     dpkg-dev binutils file
 )
 REQUIRED_TOOLS=(
     cmake dpkg dpkg-query dpkg-deb dpkg-shlibdeps pkg-config
     file strip gzip sha256sum
 )
-TRAY_PACKAGES=(libgtk-3-dev libayatana-appindicator3-dev)
+TRAY_PACKAGES=(libayatana-appindicator3-dev)
 DICTIONARY_PACKAGES=(hunspell hunspell-en-us hunspell-ru wamerican-huge)
 RUNTIME_PACKAGES=(
     interception-tools libgtk-3-0 libayatana-appindicator3-1
@@ -255,10 +256,12 @@ trap 'cleanup; trap - EXIT; exit 130' INT
 trap 'cleanup; trap - EXIT; exit 143' TERM
 
 missing_test_tools=""
-if [[ -n ${PUNTO_CONTRACT_LIFECYCLE_ONLY_ARTIFACT:-} ]]; then
+if [[ -n ${PUNTO_CONTRACT_LIFECYCLE_ONLY_ARTIFACT:-} ||
+      ${PUNTO_CONTRACT_DIRECTORY_SOURCE_ONLY:-0} == 1 ]]; then
     prerequisite_tools=(
         bash bwrap dpkg dpkg-query dpkg-deb realpath timeout python3 busybox ldd
         awk mkdir chmod cp dirname ln sed rm sha256sum grep chroot mktemp mkfifo find sort
+        stat cut install ls
     )
 else
     prerequisite_tools=(
@@ -281,8 +284,10 @@ fi
 tmp_root=$(mktemp -d /tmp/punto-packaging-contract.XXXXXX)
 if [[ -z ${PUNTO_CONTRACT_LIFECYCLE_ONLY_ARTIFACT:-} ]]; then
     load_root_version
-    assert_file_not_contains "$REPO_ROOT/README.md" "./build-deb.sh --install" \
-        "B15: README does not recommend an unsupported build option"
+    if [[ ${PUNTO_CONTRACT_DIRECTORY_SOURCE_ONLY:-0} != 1 ]]; then
+        assert_file_not_contains "$REPO_ROOT/README.md" "./build-deb.sh --install" \
+            "B15: README does not recommend an unsupported build option"
+    fi
 fi
 
 copy_repo() {
@@ -370,6 +375,7 @@ set -u
 printf 'CMAKE' >>"${TEST_CALLS:?}"
 printf ' %q' "$@" >>"$TEST_CALLS"
 printf '\n' >>"$TEST_CALLS"
+printf 'CMAKE_BUILD_PARALLEL_LEVEL %q\n' "${CMAKE_BUILD_PARALLEL_LEVEL:-}" >>"$TEST_CALLS"
 [[ ${TEST_MISSING_TOOL:-} == cmake ]] && exit 127
 mkdir -p "${TEST_REPO:?}/cpp/build"
 if [[ " $* " == *' -DBUILD_TRAY=OFF '* ]]; then
@@ -381,6 +387,11 @@ elif [[ ! -f $TEST_REPO/cpp/build/.tray-mode ]]; then
 fi
 cp /bin/true "$TEST_REPO/cpp/build/punto"
 chmod 0755 "$TEST_REPO/cpp/build/punto"
+cp /bin/true "$TEST_REPO/cpp/build/punto-session-bridge"
+chmod 0755 "$TEST_REPO/cpp/build/punto-session-bridge"
+mkdir -p "$TEST_REPO/cpp/build/gtk-3.0/modules"
+cp /bin/true "$TEST_REPO/cpp/build/gtk-3.0/modules/libpunto-gtk-editor-adapter.so"
+chmod 0644 "$TEST_REPO/cpp/build/gtk-3.0/modules/libpunto-gtk-editor-adapter.so"
 if [[ $(<"$TEST_REPO/cpp/build/.tray-mode") == on ]]; then
     cp /bin/true "$TEST_REPO/cpp/build/punto-tray"
     chmod 0755 "$TEST_REPO/cpp/build/punto-tray"
@@ -469,12 +480,14 @@ run_fake_build() {
     local name=$1 missing_packages=${2:-} missing_tool=${3:-} version_mode=${4:-preserve}
     local build_flavor=${5:-full}
     local source_epoch=${6:-}
-    local sound_fault=${7:-}
+    local sound_fault=${7:-} parallel_level=${8:-}
     local work="$tmp_root/fake-$name" spies bash_env output_file
     local -a build_options=(--non-interactive --skip-runtime-installs)
     local -a epoch_environment=()
+    local -a parallel_environment=()
     [[ $build_flavor == daemon ]] && build_options+=(--without-tray)
     [[ -n $source_epoch ]] && epoch_environment=(--setenv SOURCE_DATE_EPOCH "$source_epoch")
+    [[ -n $parallel_level ]] && parallel_environment=(--setenv CMAKE_BUILD_PARALLEL_LEVEL "$parallel_level")
     FAKE_REPO="$work/repo"
     FAKE_STAGE="$work/stage"
     FAKE_CALLS="$work/calls.log"
@@ -531,6 +544,7 @@ PY
         --setenv TEST_MISSING_PACKAGES "$missing_packages" \
         --setenv TEST_MISSING_TOOL "$missing_tool" --setenv BASH_ENV "$bash_env" \
         "${epoch_environment[@]}" \
+        "${parallel_environment[@]}" \
         bash ./build-deb.sh "${build_options[@]}" </dev/null \
         >"$output_file" 2>&1
     FAKE_RC=$?
@@ -630,6 +644,19 @@ run_required_package_matrix() {
         else
             fail "B21d: missing $package left $artifact_count artifact(s)"
         fi
+    done
+}
+
+run_build_parallelism_gate() {
+    local parallel_level expected
+    for parallel_level in '' 1; do
+        expected=${parallel_level:-2}
+        run_fake_build "parallelism-$expected" '' '' preserve full '' '' "$parallel_level"
+        assert_zero "$FAKE_RC" "build parallelism $expected keeps fake build working"
+        assert_contains "$(<"$FAKE_CALLS")" "CMAKE_BUILD_PARALLEL_LEVEL $expected" \
+            "build parallelism defaults safely or respects the caller"
+        assert_not_contains "$(<"$FAKE_CALLS")" ' -j ' \
+            "build does not override CMake parallelism"
     done
 }
 
@@ -786,7 +813,7 @@ run_optional_matrix() {
             "B21b: explicit daemon build without $package" "$FAKE_TRACE"
         stage_root="$FAKE_STAGE/root"
         if [[ -d $stage_root ]] && ! find "$stage_root" -type f \
-            \( -name punto-tray -o -name '*punto*.desktop' -o -name punto-tray.service \) \
+            \( -name punto-tray -o -name punto-tray.desktop -o -name punto-tray.service \) \
             -print -quit | grep -q .; then
             pass "B21b: explicit daemon stage excludes tray payloads"
         else
@@ -839,14 +866,15 @@ def walk_error(error: OSError) -> None:
     raise error
 
 
-for directory, names, files in os.walk(
-    root, topdown=True, onerror=walk_error, followlinks=False
-):
-    names.sort()
-    files.sort()
-    base = pathlib.Path(directory)
-    entries.extend(base / name for name in names)
-    entries.extend(base / name for name in files)
+if stat.S_ISDIR(root.lstat().st_mode):
+    for directory, names, files in os.walk(
+        root, topdown=True, onerror=walk_error, followlinks=False
+    ):
+        names.sort()
+        files.sort()
+        base = pathlib.Path(directory)
+        entries.extend(base / name for name in names)
+        entries.extend(base / name for name in files)
 
 rows = []
 for path in sorted(set(entries), key=lambda item: os.fsencode(str(item.relative_to(root.parent)))):
@@ -1414,9 +1442,13 @@ check_tree_modes() {
 usr/bin/punto|755
 usr/bin/punto-daemon|755
 usr/bin/punto-tray|755
+usr/libexec/punto-session-bridge|755
 etc/punto/config.yaml|644
+etc/xdg/autostart/punto-session-bridge.desktop|644
 etc/xdg/autostart/punto-tray.desktop|644
+usr/lib/systemd/user/punto-session-bridge.service|644
 usr/lib/systemd/user/punto-tray.service|644
+usr/share/punto-switcher/protocol/punto-dbus-v1.xml|644
 usr/share/punto-switcher/VERSION|644
 MODES
 
@@ -1427,14 +1459,16 @@ MODES
         fail "$label has non-0755 directories: ${bad//$'\n'/, }"
     fi
 
-    bad=$(find "$root/usr/bin" -xdev -type f ! -perm 0755 -printf '%m %P\n' 2>/dev/null | sort)
+    bad=$(find "$root/usr/bin" "$root/usr/libexec" -xdev -type f ! -perm 0755 \
+        -printf '%m %P\n' 2>/dev/null | sort)
     if [[ -z $bad ]]; then
         pass "$label executable payloads have normalized 0755 modes"
     else
         fail "$label has non-0755 executable payloads: ${bad//$'\n'/, }"
     fi
 
-    bad=$(find "$root" -xdev -type f ! -path "$root/usr/bin/*" ! -perm 0644 \
+    bad=$(find "$root" -xdev -type f ! -path "$root/usr/bin/*" \
+        ! -path "$root/usr/libexec/*" ! -perm 0644 \
         -printf '%m %P\n' | sort)
     if [[ -z $bad ]]; then
         pass "$label regular data files have normalized 0644 modes"
@@ -1606,9 +1640,6 @@ check_cli_command_dependencies() {
         assert_relation_package "$depends" systemd \
             "$label Depends declares the systemd user-manager client"
     fi
-    assert_relation_package "$depends" init-system-helpers \
-        "$label Depends declares the maintainer-script helper provider"
-
     for command in "${base_commands[@]}"; do
         if grep -Eq "(^|[;&|()[:space:]])((/usr/bin/|/bin/)?$command)([[:space:]]|$)" "$cli"; then
             package=${providers[$command]}
@@ -1635,14 +1666,15 @@ assert_exact_derived_dependencies() {
     local actual_normalized expected_normalized
     local -a elf_args=() derived_parts=() control_parts=()
     local -a explicit_parts=(
-        interception-tools hunspell-en-us hunspell-ru netcat-openbsd passwd
+        interception-tools hunspell-en-us hunspell-ru netcat-openbsd passwd at-spi2-core
         'pulseaudio-utils | alsa-utils'
-        'util-linux (>= 2.38)' 'systemd (>= 249.10)' \
-        'init-system-helpers (>= 1.66)'
+        'util-linux (>= 2.38)' 'systemd (>= 249.10)'
     )
     depends=$(/usr/bin/dpkg-deb -f "$artifact" Depends 2>/dev/null || true)
     [[ -x $data_root/usr/bin/punto-daemon ]] && elf_args+=("-e$data_root/usr/bin/punto-daemon")
     [[ -x $data_root/usr/bin/punto-tray ]] && elf_args+=("-e$data_root/usr/bin/punto-tray")
+    [[ -x $data_root/usr/libexec/punto-session-bridge ]] && \
+        elf_args+=("-e$data_root/usr/libexec/punto-session-bridge")
     if [[ ${#elf_args[@]} -eq 0 ]]; then
         fail "$label cannot derive dependencies without a packaged ELF executable"
         return
@@ -1782,6 +1814,26 @@ inspect_artifact() {
 
     assert_executable "$data/usr/bin/punto" "$label provides /usr/bin/punto"
     assert_executable "$data/usr/bin/punto-daemon" "$label provides /usr/bin/punto-daemon"
+    assert_executable "$data/usr/libexec/punto-session-bridge" \
+        "$label provides the compiled session bridge"
+    if [[ -z $(find "$data" -name '*punto-gtk-editor-adapter*' -print -quit) ]]; then
+        pass "$label contains no GTK editor module or autoload descriptor"
+    else
+        fail "$label retained an editor-module dependency"
+    fi
+    if [[ $expect_tray == no ]]; then
+        if [[ $depends != *libgtk-3* && $depends != *appindicator* ]]; then
+            pass "$label daemon-only profile has no GTK/AppIndicator runtime dependency"
+        else
+            fail "$label daemon-only profile retained a GTK/AppIndicator runtime dependency"
+        fi
+    fi
+    assert_file "$data/usr/share/punto-switcher/protocol/punto-dbus-v1.xml" \
+        "$label packages the canonical bridge protocol"
+    assert_file "$data/etc/xdg/autostart/punto-session-bridge.desktop" \
+        "$label includes bridge autostart policy"
+    assert_file "$data/usr/lib/systemd/user/punto-session-bridge.service" \
+        "$label includes the package-owned bridge user unit"
     assert_file "$data/etc/punto/config.yaml" "$label packages the active config"
     if [[ -f $data/etc/punto/config.yaml ]]; then
         packaged_config=$(<"$data/etc/punto/config.yaml")
@@ -1798,7 +1850,10 @@ inspect_artifact() {
     assert_file "$data/usr/share/punto-switcher/VERSION" "$label packages canonical VERSION"
     local extension_dir="$data/usr/share/gnome-shell/extensions/punto-input-source@antonshalin76"
     assert_file "$extension_dir/compat.js" "$label packages the GNOME 46 X11 compatibility seam"
+    assert_file "$extension_dir/dbusAdapter.js" "$label packages the production D-Bus adapter"
     assert_file "$extension_dir/extension.js" "$label packages the guarded GNOME extension"
+    assert_file "$extension_dir/inputSourceBridge.js" "$label packages the input-source bridge core"
+    assert_file "$extension_dir/punto-dbus-v1.xml" "$label packages the frozen bridge protocol"
     assert_file "$extension_dir/metadata.json" "$label packages GNOME extension metadata"
     if [[ -f $extension_dir/metadata.json ]]; then
         local extension_metadata
@@ -1841,8 +1896,46 @@ inspect_artifact() {
     conffiles=""
     [[ -f $control/conffiles ]] && conffiles=$(<"$control/conffiles")
     assert_exact_line "$conffiles" '/etc/punto/config.yaml' "$label declares config as conffile"
+    assert_exact_line "$conffiles" '/etc/xdg/autostart/punto-session-bridge.desktop' \
+        "$label declares bridge autostart policy as conffile"
+    assert_not_contains "$conffiles" '/usr/lib/systemd/user/punto-session-bridge.service' \
+        "$label does not declare the package-owned bridge unit as conffile"
     assert_not_contains "$conffiles" '/etc/interception/udevmon.yaml' \
         "$label does not declare the foreign udevmon config as a conffile"
+
+    if [[ -f $data/usr/lib/systemd/user/punto-session-bridge.service && \
+          -f $data/etc/xdg/autostart/punto-session-bridge.desktop ]]; then
+        local bridge_unit_source bridge_desktop_source
+        bridge_unit_source=$(<"$data/usr/lib/systemd/user/punto-session-bridge.service")
+        bridge_desktop_source=$(<"$data/etc/xdg/autostart/punto-session-bridge.desktop")
+        assert_contains "$bridge_unit_source" 'Type=exec' \
+            "$label bridge unit reports exec readiness"
+        assert_contains "$bridge_unit_source" 'ExecStart=/usr/libexec/punto-session-bridge' \
+            "$label bridge unit starts the exact packaged helper"
+        assert_contains "$bridge_unit_source" 'RuntimeDirectory=punto' \
+            "$label bridge unit owns its private runtime directory"
+        assert_contains "$bridge_unit_source" 'StateDirectory=punto-session-bridge' \
+            "$label bridge enrollment state avoids the legacy settings directory"
+        assert_contains "$bridge_unit_source" 'StateDirectoryMode=0700' \
+            "$label bridge enrollment state is private and persists across updates"
+        assert_contains "$bridge_unit_source" 'Restart=on-failure' \
+            "$label bridge unit recovers from Shell owner loss"
+        assert_contains "$bridge_unit_source" 'RestartPreventExitStatus=64' \
+            "$label permanent bridge failures do not restart forever"
+        assert_contains "$bridge_unit_source" 'StartLimitIntervalSec=0' \
+            "$label bridge retries remain rearmable after a long Shell outage"
+        assert_contains "$bridge_unit_source" 'RestartSec=5s' \
+            "$label bridge retry cadence avoids a restart storm"
+        assert_not_contains "$bridge_unit_source" 'StartLimitBurst=' \
+            "$label bridge has no finite retry exhaustion"
+        assert_not_contains "$bridge_unit_source" '[Install]' \
+            "$label bridge unit remains static"
+        assert_contains "$bridge_desktop_source" \
+            'Exec=/usr/bin/systemctl --user start --no-block -- punto-session-bridge.service' \
+            "$label bridge autostart delegates asynchronously to the user manager"
+        assert_contains "$bridge_desktop_source" 'OnlyShowIn=GNOME;' \
+            "$label bridge autostart is limited to the supported desktop"
+    fi
 
     if [[ $expect_tray == yes ]]; then
         assert_executable "$data/usr/bin/punto-tray" "$label includes tray ELF"
@@ -1896,8 +1989,8 @@ inspect_artifact() {
         else
             fail "$label daemon-only payload retains tray-specific paths: ${tray_paths//$'\n'/, }"
         fi
-        assert_not_contains "$relationships" 'libgtk-3-0' \
-            "$label daemon-only relationship fields exclude GTK runtime"
+        assert_contains "$relationships" 'libgtk-3-0' \
+            "$label tray-free build retains the GTK editor runtime"
         assert_not_contains "$relationships" 'libayatana-appindicator3-1' \
             "$label daemon-only relationship fields exclude AppIndicator runtime"
     fi
@@ -1908,7 +2001,8 @@ inspect_artifact() {
     check_symlinks_bounded "$data" "$label"
 
     expected_machine=$(elf_machine_for_arch "$architecture")
-    for binary in "$data/usr/bin/punto-daemon" "$data/usr/bin/punto-tray"; do
+    for binary in "$data/usr/bin/punto-daemon" "$data/usr/bin/punto-tray" \
+        "$data/usr/libexec/punto-session-bridge"; do
         [[ -e $binary ]] || continue
         binary_name=$(basename "$binary")
         assert_contains "$(/usr/bin/file "$binary")" 'ELF' "$label $binary_name is ELF"
@@ -1950,12 +2044,15 @@ inspect_artifact() {
     assert_not_contains "$(/usr/bin/strings -a "$data/usr/bin/punto-daemon")" \
         'PUNTO_TEST_MAIN_EXCEPTION' \
         "$label production daemon excludes the test-only exception seam"
+    assert_not_contains "$(/usr/bin/strings -a "$data/usr/libexec/punto-session-bridge")" \
+        'PUNTO_TEST_SESSION_MODE' \
+        "$label production bridge excludes the test-only logind seam"
 
     assert_matches "$(/usr/bin/readelf -d "$data/usr/bin/punto-daemon" 2>/dev/null || true)" \
         'Shared library: \[libyaml-cpp\.so\.[^]]+\]' \
         "$label daemon records its libyaml-cpp DT_NEEDED dependency"
 
-    for package in interception-tools hunspell-en-us hunspell-ru netcat-openbsd passwd; do
+    for package in interception-tools hunspell-en-us hunspell-ru netcat-openbsd passwd at-spi2-core; do
         assert_matches ",$depends," "(^|,)[[:space:]]*${package//+/\\+}([[:space:](,]|$)" \
             "$label Depends includes required runtime $package"
     done
@@ -1988,11 +2085,12 @@ inspect_artifact() {
 }
 
 prepare_lifecycle_root() {
-    local root=$1 applet library
+    local root=$1 applet library tool binary
     mkdir -p "$root/bin" "$root/contract-bin" "$root/contract-state" "$root/dev" \
         "$root/etc" "$root/tmp" "$root/var/lib/dpkg/info" "$root/var/lib/dpkg/updates" \
         "$root/var/lib/dpkg/triggers" "$root/var/lib/dpkg/parts" "$root/var/log" \
-        "$root/run/systemd/system" "$root/usr/bin" "$root/usr/sbin"
+        "$root/run/systemd/system" "$root/usr/bin" "$root/usr/sbin" "$root/usr/share"
+    chmod 0755 "$root" "$root/etc" "$root/usr" "$root/usr/share"
     chmod 0777 "$root/tmp" "$root/contract-state"
     : >"$root/var/lib/dpkg/status"
     : >"$root/var/lib/dpkg/available"
@@ -2007,8 +2105,20 @@ prepare_lifecycle_root() {
         cp -- "$library" "$root$library"
     done < <(ldd /bin/bash | awk '/=> \// {print $3} $1 ~ /^\// {print $1}')
     cp -- /usr/bin/busybox "$root/bin/busybox"
-    for applet in sh cat chmod chown cp date grep id mkdir mv rm sed sleep stat tr; do
+    for applet in sh cat chmod chown cp date grep id mkdir mv rm sed sleep stat touch tr; do
         ln -s busybox "$root/bin/$applet"
+    done
+    # Maintscript admission needs real coreutils metadata, including ACL markers.
+    for tool in stat chmod chown cut mktemp mv rm ls; do
+        binary=$(command -v "$tool")
+        cp -- "$binary" "$root/usr/bin/$tool"
+        rm -f -- "$root/bin/$tool"
+        ln -s "/usr/bin/$tool" "$root/bin/$tool"
+        while IFS= read -r library; do
+            [[ -n $library ]] || continue
+            mkdir -p "$root$(dirname "$library")"
+            cp -- "$library" "$root$library"
+        done < <(ldd "$binary" | awk '/=> \// {print $3} $1 ~ /^\// {print $1}')
     done
     cp -- /usr/bin/timeout "$root/usr/bin/timeout"
 
@@ -2037,11 +2147,16 @@ fi
 exit 0
 SPY
     : >"$root/contract-state/tray-1000.active"
-    cat >"$root/contract-bin/systemctl" <<'SPY'
+cat >"$root/contract-bin/systemctl" <<'SPY'
 #!/bin/sh
 printf 'SYSTEMCTL' >>/contract-state/calls.log
 printf ' %s' "$@" >>/contract-state/calls.log
 printf '\n' >>/contract-state/calls.log
+if [ "${CONTRACT_SERVICE_MODE:-ok}" = legacy285 ]; then
+    case "$*" in
+        daemon-reload|'enable udevmon'|'restart udevmon'|'stop udevmon') exit 0 ;;
+    esac
+fi
 case "$*" in
     '--system --no-legend --plain --state=active --type=service list-units user@*.service')
         printf '%s\n' \
@@ -2212,9 +2327,8 @@ run_package_lifecycle_gate() {
         --log="$root/var/log/dpkg.log" --force-depends --force-confdef \
         --force-confold -i "$artifact"
     assert_zero "$LIFECYCLE_RC" "B14 lifecycle isolated install"
-    expected_service_calls='DEB_SYSTEMD_INVOKE --user daemon-reload'
     assert_lifecycle_service_log "$root" "$expected_service_calls" \
-        "B14 lifecycle install"
+        "B14 lifecycle install leaves active user managers untouched"
     if [[ ! -e $root/etc/interception ]]; then
         pass "B14 lifecycle install leaves global interception config absent"
     else
@@ -2246,12 +2360,8 @@ run_package_lifecycle_gate() {
         run_lifecycle_command "$root" repeat-postinst /usr/sbin/chroot "$root" \
             /var/lib/dpkg/info/punto-switcher.postinst configure "$EXPECTED_VERSION"
         assert_zero "$LIFECYCLE_RC" "B14 lifecycle repeated postinst"
-        expected_service_calls+=$'\nDEB_SYSTEMD_INVOKE --user daemon-reload'
-        expected_service_calls+=$'\nSYSTEMCTL --system --no-legend --plain --state=active --type=service list-units user@*.service'
-        expected_service_calls+=$'\nSYSTEMCTL --quiet --no-block --user --machine=1000@ try-restart -- punto-tray.service'
-        expected_service_calls+=$'\nSYSTEMCTL --quiet --no-block --user --machine=1001@ try-restart -- punto-tray.service'
         assert_lifecycle_service_log "$root" "$expected_service_calls" \
-            "B14 lifecycle repeated postinst"
+            "B14 lifecycle repeated postinst leaves active user managers untouched"
     else
         fail "B14 lifecycle installed no executable postinst"
         run_package_setup_failure "$artifact"
@@ -2294,12 +2404,8 @@ run_package_lifecycle_gate() {
         --log="$root/var/log/dpkg.log" --force-depends --force-confdef \
         --force-confold -i "$upgrade_artifact"
     assert_zero "$LIFECYCLE_RC" "B14 lifecycle isolated upgrade"
-    expected_service_calls+=$'\nDEB_SYSTEMD_INVOKE --user daemon-reload'
-    expected_service_calls+=$'\nSYSTEMCTL --system --no-legend --plain --state=active --type=service list-units user@*.service'
-    expected_service_calls+=$'\nSYSTEMCTL --quiet --no-block --user --machine=1000@ try-restart -- punto-tray.service'
-    expected_service_calls+=$'\nSYSTEMCTL --quiet --no-block --user --machine=1001@ try-restart -- punto-tray.service'
     assert_lifecycle_service_log "$root" "$expected_service_calls" \
-        "B14 lifecycle upgrade"
+        "B14 lifecycle upgrade leaves active user managers untouched"
     assert_package_status "$root" 'ii ' "B14 lifecycle upgrade"
     if [[ $(stat -c '%a:%h:%i' "$root/etc/punto/undo_exclusions.txt") == "600:1:$legacy_inode" &&
           $(sha256sum "$root/etc/punto/undo_exclusions.txt" | awk '{print $1}') == "$legacy_hash" ]]; then
@@ -2330,10 +2436,8 @@ run_package_lifecycle_gate() {
     run_lifecycle_command "$root" remove /usr/bin/dpkg --root="$root" \
         --log="$root/var/log/dpkg.log" --force-depends -r punto-switcher
     assert_zero "$LIFECYCLE_RC" "B14 lifecycle isolated remove"
-    expected_service_calls+=$'\nDEB_SYSTEMD_INVOKE --user stop punto-tray.service'
-    expected_service_calls+=$'\nDEB_SYSTEMD_INVOKE --user daemon-reload'
     assert_lifecycle_service_log "$root" "$expected_service_calls" \
-        "B14 lifecycle remove"
+        "B14 lifecycle remove leaves active user managers untouched"
     assert_package_status "$root" 'rc ' "B14 lifecycle remove"
     assert_file "$root/etc/punto/config.yaml" "B14 lifecycle remove retains the conffile"
     if [[ -f $root/etc/punto/config.yaml && \
@@ -2346,9 +2450,8 @@ run_package_lifecycle_gate() {
     run_lifecycle_command "$root" purge /usr/bin/dpkg --root="$root" \
         --log="$root/var/log/dpkg.log" --force-depends -P punto-switcher
     assert_zero "$LIFECYCLE_RC" "B14 lifecycle isolated purge"
-    expected_service_calls+=$'\nDEB_SYSTEMD_INVOKE --user daemon-reload'
     assert_lifecycle_service_log "$root" "$expected_service_calls" \
-        "B14 lifecycle purge"
+        "B14 lifecycle purge leaves active user managers untouched"
     assert_package_absent "$root" "B14 lifecycle purge"
     if [[ ! -e $root/etc/punto/config.yaml && \
           ! -e $root/etc/punto/config.yaml.dpkg-dist ]]; then
@@ -2367,6 +2470,210 @@ run_package_lifecycle_gate() {
     run_package_service_failure "$artifact"
     run_package_policy_denial "$artifact"
     run_legacy_exclusion_migration_gate "$artifact"
+}
+
+run_legacy_directory_mode_gate() {
+    local artifact=$1 root="$tmp_root/lifecycle-285-directory/root"
+    local control="$tmp_root/lifecycle-285-directory/control"
+    local config before_hash before_inode before_dir_owner after_first after_repeat
+    local gtk_module_dir module_before module_after share sounds files_before files_after
+    local fault before_rejection after_rejection expected_refusal
+    prepare_lifecycle_root "$root"
+    share="$root/usr/share/punto-switcher"
+    sounds="$share/sounds"
+    mkdir -p "$root/etc/punto" "$sounds" "$control"
+    cp -- "$REPO_ROOT/cpp/src/sound/en_ru.wav" "$sounds/en_ru.wav"
+    cp -- "$REPO_ROOT/cpp/src/sound/ru_en.wav" "$sounds/ru_en.wav"
+    chmod 0644 "$sounds/en_ru.wav" "$sounds/ru_en.wav"
+    gtk_module_dir="$root/usr/lib/gnome-settings-daemon-3.0/gtk-modules"
+    mkdir -p "$gtk_module_dir"
+    printf 'unrelated module\n' >"$gtk_module_dir/foreign-module.desktop"
+    module_before=$(snapshot_tree "$gtk_module_dir")
+    config="$root/etc/punto/config.yaml"
+    printf '%s\n' '# preserved 2.8.5 user config' 'user: value' >"$config"
+    chmod 0644 "$config"
+    chmod 0775 "$root/etc/punto" "$share" "$sounds"
+    before_dir_owner=$(stat -c '%u:%g' "$root/etc/punto")
+    before_hash=$(sha256sum "$config" | awk '{print $1}')
+    before_inode=$(stat -c '%i' "$config")
+    files_before="$(snapshot_tree "$config")$(snapshot_tree "$sounds/en_ru.wav")$(snapshot_tree "$sounds/ru_en.wav")"
+    if [[ ${PUNTO_CONTRACT_DIRECTORY_SOURCE_ONLY:-0} == 1 ]]; then
+        sed "s|@PUNTO_VERSION@|$EXPECTED_VERSION|g" \
+            "$PUNTO_CONTRACT_POSTINST_SOURCE" >"$control/postinst"
+    else
+        /usr/bin/dpkg-deb -e "$artifact" "$control"
+    fi
+    install -m 0755 "$control/postinst" \
+        "$root/var/lib/dpkg/info/punto-switcher.postinst"
+
+    run_lifecycle_command "$root" legacy-directory-285 /usr/sbin/chroot "$root" \
+        /var/lib/dpkg/info/punto-switcher.postinst configure 2.8.5
+    assert_zero "$LIFECYCLE_RC" "B14 direct 2.8.5 directory migration configures"
+    module_after=$(snapshot_tree "$gtk_module_dir")
+    if [[ $module_after == "$module_before" ]]; then
+        pass "B14 postinst neither requires a descriptor nor changes foreign GTK metadata"
+    else
+        fail "B14 postinst changed foreign GTK metadata"
+    fi
+    if [[ $(stat -c '%u:%g:%a' "$root/etc/punto") == "$before_dir_owner:755" &&
+          $(sha256sum "$config" | awk '{print $1}') == "$before_hash" &&
+          $(stat -c '%i' "$config") == "$before_inode" ]]; then
+        pass "B14 direct 2.8.5 directory migration secures only directory metadata"
+    else
+        fail "B14 direct 2.8.5 directory migration changed config or retained unsafe mode"
+    fi
+    files_after="$(snapshot_tree "$config")$(snapshot_tree "$sounds/en_ru.wav")$(snapshot_tree "$sounds/ru_en.wav")"
+    if [[ $(stat -c '%u:%g:%a' "$share" "$sounds") == "$before_dir_owner:755"$'\n'"$before_dir_owner:755" &&
+          $files_after == "$files_before" ]]; then
+        pass "B14 package-owned legacy share directories are secured without rewriting payloads"
+    else
+        fail "B14 package-owned share permissions or preserved payload metadata differ"
+    fi
+    after_first="$(snapshot_tree "$root/etc/punto")$(snapshot_tree "$share")"
+    run_lifecycle_command "$root" legacy-directory-repeat /usr/sbin/chroot "$root" \
+        /var/lib/dpkg/info/punto-switcher.postinst configure 2.8.5
+    assert_zero "$LIFECYCLE_RC" "B14 direct 2.8.5 migration permits repeated configure"
+    after_repeat="$(snapshot_tree "$root/etc/punto")$(snapshot_tree "$share")"
+    if [[ $after_first == "$after_repeat" ]]; then
+        pass "B14 direct 2.8.5 directory migration is idempotent"
+    else
+        fail "B14 direct 2.8.5 directory migration changed repeated state"
+    fi
+    assert_not_contains "$(<"$root/contract-state/calls.log")" 'SYSTEMCTL ' \
+        "B14 legacy directory migration does not touch active services"
+
+    for fault in writable symlink acl; do
+        chmod 0775 "$root/etc/punto" "$share" "$sounds"
+        case $fault in
+            writable)
+                expected_refusal='package directory metadata is not admitted'
+                chmod 0777 "$sounds"
+                ;;
+            symlink)
+                expected_refusal='package directory is not trusted'
+                mv "$sounds" "$share/sounds-owned"
+                ln -s sounds-owned "$sounds"
+                ;;
+            acl)
+                expected_refusal='alternate directory access is not admitted'
+                python3 - "$sounds" <<'PY'
+import os, struct, sys
+entries = ((1, 7, 0xffffffff), (2, 4, 0), (4, 7, 0xffffffff),
+           (16, 7, 0xffffffff), (32, 5, 0xffffffff))
+value = struct.pack('<I', 2) + b''.join(struct.pack('<HHI', *entry) for entry in entries)
+os.setxattr(sys.argv[1], 'system.posix_acl_access', value, follow_symlinks=False)
+assert os.getxattr(sys.argv[1], 'system.posix_acl_access', follow_symlinks=False)
+PY
+                ;;
+        esac
+        before_rejection="$(snapshot_tree "$root/etc/punto")$(snapshot_tree "$share")"
+        run_lifecycle_command "$root" "legacy-directory-$fault-last" /usr/sbin/chroot "$root" \
+            /var/lib/dpkg/info/punto-switcher.postinst configure 2.8.5
+        assert_nonzero "$LIFECYCLE_RC" "B14 unsafe final package directory ($fault) is rejected"
+        assert_contains "$(<"$tmp_root/lifecycle-legacy-directory-$fault-last.log")" \
+            "$expected_refusal" "B14 final directory rejection has its specific cause ($fault)"
+        after_rejection="$(snapshot_tree "$root/etc/punto")$(snapshot_tree "$share")"
+        if [[ $after_rejection == "$before_rejection" ]]; then
+            pass "B14 all directory admissions precede any metadata effects ($fault)"
+        else
+            fail "B14 invalid final directory caused partial metadata changes ($fault)"
+        fi
+        case $fault in
+            symlink) rm "$sounds"; mv "$share/sounds-owned" "$sounds" ;;
+            acl) python3 - "$sounds" <<'PY'
+import os, sys
+os.removexattr(sys.argv[1], 'system.posix_acl_access', follow_symlinks=False)
+PY
+                ;;
+        esac
+    done
+    chmod 0755 "$share" "$sounds"
+
+    chmod 0777 "$root/etc/punto"
+    run_lifecycle_command "$root" legacy-directory-world-writable /usr/sbin/chroot "$root" \
+        /var/lib/dpkg/info/punto-switcher.postinst configure 2.8.5
+    assert_nonzero "$LIFECYCLE_RC" "B14 world-writable legacy directory is rejected"
+    if [[ $(stat -c '%a' "$root/etc/punto") == 777 ]]; then
+        pass "B14 rejected world-writable directory remains unchanged"
+    else
+        fail "B14 world-writable directory was silently rewritten"
+    fi
+    chmod 0775 "$root/etc/punto"
+    run_lifecycle_command "$root" legacy-directory-wrong-version /usr/sbin/chroot "$root" \
+        /var/lib/dpkg/info/punto-switcher.postinst configure 2.8.14
+    assert_nonzero "$LIFECYCLE_RC" "B14 unrecognized 0775 directory is rejected"
+    if [[ $(stat -c '%a' "$root/etc/punto") == 775 ]]; then
+        pass "B14 unrelated upgrade does not apply 2.8.5 migration"
+    else
+        fail "B14 unrelated upgrade changed directory permissions"
+    fi
+}
+
+run_direct_285_upgrade_gate() {
+    local artifact=$1 legacy=${PUNTO_CONTRACT_LEGACY_285_ARTIFACT:-}
+    local root="$tmp_root/lifecycle-direct-285/root" config before_hash dir_owner calls
+    [[ -n $legacy ]] || return 0
+    if [[ ! -f $legacy || -L $legacy ]] ||
+       [[ $(/usr/bin/dpkg-deb -f "$legacy" Package 2>/dev/null) != punto-switcher ]] ||
+       [[ $(/usr/bin/dpkg-deb -f "$legacy" Version 2>/dev/null) != 2.8.5 ]] ||
+       [[ $(/usr/bin/dpkg-deb -f "$legacy" Architecture 2>/dev/null) != "$(/usr/bin/dpkg --print-architecture)" ]]; then
+        fail "B14 exact 2.8.5 upgrade input must be the matching Punto package"
+        return
+    fi
+    prepare_lifecycle_root "$root"
+    LIFECYCLE_SERVICE_MODE=legacy285
+    run_lifecycle_command "$root" exact-285-install /usr/bin/dpkg --root="$root" \
+        --log="$root/var/log/dpkg.log" --force-depends --force-confdef \
+        --force-confold -i "$legacy"
+    assert_zero "$LIFECYCLE_RC" "B14 exact 2.8.5 package installs in disposable root"
+    assert_package_status "$root" 'ii ' "B14 exact 2.8.5 install"
+    config="$root/etc/punto/config.yaml"
+    if [[ $LIFECYCLE_RC -ne 0 || ! -f $config ]]; then
+        fail "B14 exact 2.8.5 install did not create its user config"
+        LIFECYCLE_SERVICE_MODE=ok
+        return
+    fi
+    printf '\n# exact-285-user-override: preserve me\n' >>"$config"
+    before_hash=$(sha256sum "$config" | awk '{print $1}')
+    dir_owner=$(stat -c '%u:%g' "$root/etc/punto")
+    if [[ $(stat -c '%a' "$root/etc/punto") == 775 ]]; then
+        pass "B14 exact 2.8.5 archive creates its legacy directory mode"
+    else
+        fail "B14 exact 2.8.5 archive directory metadata differs"
+    fi
+    : >"$root/contract-state/calls.log"
+    run_lifecycle_command "$root" exact-285-upgrade /usr/bin/dpkg --root="$root" \
+        --log="$root/var/log/dpkg.log" --force-depends --force-confdef \
+        --force-confold -i "$artifact"
+    assert_zero "$LIFECYCLE_RC" "B14 direct 2.8.5 to current package upgrade"
+    assert_package_status "$root" 'ii ' "B14 direct 2.8.5 upgrade"
+    if [[ -f $config && $(sha256sum "$config" | awk '{print $1}') == "$before_hash" &&
+          $(stat -c '%u:%g:%a' "$root/etc/punto") == "$dir_owner:755" ]]; then
+        pass "B14 direct 2.8.5 upgrade preserves user config and secures parent"
+    else
+        fail "B14 direct 2.8.5 upgrade lost config or retained unsafe parent"
+    fi
+    calls=$(<"$root/contract-state/calls.log")
+    assert_contains "$calls" 'SYSTEMCTL stop udevmon' \
+        "B14 old prerm stops udevmon before new package configuration"
+    assert_not_contains "$calls" 'SYSTEMCTL restart udevmon' \
+        "B14 new package does not silently reactivate udevmon"
+
+    : >"$root/contract-state/calls.log"
+    run_lifecycle_command "$root" exact-285-rollback /usr/bin/dpkg --root="$root" \
+        --log="$root/var/log/dpkg.log" --force-depends --force-downgrade \
+        --force-confdef --force-confold -i "$legacy"
+    assert_zero "$LIFECYCLE_RC" "B14 immediate rollback to exact 2.8.5 package"
+    assert_package_status "$root" 'ii ' "B14 immediate 2.8.5 rollback"
+    if [[ -f $config && $(sha256sum "$config" | awk '{print $1}') == "$before_hash" ]]; then
+        pass "B14 immediate 2.8.5 rollback preserves user config bytes"
+    else
+        fail "B14 immediate 2.8.5 rollback changed user config bytes"
+    fi
+    calls=$(<"$root/contract-state/calls.log")
+    assert_contains "$calls" 'SYSTEMCTL restart udevmon' \
+        "B14 legacy rollback postinst attempts udevmon recovery"
+    LIFECYCLE_SERVICE_MODE=ok
 }
 
 run_legacy_exclusion_migration_gate() {
@@ -2515,9 +2822,9 @@ run_package_service_failure() {
         /var/lib/dpkg/info/punto-switcher.postinst configure "$EXPECTED_VERSION"
     assert_zero "$LIFECYCLE_RC" \
         "B14 lifecycle service helper failures are fail-soft"
-    expected=$'DEB_SYSTEMD_INVOKE --user daemon-reload\nSYSTEMCTL --system --no-legend --plain --state=active --type=service list-units user@*.service\nSYSTEMCTL --quiet --no-block --user --machine=1000@ try-restart -- punto-tray.service\nSYSTEMCTL --quiet --no-block --user --machine=1001@ try-restart -- punto-tray.service'
+    expected=''
     assert_lifecycle_service_log "$root" "$expected" \
-        "B14 lifecycle failed helpers keep exact owned-unit ordering"
+        "B14 lifecycle maintainer scripts never call service helpers"
     assert_package_status "$root" 'ii ' \
         "B14 lifecycle service helper failures"
     LIFECYCLE_GROUP_MODE=ok
@@ -2537,12 +2844,12 @@ run_package_policy_denial() {
     run_lifecycle_command "$root" policy-denial /usr/sbin/chroot "$root" \
         /var/lib/dpkg/info/punto-switcher.postinst configure "$EXPECTED_VERSION"
     assert_zero "$LIFECYCLE_RC" "B14 lifecycle policy denial is fail-soft"
-    expected='DEB_SYSTEMD_INVOKE --user daemon-reload'
+    expected=''
     assert_lifecycle_service_log "$root" "$expected" \
-        "B14 lifecycle policy denial performs no per-user restart"
+        "B14 lifecycle policy denial needs no service interaction"
     calls=$(<"$root/contract-state/calls.log")
-    assert_contains "$calls" 'POLICY_RC_D punto-tray.service restart' \
-        "B14 lifecycle policy denial consults policy before enumeration"
+    assert_not_contains "$calls" 'POLICY_RC_D ' \
+        "B14 lifecycle policy denial does not consult service policy"
     assert_not_contains "$calls" 'SYSTEMCTL ' \
         "B14 lifecycle policy denial skips systemctl"
     LIFECYCLE_POLICY_MODE=allow
@@ -2571,9 +2878,9 @@ run_full_to_daemon_lifecycle_gate() {
         --log="$root/var/log/dpkg.log" --force-depends --force-confdef \
         --force-confold -i "$upgrade_artifact"
     assert_zero "$LIFECYCLE_RC" "B14 full-to-daemon replacement succeeds"
-    expected=$'DEB_SYSTEMD_INVOKE --user stop punto-tray.service\nDEB_SYSTEMD_INVOKE --user daemon-reload'
+    expected=''
     assert_lifecycle_service_log "$root" "$expected" \
-        "B14 full-to-daemon replacement"
+        "B14 full-to-daemon replacement leaves active user managers untouched"
     if ! grep -Eq 'DEB_SYSTEMD_INVOKE .* (start|restart)( |$)' \
         "$root/contract-state/calls.log"; then
         pass "B14 full-to-daemon replacement never starts a static user unit"
@@ -2592,9 +2899,9 @@ run_full_to_daemon_lifecycle_gate() {
     run_lifecycle_command "$root" flavor-purge /usr/bin/dpkg --root="$root" \
         --log="$root/var/log/dpkg.log" --force-depends -P punto-switcher
     assert_zero "$LIFECYCLE_RC" "B14 daemon flavor purges after replacement"
-    expected=$'DEB_SYSTEMD_INVOKE --user stop punto-tray.service\nDEB_SYSTEMD_INVOKE --user daemon-reload\nDEB_SYSTEMD_INVOKE --user daemon-reload'
+    expected=''
     assert_lifecycle_service_log "$root" "$expected" \
-        "B14 daemon flavor purge"
+        "B14 daemon flavor purge leaves active user managers untouched"
     assert_package_absent "$root" "B14 daemon flavor purge"
     if [[ ! -e $root/etc/xdg/autostart/punto-tray.desktop ]]; then
         pass "B14 daemon flavor purge leaves no obsolete tray autostart"
@@ -2628,6 +2935,8 @@ run_reproducibility_and_real_artifacts() {
     inspect_artifact "$artifact_a" "$EXPECTED_VERSION" yes 'B14: full release artifact' \
         "$tmp_root/real-reproducible-a/inspect"
     run_package_lifecycle_gate "$artifact_a"
+    run_legacy_directory_mode_gate "$artifact_a"
+    run_direct_285_upgrade_gate "$artifact_a"
     assert_file "$sha_file_a" "B15: build A emits SHA256SUMS"
 
     run_real_build reproducible-b
@@ -2797,7 +3106,7 @@ run_reproducibility_and_real_artifacts() {
     fi
 
     run_real_build daemon-only "" \
-        'libgtk-3-dev,libayatana-appindicator3-dev,libgtk-3-0,libayatana-appindicator3-1' \
+        'libayatana-appindicator3-dev,libayatana-appindicator3-1' \
         daemon
     daemon_artifact=$RUN_ARTIFACT; daemon_calls=$RUN_CALLS
     assert_real_build_safe 'B21: real daemon-only release build'
@@ -2808,6 +3117,19 @@ run_reproducibility_and_real_artifacts() {
         "$tmp_root/real-daemon-only/inspect"
     run_full_to_daemon_lifecycle_gate "$artifact_a" "$daemon_artifact"
 }
+
+if [[ ${PUNTO_CONTRACT_DIRECTORY_SOURCE_ONLY:-0} == 1 ]]; then
+    directory_source=${PUNTO_CONTRACT_POSTINST_SOURCE:-}
+    if [[ -z $directory_source || ! -f $directory_source || -L $directory_source ]]; then
+        fail "B14 directory source input is an existing regular non-symlink maintscript"
+    else
+        PUNTO_CONTRACT_POSTINST_SOURCE=$(realpath -e "$directory_source")
+        run_legacy_directory_mode_gate ''
+    fi
+    printf '\nPackaging directory source contract: %d checks, %d failure(s)\n' "$checks" "$failures"
+    [[ $failures -eq 0 ]]
+    exit
+fi
 
 if [[ -n ${PUNTO_CONTRACT_LIFECYCLE_ONLY_ARTIFACT:-} ]]; then
     lifecycle_only_input=$PUNTO_CONTRACT_LIFECYCLE_ONLY_ARTIFACT
@@ -2832,6 +3154,8 @@ if [[ -n ${PUNTO_CONTRACT_LIFECYCLE_ONLY_ARTIFACT:-} ]]; then
     fi
     pass "B14 lifecycle-only artifact version is valid"
     run_package_lifecycle_gate "$lifecycle_only_artifact"
+    run_legacy_directory_mode_gate "$lifecycle_only_artifact"
+    run_direct_285_upgrade_gate "$lifecycle_only_artifact"
     printf '\nPackaging lifecycle contract: %d checks, %d failure(s)\n' "$checks" "$failures"
     [[ $failures -eq 0 ]]
     exit
@@ -2849,6 +3173,7 @@ done
 run_version_source_gate
 run_default_source_epoch_gate
 run_required_package_matrix
+run_build_parallelism_gate
 run_required_tool_matrix
 run_tool_provider_gate
 run_optional_matrix

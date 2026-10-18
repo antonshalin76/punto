@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Punto Desktop Bridge
+Name[ru]=Мост раскладки Punto
+Comment=Connect Punto to the active GNOME input-source manager
+Comment[ru]=Подключает Punto к менеджеру раскладок активной сессии GNOME
+TryExec=/usr/bin/systemctl
+Exec=/usr/bin/systemctl --user start --no-block -- punto-session-bridge.service
+Terminal=false
+NoDisplay=true
+OnlyShowIn=GNOME;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=2

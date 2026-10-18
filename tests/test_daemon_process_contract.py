@@ -1220,6 +1220,65 @@ def test_service_home_is_not_startup_config_authority(daemon: str) -> None:
             cleanup_process(process)
 
 
+def test_production_stats_are_accepted_by_current_consumers(
+    daemon: str, cli: str, tray_probe: str
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="punto-stats-consumers-") as directory:
+        root = Path(directory)
+        socket_path = root / "run" / IPC_SOCKET_NAME
+        version_path = root / "VERSION"
+        version_path.write_text(
+            Path(cli).with_name("VERSION").read_text(encoding="ascii"),
+            encoding="ascii",
+        )
+        process = spawn_daemon(daemon, root, subprocess.DEVNULL)
+        try:
+            captured = wait_until_ready(process, socket_path)
+            response = ipc_request(socket_path, b"STATS\n")
+            fields = parse_stats(response)
+            if "history_words" in fields or "history_max_words" in fields:
+                fail("production STATS leaked test-only history diagnostics", captured)
+
+            cli_environment = {
+                **os.environ,
+                "PUNTO_SOCKET": str(socket_path),
+                "PUNTO_VERSION_FILE": str(version_path),
+                "PUNTO_IPC_TIMEOUT_MS": "500",
+            }
+            cli_result = subprocess.run(
+                [cli, "status"],
+                env=cli_environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=3.0,
+                check=False,
+            )
+            if cli_result.returncode != 0 or cli_result.stdout != response.decode("ascii"):
+                fail(
+                    "current CLI rejected production STATS: "
+                    f"exit={cli_result.returncode} stderr={cli_result.stderr!r}",
+                    captured,
+                )
+
+            tray_result = subprocess.run(
+                [tray_probe, "--probe-runtime", str(socket_path)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=3.0,
+                check=False,
+            )
+            if tray_result.returncode != 0 or tray_result.stdout != response.decode("ascii"):
+                fail(
+                    "current tray IPC client rejected production STATS: "
+                    f"exit={tray_result.returncode} stderr={tray_result.stderr!r}",
+                    captured,
+                )
+        finally:
+            cleanup_process(process)
+
+
 def assert_runtime_status(socket_path: Path, enabled: bool, configured: bool) -> None:
     expected = b"OK ENABLED\n" if enabled else b"OK DISABLED\n"
     response = ipc_request(socket_path, b"GET_STATUS\n")
@@ -2035,10 +2094,17 @@ def preflight() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("daemon")
+    parser.add_argument("cli")
+    parser.add_argument("tray_probe")
     args = parser.parse_args()
     daemon = os.path.realpath(args.daemon)
     if not os.path.isfile(daemon) or not os.access(daemon, os.X_OK):
         fail(f"daemon is not an executable regular file: {daemon}")
+    cli = os.path.realpath(args.cli)
+    tray_probe = os.path.realpath(args.tray_probe)
+    for name, path in (("cli", cli), ("tray probe", tray_probe)):
+        if not os.path.isfile(path) or not os.access(path, os.X_OK):
+            fail(f"{name} is not an executable regular file: {path}")
 
     preflight()
     cases = (
@@ -2051,6 +2117,12 @@ def main() -> int:
         (
             "startup config authority",
             lambda: test_service_home_is_not_startup_config_authority(daemon),
+        ),
+        (
+            "production STATS consumers",
+            lambda: test_production_stats_are_accepted_by_current_consumers(
+                daemon, cli, tray_probe
+            ),
         ),
         (
             "runtime status toggle and shared publication",

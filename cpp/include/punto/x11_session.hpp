@@ -24,6 +24,7 @@
 namespace punto {
 
 class ClipboardManager;
+struct ClipboardManagerTestAccess;
 
 struct X11SessionInfo {
   std::string session_id;
@@ -83,8 +84,9 @@ retry_delay_after_failure(std::size_t failure_count) noexcept;
 
 /**
  * Owns one XCB connection and applies absolute deadlines to reply-bearing and
- * checked-void requests. Any timeout, transport error, or protocol error
- * closes the connection before returning.
+ * checked-void requests. Mutating requests and ordinary reply waits close on
+ * timeout. Explicit read-only observation waits may discard only their timed
+ * out reply while retaining the connection and its event history.
  */
 class BoundedXcbConnection {
 public:
@@ -106,6 +108,12 @@ public:
                  std::chrono::steady_clock::time_point deadline,
                  x11_detail::XcbOperationResult &result) noexcept;
 
+  /** Read-only query wait; timeout discards that reply without reconnecting. */
+  [[nodiscard]] void *
+  wait_for_read_reply(std::uint32_t sequence,
+                      std::chrono::steady_clock::time_point deadline,
+                      x11_detail::XcbOperationResult &result) noexcept;
+
   [[nodiscard]] bool
   check_request(xcb_void_cookie_t cookie,
                 std::chrono::steady_clock::time_point deadline,
@@ -115,12 +123,15 @@ public:
 
 private:
   friend class ClipboardManager;
+  friend struct ClipboardManagerTestAccess;
   friend class X11Session;
   explicit BoundedXcbConnection(xcb_connection_t *connection,
                                 int screen_number) noexcept;
-  [[nodiscard]] void *poll_reply(
-      std::uint32_t sequence, std::chrono::steady_clock::time_point deadline,
-      bool allow_null_reply, x11_detail::XcbOperationResult &result) noexcept;
+  [[nodiscard]] void *
+  poll_reply(std::uint32_t sequence,
+             std::chrono::steady_clock::time_point deadline,
+             bool allow_null_reply, bool retain_on_timeout,
+             x11_detail::XcbOperationResult &result) noexcept;
 
   xcb_connection_t *connection_ = nullptr;
   int screen_number_ = -1;
@@ -143,6 +154,10 @@ public:
     int group = -1;
     std::uint32_t focus_window = 0;
     std::uint8_t locked_mods = 0;
+    std::int16_t pointer_x = 0;
+    std::int16_t pointer_y = 0;
+    std::uint16_t pointer_buttons = 0;
+    bool live_current = false;
   };
 
   using ProbeFunction = std::function<x11_detail::ProbeResult()>;
@@ -163,6 +178,9 @@ public:
     [[nodiscard]] bool valid() const noexcept;
     [[nodiscard]] const X11SessionInfo &info() const noexcept;
     [[nodiscard]] std::uint64_t generation() const noexcept;
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    void revoke_for_testing() noexcept;
+#endif
     [[nodiscard]] BoundedXcbConnection open_bounded_connection(
         std::chrono::steady_clock::time_point deadline) const;
     [[nodiscard]] BoundedXcbConnection open_bounded_connection(
@@ -189,6 +207,8 @@ public:
   X11Session &operator=(const X11Session &) = delete;
 
   [[nodiscard]] bool initialize();
+  [[nodiscard]] bool constrain_to_target(std::string display,
+                                         std::uint32_t uid);
   [[nodiscard]] RefreshResult refresh();
 
   bool start_background_refresh();
@@ -196,6 +216,8 @@ public:
   [[nodiscard]] bool
   start_background_keyboard_observation(std::uint64_t request_id);
   [[nodiscard]] std::optional<KeyboardObservation> poll_keyboard_observation();
+  [[nodiscard]] bool publish_keyboard_layout(int group,
+                                             std::uint64_t session_generation);
 
   /**
    * Requests cancellation and waits no longer than timeout. A stuck system
@@ -224,6 +246,7 @@ private:
     std::atomic<bool> cancel_requested{false};
     bool done = false;
     std::uint64_t generation = 0;
+    std::uint64_t keyboard_revision = 0;
     x11_detail::ProbeResult probe;
     KeyboardObservation keyboard;
     X11SessionInfo keyboard_session;
@@ -240,10 +263,12 @@ private:
   static void
   run_background_probe(const std::shared_ptr<BackgroundState> &state) noexcept;
   [[nodiscard]] RefreshResult commit_probe(std::uint64_t generation,
+                                           std::uint64_t keyboard_revision,
                                            x11_detail::ProbeResult probe);
 
   mutable std::mutex mu_;
   X11SessionInfo info_;
+  std::uint64_t keyboard_revision_ = 0;
   std::atomic<bool> initialized_{false};
 
   mutable std::mutex refresh_mutex_;
@@ -254,6 +279,8 @@ private:
   std::thread keyboard_thread_;
   std::shared_ptr<std::atomic<std::uint64_t>> generation_clock_;
   ProbeFunction probe_function_;
+  std::string required_display_;
+  std::uint32_t required_uid_ = 0;
   RetryWaitFunction retry_wait_function_;
   std::shared_ptr<WriteGate> write_gate_;
 };

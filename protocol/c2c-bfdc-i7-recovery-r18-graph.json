@@ -1,0 +1,122 @@
+{
+  "name": "punto-c2c-bfdc-i7-product-recovery-r18",
+  "task_id": "c2c_bfdc",
+  "iteration": 7,
+  "plan_revision": 18,
+  "previous_plan_revision": 17,
+  "next_available_step": "c2c_review_r18_resource_proof",
+  "nodes": [
+    {
+      "id": "freeze_and_reframe",
+      "needs": [],
+      "status": "DONE_ACCEPTED",
+      "evidence": "revision-7 freeze plus unchanged revision-5-15 manifests",
+      "done": "Frozen candidate, baseline and recovery identities remain byte-identical; no product or host bytes changed"
+    },
+    {
+      "id": "authoritative_behavior_contract",
+      "needs": ["freeze_and_reframe"],
+      "status": "DONE_ACCEPTED",
+      "evidence": "C2C revision-10 acceptance; frozen contract/evaluator identities",
+      "done": "Recovery contract and evaluator are accepted without claiming live product behavior"
+    },
+    {
+      "id": "r15_offline_staged_proof",
+      "needs": ["authoritative_behavior_contract"],
+      "status": "PARTIAL_ACCEPTED_SUPERSEDED",
+      "evidence": "C2C revision-16 accepted diagnostics, cleanup verdict and downstream graph restoration; observer and attribution findings moved to r16",
+      "done": "Revision-15 accepted portions remain immutable; staged memory proof is not live-ready"
+    },
+    {
+      "id": "r16_offline_observer_and_attribution",
+      "needs": ["r15_offline_staged_proof"],
+      "status": "PARTIAL_ACCEPTED_SUPERSEDED",
+      "evidence": ".cache/codex-thread-workflows/punto-i7-recovery-r16/evidence-index.md",
+      "done": "Counter sampling, ordered counters, exact OOM attribution, baselines, rejected phase evidence and revision ownership are accepted; transport-to-verdict gap moved to r17"
+    },
+    {
+      "id": "r17_offline_transport_integration",
+      "needs": ["r16_offline_observer_and_attribution"],
+      "status": "DONE_ACCEPTED",
+      "evidence": ".cache/codex-thread-workflows/punto-i7-recovery-r17/evidence-index.md",
+      "done": "Transport eligibility is structured and verdict-enforced; duplicate and malformed evidence reject independently of read boundaries; genuine reporter loss remains explicitly bounded"
+    },
+    {
+      "id": "dedicated_resource_boundary_proof",
+      "needs": ["r17_offline_transport_integration"],
+      "status": "BLOCKED_AWAITING_C2C_REVIEW",
+      "evidence": ".cache/codex-thread-workflows/punto-i7-recovery-r18/evidence-index.md: one invocation, two sequential scopes, scope-small VERIFIED, scope-production FAILED at WORKLOAD_RELEASED because starter remained alive before cleanup; cleanup and protected-host postflight PASS",
+      "done": "Two unique sequential scopes prove limits, one writable budget, exact smoke payload, descendant cleanup and protected-host invariants"
+    },
+    {
+      "id": "baseline_2_8_5_probe",
+      "needs": ["dedicated_resource_boundary_proof"],
+      "status": "WAITING_DEPENDENCIES",
+      "evidence": "exact artifact identity frozen; target graphics not authorized in revision 18",
+      "done": "Exact baseline runs in its isolated native target and records comparable product behavior"
+    },
+    {
+      "id": "candidate_2_8_14_probe",
+      "needs": ["dedicated_resource_boundary_proof"],
+      "status": "WAITING_DEPENDENCIES",
+      "evidence": "exact source/package identities frozen; target graphics not authorized in revision 18",
+      "done": "Exact candidate runs in the same isolated target class and records comparable product behavior"
+    },
+    {
+      "id": "architecture_route_decision",
+      "needs": ["baseline_2_8_5_probe", "candidate_2_8_14_probe"],
+      "status": "WAITING_DEPENDENCIES",
+      "evidence": "none yet",
+      "done": "C2C-reviewed salvage-or-recover decision is based on comparable live evidence"
+    },
+    {
+      "id": "manual_word_vertical_slice",
+      "needs": ["architecture_route_decision"],
+      "status": "WAITING_DEPENDENCIES",
+      "evidence": "none yet",
+      "done": "Repeated EN/RU Pause behavior and persistent active layout pass real target oracles"
+    },
+    {
+      "id": "automatic_vertical_slice",
+      "needs": ["manual_word_vertical_slice"],
+      "status": "WAITING_DEPENDENCIES",
+      "evidence": "none yet",
+      "done": "Space/Tab correction, negatives, focus changes and rapid tails pass real target oracles"
+    },
+    {
+      "id": "remaining_capabilities",
+      "needs": ["automatic_vertical_slice"],
+      "status": "WAITING_DEPENDENCIES",
+      "evidence": "none yet",
+      "done": "Selection, case, transliteration, undo, learning, tray, typo, sticky shift, CLI and terminal promises pass"
+    },
+    {
+      "id": "source_and_architecture_gate",
+      "needs": ["remaining_capabilities"],
+      "status": "WAITING_DEPENDENCIES",
+      "evidence": "none yet",
+      "done": "Frozen source passes deterministic checks, sanitizers, static analysis and architecture review with no unresolved P0-P2 finding"
+    },
+    {
+      "id": "reversible_candidate_install",
+      "needs": ["source_and_architecture_gate"],
+      "status": "WAITING_DEPENDENCIES",
+      "evidence": "none yet",
+      "done": "Exact candidate is installed with verified rollback and without desktop restart or reboot"
+    },
+    {
+      "id": "real_target_acceptance_and_soak",
+      "needs": ["reversible_candidate_install"],
+      "status": "WAITING_DEPENDENCIES",
+      "evidence": "none yet",
+      "done": "Real GTK and Chromium session matrix and soak pass without lost input, clipboard damage or stuck modifiers"
+    },
+    {
+      "id": "release_review_and_publication",
+      "needs": ["real_target_acceptance_and_soak"],
+      "status": "WAITING_DEPENDENCIES",
+      "evidence": "none yet",
+      "done": "C2C accepts exact source/package/live evidence; commit, tag, publication and installed smoke match accepted bytes"
+    }
+  ]
+}

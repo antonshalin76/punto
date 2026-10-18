@@ -6,6 +6,7 @@
 set -Eeuo pipefail
 
 export LC_ALL=C.UTF-8
+export CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-2}
 umask 0022
 
 SCRIPT_DIR=$(cd "${BASH_SOURCE[0]%/*}" && pwd -P)
@@ -20,16 +21,17 @@ BUILD_TRAY=true
 SKIP_RUNTIME_INSTALLS=false
 
 required_packages=(
-    build-essential cmake pkg-config libsystemd-dev libxcb1-dev
-    libxcb-xkb-dev libxau-dev libhunspell-dev libyaml-cpp-dev
-    libxcb-xfixes0-dev libxcb-xtest0-dev libxcb-xinput-dev libxkbcommon-dev
+    build-essential cmake pkg-config libglib2.0-dev libsystemd-dev libxcb1-dev
+    libxcb-xkb-dev libxau-dev libhunspell-dev libyaml-cpp-dev libjson-glib-dev
+    libxcb-xfixes0-dev libxcb-xtest0-dev libxcb-xinput-dev libxcb-res0-dev libxkbcommon-dev
+    libgtk-3-dev libssl-dev
     dpkg-dev binutils file
 )
 required_tools=(
     cmake dpkg dpkg-query dpkg-deb dpkg-shlibdeps pkg-config file strip gzip
     sha256sum
 )
-tray_packages=(libgtk-3-dev libayatana-appindicator3-dev)
+tray_packages=(libayatana-appindicator3-dev)
 dictionary_packages=(hunspell hunspell-en-us hunspell-ru wamerican-huge)
 runtime_packages=(
     interception-tools libgtk-3-0 libayatana-appindicator3-1 netcat-openbsd
@@ -145,8 +147,13 @@ done
 for input in \
     punto-cli.sh config.yaml udevmon.yaml README.md RESTORATION.md LICENSE \
     gnome/punto-input-source@antonshalin76/compat.js \
+    gnome/punto-input-source@antonshalin76/dbusAdapter.js \
     gnome/punto-input-source@antonshalin76/extension.js \
+    gnome/punto-input-source@antonshalin76/inputSourceBridge.js \
     gnome/punto-input-source@antonshalin76/metadata.json \
+    gnome/punto-input-source@antonshalin76/punto-dbus-v1.xml \
+    protocol/punto-dbus-v1.xml \
+    punto-session-bridge.desktop punto-session-bridge.service \
     cpp/src/sound/en_ru.wav cpp/src/sound/ru_en.wav \
     DEBIAN/control DEBIAN/postinst DEBIAN/prerm DEBIAN/postrm; do
     require_regular_input "$input"
@@ -176,7 +183,7 @@ done
 reset_directory "$CPP_BUILD_DIR"
 
 tray_flag=OFF
-targets=(punto)
+targets=(punto punto-session-bridge)
 if [[ $BUILD_TRAY == true ]]; then
     tray_flag=ON
     targets+=(punto-tray)
@@ -190,13 +197,16 @@ cmake -S cpp -B "$CPP_BUILD_DIR" \
     -DBUILD_TESTING=OFF \
     -DBUILD_TRAY="$tray_flag" \
     "-DCMAKE_CXX_FLAGS=-ffile-prefix-map=${SCRIPT_DIR}=."
-cmake --build "$CPP_BUILD_DIR" --target "${targets[@]}" -j "$(nproc)"
+cmake --build "$CPP_BUILD_DIR" --target "${targets[@]}"
 
 require_regular_input "$CPP_BUILD_DIR/punto"
+require_regular_input "$CPP_BUILD_DIR/punto-session-bridge"
 if [[ $BUILD_TRAY == true ]]; then
     require_regular_input "$CPP_BUILD_DIR/punto-tray"
 fi
 file "$CPP_BUILD_DIR/punto" | grep -Fq ELF || fail 'invalid-build-output: punto'
+file "$CPP_BUILD_DIR/punto-session-bridge" | grep -Fq ELF ||
+    fail 'invalid-build-output: punto-session-bridge'
 if [[ $BUILD_TRAY == true ]]; then
     file "$CPP_BUILD_DIR/punto-tray" | grep -Fq ELF ||
         fail 'invalid-build-output: punto-tray'
@@ -206,16 +216,27 @@ reset_directory "$STAGE_DIR"
 install -d -m 0755 \
     "$STAGE_DIR/DEBIAN" \
     "$STAGE_DIR/etc/punto" \
+    "$STAGE_DIR/etc/xdg/autostart" \
     "$STAGE_DIR/usr/bin" \
+    "$STAGE_DIR/usr/libexec" \
+    "$STAGE_DIR/usr/lib/systemd/user" \
     "$STAGE_DIR/usr/share/punto-switcher" \
+    "$STAGE_DIR/usr/share/punto-switcher/protocol" \
     "$STAGE_DIR/usr/share/punto-switcher/sounds" \
     "$STAGE_DIR/usr/share/gnome-shell/extensions/punto-input-source@antonshalin76" \
     "$STAGE_DIR/usr/share/doc/punto-switcher/examples" \
     "$STAGE_DIR/usr/share/doc/punto-switcher"
 
 install -m 0755 "$CPP_BUILD_DIR/punto" "$STAGE_DIR/usr/bin/punto-daemon"
+install -m 0755 "$CPP_BUILD_DIR/punto-session-bridge" \
+    "$STAGE_DIR/usr/libexec/punto-session-bridge"
 install -m 0755 punto-cli.sh "$STAGE_DIR/usr/bin/punto"
 strip --strip-unneeded "$STAGE_DIR/usr/bin/punto-daemon"
+strip --strip-unneeded "$STAGE_DIR/usr/libexec/punto-session-bridge"
+install -m 0644 punto-session-bridge.desktop \
+    "$STAGE_DIR/etc/xdg/autostart/punto-session-bridge.desktop"
+install -m 0644 punto-session-bridge.service \
+    "$STAGE_DIR/usr/lib/systemd/user/punto-session-bridge.service"
 if [[ $BUILD_TRAY == true ]]; then
     install -d -m 0755 \
         "$STAGE_DIR/etc/xdg/autostart" \
@@ -231,9 +252,14 @@ fi
 install -m 0644 VERSION "$STAGE_DIR/usr/share/punto-switcher/VERSION"
 install -m 0644 \
     gnome/punto-input-source@antonshalin76/compat.js \
+    gnome/punto-input-source@antonshalin76/dbusAdapter.js \
     gnome/punto-input-source@antonshalin76/extension.js \
+    gnome/punto-input-source@antonshalin76/inputSourceBridge.js \
     gnome/punto-input-source@antonshalin76/metadata.json \
+    gnome/punto-input-source@antonshalin76/punto-dbus-v1.xml \
     "$STAGE_DIR/usr/share/gnome-shell/extensions/punto-input-source@antonshalin76/"
+install -m 0644 protocol/punto-dbus-v1.xml \
+    "$STAGE_DIR/usr/share/punto-switcher/protocol/punto-dbus-v1.xml"
 install -m 0644 cpp/src/sound/en_ru.wav cpp/src/sound/ru_en.wav \
     "$STAGE_DIR/usr/share/punto-switcher/sounds/"
 install -m 0644 udevmon.yaml \
@@ -278,6 +304,7 @@ install -d -m 0755 "$shlib_work/debian"
 } >"$shlib_work/debian/control"
 chmod 0644 "$shlib_work/debian/control"
 elf_arguments=("-e$SCRIPT_DIR/$STAGE_DIR/usr/bin/punto-daemon")
+elf_arguments+=("-e$SCRIPT_DIR/$STAGE_DIR/usr/libexec/punto-session-bridge")
 if [[ $BUILD_TRAY == true ]]; then
     elf_arguments+=("-e$SCRIPT_DIR/$STAGE_DIR/usr/bin/punto-tray")
 fi
@@ -287,10 +314,9 @@ derived_dependencies=$(cd "$shlib_work" && dpkg-shlibdeps -O "${elf_arguments[@]
 derived_dependencies=${derived_dependencies#shlibs:Depends=}
 
 explicit_dependencies=(
-    interception-tools hunspell-en-us hunspell-ru netcat-openbsd passwd
+    interception-tools hunspell-en-us hunspell-ru netcat-openbsd passwd at-spi2-core
     'pulseaudio-utils | alsa-utils'
-    'util-linux (>= 2.38)' 'systemd (>= 249.10)' \
-    'init-system-helpers (>= 1.66)'
+    'util-linux (>= 2.38)' 'systemd (>= 249.10)'
 )
 if grep -Eq '(^|[;&|()[:space:]])((/usr/bin/|/bin/)?sudo)([[:space:]]|$)' \
     punto-cli.sh; then
@@ -315,6 +341,7 @@ chmod 0755 "$STAGE_DIR/DEBIAN/postinst"
 
 {
     printf '%s\n' /etc/punto/config.yaml
+    printf '%s\n' /etc/xdg/autostart/punto-session-bridge.desktop
     if [[ $BUILD_TRAY == true ]]; then
         printf '%s\n' /etc/xdg/autostart/punto-tray.desktop
     else
@@ -327,11 +354,13 @@ chmod 0644 "$STAGE_DIR/DEBIAN/conffiles"
 rm -rf -- "$shlib_work"
 find "$STAGE_DIR" -xdev -type d -exec chmod 0755 {} +
 find "$STAGE_DIR" -xdev -type f ! -path "$STAGE_DIR/usr/bin/*" \
+    ! -path "$STAGE_DIR/usr/libexec/*" \
     ! -path "$STAGE_DIR/DEBIAN/postinst" ! -path "$STAGE_DIR/DEBIAN/prerm" \
     ! -path "$STAGE_DIR/DEBIAN/postrm" \
     -exec chmod 0644 {} +
 chmod 0755 "$STAGE_DIR/usr/bin/"* "$STAGE_DIR/DEBIAN/postinst" \
     "$STAGE_DIR/DEBIAN/prerm" "$STAGE_DIR/DEBIAN/postrm"
+chmod 0755 "$STAGE_DIR/usr/libexec/punto-session-bridge"
 
 # Re-check output types immediately before replacing regular prior artifacts.
 reject_unsafe_output "$OUTPUT_DEB"

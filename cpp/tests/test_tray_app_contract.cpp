@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -121,6 +122,27 @@ GtkWidget *find_sound_checkbox(GtkWidget *widget) {
   return found;
 }
 
+GtkSpinButton *find_threshold_spin(GtkWidget *widget) {
+  if (GTK_IS_GRID(widget)) {
+    GtkWidget *label = gtk_grid_get_child_at(GTK_GRID(widget), 0, 0);
+    GtkWidget *spin = gtk_grid_get_child_at(GTK_GRID(widget), 1, 0);
+    if (GTK_IS_LABEL(label) && GTK_IS_SPIN_BUTTON(spin) &&
+        std::string_view{gtk_label_get_text(GTK_LABEL(label))} ==
+            "Порог срабатывания:") {
+      return GTK_SPIN_BUTTON(spin);
+    }
+  }
+  if (!GTK_IS_CONTAINER(widget))
+    return nullptr;
+  GList *children = gtk_container_get_children(GTK_CONTAINER(widget));
+  GtkSpinButton *found = nullptr;
+  for (GList *child = children; child && !found; child = child->next) {
+    found = find_threshold_spin(GTK_WIDGET(child->data));
+  }
+  g_list_free(children);
+  return found;
+}
+
 unsigned int count_widgets(GtkWidget *widget, GType type) {
   unsigned int count = G_TYPE_CHECK_INSTANCE_TYPE(widget, type) ? 1U : 0U;
   if (!GTK_IS_CONTAINER(widget))
@@ -170,6 +192,7 @@ struct SoundDialogAction {
   bool correct_view = false;
   GtkWidget *reenter_item = nullptr;
   bool reentry_preserved = false;
+  std::function<void(GtkWidget *)> before_response;
   std::filesystem::path fail_path;
   std::string error;
 };
@@ -272,6 +295,9 @@ void exercise_sound_menu(punto::TrayApp &app, SoundDialogAction &action) {
               std::filesystem::create_directory(state.fail_path);
             }
           }
+          if (state.before_response) {
+            state.before_response(dialog);
+          }
           gtk_dialog_response(GTK_DIALOG(dialog), sound && state.accept
                                                       ? GTK_RESPONSE_ACCEPT
                                                       : GTK_RESPONSE_CANCEL);
@@ -301,7 +327,7 @@ void test_sound_menu_uses_settings_persistence_and_failure_readback() {
   PrivateSoundConfig fixture;
   punto::Config expected;
   expected.auto_switch.enabled = false;
-  expected.auto_switch.threshold = 4.2;
+  expected.auto_switch.threshold = 4.2000000005;
   expected.runtime.analysis_threads = 2;
   expected.runtime.max_analysis_threads_per_daemon = 3;
   expected.logging.level = punto::LogLevel::Debug;
@@ -325,6 +351,25 @@ void test_sound_menu_uses_settings_persistence_and_failure_readback() {
       });
   SoundDialogAction save;
   save.toggle = save.accept = true;
+  unsigned int intervening_edits = 0;
+  const auto edit_private_config = [&](GtkWidget *) {
+    ++intervening_edits;
+    expected.auto_switch.enabled = !expected.auto_switch.enabled;
+    expected.auto_switch.threshold += 1.0;
+    expected.hotkey.modifier =
+        intervening_edits == 1 ? KEY_LEFTALT : KEY_RIGHTSHIFT;
+    expected.hotkey.key = intervening_edits == 1 ? KEY_SPACE : KEY_TAB;
+    ++expected.runtime.analysis_threads;
+    ++expected.runtime.max_analysis_threads_per_daemon;
+    expected.logging.level = punto::LogLevel::Error;
+    const auto contents = punto::serialize_config(expected);
+    expect(contents.has_value(), "intervening private edit is valid");
+    std::ofstream output{fixture.path};
+    output << *contents;
+    output.close();
+    expect(output.good(), "intervening private edit completes before UI save");
+  };
+  save.before_response = edit_private_config;
   exercise_sound_menu(app, save);
   expect(save.initial_enabled && save.save_enabled && !save.error_seen,
          "sound edit enables Save without an error");
@@ -333,11 +378,12 @@ void test_sound_menu_uses_settings_persistence_and_failure_readback() {
   expect(loaded.result == punto::ConfigResult::Ok &&
              punto::serialize_config(loaded.config) ==
                  punto::serialize_config(expected),
-         "sound save preserves every other serialized config field");
+         "sound save preserves concurrent edits to untouched config fields");
   expect(reloads == 1 && reload_path == fixture.path,
          "successful save requests exactly one reload of the private config");
   expect(punto::TrayAppTestAccess::command_failed(app),
-         "a saved preference with an unconfirmed reload is visible as a tray failure");
+         "a saved preference with an unconfirmed reload is visible as a tray "
+         "failure");
   SoundDialogAction cancel;
   cancel.toggle = true;
   cancel.reenter_item = punto::TrayAppTestAccess::settings_item(app);
@@ -373,6 +419,61 @@ void test_sound_menu_uses_settings_persistence_and_failure_readback() {
   expect(punto::serialize_config(loaded.config) ==
              punto::serialize_config(expected),
          "Cancel and failure preserve persisted config fields");
+  SoundDialogAction general_save;
+  general_save.sound_only = false;
+  general_save.toggle = general_save.accept = true;
+  general_save.before_response = [&](GtkWidget *dialog) {
+    GtkSpinButton *threshold = find_threshold_spin(dialog);
+    expect(threshold != nullptr, "General exposes the threshold spin");
+    const double initial_threshold = expected.auto_switch.threshold;
+    expect(std::abs(gtk_spin_button_get_value(threshold) - initial_threshold) <
+               1e-10,
+           "threshold spin retains the opening snapshot");
+    gtk_spin_button_update(threshold);
+    const double normalized = gtk_spin_button_get_value(threshold);
+    expect(normalized != initial_threshold &&
+               std::abs(normalized - initial_threshold) < 1e-9,
+           "GTK normalizes display precision without changing UI intent");
+    edit_private_config(dialog);
+  };
+  exercise_sound_menu(app, general_save);
+  expected.sound.enabled = true;
+  loaded = punto::load_config_checked(fixture.path);
+  expect(
+      !general_save.initial_enabled && general_save.save_enabled &&
+          !general_save.error_seen &&
+          loaded.result == punto::ConfigResult::Ok &&
+          punto::serialize_config(loaded.config) ==
+              punto::serialize_config(expected) &&
+          intervening_edits == 2 && reloads == 2 && reload_path == fixture.path,
+      "General precision normalization preserves latest untouched and hidden "
+      "fields");
+  SoundDialogAction intentional_save;
+  intentional_save.sound_only = false;
+  intentional_save.accept = true;
+  intentional_save.before_response = [&](GtkWidget *dialog) {
+    GtkSpinButton *threshold = find_threshold_spin(dialog);
+    expect(threshold != nullptr, "General exposes threshold for an edit");
+    constexpr double user_threshold = 7.5;
+    gtk_spin_button_set_value(threshold, user_threshold);
+    expect(gtk_widget_get_sensitive(gtk_dialog_get_widget_for_response(
+               GTK_DIALOG(dialog), GTK_RESPONSE_ACCEPT)),
+           "intentional threshold edit enables Save");
+    edit_private_config(dialog);
+    expect(expected.auto_switch.threshold != user_threshold,
+           "completed external edit differs from intentional UI edit");
+    expected.auto_switch.threshold = user_threshold;
+  };
+  exercise_sound_menu(app, intentional_save);
+  loaded = punto::load_config_checked(fixture.path);
+  expect(!intentional_save.error_seen &&
+             loaded.result == punto::ConfigResult::Ok &&
+             punto::serialize_config(loaded.config) ==
+                 punto::serialize_config(expected) &&
+             intervening_edits == 3 && reloads == 3 &&
+             reload_path == fixture.path,
+         "intentional threshold edit wins without overwriting unrelated latest "
+         "fields and requests one reload");
 }
 
 void test_status_poll_is_single_flight_and_does_not_block_main_context() {
@@ -648,11 +749,10 @@ void test_invalid_config_is_reported_without_showing_default_settings() {
   punto::TrayApp app;
   punto::TrayAppTestAccess::create_menu(app);
   unsigned int reloads = 0;
-  punto::TrayAppTestAccess::set_config_reloader(
-      app, [&](const std::string &) {
-        ++reloads;
-        return true;
-      });
+  punto::TrayAppTestAccess::set_config_reloader(app, [&](const std::string &) {
+    ++reloads;
+    return true;
+  });
   bool error_seen = false;
   const guint closer = g_timeout_add(
       5,
@@ -675,8 +775,8 @@ void test_invalid_config_is_reported_without_showing_default_settings() {
         return G_SOURCE_CONTINUE;
       },
       &error_seen);
-  gtk_menu_item_activate(GTK_MENU_ITEM(
-      punto::TrayAppTestAccess::settings_item(app)));
+  gtk_menu_item_activate(
+      GTK_MENU_ITEM(punto::TrayAppTestAccess::settings_item(app)));
   if (g_main_context_find_source_by_id(nullptr, closer)) {
     g_source_remove(closer);
   }

@@ -2,20 +2,29 @@
 
 #include <linux/input.h>
 
-#include <string>
-#include <string_view>
-#include <cstdint>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace punto {
 
 class X11Session;
 class ClipboardManager;
+class DesktopLayoutClient;
+struct SelectionData;
 
 enum class WordEditOperation {
+  // Exact expected range, used by automatic correction and undo.
   Word,
+  // GUI range comes from the application; terminals use admitted typing
+  // history.
+  CurrentWordLayout,
+  CurrentWordCase,
   SelectionLayout,
   SelectionCase,
   SelectionTranslit,
@@ -32,11 +41,9 @@ struct WordEditRequest {
   std::uint32_t expected_focus = 0;
   int source_locked_mods = -1;
   bool allow_terminal = true;
-  // Invalid until the EventLoop transports the active configuration. This
-  // keeps a missing call path fail-closed instead of silently assuming a
-  // desktop shortcut.
-  std::uint16_t layout_hotkey_modifier = 0;
-  std::uint16_t layout_hotkey_key = 0;
+  std::uint64_t text_input_sequence = 0;
+  std::optional<std::chrono::steady_clock::time_point> held_tab_deadline;
+  std::string expected_editor_token = {};
 };
 
 enum class WordEditStatus {
@@ -44,6 +51,17 @@ enum class WordEditStatus {
   PreparedNotReplayed,
   Dispatched,
   PartialFailure,
+};
+
+enum class WordEditRetryPolicy {
+  Never,
+  AfterFreshInput,
+};
+
+enum class DesktopLayoutTransitionState {
+  NotRequested,
+  RequestedUnresolved,
+  TargetObserved,
 };
 
 struct WordEditOutcome {
@@ -55,6 +73,13 @@ struct WordEditOutcome {
   std::uint64_t session_generation = 0;
   std::uint32_t focused_window = 0;
   bool terminal_insert = false;
+  bool terminal_history = false;
+  std::string editor_token;
+  WordEditRetryPolicy retry_policy = WordEditRetryPolicy::Never;
+  DesktopLayoutTransitionState layout_transition =
+      DesktopLayoutTransitionState::NotRequested;
+  // Last layout observed under the same session/focus/pointer/lock context.
+  int observed_layout = -1;
   // Static check-group label only; never editor or clipboard content.
   std::string_view rejection_stage = "invalid_request";
 };
@@ -69,17 +94,31 @@ public:
   ~WordEditor();
   [[nodiscard]] WordEditOutcome execute(const WordEditRequest &request);
   void pump();
+  // Cancel intent, retaining completed identity but never an old edit range.
   void reset();
+  // Short admission fence after a queued paste. The retained payload may
+  // outlive it until the application requests it or clipboard ownership ends.
   [[nodiscard]] bool busy() const noexcept;
+  [[nodiscard]] bool has_pending_paste() const noexcept;
+  [[nodiscard]] std::optional<std::string>
+  editor_context(std::chrono::steady_clock::time_point deadline,
+                 std::string_view expected_token = {}, WaitFunction wait = {},
+                 bool preparation = false);
 
 private:
   struct PendingPaste;
   struct RetainedWordSelection;
+  struct RevokedWordContext;
   X11Session &session_;
   WaitFunction wait_;
   std::unique_ptr<ClipboardManager> clipboard_;
+  std::unique_ptr<DesktopLayoutClient> desktop_layout_;
   std::unique_ptr<PendingPaste> pending_;
+  // Retained bytes do not confer restoration authority after proof is lost.
+  std::shared_ptr<const std::vector<SelectionData>> retired_clipboard_data_;
   std::unique_ptr<RetainedWordSelection> retained_word_selection_;
+  // Negative provenance only: it cannot authorize an old selection or replay.
+  std::unique_ptr<RevokedWordContext> revoked_word_context_;
   std::uint64_t clipboard_session_ = 0;
 };
 

@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "shell_major": 46,
+  "library_sha256": "35f439ff850147ccf01fae2d715f69252eb9f8631cb5702e9449c88563cb8885",
+  "reviewed_resource_sha256": {
+    "/org/gnome/shell/ui/status/keyboard.js": [
+      "adf1af6d9d7fb888c429cc8e2fa7339b2ea5a23806fe1439c9934edbb9ff7285"
+    ]
+  },
+  "resources": {
+    "/org/gnome/shell/ui/status/keyboard.js": "ede25eee29bf2b3520ef535e7691322975596653a479582ece7ff33993e139c1",
+    "/org/gnome/shell/misc/ibusManager.js": "1b15579d257a3811cebba48ccb7aa85381b10f74780487ce5ff1636354b274c4",
+    "/org/gnome/shell/misc/keyboardManager.js": "d292f164095249942c454674c7e19bfdb007fea3d39e65be25714c4c3fe4ae2a"
+  }
+}

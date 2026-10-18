@@ -13,11 +13,19 @@ from typing import Any
 
 TEST_TARGETS = {
     "clipboard_manager.cpp": "punto-clipboard-contract",
+    "editor_transaction_client.cpp": "punto-editor-transaction-contract",
     "key_injector.cpp": "punto-key-injector-contract",
     "macro_lock.cpp": "punto-runtime-files-contract",
     "sound_manager.cpp": "punto-sound-manager-contract",
+    "session_resolver_probe.cpp": "punto-session-resolver-probe",
     "terminal_detection.cpp": "punto-tests",
     "undo_detector.cpp": "punto-undo-detector-contract",
+}
+
+PRODUCT_TARGETS = {
+    "accessible_context.cpp": "punto-session-bridge",
+    "session_bridge.cpp": "punto-session-bridge",
+    "session_resolver.cpp": "punto-session-bridge",
 }
 
 
@@ -82,12 +90,16 @@ def main() -> int:
     parser.add_argument("--product-db", type=pathlib.Path, required=True)
     parser.add_argument("--contract-db", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
+    parser.add_argument("--profile", choices=("ordinary", "native"), default="ordinary")
     args = parser.parse_args()
 
     source_root = args.source_root.resolve()
     all_sources = sorted(path.resolve() for path in source_root.rglob("*.cpp"))
     if not all_sources:
         raise ValueError(f"no C++ sources found in {source_root}")
+    native_source = source_root / "xorg_recipient.cpp"
+    if args.profile == "ordinary":
+        all_sources = [source for source in all_sources if source != native_source]
 
     product = indexed(load_database(args.product_db.resolve()))
     contract = indexed(load_database(args.contract_db.resolve()))
@@ -101,6 +113,12 @@ def main() -> int:
             entry = select_exact(product_candidates, target, source)
         elif "punto-tray" in product_targets:
             target = "punto-tray"
+            entry = select_exact(product_candidates, target, source)
+        elif source.name in PRODUCT_TARGETS:
+            target = PRODUCT_TARGETS[source.name]
+            entry = select_exact(product_candidates, target, source)
+        elif source == native_source and args.profile == "native":
+            target = "punto-gtk-editor-adapter"
             entry = select_exact(product_candidates, target, source)
         else:
             target = TEST_TARGETS.get(source.name, "")
@@ -118,7 +136,7 @@ def main() -> int:
             "selected compilation database contains duplicate source paths"
         )
     if set(selected_paths) != set(all_sources):
-        raise ValueError("selected compilation database does not cover cpp/src exactly")
+        raise ValueError("selected compilation database does not cover the source profile exactly")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

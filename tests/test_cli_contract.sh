@@ -701,6 +701,8 @@ SPY
 cat >"$tmp_root/bin/punto-session-bridge-fixture" <<'SPY'
 #!/usr/bin/env bash
 [[ $# -eq 1 && $1 == --check-ready ]] || exit 97
+# Exercise positive startup slower than the virtual 40 ms START budget.
+read -r -t 0.060 _ <>"${TEST_TRAY_WAIT_FIFO:?}" || true
 [[ $(<"$TEST_BRIDGE_STATE") == active ]] || exit 75
 SPY
 
@@ -771,6 +773,11 @@ for argument in "$@"; do
     esac
     previous=$argument
 done
+# Only this positive stub uses virtual policy time; Python covers real bridge deadlines.
+if [[ $# -eq 5 && $1 == --signal=TERM && $2 == --kill-after=0.200s &&
+      $4 == "${PUNTO_SESSION_BRIDGE:?}" && $5 == --check-ready ]]; then
+    set -- "$1" "$2" 0.500s "$4" "$5"
+fi
 exec /usr/bin/timeout "$@"
 SPY
 

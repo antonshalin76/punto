@@ -157,6 +157,7 @@ if { (( EUID != 0 )) || [[ ${PUNTO_REHEARSAL_GUARD_ONLY:-0} == 1 ]]; } &&
         seam=$(mktemp -d)
         trap 'rm -rf -- "$seam"' EXIT
         : >"$seam/real-ln"
+        # shellcheck disable=SC2016 # Expanded by the generated fixture.
         printf '%s\n' '#!/bin/sh' \
             '"$PUNTO_REAL_LN" "$@" || exit "$?"' \
             'for argument do destination=$argument; done' \
@@ -298,6 +299,7 @@ PY
                 [[ $case_name != quiescelegacy ]] || export PUNTO_REHEARSAL_PROFILE=legacy
                 [[ $case_name != quiescedrift ]] || export PUNTO_REHEARSAL_QUIESCE_FAULT=drift
                 [[ $case_name != quiesceunknown ]] || export PUNTO_REHEARSAL_QUIESCE_FAULT=unknown
+                # shellcheck disable=SC2034 # Read by sourced quiesce_writers.
                 lifecycle_mode=upgrade quiesce="$0" activation_timeout=2
                 if [[ $case_name == quiescemodern || $case_name == quiescelegacy ]]; then
                     quiesce_writers >"$work/$case_name/callback.log" 2>&1 || {
@@ -423,6 +425,7 @@ fi
 (( $(date +%s) - start < 3 ))
 grep -q 'activation_status=42 package_restored=1' "$orchestrator_log"
 rollback_postflight="$work/rollback-postflight"
+# shellcheck disable=SC2016 # Expanded by the generated fixture.
 printf '#!/bin/sh\n[ "$1" = rollback-v1 ] && [ "$2" = 1.0 ] && [ "$3" = none ] || exit 49\ntouch "$PUNTO_POSTFLIGHT_MARKER"\n' >"$rollback_postflight"
 chmod 0700 "$rollback_postflight"
 set +e
@@ -445,7 +448,10 @@ postflight_fail_status=$?
 set -e
 (( postflight_fail_status == 70 ))
 grep -q 'rollback_postflight_status=48 package_restored=1 files_restored=1 runtime_restored=unknown input_verified=unknown' "$work/postflight-fail.log"
-! grep -q 'package_restored=0' "$work/postflight-fail.log"
+if grep -q 'package_restored=0' "$work/postflight-fail.log"; then
+    echo 'failed postflight incorrectly reports an unrestored package' >&2
+    exit 1
+fi
 [[ $(dpkg-query --admindir="$root/var/lib/dpkg" -W -f='${Version}' punto-rehearsal) == 1.0 ]]
 [[ $(dpkg-query --admindir="$root/var/lib/dpkg" -W -f='${db:Status-Abbrev}' punto-rehearsal) == 'ii ' ]]
 [[ $(sha256sum "$root/etc/punto/config.yaml" | cut -d' ' -f1) == "$config_hash" ]]
@@ -466,6 +472,7 @@ grep -q 'candidate or rollback is not a regular file' "$orchestrator_log"
 [[ $(dpkg-query --admindir="$root/var/lib/dpkg" -W -f='${Version}' punto-rehearsal) == 1.0 ]]
 
 activation_slow="$work/activation-slow"
+# shellcheck disable=SC2016 # Expanded by the generated fixture.
 printf '#!/bin/sh\ntouch "$PUNTO_ACTIVATION_MARKER"\nsleep 3\n' >"$activation_slow"
 chmod 0700 "$activation_slow"
 PUNTO_ACTIVATION_MARKER="$work/activation-entered" \

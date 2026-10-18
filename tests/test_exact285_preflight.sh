@@ -104,6 +104,7 @@ if sh "$preflight" "$legacy" "$candidate" "$root" >"$work/foreign.log" 2>&1; the
     exit 1
 fi
 grep -q 'foreign job or tray' "$work/foreign.log"
+# shellcheck disable=SC2016 # Expanded by the generated fixture.
 printf '#!/bin/sh\ntouch "$PUNTO_TEST_TRANSACTION_MARKER"\n' \
     >"$work/transaction"
 printf '#!/bin/sh\nexit 0\n' >"$work/activate"

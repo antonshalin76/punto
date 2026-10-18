@@ -101,6 +101,7 @@ fi
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 printf 'dummy\n' >"$work/package.deb"
+# shellcheck disable=SC2016 # Expanded by the generated fixture.
 printf '%s\n' '#!/bin/sh' \
     'last_root= last_admin=' \
     'for argument do case "$argument" in --root=*) last_root=${argument#--root=} ;; --admindir=*) last_admin=${argument#--admindir=} ;; esac; done' \

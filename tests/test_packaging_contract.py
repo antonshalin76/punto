@@ -32,8 +32,6 @@ class MaintainerHarness:
         self.etc.chmod(0o755)
         self.bin.mkdir()
         self.sbin.mkdir()
-        self.tray = self.root / "punto-tray"
-        write_executable(self.tray, "#!/bin/sh\nexit 0\n")
         self.calls = self.etc / "calls"
         self.calls.touch()
         self._install_fixtures()
@@ -183,9 +181,6 @@ class MaintainerHarness:
             "--bind",
             str(self.etc),
             "/etc/punto",
-            "--ro-bind",
-            str(self.tray),
-            "/usr/bin/punto-tray",
             "--bind",
             str(self.sbin),
             "/usr/sbin",

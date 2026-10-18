@@ -22,6 +22,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             apparmor \
+            at-spi2-core \
             build-essential \
             bubblewrap \
             busybox-static \
@@ -94,6 +95,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             apparmor \
+            at-spi2-core \
             build-essential \
             bubblewrap \
             busybox-static \

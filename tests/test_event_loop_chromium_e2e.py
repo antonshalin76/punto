@@ -783,10 +783,12 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
             self.assertFalse(self.key_is_down(key))
 
     def prepare_unrepresentable_selection(self):
-        # Bound only the private driver while exercising an invalid optional
-        # dereference in the old path; Chromium keeps its own address space.
+        # Bound growth without invalidating ASan's existing shadow mappings.
         budget = 512 * 1024 * 1024
-        resource.prlimit(self.harness.process.pid, resource.RLIMIT_AS, (budget, budget))
+        mapped = int(pathlib.Path(f"/proc/{self.harness.process.pid}/statm")
+                     .read_text(encoding="ascii").split()[0]) * os.sysconf("SC_PAGE_SIZE")
+        limit = mapped + budget
+        resource.prlimit(self.harness.process.pid, resource.RLIMIT_AS, (limit, limit))
         self.xdo("key", "End")
         self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn☃☃", 8, 8],
                         "source with a character outside the keyboard map")

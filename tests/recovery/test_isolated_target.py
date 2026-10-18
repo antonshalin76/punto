@@ -137,7 +137,7 @@ class IsolationPolicyTests(unittest.TestCase):
     def test_rejects_symlink_alias_to_forbidden_mount(self):
         with tempfile.TemporaryDirectory() as tmp:
             alias = Path(tmp) / "bus"
-            alias.symlink_to("/run/user/1000/bus")
+            alias.symlink_to("/run/user")
             with self.assertRaisesRegex(IsolationError, "forbidden host mount"):
                 self.policy.validate_mount_sources([alias])
 

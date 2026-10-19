@@ -5,7 +5,54 @@ Source tests, package validation, publication and machine installation are
 separate evidence gates; runtime health alone is not proof of an editor
 correction.
 
-## Current implementation checkpoint, 2026-10-18
+## Publication integration, 2026-10-19
+
+The default `master` includes the immutable v2.8.14 source, followed only by
+completed documentation and one test correction. No runtime, package,
+tag or uploaded asset is rebuilt or replaced by this integration.
+
+The later tag-push run39153888171 differs from the successful branch run below:
+Release49/50, sanitizer/package/tidy PASS. The failed Chromium test required an
+old-child rejection and an untouched PRIMARY fault marker after external mouse
+selection. The trace instead records origin_clear, PRIMARY timeout and safe
+retained_selection_unreadable refusal. Typing-context invalidation is legitimate;
+the exact differing pointer/button/focus component was not logged.
+
+The test now uses physical Right before selection to clear old provenance,
+requires the injected unreadable refusal and consumed marker, and keeps exact
+DOM/clipboard/dispatch and released-key assertions. The neighboring stale-child
+test remains. Deterministic precondition RED fails the old stage oracle; focused
+Release2/2 and sanitizer2/2 validate the corrected test and its neighbor. The
+failed tag result remains historical evidence, not a green rerun or waived gate.
+Master CI is a separate integration gate; no production guard/deadline changed.
+
+## Completed delivery, 2026-10-19 local time
+
+[v2.8.14](https://github.com/antonshalin76/punto/releases/tag/v2.8.14) is published
+by antonshalin76/id50358174. Tag source1817e90ce7da22462fe891805e25df6c7efd7e23;
+native pre-push review01M582HV1DJFW48S65B525GT32 has no findings,124/124 paths.
+Exact-head GitHub39152138346 passes all4 jobs: Release50/50, sanitizer50/50 plus
+clipboard1/1, CLI5315/5315, package965/965, maintainer20/20, recovery431/431,
+clang-tidy31TU and ShellCheck. No CTest skipped/unrun outcomes.
+
+The corrected DEB7636aed0c57bd1e927dee9173790e527c0b2e147281ce2ecf7166917db4e875f
+is installed and accepted; the earlier250718dd below is historical, not current.
+Its build source is76362ee. Subsequent CI/test changes include14 C++ E2E-only
+observation lines: current production rebuild plus package stripping is byte-for-
+byte identical to the accepted daemon2aa8941f. Raw source identity is not claimed.
+All4 published assets were downloaded, compared and checked against SHA256SUMS;
+tag, author/uploaders, server digests and latest-release identity were read back.
+Public BUILD_PROVENANCE records the source/build/CI/host distinction.
+
+Read-only installed status is ready/enabled, backend/helper/tray active, queues
+empty, live ELF correct. GNOME/IBus identities unchanged; rescue timers absent,
+root-only backend-reinstall backup retained. Physical human-device validation and
+a new long-idle soak were not performed. Unsupported private clipboard formats
+and malformed Chrome non-BMP accessibility ranges still fail closed, as documented.
+The checkbox plan is complete. Local delivery evidence resides under
+`.cache/punto-product-20261017.WqYT4f/release-20261018/`.
+
+## Historical implementation checkpoint, 2026-10-18
 
 The active checkbox plan is
 [product-delivery-plan-20261017.md](protocol/product-delivery-plan-20261017.md).

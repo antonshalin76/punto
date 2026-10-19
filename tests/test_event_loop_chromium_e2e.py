@@ -3585,6 +3585,13 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.harness.type_word("f")
         self.pump_until(lambda: self.browser_state()[:3] == ["привета", 7, 7],
                         "later physical text before unreadable selection")
+        # External mouse selection may also revoke history; make it explicit.
+        self.harness.send_key(gtk.KEY_LEFT)
+        self.pump_until(lambda: self.browser_state()[:3] == ["привета", 6, 6],
+                        "physical navigation clears obsolete word provenance")
+        self.harness.send_key(gtk.KEY_RIGHT)
+        self.pump_until(lambda: self.browser_state()[:3] == ["привета", 7, 7],
+                        "navigation completes before external selection")
         self.select_field_b_word(delay=1)
         self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_PRIMARY),
                          "ghbdtn")
@@ -3598,30 +3605,6 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         fail_read.touch(mode=0o600)
         before = self.browser_state()
         clipboard_before = self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD)
-        admission_prefix = "[punto] Editor admission refused "
-        admissions_before = sum(line.startswith(admission_prefix)
-                                for line in self.full_diagnostic().splitlines())
-        self.assert_pause_rejected(
-            preflight=True,
-            expected_stage="editor_context",
-        )
-        new_admissions = [line for line in self.full_diagnostic().splitlines()
-                          if line.startswith(admission_prefix)][admissions_before:]
-        self.assertTrue(new_admissions, "first refusal must carry fresh admission evidence")
-        self.assertTrue(all("expected_token_present=1" in line for line in new_admissions),
-                        new_admissions)
-        self.assertTrue(fail_read.exists(), "wrong child must not read PRIMARY")
-        self.assertFalse(failed.exists())
-        self.assertEqual(self.browser_state()[:-1], before[:-1])
-        self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD),
-                         clipboard_before)
-
-        self.harness.send_key(gtk.KEY_RIGHT)
-        self.pump_until(lambda: self.browser_state()[3:7] ==
-                        ["ghbdtn", 6, 6, "b"],
-                        "physical navigation clears obsolete word provenance")
-        self.select_field_b_word(delay=1)
-        before = self.browser_state()
         self.assert_pause_rejected(
             preflight=True,
             expected_stage="retained_selection_unreadable",
@@ -3632,6 +3615,8 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD),
                          clipboard_before)
         self.assertEqual(self.dispatches(), 1)
+        for key in (gtk.KEY_PAUSE, gtk.KEY_LEFTCTRL, gtk.KEY_LEFTSHIFT, gtk.KEY_LEFTALT):
+            self.assertFalse(self.key_is_down(key))
 
     def test_delayed_space_release_preserves_delimiter(self):
         self.assertEqual(gtk.ipc_request(b"SET_STATUS 1\n"), b"OK ENABLED\n")

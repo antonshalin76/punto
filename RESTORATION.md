@@ -57,6 +57,16 @@ stalled readiness case additionally requires the exact configured virtual
 deadline, alongside five calls and their exact50ms timeouts. This distinguishes
 policy proof from instrumented execution time; it changes no product deadline.
 
+Run39208948783 sanitizer49/50 finds one shared recovery-oracle error:
+test_post_dispatch_pointer_change_invalidates_retained_receipt waits for an
+origin_reset log that is intentionally omitted when history/token is already
+empty. Its fresh origin capture returned no token, so Right had no diagnostic
+state change to report. The shared recovery helper now requires visible Left
+to caret5 and Right back to caret6, then the existing zero-history check. This
+proves physical navigation without assuming prior history exists. Fresh manual
+conversion, next glyph, clipboard, layout, modifiers and process checks remain;
+the added Left must also be released. No production logic or deadlines changed.
+
 ## Completed delivery, 2026-10-19 local time
 
 [v2.8.14](https://github.com/antonshalin76/punto/releases/tag/v2.8.14) is published

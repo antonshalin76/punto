@@ -384,11 +384,12 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.harness.type_word("ghbdtn")
         self.pump_until(lambda: self.browser_state()[:3] == [source, 6, 6],
                         "fresh physical source after persistent refusal")
-        resets = self.full_diagnostic().count("[punto-e2e] origin_reset ")
+        self.harness.send_key(gtk.KEY_LEFT)
+        self.pump_until(lambda: self.browser_state()[:3] == [source, 5, 5],
+                        "ordinary Left reaches the editor before recovery")
         self.harness.send_key(gtk.KEY_RIGHT)
-        self.pump_until(lambda: self.full_diagnostic().count(
-            "[punto-e2e] origin_reset ") > resets,
-                        "ordinary Right clears fresh first-key provenance")
+        self.pump_until(lambda: self.browser_state()[:3] == [source, 6, 6],
+                        "ordinary Right returns to the exact recovery caret")
         serial = self.browser_state()[-1]
         self.wait_for_fresh_dom(serial, "fresh DOM after recovery navigation")
         self.assertEqual(self.browser_state()[:3], [source, 6, 6])
@@ -410,7 +411,7 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.assertEqual(self.clipboard_owner(), clipboard_owner)
         self.assertEqual(self.output_count(gtk.KEY_PAUSE), 0)
         for key in (gtk.KEY_PAUSE, gtk.KEY_LEFTCTRL, gtk.KEY_LEFTSHIFT,
-                    gtk.KEY_LEFTALT, gtk.KEY_RIGHT, gtk.KEY_BACKSPACE,
+                    gtk.KEY_LEFTALT, gtk.KEY_LEFT, gtk.KEY_RIGHT, gtk.KEY_BACKSPACE,
                     key, modifier):
             self.assertFalse(self.key_is_down(key))
         self.assertEqual(self.harness.process.pid, daemon_pid)

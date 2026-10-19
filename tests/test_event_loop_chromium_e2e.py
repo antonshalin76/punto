@@ -3452,6 +3452,8 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
     def test_automatic_retry_budget_does_not_loop_or_replay_later(self):
         daemon_pid = self.harness.process.pid
         daemon_start = gtk.process_start_time(daemon_pid)
+        clipboard = self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD)
+        clipboard_owner = self.clipboard_owner()
         self.assertEqual(gtk.ipc_request(b"SET_STATUS 1\n"), b"OK ENABLED\n")
         self.harness.type_word("ghbdtn")
         self.harness.send_key(gtk.KEY_SPACE)
@@ -3459,29 +3461,28 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
             lambda: self.browser_state()[:3] == ["привет ", 7, 7],
             "first automatic correction before retry budget control",
         )
-        initial_fault = pathlib.Path("/run/punto-e2e-force-layout-bridge-reject")
-        initial_fault.unlink(missing_ok=True)
-        self.addCleanup(initial_fault.unlink, missing_ok=True)
-        initial_fault.touch(mode=0o600)
+        self.pump_until(lambda: self.dispatches() == 1,
+                        "first automatic dispatch completed before retry fault")
+        marker = pathlib.Path("/run/punto-e2e-fail-word-keymap")
+        marker.unlink(missing_ok=True)
+        self.addCleanup(marker.unlink, missing_ok=True)
+        marker.touch(mode=0o600)
         rejection = (
-            "Word edit dispatch status=0 rejection_stage=layout_bridge_test_rejected retry_policy=1")
+            "Word edit dispatch status=0 rejection_stage=key_release retry_policy=1")
         rejected = self.full_diagnostic().count(rejection)
         self.harness.type_word("hello")
         self.harness.send_key(gtk.KEY_SPACE)
         self.pump_until(
             lambda: self.full_diagnostic().count(rejection) > rejected,
-            "initial automatic rejection",
+            "initial automatic rejection before selection preparation",
         )
-        self.assertFalse(initial_fault.exists(), "initial safe fault consumed")
+        self.assertFalse(marker.exists(), "initial safe fault consumed")
         serial = self.browser_state()[-1]
         self.wait_for_fresh_dom(serial, "fresh DOM after typed automatic rejection")
         self.assertEqual(self.browser_state()[:3], ["привет руддщ ", 13, 13])
         self.assertEqual(self.dispatches(), 1)
 
-        marker = pathlib.Path("/run/punto-e2e-fail-word-keymap")
-        marker.unlink(missing_ok=True)
         marker.touch(mode=0o600)
-        self.addCleanup(marker.unlink, missing_ok=True)
         attempts = self.harness.diagnostic().count("Word edit dispatch status=")
         self.harness.type_word("ghbdtn")
         self.harness.send_key(gtk.KEY_SPACE)
@@ -3498,6 +3499,8 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.assertFalse(marker.exists(), "retry fault was not consumed")
         self.assertEqual(self.harness.diagnostic().count("Word edit dispatch status="),
                          attempts + 1, "exactly one automatic retry")
+        self.assertEqual(self.full_diagnostic().count(rejection), rejected + 2,
+                         "both refusals are safely retryable before selection")
 
         attempts = self.harness.diagnostic().count("Word edit dispatch status=")
         self.harness.send_key(gtk.KEY_F8)
@@ -3519,6 +3522,12 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.assertEqual(self.browser_state()[:3],
                          ["привет руддщ привет привет ", 27, 27])
         self.assertEqual(self.dispatches(), 1)
+        self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD), clipboard)
+        self.assertEqual(self.clipboard_owner(), clipboard_owner)
+        self.assertEqual(self.keyboard_group(), 1)
+        self.assertEqual(self.desktop_source_role(), 1)
+        for key in (gtk.KEY_LEFTCTRL, gtk.KEY_LEFTSHIFT, gtk.KEY_LEFTALT):
+            self.assertFalse(self.key_is_down(key))
         self.assertEqual(self.harness.process.pid, daemon_pid)
         self.assertEqual(gtk.process_start_time(daemon_pid), daemon_start)
         self.assertIsNone(self.harness.process.poll())

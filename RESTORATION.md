@@ -36,6 +36,27 @@ delayed valid peer is a causal regression: it fails the old50ms setup, then
 returns one byte-exact request and response with the corrected setup. No retry,
 production timeout change or successful-rerun claim erases the failed master run.
 
+Run39206179947 exposes a separate Chromium retry-budget fixture assumption in
+sanitizers: forced layout refusal returned PreparedNotReplayed/Never with its
+range still selected, not the test's assumed Rejected/AfterFreshInput. That is
+the conservative contract when cleanup cannot be proved; the exact failing
+cleanup substep was not logged. The retry-accounting test now uses the existing
+key-release protocol fault before selection preparation and requires the exact
+safe rejection twice. Attempt limits, fresh-input gating and no-later-replay
+checks remain; clipboard/layout/modifier assertions were added. Independent
+post-layout retry and expired-cleanup tests remain unchanged. No runtime cleanup
+deadline was increased and an unproved cleanup was not made retryable.
+
+The same run's CLI5326 has one failure: stalled restart takes1460ms against a
+1200ms instrumented wall allowance; five50ms IPC calls and all substantive state,
+output and ownership assertions pass. Readiness policy uses a virtual40ms clock,
+but process tracing and five IPC attempts consume real time. Stalled restart and
+active-start now share the existing2200ms start/rollback execution allowance,
+below the unchanged3s watchdog. Non-stalled wall limits remain unchanged. Every
+stalled readiness case additionally requires the exact configured virtual
+deadline, alongside five calls and their exact50ms timeouts. This distinguishes
+policy proof from instrumented execution time; it changes no product deadline.
+
 ## Completed delivery, 2026-10-19 local time
 
 [v2.8.14](https://github.com/antonshalin76/punto/releases/tag/v2.8.14) is published

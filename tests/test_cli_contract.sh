@@ -1877,7 +1877,7 @@ prepare_response() {
 }
 
 assert_readiness_observation() {
-    local fixture_mode=$1 message=$2
+    local fixture_mode=$1 message=$2 fake_clock
     case $fixture_mode in
         none)
             assert_no_requests "$message"
@@ -1889,6 +1889,12 @@ assert_readiness_observation() {
             ;;
         stall)
             assert_exact_stats_requests "$message" 1 5
+            fake_clock=$(<"$tmp_root/clock.ms")
+            if [[ $fake_clock -eq $START_TIMEOUT_MS ]]; then
+                pass "$message reaches the exact virtual startup deadline"
+            else
+                fail "$message virtual clock is $fake_clock, expected $START_TIMEOUT_MS"
+            fi
             ;;
         *)
             assert_exact_stats_requests "$message"
@@ -2019,7 +2025,7 @@ run_start_transport_failure() {
 }
 
 run_start_failure_matrix() {
-    local label fixture response expected rollback
+    local label fixture response expected rollback fake_clock wall_bound
     local -a readiness_cases=(
         'unavailable none valid unavailable'
         'denied denied valid denied'
@@ -2070,7 +2076,11 @@ run_start_failure_matrix() {
     for label in "${active_readiness_cases[@]}"; do
         read -r label fixture response expected <<<"$label"
         reset_case
-        [[ $fixture != stall ]] || IPC_TIMEOUT_MS=50
+        wall_bound=$ACTIVE_READINESS_WALL_BOUND_MS
+        if [[ $fixture == stall ]]; then
+            IPC_TIMEOUT_MS=50
+            wall_bound=$START_ROLLBACK_WALL_BOUND_MS
+        fi
         printf 'active\n' >"$tmp_root/service.state"
         TRAY_PATH="$tmp_root/bin/not-installed-tray"
         prepare_response "$response"
@@ -2103,7 +2113,7 @@ run_start_failure_matrix() {
                 "B26 active $label backend readiness"
         fi
         assert_no_pid_or_undeclared_calls "B26 active $label backend"
-        assert_bounded "$CLI_RC" "$CLI_DURATION_MS" "$ACTIVE_READINESS_WALL_BOUND_MS" \
+        assert_bounded "$CLI_RC" "$CLI_DURATION_MS" "$wall_bound" \
             "B26 active $label start is bounded"
     done
 
@@ -2125,9 +2135,13 @@ run_start_failure_matrix() {
 }
 
 run_restart_transport_failure() {
-    local label=$1 fixture_mode=$2 response_kind=$3 expected=$4
+    local label=$1 fixture_mode=$2 response_kind=$3 expected=$4 wall_bound=1200
     reset_case
-    [[ $fixture_mode != stall ]] || IPC_TIMEOUT_MS=50
+    if [[ $fixture_mode == stall ]]; then
+        IPC_TIMEOUT_MS=50
+        # Five traced attempts share the start/rollback execution allowance.
+        wall_bound=$START_ROLLBACK_WALL_BOUND_MS
+    fi
     set_response_line "$READY_STATS"
     printf 'active\n' >"$tmp_root/service.state"
     seed_active_tray
@@ -2149,7 +2163,7 @@ run_restart_transport_failure() {
             "B26 restart $label checks IPC only after restart"
     fi
     assert_no_pid_or_undeclared_calls "B26 restart $label"
-    assert_bounded "$CLI_RC" "$CLI_DURATION_MS" 1200 "B26 restart $label is bounded"
+    assert_bounded "$CLI_RC" "$CLI_DURATION_MS" "$wall_bound" "B26 restart $label is bounded"
 }
 
 run_restart_matrix() {

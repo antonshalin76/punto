@@ -8,7 +8,7 @@ correction.
 ## Publication integration, 2026-10-19
 
 The default `master` includes the immutable v2.8.14 source, followed only by
-completed documentation and one test correction. No runtime, package,
+completed documentation and test corrections. No runtime, package,
 tag or uploaded asset is rebuilt or replaced by this integration.
 
 The later tag-push run39153888171 differs from the successful branch run below:
@@ -25,6 +25,16 @@ test remains. Deterministic precondition RED fails the old stage oracle; focused
 Release2/2 and sanitizer2/2 validate the corrected test and its neighbor. The
 failed tag result remains historical evidence, not a green rerun or waived gate.
 Master CI is a separate integration gate; no production guard/deadline changed.
+
+The first master run39203613330 passes CTest50/50, sanitizer50/50 plus clipboard1/1,
+package and tidy, but CLI5315 records four assertions from one timeout: the
+valid daemon_peers=0 case received ERROR timeout and its fixture saw no request.
+The suite had forced50ms around a traced Bash/netcat process chain, unlike the
+product default1000ms. Ordinary grammar/lifecycle cases now use that product
+budget; the real50ms stalled-peer and25ms IPC checks remain explicit. A100ms
+delayed valid peer is a causal regression: it fails the old50ms setup, then
+returns one byte-exact request and response with the corrected setup. No retry,
+production timeout change or successful-rerun claim erases the failed master run.
 
 ## Completed delivery, 2026-10-19 local time
 

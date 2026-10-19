@@ -23,7 +23,8 @@ CLI_LAST_TRACE_DIR=""
 SYSTEMCTL_MODE=ok
 TRAY_MODE=ok
 TRAY_PATH=""
-IPC_TIMEOUT_MS=50
+# Grammar and lifecycle checks use the product IPC budget, not a scheduling race.
+IPC_TIMEOUT_MS=1000
 COMMAND_TIMEOUT_MS=120
 START_TIMEOUT_MS=40
 STOP_TIMEOUT_MS=40
@@ -501,6 +502,8 @@ while not stopping.is_set():
         if mode == "stall":
             stopping.wait(30.0)
             continue
+        if mode == "delayed":
+            stopping.wait(0.1)
         try:
             with open(response_path, "rb") as response_file:
                 response = response_file.read()
@@ -1144,7 +1147,7 @@ reset_case() {
     SYSTEMCTL_MODE=ok
     TRAY_MODE=ok
     TRAY_PATH="$tmp_root/bin/punto-tray-fixture"
-    IPC_TIMEOUT_MS=50
+    IPC_TIMEOUT_MS=1000
     COMMAND_TIMEOUT_MS=120
     START_TIMEOUT_MS=40
     STOP_TIMEOUT_MS=40
@@ -1616,6 +1619,13 @@ run_stats_grammar_matrix() {
     assert_status_success "$VALID_STATS" "B11 canonical status"
     assert_privilege_dropped "B11 canonical status"
 
+    reset_case
+    payload=${VALID_STATS/daemon_peers=6/daemon_peers=0}
+    set_response_line "$payload"
+    start_fixture delayed || return
+    run_cli status-delayed-valid status
+    assert_status_success "$payload" "B11 valid payload after peer scheduling delay"
+
     for field in x11_health analysis_health input_health; do
         for value in ready degraded failed; do
             case $field in
@@ -1828,6 +1838,7 @@ run_transport_error_matrix() {
     assert_bounded "$CLI_RC" "$CLI_DURATION_MS" 800 "B11 denied transport is bounded"
 
     reset_case
+    IPC_TIMEOUT_MS=50
     start_fixture stall || return
     run_cli status-timeout status
     assert_nonzero "$CLI_RC" "B11 stalled transport"
@@ -1968,6 +1979,7 @@ run_start_transport_failure() {
     fi
     reset_case
     SYSTEMCTL_MODE=$rollback_mode
+    [[ $fixture_mode != stall ]] || IPC_TIMEOUT_MS=50
     prepare_response "$response_kind"
     if [[ $fixture_mode != none ]]; then
         start_fixture "$fixture_mode" || return
@@ -2058,6 +2070,7 @@ run_start_failure_matrix() {
     for label in "${active_readiness_cases[@]}"; do
         read -r label fixture response expected <<<"$label"
         reset_case
+        [[ $fixture != stall ]] || IPC_TIMEOUT_MS=50
         printf 'active\n' >"$tmp_root/service.state"
         TRAY_PATH="$tmp_root/bin/not-installed-tray"
         prepare_response "$response"
@@ -2114,6 +2127,7 @@ run_start_failure_matrix() {
 run_restart_transport_failure() {
     local label=$1 fixture_mode=$2 response_kind=$3 expected=$4
     reset_case
+    [[ $fixture_mode != stall ]] || IPC_TIMEOUT_MS=50
     set_response_line "$READY_STATS"
     printf 'active\n' >"$tmp_root/service.state"
     seed_active_tray

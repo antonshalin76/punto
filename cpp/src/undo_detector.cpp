@@ -5,8 +5,8 @@
 
 #include <algorithm>
 #include <atomic>
-#include <charconv>
 #include <cerrno>
+#include <charconv>
 #include <condition_variable>
 #include <deque>
 #include <iostream>
@@ -105,9 +105,9 @@ read_reset_marker_at(int directory_fd, std::string_view name,
   std::string payload(static_cast<std::size_t>(metadata.st_size), '\0');
   std::size_t offset = 0;
   while (offset < payload.size()) {
-    const ssize_t count = ::pread(fd, payload.data() + offset,
-                                  payload.size() - offset,
-                                  static_cast<off_t>(offset));
+    const ssize_t count =
+        ::pread(fd, payload.data() + offset, payload.size() - offset,
+                static_cast<off_t>(offset));
     if (count > 0) {
       offset += static_cast<std::size_t>(count);
       continue;
@@ -141,9 +141,8 @@ read_reset_marker_at(int directory_fd, std::string_view name,
   if (fields.empty()) {
     return std::nullopt;
   }
-  const auto parsed = std::from_chars(fields.data(),
-                                      fields.data() + fields.size(),
-                                      marker.timestamp);
+  const auto parsed = std::from_chars(
+      fields.data(), fields.data() + fields.size(), marker.timestamp);
   if (marker.timestamp == 0 || parsed.ec != std::errc{} ||
       parsed.ptr != fields.data() + fields.size() || fields.front() == '0') {
     return std::nullopt;
@@ -166,13 +165,13 @@ bool publish_reset_marker_at(int directory_fd, std::string_view name,
   int temp_fd = -1;
   std::string temp_name;
   for (unsigned int attempt = 0; attempt < 64U && temp_fd < 0; ++attempt) {
-    temp_name = marker_name + ".tmp." + std::to_string(::getpid()) + "." +
-                std::to_string(sequence.fetch_add(1,
-                                                  std::memory_order_relaxed));
+    temp_name =
+        marker_name + ".tmp." + std::to_string(::getpid()) + "." +
+        std::to_string(sequence.fetch_add(1, std::memory_order_relaxed));
     do {
-      temp_fd = ::openat(directory_fd, temp_name.c_str(),
-                         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-                         0600);
+      temp_fd =
+          ::openat(directory_fd, temp_name.c_str(),
+                   O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     } while (temp_fd < 0 && errno == EINTR);
     if (temp_fd < 0 && errno != EEXIST) {
       break;
@@ -448,7 +447,7 @@ void UndoDetector::worker(const std::shared_ptr<SharedState> &state) noexcept {
           }
           if (!cleared) {
             if ((request.mutation == PersistenceMutation::Add &&
-                !store.last_add_skipped_) ||
+                 !store.last_add_skipped_) ||
                 (request.mutation == PersistenceMutation::SyncDirectory &&
                  !request.word.empty() && !store.last_add_skipped_)) {
               state->exclusions.insert(request.word);
@@ -494,51 +493,6 @@ void UndoDetector::worker(const std::shared_ptr<SharedState> &state) noexcept {
     state->exited = true;
   }
   state->condition.notify_all();
-}
-
-void UndoDetector::on_correction_applied(std::uint64_t task_id,
-                                         const std::string &original_word) {
-  if (!valid_word(original_word)) {
-    last_correction_.reset();
-    backspace_count_since_correction_ = 0;
-    return;
-  }
-  last_correction_ = RecentCorrection{task_id, original_word,
-                                      std::chrono::steady_clock::now()};
-  backspace_count_since_correction_ = 0;
-}
-
-bool UndoDetector::on_backspace(std::chrono::steady_clock::time_point now) {
-  if (!last_correction_) {
-    return false;
-  }
-  if (now - last_correction_->applied_at > kUndoWindow) {
-    last_correction_.reset();
-    backspace_count_since_correction_ = 0;
-    return false;
-  }
-  ++backspace_count_since_correction_;
-  if (backspace_count_since_correction_ < kMinBackspaceCount) {
-    return false;
-  }
-  add_exclusion(last_correction_->original_word);
-  last_correction_.reset();
-  backspace_count_since_correction_ = 0;
-  return true;
-}
-
-void UndoDetector::on_undo() {
-  if (!last_correction_) {
-    return;
-  }
-  add_exclusion(last_correction_->original_word);
-  last_correction_.reset();
-  backspace_count_since_correction_ = 0;
-}
-
-void UndoDetector::on_key_typed() noexcept {
-  last_correction_.reset();
-  backspace_count_since_correction_ = 0;
 }
 
 bool UndoDetector::is_excluded(const std::string &word) const {
@@ -695,9 +649,8 @@ Publication UndoDetector::Store::persist(PersistenceMutation mutation,
     return synced ? Publication::Durable : Publication::NotPublished;
   }
 
-  if (mutation == PersistenceMutation::Add &&
-      marker->boot_id == boot_id_ && accepted_at != 0 &&
-      accepted_at <= marker->timestamp) {
+  if (mutation == PersistenceMutation::Add && marker->boot_id == boot_id_ &&
+      accepted_at != 0 && accepted_at <= marker->timestamp) {
     last_add_skipped_ = true;
     exclusions_ = *existing;
     (void)::close(lock_fd);
@@ -815,9 +768,8 @@ void UndoDetector::add_exclusion(const std::string &word) {
     return;
   if (!state_->exclusions.contains(word) &&
       state_->exclusions.size() < maximum_entries()) {
-    state_->requests.push_back(
-        {PersistenceMutation::Add, word, ++state_->generation,
-         monotonic_timestamp()});
+    state_->requests.push_back({PersistenceMutation::Add, word,
+                                ++state_->generation, monotonic_timestamp()});
     state_->exclusions.insert(word);
   }
   state_->retry = true;

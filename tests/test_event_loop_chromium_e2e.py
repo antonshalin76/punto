@@ -78,7 +78,43 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
             "test_extensionless_unsent_chord_expiry_restores_and_recovers",
             "test_extensionless_unsent_rollback_preserves_foreign_clipboard",
         }
-        if self._testMethodName in layout_sources:
+        contenteditable = self._testMethodName.startswith("test_contenteditable_")
+        if contenteditable:
+            self.contenteditable_paragraphs = "paragraph" in self._testMethodName
+            self.contenteditable_mutation = (
+                "duplicate" if "duplicate_switch" in self._testMethodName else
+                "replace" if "descendant_replacement" in self._testMethodName else None)
+            if self._testMethodName == "test_contenteditable_paragraph_automatic_layout":
+                self.contenteditable_source = ("before ", "", "")
+                contents = '<div><b>before </b><span></span></div>'
+            elif self.contenteditable_mutation:
+                self.contenteditable_source = ("before ", "ghbdtn", " after")
+                contents = ('<div><b>before </b><span>ghbdtn</span>'
+                            '<i> after</i></div>') * 2
+            elif self.contenteditable_paragraphs:
+                source = ("привет мир\nкак дела" if "translit" in self._testMethodName else
+                          "hELLo wORld\nmIXed cASe" if "case" in self._testMethodName else
+                          "d rfrb[ ghkj;tybz[\nctqxfc yt hf,jnftn dsltktybt b [jnrtb ")
+                if "multiline" not in self._testMethodName:
+                    source = source.replace("\n", " ")
+                self.contenteditable_source = ("before ", source, " after")
+                contents = ('<div><b>before </b><span>' +
+                            '</span></div><div><span>'.join(source.split("\n")) +
+                            '</span><i> after</i></div>')
+            else:
+                source = ("привет" if "translit" in self._testMethodName or
+                          "ru_to_en" in self._testMethodName else
+                          "hELLo" if "case" in self._testMethodName else "ghbdtn")
+                separator = "\n" if "multiline" in self._testMethodName else " "
+                self.contenteditable_source = ("before" + separator, source,
+                                               separator + "after")
+                contents = ('<b>before</b>' + separator + source + separator +
+                            '<i>after</i>')
+            first_control = ('<div id="a" contenteditable="true" role="textbox" '
+                             'aria-multiline="true" tabindex="0" '
+                             'style="white-space:pre-wrap;margin:20px;font-size:24px">' +
+                             contents + '</div>')
+        elif self._testMethodName in layout_sources:
             first_control = ('<input id="a" autofocus value="' +
                              layout_sources[self._testMethodName] + '">')
         elif delimiter_mode:
@@ -99,6 +135,27 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         rollback_state = ""
         cleanup_script = ""
         cleanup_state = ""
+        mutation_state = ""
+        first_state = "a.value,a.selectionStart,a.selectionEnd,"
+        if contenteditable:
+            cleanup_script = (
+                'a.focus();function rangeOffsets(){const s=getSelection();'
+                'if(!s.rangeCount)return[-1,-1];const r=s.getRangeAt(0);'
+                'if(!a.contains(r.commonAncestorContainer))return[-1,-1];'
+                'const p=document.createRange();p.selectNodeContents(a);'
+                'p.setEnd(r.startContainer,r.startOffset);const start=p.toString().length;'
+                'p.setEnd(r.endContainer,r.endOffset);return[start,p.toString().length]}')
+            first_state = "a.innerText,...rangeOffsets(),"
+            if self.contenteditable_mutation:
+                action = ('let p=a.children[1];' if self.contenteditable_mutation == "duplicate" else
+                          'let old=a.children[0],p=old.cloneNode(true);old.replaceWith(p);')
+                cleanup_script += (
+                    'let richMutations=0;a.addEventListener("keydown",e=>{'
+                    'if(e.code!=="F8")return;e.preventDefault();' + action +
+                    'const t=p.querySelector("span").firstChild,r=document.createRange();'
+                    'r.setStart(t,0);r.setEnd(t,t.length);const s=getSelection();'
+                    's.removeAllRanges();s.addRange(r);richMutations++});')
+                mutation_state = "richMutations,"
         if self._testMethodName in {
             "test_selection_revalidation_failure_collapses_and_recovers",
             "test_post_cleanup_right_same_text_selection_rejects_receipt",
@@ -138,10 +195,10 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
             'addEventListener("keydown",e=>{keys++;if(e.key==="Tab")tabsDown++});'
             'addEventListener("keyup",e=>{if(e.key==="Tab")tabsUp++});'
             'setInterval(()=>document.title="PUNTO"+encodeURIComponent(JSON.stringify('
-            '[a.value,a.selectionStart,a.selectionEnd,b.value,b.selectionStart,'
+            '[' + first_state + 'b.value,b.selectionStart,'
             'b.selectionEnd,document.activeElement.id,keys,'
             '[b.getBoundingClientRect().left,b.getBoundingClientRect().top,'
-            'outerHeight-innerHeight],[tabsDown,tabsUp],' + delimiter_state + rollback_state + cleanup_state +
+            'outerHeight-innerHeight],[tabsDown,tabsUp],' + delimiter_state + rollback_state + cleanup_state + mutation_state +
             '++snapshots])),20)</script>',
             encoding="utf-8",
         )
@@ -460,6 +517,234 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.pump_until(lambda: self.browser_state()[:3] == ["ghbdtn", 6, 6],
                         "second native browser correction with retained PRIMARY")
         self.pump_until(lambda: self.dispatches() == 2, "second dispatch receipt")
+
+    def assert_contenteditable_selection(self, expected, modifiers, target_group,
+                                         initial_group=0, *, selected=True):
+        prefix, source, suffix = self.contenteditable_source
+        original = prefix + source + suffix
+        self.set_desktop_layout(initial_group)
+        self.pump_until(lambda: self.browser_state()[0] == original,
+                        "rich editor initial text")
+        clipboard = self.plain_clipboard_snapshot()
+        # Native navigation crosses formatting nodes; no DOM range is assigned.
+        self.send_chord((gtk.KEY_LEFTCTRL,), key=gtk.KEY_END)
+        for _ in range(len(source + suffix) if selected else len(suffix)):
+            self.harness.send_key(gtk.KEY_LEFT)
+        source_start = len(prefix) if selected else len(prefix + source)
+        if not selected and self.contenteditable_paragraphs:
+            source_start -= source.count("\n")
+        self.pump_until(lambda: self.browser_state()[:3] ==
+                        [original, source_start, source_start],
+                        "rich editor physical caret at operation range")
+        if selected:
+            for _ in source:
+                self.send_chord((gtk.KEY_LEFTSHIFT,), key=gtk.KEY_RIGHT)
+            selected_end = len(prefix + source)
+            if self.contenteditable_paragraphs:
+                selected_end -= source.count("\n")
+            self.pump_until(lambda: self.browser_state()[:3] ==
+                            [original, len(prefix), selected_end],
+                            "rich editor exact physical selected range")
+            self.pump_until(lambda: self.selection_text(gtk.Gdk.SELECTION_PRIMARY) == source,
+                            "rich editor publishes the physically selected text")
+        serial = self.browser_state()[-1]
+        self.send_chord(modifiers)
+        replacement = prefix + expected + suffix
+        caret = len(prefix + expected)
+        if self.contenteditable_paragraphs:
+            caret -= expected.count("\n")
+        self.pump_until(lambda: self.browser_state()[-1] > serial and
+                        self.browser_state()[:3] == [replacement, caret, caret],
+                        "rich editor transforms only the selected range")
+        self.pump_until(lambda: self.dispatches() == 1,
+                        "rich editor completed selection dispatch")
+        self.assertEqual(self.keyboard_group(), target_group)
+        self.assertEqual(self.desktop_source_role(), target_group)
+        restored_clipboard = clipboard
+        if selected and self.contenteditable_paragraphs and "\n" in source:
+            self.pump_until(lambda: self.external_clipboard_target("UTF8_STRING") == clipboard[2],
+                            "rich paragraph paste restores original clipboard payload")
+            restored_clipboard = self.plain_clipboard_snapshot()
+            metadata = {"TARGETS", "TIMESTAMP", "MULTIPLE", "SAVE_TARGETS"}
+            self.assertEqual(set(restored_clipboard[1]) - metadata, set(clipboard[1]) - metadata)
+            self.assertEqual(restored_clipboard[2], clipboard[2])
+        else:
+            self.assertEqual(self.plain_clipboard_snapshot(), clipboard)
+        for key in (gtk.KEY_PAUSE, gtk.KEY_LEFTSHIFT, gtk.KEY_RIGHTSHIFT,
+                    gtk.KEY_LEFTCTRL, gtk.KEY_RIGHTCTRL,
+                    gtk.KEY_LEFTALT, gtk.KEY_RIGHTALT):
+            self.assertFalse(self.key_is_down(key), f"key {key} remains pressed")
+        self.harness.type_word("f")
+        following = "а" if target_group else "f"
+        self.pump_until(lambda: self.browser_state()[:3] ==
+                        [prefix + expected + following + suffix, caret + 1, caret + 1],
+                        "rich editor next physical key uses completed layout")
+        self.assertEqual(self.plain_clipboard_snapshot(), restored_clipboard)
+        self.assertEqual(self.browser_state()[3:7], ["ghbdtn", 0, 0, "a"])
+        self.assertEqual(self.output_count(gtk.KEY_PAUSE), 0)
+        self.assertIsNone(self.harness.process.poll())
+
+    def test_contenteditable_selection_layout_en_to_ru(self):
+        self.assert_contenteditable_selection("привет", (gtk.KEY_LEFTSHIFT,), 1)
+
+    def test_contenteditable_multiline_selection_layout_en_to_ru(self):
+        self.assert_contenteditable_selection("привет", (gtk.KEY_LEFTSHIFT,), 1)
+
+    def test_contenteditable_selection_layout_ru_to_en(self):
+        self.assert_contenteditable_selection("ghbdtn", (gtk.KEY_LEFTSHIFT,), 0, 1)
+
+    def test_contenteditable_multiline_selection_layout_ru_to_en(self):
+        self.assert_contenteditable_selection("ghbdtn", (gtk.KEY_LEFTSHIFT,), 0, 1)
+
+    def test_contenteditable_selection_case(self):
+        self.assert_contenteditable_selection("HellO", (gtk.KEY_LEFTALT,), 0)
+
+    def test_contenteditable_multiline_selection_case(self):
+        self.assert_contenteditable_selection("HellO", (gtk.KEY_LEFTALT,), 0)
+
+    def test_contenteditable_selection_translit(self):
+        self.assert_contenteditable_selection("privet", (gtk.KEY_LEFTCTRL, gtk.KEY_LEFTALT), 0)
+
+    def test_contenteditable_multiline_selection_translit(self):
+        self.assert_contenteditable_selection("privet", (gtk.KEY_LEFTCTRL, gtk.KEY_LEFTALT), 0)
+
+    def test_contenteditable_paragraph_selection_layout_phrase(self):
+        self.assert_contenteditable_selection(
+            "в каких прложениях сейчас не работает выделение и хоткеи ",
+            (gtk.KEY_LEFTSHIFT,), 1)
+
+    def test_contenteditable_paragraph_selection_layout_multiline_phrase(self):
+        self.assert_contenteditable_selection(
+            "в каких прложениях\nсейчас не работает выделение и хоткеи ",
+            (gtk.KEY_LEFTSHIFT,), 1)
+
+    def test_contenteditable_paragraph_selection_case_multiline_phrase(self):
+        self.assert_contenteditable_selection(
+            "HellO WorLD\nMixED CasE", (gtk.KEY_LEFTALT,), 0)
+
+    def test_contenteditable_paragraph_selection_translit_multiline_phrase(self):
+        self.assert_contenteditable_selection(
+            "privet mir\nkak dela", (gtk.KEY_LEFTCTRL, gtk.KEY_LEFTALT), 0)
+
+    def test_contenteditable_paragraph_current_word_case(self):
+        self.assert_contenteditable_selection(
+            "hELLo wORld mIXed CasE", (gtk.KEY_LEFTCTRL,), 0, selected=False)
+
+    def test_contenteditable_paragraph_current_word_case_multiline(self):
+        self.assert_contenteditable_selection(
+            "hELLo wORld\nmIXed CasE", (gtk.KEY_LEFTCTRL,), 0, selected=False)
+
+    def test_contenteditable_paragraph_automatic_layout(self):
+        clipboard = self.plain_clipboard_snapshot()
+        daemon_pid = self.harness.process.pid
+        helper_pid = self.session_bridge_process.pid
+        self.send_chord((gtk.KEY_LEFTCTRL,), key=gtk.KEY_END)
+        self.pump_until(lambda: self.browser_state()[:3] == ["before ", 7, 7],
+                        "rich paragraph physical caret after existing prefix")
+        self.assertEqual(gtk.ipc_request(b"SET_STATUS 1\n"), b"OK ENABLED\n")
+        self.harness.type_word("ghbdtn")
+        self.pump_until(lambda: self.browser_state()[:3] == ["before ghbdtn", 13, 13],
+                        "rich paragraph receives physical wrong-layout word")
+        serial = self.browser_state()[-1]
+        self.harness.send_key(gtk.KEY_SPACE)
+        self.pump_until(lambda: self.browser_state()[-1] > serial and
+                        self.browser_state()[:3] == ["before привет ", 14, 14],
+                        "rich paragraph automatically corrects only the typed word")
+        self.pump_until(lambda: self.dispatches() == 1, "rich paragraph automatic dispatch")
+        self.assertEqual(self.keyboard_group(), 1)
+        self.assertEqual(self.desktop_source_role(), 1)
+        self.harness.type_word("f")
+        self.pump_until(lambda: self.browser_state()[:3] == ["before привет а", 15, 15],
+                        "ordinary physical key follows rich automatic correction layout")
+        self.assertEqual(self.plain_clipboard_snapshot(), clipboard)
+        self.assertEqual(self.browser_state()[3:7], ["ghbdtn", 0, 0, "a"])
+        self.assertEqual(self.dispatches(), 1)
+        self.assertEqual(self.harness.process.pid, daemon_pid)
+        self.assertEqual(self.session_bridge_process.pid, helper_pid)
+        self.assertIsNone(self.harness.process.poll())
+        self.assertIsNone(self.session_bridge_process.poll())
+        self.assertEqual(self.output_count(gtk.KEY_PAUSE), 0)
+        for key in (gtk.KEY_PAUSE, gtk.KEY_LEFTCTRL, gtk.KEY_LEFTSHIFT, gtk.KEY_LEFTALT):
+            self.assertFalse(self.key_is_down(key))
+
+    def observe_contenteditable_selection(self, token="", exact=(-1, -1, "", "")):
+        helper = self.real_layout_bridge or self.helper_layout_bridge
+        return gtk.AccessibleContextGtkE2E.accessible_call(
+            self, "ObserveSelection", gtk.GLib.Variant("(sutsiiss)", (
+                helper.bound_helper, self.browser.pid,
+                gtk.GLib.get_monotonic_time() + 300_000, token, *exact)),
+            "(ustssottuiiiiisss)")
+
+    def assert_contenteditable_stale_selection_rejected(self):
+        line = "before ghbdtn after"
+        original = line + "\n" + line
+        clipboard = self.plain_clipboard_snapshot()
+        daemon_pid = self.harness.process.pid
+        self.xdo("key", "ctrl+Home")
+        for _ in "before ":
+            self.harness.send_key(gtk.KEY_RIGHT)
+        for _ in "ghbdtn":
+            self.send_chord((gtk.KEY_LEFTSHIFT,), key=gtk.KEY_RIGHT)
+        self.pump_until(lambda: self.browser_state()[:3] == [original, 7, 13],
+                        "first duplicate paragraph word physically selected")
+        self.pump_until(lambda: self.selection_text(gtk.Gdk.SELECTION_PRIMARY) == "ghbdtn",
+                        "initial duplicate paragraph PRIMARY source")
+        before = self.observe_contenteditable_selection()
+        self.assertEqual(before[0], 0, "initial native rich selection proof")
+        self.assertTrue(before[16], "native proof binds selected descendant identity")
+        markers = {name: pathlib.Path("/run", f"punto-e2e-{name}") for name in
+                   ("arm-after-replay-layout", "after-replay-layout", "release-after-replay-layout")}
+        for marker in markers.values():
+            marker.unlink(missing_ok=True)
+            self.addCleanup(marker.unlink, missing_ok=True)
+        self.addCleanup(markers["release-after-replay-layout"].touch, exist_ok=True)
+        markers["arm-after-replay-layout"].touch(mode=0o600)
+        rejected = self.full_diagnostic().count("Word edit dispatch status=0")
+        self.send_chord((gtk.KEY_LEFTSHIFT,))
+        self.pump_until(markers["after-replay-layout"].exists,
+                        "rich selection held after layout but before first mutation")
+        serial = self.browser_state()[-1]
+        self.xdo("key", "F8")
+        start = len(line) + 7 if self.contenteditable_mutation == "duplicate" else 7
+        self.pump_until(lambda: self.browser_state()[-1] > serial and
+                        self.browser_state()[-2] == 1 and
+                        self.browser_state()[:3] == [original, start, start + 6],
+                        "fixture changes native descendant identity without changing text")
+        self.assertEqual(self.browser_state()[6], "a")
+        self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_PRIMARY), "ghbdtn")
+        fresh = self.observe_contenteditable_selection()
+        self.assertEqual(fresh[0], 0, "replacement native rich selection proof")
+        self.assertEqual(fresh[4:6], before[4:6], "same provider and focused editor root")
+        self.assertEqual(fresh[12:15], before[12:15], "identical projected selected text")
+        self.assertNotEqual(fresh[16], before[16], "selected descendants have different authority")
+        stale = self.observe_contenteditable_selection(
+            fresh[15], (*fresh[12:15], before[16]))
+        self.assertEqual(stale[0], 2, "old descendant identity rejects even with fresh focus and hash")
+        markers["release-after-replay-layout"].touch(mode=0o600)
+        self.pump_until(lambda: self.full_diagnostic().count("Word edit dispatch status=0") > rejected,
+                        "old rich descendant proof refuses before any text write")
+        self.wait_for_fresh_dom(self.browser_state()[-1], "fresh DOM after stale descendant refusal")
+        self.assertEqual(self.browser_state()[:3], [original, start, start + 6])
+        self.assertEqual(self.dispatches(), 0)
+        self.assertEqual(self.plain_clipboard_snapshot(), clipboard)
+        self.send_chord((gtk.KEY_LEFTSHIFT,))
+        expected = (line + "\n" + "before привет after" if
+                    self.contenteditable_mutation == "duplicate" else
+                    "before привет after\n" + line)
+        self.pump_until(lambda: self.browser_state()[:3] == [expected, start + 6, start + 6],
+                        "fresh rich descendant selection recovers without daemon restart")
+        self.pump_until(lambda: self.dispatches() == 1, "fresh descendant selection dispatched")
+        self.assertEqual(self.plain_clipboard_snapshot(), clipboard)
+        self.assertEqual(self.harness.process.pid, daemon_pid)
+        self.assertEqual(self.output_count(gtk.KEY_PAUSE), 0)
+        for key in (gtk.KEY_F8, gtk.KEY_PAUSE, gtk.KEY_LEFTSHIFT, gtk.KEY_LEFTCTRL, gtk.KEY_LEFTALT):
+            self.assertFalse(self.key_is_down(key))
+
+    def test_contenteditable_paragraph_selection_duplicate_switch_rejected(self):
+        self.assert_contenteditable_stale_selection_rejected()
+
+    def test_contenteditable_paragraph_selection_descendant_replacement_rejected(self):
+        self.assert_contenteditable_stale_selection_rejected()
 
     def test_selection_hotkeys_without_visible_selection_preserve_receipt(self):
         self.first_manual_conversion()
@@ -954,7 +1239,8 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.send_chord((gtk.KEY_LEFTSHIFT,))
         self.pump_until(lambda: self.browser_state()[:3] == ["привет☃☃", 8, 8],
                         "fresh correction recovers without restart")
-        self.pump_until(lambda: self.external_selection_text() == baseline,
+        self.pump_until(lambda: self.selection_text(gtk.Gdk.SELECTION_CLIPBOARD)
+                        == baseline,
                         "recovered paste restores its admitted plain-text baseline", timeout=2)
         self.assertEqual(self.browser_state()[-2], [1, 1])
         self.assertEqual(self.dispatches(), 1)
@@ -3315,6 +3601,69 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.first_manual_conversion()
         self.assertFalse(marker.exists(), "clipboard initialization fault was not reached")
 
+    def test_explicit_learning_gesture_in_browser(self):
+        self.assertEqual(gtk.ipc_request(b"SET_STATUS 1\n"), b"OK ENABLED\n")
+        self.harness.type_word("ghbdtn")
+        self.harness.send_key(gtk.KEY_SPACE)
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет ", 7, 7],
+                        "automatic browser correction before explicit learning")
+        self.pump_until(lambda: self.dispatches() == 1, "automatic receipt settled")
+        clipboard = self.plain_clipboard_snapshot()
+        serial = self.browser_state()[-1]
+        self.send_explicit_learning_gesture()
+        self.pump_until(lambda: self.browser_state()[-1] > serial and
+                        self.browser_state()[:3] == ["ghbdtn ", 7, 7],
+                        "explicit browser inverse restores source")
+        self.pump_until(lambda: self.stats_fields()[1]["exclusions"] == "1" and
+                        self.stats_fields()[1]["learning_pending"] == "0",
+                        "one durable explicit browser exception")
+        self.assertEqual(self.dispatches(), 2)
+        self.assertEqual(self.output_count(gtk.KEY_BACKSPACE), 0)
+        self.assertEqual(self.plain_clipboard_snapshot(), clipboard)
+        self.harness.type_word("ghbdtn")
+        self.harness.send_key(gtk.KEY_SPACE)
+        self.pump_until(lambda: self.stats_fields()[1]["analyzed"] == "2",
+                        "explicitly excluded browser word analyzed")
+        self.wait_event_loop_idle("browser exclusion applied")
+        self.pump_until(lambda: self.browser_state()[:3] ==
+                        ["ghbdtn ghbdtn ", 14, 14],
+                        "fresh DOM after excluded browser word")
+        for key in (gtk.KEY_LEFTCTRL, gtk.KEY_LEFTSHIFT, gtk.KEY_BACKSPACE):
+            self.assertFalse(self.key_is_down(key))
+
+    def test_explicit_learning_browser_new_field_does_not_learn(self):
+        self.assertEqual(gtk.ipc_request(b"SET_STATUS 1\n"), b"OK ENABLED\n")
+        self.harness.type_word("ghbdtn")
+        self.harness.send_key(gtk.KEY_SPACE)
+        self.pump_until(lambda: self.browser_state()[:3] == ["привет ", 7, 7],
+                        "automatic source before browser child change")
+        self.pump_until(lambda: self.dispatches() == 1, "automatic source receipt")
+        self.harness.send_events([
+            (gtk.EV_KEY, gtk.KEY_LEFTCTRL, 1), (gtk.EV_SYN, gtk.SYN_REPORT, 0),
+            (gtk.EV_KEY, gtk.KEY_LEFTSHIFT, 1), (gtk.EV_SYN, gtk.SYN_REPORT, 0),
+            (gtk.EV_KEY, gtk.KEY_BACKSPACE, 1), (gtk.EV_SYN, gtk.SYN_REPORT, 0),
+            (gtk.EV_KEY, gtk.KEY_BACKSPACE, 0), (gtk.EV_SYN, gtk.SYN_REPORT, 0),
+        ])
+        self.wait_event_loop_idle("first browser gesture press processed")
+        self.assertEqual(self.output_count(gtk.KEY_BACKSPACE), 0)
+        self.assertEqual(self.browser_state()[:3], ["привет ", 7, 7])
+        self.select_field_b_word()
+        self.assertEqual(self.browser_state()[3:7], ["ghbdtn", 0, 6, "b"])
+        self.harness.send_events([
+            (gtk.EV_KEY, gtk.KEY_BACKSPACE, 1), (gtk.EV_SYN, gtk.SYN_REPORT, 0),
+            (gtk.EV_KEY, gtk.KEY_BACKSPACE, 0), (gtk.EV_SYN, gtk.SYN_REPORT, 0),
+            (gtk.EV_KEY, gtk.KEY_LEFTSHIFT, 0), (gtk.EV_SYN, gtk.SYN_REPORT, 0),
+            (gtk.EV_KEY, gtk.KEY_LEFTCTRL, 0), (gtk.EV_SYN, gtk.SYN_REPORT, 0),
+        ])
+        self.wait_event_loop_idle("different browser child cancels learning")
+        self.assertEqual(self.browser_state()[:3], ["привет ", 7, 7])
+        self.assertEqual(self.browser_state()[3:7], ["ghbdtn", 0, 6, "b"])
+        self.assertEqual(self.output_count(gtk.KEY_BACKSPACE), 0)
+        self.assertEqual(self.stats_fields()[1]["exclusions"], "0")
+        self.assertEqual(self.dispatches(), 1)
+        for key in (gtk.KEY_LEFTCTRL, gtk.KEY_LEFTSHIFT, gtk.KEY_BACKSPACE):
+            self.assertFalse(self.key_is_down(key))
+
     def test_consecutive_automatic_corrections(self):
         self.assertEqual(gtk.ipc_request(b"SET_STATUS 1\n"), b"OK ENABLED\n")
         self.harness.type_word("ghbdtn")
@@ -3602,7 +3951,7 @@ class ChromiumE2E(gtk.EventLoopGtkE2E):
         self.harness.send_key(gtk.KEY_RIGHT)
         self.pump_until(lambda: self.browser_state()[:3] == ["привета", 7, 7],
                         "navigation completes before external selection")
-        self.select_field_b_word(delay=1)
+        self.select_field_b_word()
         self.assertEqual(self.selection_text(gtk.Gdk.SELECTION_PRIMARY),
                          "ghbdtn")
         fail_read = pathlib.Path(

@@ -38,6 +38,7 @@ namespace {
 
 #if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
 extern "C" void punto_e2e_after_x11_session_commit(const char *session_id);
+extern "C" bool punto_e2e_hold_contextual_result();
 #endif
 
 constexpr std::uint64_t kTaskIdFenceStride = 1024;
@@ -995,7 +996,6 @@ int EventLoop::run() {
     process_ready_results();
     flush_unfinished_read_frame();
     process_held_tab();
-    process_pending_learning();
     if (stop_requested_.load(std::memory_order_relaxed)) {
       break;
     }
@@ -1524,12 +1524,62 @@ void EventLoop::handle_event(const input_event &ev) {
       }
     }
     update_modifier_state(code, !is_release);
+    if (!modifiers_.any_ctrl() || !modifiers_.any_shift() ||
+        modifiers_.any_alt() || modifiers_.any_meta())
+      learning_gesture_ = LearningGesture::None;
     if (layout_hotkey) {
       reset_async_state();
       buffer_.reset_all();
     }
     emit_passthrough_event(ev);
     return;
+  }
+
+  if (code == KEY_BACKSPACE && swallow_backspace_until_release_) {
+    if (is_release)
+      swallow_backspace_until_release_ = false;
+    return;
+  }
+  if (code == KEY_BACKSPACE && !is_release && !is_repeat &&
+      modifiers_.any_ctrl() && modifiers_.any_shift() &&
+      !modifiers_.any_alt() && !modifiers_.any_meta() && !ingress_transport_) {
+    if (learning_gesture_ == LearningGesture::Finished) {
+      swallow_backspace_until_release_ = true;
+      return;
+    }
+    if (undo_request_ && !undo_exclusion_key_.empty() &&
+        user_input_sequence_ == undo_input_sequence_ && !raw_word_candidate_ &&
+        !pending_word_edit_ && queued_word_candidates_.empty() &&
+        word_editor_ &&
+        std::chrono::steady_clock::now() - undo_applied_at_ <= kUndoWindow) {
+      const auto token = undo_request_->expected_editor_token;
+      macro_active_ = true;
+      const auto proof = word_editor_->editor_context(
+          std::chrono::steady_clock::now() + std::chrono::milliseconds{100},
+          token, [this](auto until) {
+            std::this_thread::sleep_until(until);
+            return !stop_requested_.load(std::memory_order_relaxed);
+          });
+      macro_active_ = false;
+      if (proof && undo_request_ && *proof == token &&
+          !undo_exclusion_key_.empty() &&
+          user_input_sequence_ == undo_input_sequence_ &&
+          std::chrono::steady_clock::now() - undo_applied_at_ <= kUndoWindow) {
+        swallow_backspace_until_release_ = true;
+        if (learning_gesture_ == LearningGesture::FirstPress)
+          queue_undo(true);
+        else
+          learning_gesture_ = LearningGesture::FirstPress;
+        return;
+      }
+    }
+    if (learning_gesture_ == LearningGesture::FirstPress) {
+      // A started gesture must not become deletion in a different editor.
+      swallow_backspace_until_release_ = true;
+      learning_gesture_ = LearningGesture::Finished;
+      undo_exclusion_key_.clear();
+      return;
+    }
   }
 
   if (code == KEY_Z && swallow_z_until_release_) {
@@ -1543,14 +1593,7 @@ void EventLoop::handle_event(const input_event &ev) {
       user_input_sequence_ == undo_input_sequence_ &&
       std::chrono::steady_clock::now() - undo_applied_at_ <= kUndoWindow &&
       word_editor_ && !word_editor_->has_pending_paste()) {
-    finalize_queued_words();
-    raw_word_candidate_ = RawWordCandidate{RawWordCandidate::Kind::Undo,
-                                           ++next_word_observation_id_,
-                                           {},
-                                           {},
-                                           0,
-                                           current_layout_,
-                                           config_};
+    queue_undo(false);
     swallow_z_until_release_ = true;
     return;
   }
@@ -1561,15 +1604,10 @@ void EventLoop::handle_event(const input_event &ev) {
 
   ++user_input_sequence_;
   undo_request_.reset();
-  const bool cancelled_undo =
-      pending_is_undo_ ||
-      (raw_word_candidate_ &&
-       raw_word_candidate_->kind == RawWordCandidate::Kind::Undo);
-  if (undo_detector_ && (code != KEY_BACKSPACE || cancelled_undo)) {
-    undo_detector_->on_key_typed();
-    learning_editor_token_.clear();
-    learning_backspaces_.clear();
-  }
+  undo_exclusion_key_.clear();
+  pending_learning_word_.clear();
+  if (learning_gesture_ != LearningGesture::None)
+    learning_gesture_ = LearningGesture::Finished;
   if (raw_word_candidate_ &&
       raw_word_candidate_->kind != RawWordCandidate::Kind::Automatic) {
     raw_word_candidate_.reset();
@@ -1602,13 +1640,6 @@ void EventLoop::handle_event(const input_event &ev) {
   }
 
   if (code == KEY_BACKSPACE) {
-    if (undo_detector_) {
-      if (learning_editor_token_.empty()) {
-        (void)undo_detector_->on_backspace(std::chrono::steady_clock::now());
-      } else if (learning_backspaces_.size() < 3) {
-        learning_backspaces_.push_back(std::chrono::steady_clock::now());
-      }
-    }
     auto visible = std::move(active_word_visible_);
     auto origin = std::move(input_history_editor_token_);
     const bool manually_edited = active_word_manually_edited_;
@@ -1648,16 +1679,6 @@ void EventLoop::handle_event(const input_event &ev) {
       return;
     }
     const auto full_word = buffer_.current_word();
-    std::span<const KeyEntry> analysis_word = full_word;
-    while (!analysis_word.empty()) {
-      const ScanCode last = analysis_word.back().code;
-      if (last == KEY_DOT || last == KEY_COMMA || last == KEY_SEMICOLON ||
-          last == KEY_APOSTROPHE || last == KEY_SLASH || last == KEY_MINUS) {
-        analysis_word = analysis_word.first(analysis_word.size() - 1);
-      } else {
-        break;
-      }
-    }
 
     // Physical input is committed before all analysis bookkeeping and never
     // waits on X11 or configuration I/O.
@@ -1679,16 +1700,29 @@ void EventLoop::handle_event(const input_event &ev) {
 
     const auto word_id = ++next_word_id_;
     const std::string trailing = code == KEY_SPACE ? " " : "\t";
+    std::vector<KeyEntry> preceding;
+    if (code == KEY_SPACE && full_word.size() == 1 &&
+        !active_word_manually_edited_ && !input_history_editor_token_.empty() &&
+        !word_history_.empty()) {
+      const auto &left = word_history_.back();
+      if (left.word.size() >= 2 && !left.manually_edited &&
+          left.editor_token == input_history_editor_token_ &&
+          !left.trailing.empty() &&
+          left.trailing.find_first_not_of(' ') == std::string::npos)
+        preceding = left.word;
+    }
     word_history_.push_back(TrackedWord{
         word_id, std::vector<KeyEntry>{full_word.begin(), full_word.end()},
         trailing, active_word_visible_});
     word_history_.back().editor_token = input_history_editor_token_;
+    word_history_.back().preceding_word = std::move(preceding);
+    word_history_.back().manually_edited = active_word_manually_edited_;
     RawWordCandidate candidate{
         RawWordCandidate::Kind::Automatic,
         ++next_word_observation_id_,
         std::vector<KeyEntry>{full_word.begin(), full_word.end()},
         trailing,
-        analysis_word.size(),
+        full_word.size(),
         current_layout_,
         std::move(cfg)};
     candidate.word_id = word_id;
@@ -1698,7 +1732,7 @@ void EventLoop::handle_event(const input_event &ev) {
     candidate.editor_token = input_history_editor_token_;
     candidate.analyze =
         analysis_pool_ && runtime_auto_enabled_ &&
-        analysis_word.size() >= candidate.config->auto_switch.min_word_len;
+        full_word.size() >= candidate.config->auto_switch.min_word_len;
     candidate.allow_correction = !active_word_manually_edited_;
     active_word_visible_.reset();
     active_word_manually_edited_ = false;
@@ -1849,10 +1883,10 @@ void EventLoop::reset_async_state(bool bump_task_barrier) {
   pending_word_edit_.reset();
   pending_is_undo_ = false;
   undo_request_.reset();
-  learning_editor_token_.clear();
-  learning_backspaces_.clear();
-  if (undo_detector_)
-    undo_detector_->on_key_typed();
+  undo_exclusion_key_.clear();
+  pending_learning_word_.clear();
+  if (learning_gesture_ != LearningGesture::None)
+    learning_gesture_ = LearningGesture::Finished;
   if (word_editor_ && !macro_active_) {
     word_editor_->reset();
   }
@@ -1996,6 +2030,7 @@ IpcResult EventLoop::execute_ipc_command(const IpcRequest &request) {
     if (!undo_detector_) {
       return {false, "Learning unavailable"};
     }
+    reset_async_state();
     const std::uint64_t generation = undo_detector_->clear_exclusions();
     if (generation == 0) {
       return {false, "Learning unavailable"};
@@ -2411,6 +2446,11 @@ void EventLoop::process_ready_results() {
   for (auto ready = ready_results_.find(next_apply_task_id_);
        ready != ready_results_.end();
        ready = ready_results_.find(next_apply_task_id_)) {
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    if (ready->second.requires_editor && ready->second.analysis_len == 1 &&
+        punto_e2e_hold_contextual_result())
+      break;
+#endif
     queue_auto_word_edit(ready->second);
     ready_results_.erase(ready);
     commit_analysis_terminal(next_apply_task_id_);
@@ -2455,6 +2495,21 @@ HotkeyAction EventLoop::determine_hotkey_action() const {
   if (modifiers_.any_ctrl())
     return HotkeyAction::InvertCaseWord;
   return HotkeyAction::InvertLayoutWord;
+}
+
+void EventLoop::queue_undo(bool learn) {
+  finalize_queued_words();
+  if (!learn)
+    undo_exclusion_key_.clear();
+  learning_gesture_ = learn ? LearningGesture::Finished : LearningGesture::None;
+  raw_word_candidate_ = RawWordCandidate{
+      learn ? RawWordCandidate::Kind::LearnUndo : RawWordCandidate::Kind::Undo,
+      ++next_word_observation_id_,
+      {},
+      {},
+      0,
+      current_layout_,
+      config_};
 }
 
 void EventLoop::queue_manual_word_edit(HotkeyAction action) {
@@ -2527,14 +2582,20 @@ void EventLoop::finish_word_candidate(
     }
   }
   if (candidate.kind != RawWordCandidate::Kind::Automatic) {
-    if (candidate.kind == RawWordCandidate::Kind::Undo) {
-      if (fresh && observation->focus_window > 1 && undo_request_) {
+    if (candidate.kind == RawWordCandidate::Kind::Undo ||
+        candidate.kind == RawWordCandidate::Kind::LearnUndo) {
+      const bool learn = candidate.kind == RawWordCandidate::Kind::LearnUndo;
+      if (fresh && observation->focus_window > 1 && undo_request_ &&
+          (!learn || (!undo_exclusion_key_.empty() &&
+                      std::chrono::steady_clock::now() - undo_applied_at_ <=
+                          kUndoWindow))) {
         pending_word_edit_ = std::move(undo_request_);
         pending_is_undo_ = true;
-      } else if (undo_detector_) {
-        undo_detector_->on_key_typed();
+        pending_learning_word_ =
+            learn ? std::move(undo_exclusion_key_) : std::string{};
       }
       undo_request_.reset();
+      undo_exclusion_key_.clear();
       return;
     }
     if (!fresh)
@@ -2639,27 +2700,69 @@ void EventLoop::finish_word_candidate(
       record->task_id = next_task_id_;
     ++next_task_id_;
     refresh_analysis_health_head();
-    return;
-  }
-  WordTask task;
-  task.task_id = next_task_id_;
-  task.word = candidate.word;
-  task.analysis_len = candidate.analysis_len;
-  task.layout_at_boundary = layout;
-  task.cfg = candidate.config->auto_switch;
-  const AnalysisAdmission admission = analysis_pool_->submit(std::move(task));
-  if (!admission.accepted) {
-    if (record != word_history_.end()) {
-      record->lifecycle = TrackedWord::Lifecycle::Complete;
-      record->correction_eligible = false;
+  } else {
+    WordTask task;
+    task.task_id = next_task_id_;
+    task.word = candidate.word;
+    task.analysis_len = candidate.analysis_len;
+    task.layout_at_boundary = layout;
+    task.cfg = candidate.config->auto_switch;
+    const AnalysisAdmission admission = analysis_pool_->submit(std::move(task));
+    if (!admission.accepted) {
+      if (record != word_history_.end()) {
+        record->lifecycle = TrackedWord::Lifecycle::Complete;
+        record->correction_eligible = false;
+      }
+      return;
     }
-    return;
+    analysis_accepted_at_[next_task_id_] = admission.accepted_at;
+    if (record != word_history_.end())
+      record->task_id = next_task_id_;
+    ++next_task_id_;
+    refresh_analysis_health_head();
   }
-  analysis_accepted_at_[next_task_id_] = admission.accepted_at;
-  if (record != word_history_.end())
-    record->task_id = next_task_id_;
-  ++next_task_id_;
-  refresh_analysis_health_head();
+
+  // Reuse the ordered analysis lane for a single-letter word once both
+  // neighbors exist; retaining its left neighbor does not enlarge rollback.
+  if (record == word_history_.end() || record == word_history_.begin() ||
+      !analysis_pool_ || !fresh || observation->focus_window <= 1 ||
+      !candidate.allow_correction || !runtime_auto_enabled_ ||
+      candidate.trailing != " ")
+    return;
+  auto &short_word = *std::prev(record);
+  if (short_word.word.size() != 1 || short_word.preceding_word.empty() ||
+      !short_word.visible || short_word.editor_token.empty() ||
+      short_word.editor_token != record->editor_token ||
+      short_word.session_generation != record->session_generation ||
+      short_word.focus_window != record->focus_window ||
+      short_word.trailing.empty() ||
+      short_word.trailing.find_first_not_of(' ') != std::string::npos)
+    return;
+  // A later layout observation cannot reinterpret the glyph already typed.
+  const auto english = key_entries_to_visible_text_checked(short_word.word, 0);
+  const auto russian = key_entries_to_visible_text_checked(short_word.word, 1);
+  const bool was_english = english && *english == *short_word.visible;
+  const bool was_russian = russian && *russian == *short_word.visible;
+  if (was_english == was_russian)
+    return;
+  WordTask context;
+  context.task_id = next_task_id_;
+  context.word = short_word.word;
+  context.analysis_len = 1;
+  context.layout_at_boundary = was_english ? 0 : 1;
+  context.cfg = candidate.config->auto_switch;
+  context.preceding_word = std::move(short_word.preceding_word);
+  context.following_word = candidate.word;
+  const auto contextual = analysis_pool_->submit(std::move(context));
+  if (contextual.accepted) {
+    analysis_accepted_at_[next_task_id_] = contextual.accepted_at;
+    short_word.task_id = next_task_id_++;
+    short_word.lifecycle = TrackedWord::Lifecycle::AwaitingAnalysis;
+    short_word.correction_eligible = true;
+    short_word.allow_terminal = false;
+    short_word.source_layout = was_english ? 0 : 1;
+    refresh_analysis_health_head();
+  }
 }
 
 void EventLoop::capture_typing_context() {
@@ -2678,10 +2781,10 @@ void EventLoop::capture_typing_context() {
 #endif
   if (!session_valid || config_load_pending_)
     return;
-  // Observe before the first physical character is forwarded. A timeout only
-  // disables terminal history admission; it cannot stop ordinary input.
+  // Observe before forwarding the first character. Slow desktop providers get
+  // a bounded admission window; an unproved origin never authorizes a GUI edit.
   const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds{20};
+      std::chrono::steady_clock::now() + std::chrono::milliseconds{100};
   process_word_observation(false);
   const auto id = ++next_word_observation_id_;
   bool started = x11_session_->start_background_keyboard_observation(id);
@@ -2762,8 +2865,9 @@ void EventLoop::process_word_observation(bool input_idle) {
         buffer_.reset_all();
         input_history_observation_.reset();
         undo_request_.reset();
-        if (undo_detector_)
-          undo_detector_->on_key_typed();
+        undo_exclusion_key_.clear();
+        if (learning_gesture_ != LearningGesture::None)
+          learning_gesture_ = LearningGesture::Finished;
       }
       current_layout_ = observation->group;
       keyboard_observation_ = *observation;
@@ -2834,6 +2938,8 @@ void EventLoop::queue_auto_word_edit(const WordResult &result) {
   }
   auto &candidate = *found;
   candidate.lifecycle = TrackedWord::Lifecycle::Complete;
+  candidate.allow_terminal =
+      candidate.allow_terminal && !result.requires_editor;
   if (!candidate.correction_eligible ||
       result.terminal_status != WordTerminalStatus::Completed ||
       result.correction_type == CorrectionType::NoCorrection ||
@@ -2952,33 +3058,12 @@ void EventLoop::process_held_tab() {
   }
 }
 
-void EventLoop::process_pending_learning() {
-  if (learning_backspaces_.size() != 3 || learning_editor_token_.empty() ||
-      macro_active_ || held_tab_ || !word_editor_ || !undo_detector_)
-    return;
-  pollfd input{STDIN_FILENO, POLLIN, 0};
-  if (::poll(&input, 1, 0) != 0)
-    return;
-  macro_active_ = true;
-  const auto proof = word_editor_->editor_context(
-      std::chrono::steady_clock::now() + std::chrono::milliseconds{100},
-      learning_editor_token_);
-  macro_active_ = false;
-  if (proof) {
-    for (const auto timestamp : learning_backspaces_)
-      (void)undo_detector_->on_backspace(timestamp);
-  } else {
-    undo_detector_->on_key_typed();
-  }
-  learning_editor_token_.clear();
-  learning_backspaces_.clear();
-}
-
 void EventLoop::complete_word_edit(const WordEditRequest &request,
                                    const WordEditOutcome &outcome, bool undo,
                                    std::optional<std::uint64_t> task_id,
                                    const std::string &exclusion_key,
-                                   bool exact_inverse) {
+                                   bool exact_inverse,
+                                   std::string_view learned_word) {
   const int layout_before_edit = current_layout_;
   const int observed_layout =
       outcome.observed_layout >= 0                   ? outcome.observed_layout
@@ -2997,12 +3082,8 @@ void EventLoop::complete_word_edit(const WordEditRequest &request,
   if (outcome.status != WordEditStatus::Dispatched)
     return;
   ++word_dispatches_;
-  if (undo && undo_detector_) {
-    if (exact_inverse)
-      undo_detector_->on_undo();
-    else
-      undo_detector_->on_key_typed();
-  }
+  if (undo && exact_inverse && !learned_word.empty() && undo_detector_)
+    undo_detector_->add_exclusion(std::string{learned_word});
   if (sound_manager_ && current_layout_ != layout_before_edit)
     sound_manager_->play_for_layout(current_layout_);
   if (!undo) {
@@ -3021,11 +3102,9 @@ void EventLoop::complete_word_edit(const WordEditRequest &request,
                                     outcome.editor_token};
     undo_applied_at_ = std::chrono::steady_clock::now();
     undo_input_sequence_ = user_input_sequence_;
-  }
-  if (task_id && undo_detector_) {
-    undo_detector_->on_correction_applied(*task_id, exclusion_key);
-    learning_editor_token_ = outcome.editor_token;
-    learning_backspaces_.clear();
+    undo_exclusion_key_ = task_id && !outcome.editor_token.empty()
+                              ? exclusion_key
+                              : std::string{};
   }
 }
 
@@ -3037,10 +3116,11 @@ void EventLoop::process_pending_word_edit() {
     pending_is_undo_ = false;
     return;
   }
-  if (!word_editor_ || word_editor_->busy() || pause_down_ ||
-      modifiers_.any_ctrl() || modifiers_.any_shift() || modifiers_.any_alt() ||
-      modifiers_.any_meta() || held_keys_.any() || input_frame_size_ != 0 ||
-      !input_frame_accepts_.empty() ||
+  if (!word_editor_ || word_editor_->busy() ||
+      (!pending_learning_word_.empty() && word_editor_->has_pending_paste()) ||
+      pause_down_ || modifiers_.any_ctrl() || modifiers_.any_shift() ||
+      modifiers_.any_alt() || modifiers_.any_meta() || held_keys_.any() ||
+      input_frame_size_ != 0 || !input_frame_accepts_.empty() ||
       stop_requested_.load(std::memory_order_relaxed) ||
       std::chrono::steady_clock::now() - last_key_event_at_ <
           std::chrono::milliseconds{6}) {
@@ -3131,6 +3211,11 @@ void EventLoop::process_pending_word_edit() {
   request.text_input_sequence = text_input_sequence_;
   const bool undo = pending_is_undo_;
   pending_is_undo_ = false;
+  const auto learned_word = std::move(pending_learning_word_);
+  pending_learning_word_.clear();
+  if (!learned_word.empty() &&
+      std::chrono::steady_clock::now() - undo_applied_at_ > kUndoWindow)
+    return;
   macro_active_ = true;
   const auto macro_started_at = std::chrono::steady_clock::now();
   WordEditOutcome outcome = word_editor_->execute(request);
@@ -3144,8 +3229,8 @@ void EventLoop::process_pending_word_edit() {
       std::memory_order_relaxed);
   lifetime_telemetry_.tail_len_sum.fetch_add(request.expected.size(),
                                              std::memory_order_relaxed);
-  if (undo && outcome.status == WordEditStatus::Rejected &&
-      keyboard_observation_) {
+  if (undo && learned_word.empty() &&
+      outcome.status == WordEditStatus::Rejected && keyboard_observation_) {
     WordEditRequest fallback{{},
                              {},
                              -1,
@@ -3171,7 +3256,7 @@ void EventLoop::process_pending_word_edit() {
       corrected_task = record->task_id;
   }
   complete_word_edit(request, outcome, undo, corrected_task,
-                     corrected_original_key, exact_inverse);
+                     corrected_original_key, exact_inverse, learned_word);
   if (outcome.status == WordEditStatus::Dispatched) {
     if (corrected_word) {
       auto record = std::find_if(
@@ -3179,6 +3264,7 @@ void EventLoop::process_pending_word_edit() {
           [&](const auto &word) { return word.id == *corrected_word; });
       if (record != word_history_.end()) {
         record->visible = std::move(record->correction);
+        record->source_layout = record->target_layout;
         record->correction.reset();
         record->correction_eligible = false;
       }
@@ -3212,8 +3298,6 @@ void EventLoop::process_pending_word_edit() {
           request.operation == WordEditOperation::CurrentWordCase;
     }
   } else {
-    if (undo && undo_detector_)
-      undo_detector_->on_key_typed();
     if (corrected_word) {
       for (auto &word : word_history_)
         if (word.id == *corrected_word) {
@@ -3708,8 +3792,11 @@ void EventLoop::poll_config_load_completion() {
     finalize_queued_words();
     clear_word_history();
     undo_request_.reset();
+    undo_exclusion_key_.clear();
+    pending_learning_word_.clear();
+    if (learning_gesture_ != LearningGesture::None)
+      learning_gesture_ = LearningGesture::Finished;
     if (undo_detector_) {
-      undo_detector_->on_key_typed();
       undo_detector_->load_from_file();
     }
     pending_word_edit_.reset();

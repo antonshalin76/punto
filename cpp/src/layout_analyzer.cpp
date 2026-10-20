@@ -84,6 +84,42 @@ AnalysisResult LayoutAnalyzer::analyze(std::span<const KeyEntry> word) const {
   return result;
 }
 
+bool LayoutAnalyzer::strongly_matches(std::span<const KeyEntry> word,
+                                      Language language) const {
+  if (word.size() < std::max<std::size_t>(config_.min_word_len, 3) ||
+      has_invalid_chars(word))
+    return false;
+  const bool english = language == Language::English;
+  for (const auto &entry : word) {
+    const char character = scancode_to_lowercase(entry.code);
+    if (!((character >= 'a' && character <= 'z') ||
+          (!english &&
+           (character == '[' || character == ']' || character == ';' ||
+            character == '\'' || character == ',' || character == '.' ||
+            character == '`'))))
+      return false;
+  }
+  const auto result = analyze(word);
+  const double target = english ? result.en_score : result.ru_score;
+  const double source = english ? result.ru_score : result.en_score;
+  if (target < std::max(config_.min_score, 15.0) || target <= source ||
+      (source > 0 && target / source < std::max(config_.threshold, 3.5)))
+    return false;
+
+  const auto ascii = word_to_ascii(word);
+  std::size_t bigrams = 0, trigrams = 0;
+  for (std::size_t i = 0; i + 1 < ascii.size(); ++i) {
+    bigrams += (english ? lookup_en_bigram(ascii[i], ascii[i + 1])
+                        : lookup_ru_bigram(ascii[i], ascii[i + 1])) > 0;
+    if (i + 2 < ascii.size())
+      trigrams +=
+          (english
+               ? lookup_en_trigram(ascii[i], ascii[i + 1], ascii[i + 2])
+               : lookup_ru_trigram(ascii[i], ascii[i + 1], ascii[i + 2])) > 0;
+  }
+  return trigrams > 0 && bigrams >= 2 && bigrams * 2 >= word.size() - 1;
+}
+
 double LayoutAnalyzer::calculate_score(std::span<const KeyEntry> word,
                                        Language lang) const {
   if (word.size() < 2) {

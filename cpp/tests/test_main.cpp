@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -358,6 +359,267 @@ void test_analysis_pool_admission_receipt_and_bound() {
     ++terminals;
   }
   expect(terminals == 2, "each bounded accepted task has one terminal");
+}
+
+void test_analysis_pool_russian_endings_and_punctuation() {
+  char pattern[] = "/tmp/punto-word-endings-XXXXXX";
+  const char *directory = ::mkdtemp(pattern);
+  expect(directory != nullptr, "word-ending dictionary directory");
+  const auto english = std::filesystem::path(directory) / "en.txt";
+  const auto russian = std::filesystem::path(directory) / "ru.txt";
+  std::ofstream(english) << "hello\nworld\n";
+  std::ofstream(russian) << "люблю\nклуб\nпляж\nалоэ\nпривет\n";
+  DictionaryLoadSpec spec;
+  spec.english_paths = {english};
+  spec.russian_paths = {russian};
+  Dictionary dictionary;
+  expect(dictionary.initialize_bounded(spec) == DictionaryLoadResult::Ok,
+         "deterministic word-ending dictionaries loaded");
+  AnalysisWorkerPool pool(dictionary);
+  pool.start(1);
+  std::uint64_t id = 0;
+  for (const auto word : {"k.,k.", "rke,", "gkz;", "fkj'"}) {
+    for (const auto suffix : {"", ".", ",", ";", "'", "/", "-", ".."}) {
+      for (int layout : {0, 1}) {
+        WordTask task;
+        task.task_id = ++id;
+        for (const char character : std::string(word) + suffix) {
+          const auto key = std::find(kScancodeToChar.begin(),
+                                     kScancodeToChar.end(), character);
+          expect(key != kScancodeToChar.end(), "physical fixture key exists");
+          task.word.push_back(
+              {static_cast<ScanCode>(key - kScancodeToChar.begin()), false});
+        }
+        task.analysis_len = task.word.size();
+        task.layout_at_boundary = layout;
+        expect(pool.submit(std::move(task)).accepted,
+               "word-ending task admitted");
+        WordResult result;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!pool.try_pop_result(result)) {
+          expect(std::chrono::steady_clock::now() < deadline,
+                 "word-ending analysis bounded");
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        expect(result.task_id == id &&
+                   result.terminal_status == WordTerminalStatus::Completed,
+               "one completed word-ending result");
+        expect(
+            result.analysis_len == std::strlen(word),
+            "longest dictionary word keeps Russian ending before punctuation");
+        expect(result.need_switch == (layout == 0),
+               "Russian ending switches only from wrong layout");
+      }
+    }
+  }
+  pool.stop();
+  expect(std::filesystem::remove(english), "remove owned English fixture");
+  expect(std::filesystem::remove(russian), "remove owned Russian fixture");
+  expect(std::filesystem::remove(directory), "remove owned fixture directory");
+}
+
+std::vector<KeyEntry> physical_keys(std::string_view text) {
+  std::vector<KeyEntry> keys;
+  for (char character : text) {
+    const bool shift = character >= 'A' && character <= 'Z';
+    if (shift)
+      character = static_cast<char>(character + ('a' - 'A'));
+    const auto key =
+        std::find(kScancodeToChar.begin(), kScancodeToChar.end(), character);
+    expect(key != kScancodeToChar.end(), "physical fixture key exists");
+    keys.push_back(
+        {static_cast<ScanCode>(key - kScancodeToChar.begin()), shift});
+  }
+  return keys;
+}
+
+void test_analysis_pool_unknown_ngram_evidence() {
+  Dictionary dictionary;
+  AnalysisWorkerPool pool(dictionary);
+  pool.start(1);
+  std::uint64_t id = 0;
+  for (const auto text : {"ghkj;tybz[", "ghbdtnn", "therre", "dj,", "zxcvbn",
+                          "qwerty", "myVariable", "API", "ghbdtn1", "ghbdtn/",
+                          "ghbdtn-", "ghbdtnn.", "helloo"}) {
+    for (const int layout : {0, 1}) {
+      WordTask task;
+      task.task_id = ++id;
+      task.word = physical_keys(text);
+      task.analysis_len = task.word.size();
+      task.layout_at_boundary = layout;
+      task.cfg.typo_correction_enabled = false;
+      expect(dictionary.lookup(task.word) == DictResult::Unknown,
+             "ngram fixture is unknown to both dictionaries");
+      expect(pool.submit(std::move(task)).accepted, "ngram task admitted");
+      WordResult result;
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      while (!pool.try_pop_result(result)) {
+        expect(std::chrono::steady_clock::now() < deadline,
+               "ngram task completes within bound");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      const bool russian = std::string_view(text) == "ghkj;tybz[" ||
+                           std::string_view(text) == "ghbdtnn" ||
+                           std::string_view(text) == "dj,";
+      const bool english = std::string_view(text) == "therre";
+      expect(result.need_switch ==
+                 ((russian && layout == 0) || (english && layout == 1)),
+             "only strong opposite ngram evidence switches unknown words");
+      expect(result.requires_editor == result.need_switch,
+             "probabilistic inversion requires native editor authority");
+      expect(!result.correction.has_value(),
+             "ngram inversion preserves the original spelling");
+      expect(result.analysis_len == std::strlen(text),
+             "unknown analysis retains the full physical word");
+    }
+  }
+  pool.stop();
+}
+
+WordResult analyze_task(AnalysisWorkerPool &pool, WordTask task) {
+  const auto id = task.task_id;
+  expect(pool.submit(std::move(task)).accepted, "evidence task admitted");
+  WordResult result;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!pool.try_pop_result(result)) {
+    expect(std::chrono::steady_clock::now() < deadline,
+           "evidence task completes within bound");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  expect(result.task_id == id &&
+             result.terminal_status == WordTerminalStatus::Completed,
+         "evidence has one matching completed result");
+  return result;
+}
+
+void test_analysis_pool_contextual_single_letters() {
+  char pattern[] = "/tmp/punto-context-XXXXXX";
+  const char *directory = ::mkdtemp(pattern);
+  expect(directory != nullptr, "context dictionary directory");
+  const auto english = std::filesystem::path(directory) / "en.txt";
+  const auto russian = std::filesystem::path(directory) / "ru.txt";
+  std::ofstream(english) << "hello\nworld\nghbdtnn\nrfr\n";
+  std::ofstream(russian) << "привет\nмир\nкак\n";
+  DictionaryLoadSpec spec;
+  spec.english_paths = {english};
+  spec.russian_paths = {russian};
+  Dictionary dictionary;
+  expect(dictionary.initialize_bounded(spec) == DictionaryLoadResult::Ok,
+         "deterministic context dictionaries loaded");
+  AnalysisWorkerPool pool(dictionary);
+  pool.start(1);
+  std::uint64_t id = 0;
+  // Exhaust the bounded standalone-letter x language x layout x context matrix.
+  for (const auto letter :
+       {"f", "d", "b", "r", "j", "c", "e", "z", "a", "I", "i", "x"}) {
+    for (const int language : {0, 1}) {
+      for (const int layout : {0, 1}) {
+        for (int context = 0; context < 6; ++context) {
+          WordTask task;
+          task.task_id = ++id;
+          task.word = physical_keys(letter);
+          task.analysis_len = 1;
+          task.layout_at_boundary = layout;
+          task.cfg.min_word_len = 8;
+          task.cfg.enabled =
+              false; // Runtime Auto admission belongs to EventLoop.
+          task.preceding_word =
+              physical_keys(language == 0 ? "hello" : "ghbdtn");
+          task.following_word = physical_keys(language == 0 ? "world" : "vbh");
+          if (context == 1)
+            task.preceding_word.clear();
+          if (context == 2)
+            task.following_word.clear();
+          if (context == 3)
+            task.following_word =
+                physical_keys(language == 0 ? "vbh" : "world");
+          if (context == 4)
+            task.preceding_word = physical_keys("rfr"); // Both dictionaries.
+          if (context == 5)
+            task.following_word = physical_keys("a");
+          const auto result = analyze_task(pool, std::move(task));
+          const bool standalone =
+              language == 0 ? std::string_view(letter) == "a" ||
+                                  std::string_view(letter) == "I"
+                            : std::string_view("fdbrjcez").find(letter) !=
+                                  std::string_view::npos;
+          const bool expected =
+              context == 0 && layout != language && standalone;
+          expect(result.need_switch == expected,
+                 "single-letter switch requires exclusive agreeing neighbors "
+                 "and opposite layout");
+          expect(result.requires_editor == expected && !result.correction,
+                 "context switch requires editor and preserves spelling");
+        }
+      }
+    }
+  }
+
+  for (const int layout : {0, 1}) {
+    WordTask task;
+    task.task_id = ++id;
+    task.word = physical_keys("ghbdtnn");
+    task.analysis_len = task.word.size();
+    task.layout_at_boundary = layout;
+    const auto result = analyze_task(pool, std::move(task));
+    expect(result.need_switch == (layout == 1) && !result.requires_editor,
+           "exclusive current dictionary outranks contrary ngram evidence");
+  }
+  pool.stop();
+
+  AnalysisWorkerPool admission(dictionary);
+  for (const bool preceding : {false, true}) {
+    WordTask task;
+    task.task_id = ++id;
+    (preceding ? task.preceding_word : task.following_word)
+        .resize(kMaxWordLen + 1, KeyEntry{KEY_A, false});
+    expect(!admission.submit(std::move(task)).accepted,
+           "oversize context rejected before queue ownership");
+  }
+  WordTask maximum;
+  maximum.task_id = ++id;
+  maximum.preceding_word.resize(kMaxWordLen, KeyEntry{KEY_A, false});
+  maximum.following_word = maximum.preceding_word;
+  expect(admission.submit(std::move(maximum)).accepted,
+         "maximum bounded context accepted");
+  admission.stop();
+  expect(std::filesystem::remove(english),
+         "remove owned context English fixture");
+  expect(std::filesystem::remove(russian),
+         "remove owned context Russian fixture");
+  expect(std::filesystem::remove(directory), "remove owned context directory");
+}
+
+void test_ngram_evidence_configuration() {
+  AutoSwitchConfig config;
+  config.enabled = false;
+  expect(LayoutAnalyzer(config).strongly_matches(physical_keys("ghbdtnn"),
+                                                 Language::Russian),
+         "analysis does not override runtime Auto enablement");
+  config.min_word_len = 8;
+  expect(!LayoutAnalyzer(config).strongly_matches(physical_keys("ghbdtnn"),
+                                                  Language::Russian),
+         "normal unknown words retain configured minimum length");
+  config.min_word_len = 2;
+  config.min_score = 1'000'000;
+  expect(!LayoutAnalyzer(config).strongly_matches(physical_keys("ghbdtnn"),
+                                                  Language::Russian),
+         "configured score stricter than safety floor is retained");
+  config.min_score = 0;
+  config.threshold = 1'000'000;
+  expect(!LayoutAnalyzer(config).strongly_matches(physical_keys("therre"),
+                                                  Language::English),
+         "configured ratio stricter than safety floor is retained");
+  config.threshold = 0;
+  for (const auto noise : {"zxcvbn", "qwerty", "helloo", "aa", "1the"})
+    for (const auto language : {Language::English, Language::Russian})
+      expect(
+          !LayoutAnalyzer(config).strongly_matches(physical_keys(noise),
+                                                   language),
+          "permissive config cannot remove independent evidence requirements");
 }
 
 void test_ipc_server() {
@@ -795,6 +1057,10 @@ int main() {
   test_analysis_pool_concurrent_stop_is_a_barrier();
   test_analysis_pool_admission_can_close_before_drain();
   test_analysis_pool_admission_receipt_and_bound();
+  test_analysis_pool_russian_endings_and_punctuation();
+  test_analysis_pool_unknown_ngram_evidence();
+  test_analysis_pool_contextual_single_letters();
+  test_ngram_evidence_configuration();
   test_ipc_server();
   test_typo_corrector();
   test_history_manager();

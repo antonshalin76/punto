@@ -143,6 +143,22 @@ void mark_private_macro_event(const char *path) noexcept {
   }
 }
 
+extern "C" bool punto_e2e_hold_contextual_result() {
+  const int marker = ::open("/run/punto-e2e-hold-contextual-result",
+                            O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (marker < 0)
+    return false;
+  struct stat metadata {};
+  const bool held = ::fstat(marker, &metadata) == 0 &&
+                    S_ISREG(metadata.st_mode) &&
+                    metadata.st_uid == ::geteuid() && metadata.st_nlink == 1 &&
+                    (metadata.st_mode & 0077) == 0;
+  (void)::close(marker);
+  if (held)
+    mark_private_macro_event("/run/punto-e2e-contextual-result-held");
+  return held;
+}
+
 void observe_admitted_macro_ipc() noexcept {
   if (macro_ipc_hold.load(std::memory_order_acquire)) {
     mark_private_macro_event("/run/punto-e2e-macro-ipc-admitted");
@@ -1613,7 +1629,8 @@ punto::DictionaryLoadOutcome deterministic_dictionary_loader() {
   const ScopedFixturePath affix{"/tmp/punto-e2e" + suffix + ".aff"};
   punto::DictionaryLoadOutcome outcome;
   if (!write_fixture(english.path, "2\nhello\nworld\n") ||
-      !write_fixture(russian.path, "2\nпривет\nжест\n") ||
+      !write_fixture(russian.path,
+                     "6\nпривет\nжест\nлюблю\nклуб\nпляж\nалоэ\n") ||
       !write_fixture(affix.path,
                      "SET UTF-8\nTRY esiarntolcdugmphbyfvkwzxjq\n")) {
     return outcome;
@@ -1666,6 +1683,12 @@ punto::DictionaryLoadOutcome blocking_dictionary_loader() {
 } // namespace
 
 int main() {
+#if defined(PUNTO_LAYOUT_SWITCH_E2E_TESTING)
+  if (std::getenv("PUNTO_REAL_LAYOUT_BRIDGE_E2E") != nullptr) {
+    std::cerr << "real bridge mode requires the native layout driver\n";
+    return 2;
+  }
+#endif
   punto::set_ipc_mailbox_admitted_test_hook(observe_admitted_macro_ipc);
   int stop_pipe[2] = {-1, -1};
   if (::pipe2(stop_pipe, O_CLOEXEC | O_NONBLOCK) != 0) {

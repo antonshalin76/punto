@@ -41,7 +41,12 @@ struct WordTask {
   // Слово (полное) в KeyEntry (включая пунктуацию, если она набиралась).
   std::vector<KeyEntry> word;
 
-  // Длина части слова для анализа (после отрезания trailing пунктуации).
+  // Native editor-owned neighbors for contextual one-letter analysis.
+  std::vector<KeyEntry> preceding_word;
+  std::vector<KeyEntry> following_word;
+
+  // Верхняя граница анализа; словарь уточняет trailing пунктуацию полного
+  // слова.
   std::size_t analysis_len = 0;
 
   // Раскладка ОС в момент завершения слова (0=EN, 1=RU)
@@ -79,6 +84,7 @@ struct WordResult {
   std::uint64_t epoch = 0;
   WordTerminalStatus terminal_status = WordTerminalStatus::Completed;
   bool need_switch = false;
+  bool requires_editor = false;
 
   /// Тип применённой коррекции
   CorrectionType correction_type = CorrectionType::NoCorrection;
@@ -200,6 +206,8 @@ public:
   [[nodiscard]] AnalysisAdmission submit(WordTask task) {
     std::lock_guard<std::mutex> state_lock(state_mu_);
     if (task.word.size() > kMaxWordLen ||
+        task.preceding_word.size() > kMaxWordLen ||
+        task.following_word.size() > kMaxWordLen ||
         task.analysis_len > task.word.size() ||
         (task.layout_at_boundary != 0 && task.layout_at_boundary != 1) ||
         !accepting_ || lifecycle_ != Lifecycle::Running || fatal_ ||
@@ -335,6 +343,38 @@ private:
         const auto t0 = std::chrono::steady_clock::now();
 
         try {
+          if (task.analysis_len == 1 && task.word.size() == 1) {
+            if (task.preceding_word.size() >= 2 &&
+                task.following_word.size() >= 2 &&
+                !LayoutAnalyzer::has_invalid_chars(task.preceding_word) &&
+                !LayoutAnalyzer::has_invalid_chars(task.following_word) &&
+                should_bypass(task.preceding_word, 2) == BypassReason::None &&
+                should_bypass(task.following_word, 2) == BypassReason::None) {
+              const auto preceding = dict_->lookup(task.preceding_word);
+              const auto following = dict_->lookup(task.following_word);
+              if (preceding == following &&
+                  ((preceding == DictResult::Russian &&
+                    task.layout_at_boundary == 0) ||
+                   (preceding == DictResult::English &&
+                    task.layout_at_boundary == 1))) {
+                const bool english = preceding == DictResult::English;
+                const auto text = keys_to_utf8(task.word, english);
+                const bool standalone =
+                    english ? text == "a" ||
+                                  (text == "i" && task.word.front().shifted)
+                            : text == "а" || text == "в" || text == "и" ||
+                                  text == "к" || text == "о" || text == "с" ||
+                                  text == "у" || text == "я";
+                if (standalone) {
+                  res.need_switch = true;
+                  res.requires_editor = true;
+                  res.correction_type = CorrectionType::LayoutSwitch;
+                }
+              }
+            }
+            finish_and_push(res, t0);
+            continue;
+          }
           // Проверяем что слово достаточно длинное
           if (task.analysis_len < task.cfg.min_word_len) {
             res.analysis_us = 0;
@@ -342,9 +382,31 @@ private:
             continue;
           }
 
-          // Берём только анализируемую часть (без trailing пунктуации)
           std::span<const KeyEntry> analysis_span(task.word.data(),
                                                   task.analysis_len);
+          auto dict_result = dict_->lookup(analysis_span);
+          // DOT/COMMA/SEMICOLON/APOSTROPHE also encode Russian ю/б/ж/э.
+          // Prefer the longest known word before treating its tail as
+          // punctuation.
+          if (task.analysis_len == task.word.size()) {
+            while (!analysis_span.empty() &&
+                   dict_result == DictResult::Unknown) {
+              const auto last = analysis_span.back().code;
+              if (last != KEY_DOT && last != KEY_COMMA &&
+                  last != KEY_SEMICOLON && last != KEY_APOSTROPHE &&
+                  last != KEY_SLASH && last != KEY_MINUS)
+                break;
+              analysis_span = analysis_span.first(analysis_span.size() - 1);
+              dict_result = dict_->lookup(analysis_span);
+            }
+            if (dict_result == DictResult::Unknown)
+              analysis_span = std::span<const KeyEntry>{task.word};
+            res.analysis_len = analysis_span.size();
+          }
+          if (analysis_span.size() < task.cfg.min_word_len) {
+            finish_and_push(res, t0);
+            continue;
+          }
 
           // =========================================================================
           // Этап 0: Smart Bypass — определяем, нужно ли пропускать РЕГИСТРОВЫЕ
@@ -382,11 +444,9 @@ private:
           //    → переключаем раскладку (word inversion);
           //  - если слова ЕСТЬ в текущей, но НЕТ в противоположной → НЕ
           //  переключаем;
-          //  - если слова НЕТ в обеих → НЕ переключаем;
+          //  - неизвестные слова требуют строгих N-граммных признаков;
           //  - если слова ЕСТЬ в обеих → дополнительно решаем по N-граммам.
           // =========================================================================
-          DictResult dict_result = dict_->lookup(analysis_span);
-
           const bool in_en_dict = (dict_result == DictResult::English ||
                                    dict_result == DictResult::Both);
           const bool in_ru_dict = (dict_result == DictResult::Russian ||
@@ -501,8 +561,34 @@ private:
             continue;
           }
 
-          // Case C: слова нет в обоих словарях -> раскладку НЕ переключаем.
-          // (можно продолжить на typo fix)
+          // Case C: Unknown inversion needs multiple independent N-gram cues.
+          if (dict_result == DictResult::Unknown && !bypass_case_fix) {
+            LayoutAnalyzer analyzer(task.cfg);
+            const auto target =
+                is_en_layout ? Language::Russian : Language::English;
+            if (analyzer.strongly_matches(analysis_span, target)) {
+              bool ambiguous_tail = false;
+              auto prefix = analysis_span;
+              while (prefix.size() > 1) {
+                const auto last = prefix.back().code;
+                if (last != KEY_DOT && last != KEY_COMMA &&
+                    last != KEY_SEMICOLON && last != KEY_APOSTROPHE)
+                  break;
+                prefix = prefix.first(prefix.size() - 1);
+                if (analyzer.strongly_matches(prefix, target)) {
+                  ambiguous_tail = true;
+                  break;
+                }
+              }
+              if (!ambiguous_tail) {
+                res.need_switch = true;
+                res.requires_editor = true;
+                res.correction_type = CorrectionType::LayoutSwitch;
+                finish_and_push(res, t0);
+                continue;
+              }
+            }
+          }
 
           // =========================================================================
           // Этап 2: Слово Unknown — пробуем typo fix
@@ -521,8 +607,6 @@ private:
 
               if (is_correct) {
                 // Слово корректное — не исправляем.
-                // Важно: для Unknown слов раскладку больше НЕ переключаем
-                // (требование).
               } else {
                 // Слово неправильное, запрашиваем предложения
                 std::vector<std::string> suggestions =

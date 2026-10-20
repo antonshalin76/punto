@@ -1259,9 +1259,10 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
       outcome.rejection_stage = "editor_process_unavailable";
       return outcome;
     }
-    auto observed =
-        desktop_layout_->observe_editor(lease->info(), *editor_pid, deadline,
-                                        wait_, request.expected_editor_token);
+    auto observed = desktop_layout_->observe_editor(
+        lease->info(), *editor_pid, deadline, wait_,
+        request.expected_editor_token, std::nullopt,
+        selection ? AccessibleScope::Selection : AccessibleScope::Range);
     if (observed.status != AccessibleStatus::Observed || !lease->valid()) {
       const auto now = Clock::now();
       std::fprintf(
@@ -1317,7 +1318,10 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
       return kind == ActiveWindowKind::Terminal;
     const auto observed = desktop_layout_->observe_editor(
         lease->info(), *editor_pid, deadline, wait_, initial_editor->token,
-        range, range ? AccessibleScope::Range : AccessibleScope::Child);
+        range,
+        range
+            ? (selection ? AccessibleScope::Selection : AccessibleScope::Range)
+            : AccessibleScope::Child);
     return observed.status == AccessibleStatus::Observed && lease->valid();
   };
   std::uint8_t xinput_opcode = 0;
@@ -2358,8 +2362,46 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
       current_receipt_active = true;
     }
   };
-  const auto selection_source_matches = [&](const SelectionRead &source,
-                                            bool describe_rejection = false) {
+  const auto native_word_range =
+      [&](const SelectionRead &source) -> std::optional<AccessibleRange> {
+    if (!initial_editor || source.text.empty() ||
+        !g_utf8_validate(source.text.data(),
+                         static_cast<gssize>(source.text.size()), nullptr))
+      return std::nullopt;
+    const auto observed = desktop_layout_->observe_editor(
+        lease->info(), *editor_pid, deadline, wait_, initial_editor->token);
+    // A retained backward selection puts the caret at its beginning.
+    const auto original_end =
+        std::max(initial_editor->caret, initial_editor->selection_end);
+    gchar *hash = g_compute_checksum_for_data(
+        G_CHECKSUM_SHA256, reinterpret_cast<const guchar *>(source.text.data()),
+        source.text.size());
+    const bool exact =
+        observed.status == AccessibleStatus::Observed &&
+        observed.range.start >= 0 && observed.range.end == original_end &&
+        observed.range.end - observed.range.start ==
+            g_utf8_strlen(source.text.data(),
+                          static_cast<gssize>(source.text.size())) &&
+        observed.range.sha256 == hash;
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    if (!exact) {
+      std::fprintf(stderr,
+                   "[punto-e2e] selection_native_word status=%u caret=%d "
+                   "start=%d end=%d chars=%ld hash_match=%d\n",
+                   static_cast<unsigned>(observed.status),
+                   initial_editor->caret, observed.range.start,
+                   observed.range.end,
+                   g_utf8_strlen(source.text.data(),
+                                 static_cast<gssize>(source.text.size())),
+                   observed.range.sha256 == hash);
+    }
+#endif
+    g_free(hash);
+    return exact ? std::optional{observed.range} : std::nullopt;
+  };
+  const auto selection_source_matches = [&](SelectionRead &source,
+                                            bool describe_rejection = false,
+                                            bool allow_refresh = true) {
     const auto reject = [&](const char *stage) {
       if (describe_rejection) {
         outcome.rejection_stage = stage;
@@ -2377,17 +2419,67 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
         clipboard_->get_text_with_owner(Selection::Primary, deadline);
     if (!current)
       return reject("selection_source_primary_read");
-    if (!same_selection(source, *current))
-      return reject("selection_source_primary_identity");
+    if (!same_selection(source, *current)) {
+      const bool same_payload =
+          allow_refresh && current->owner == source.owner &&
+          current->connection_generation == source.connection_generation &&
+          current->text == source.text;
+      const bool exact_range =
+          same_payload && initial_editor &&
+          (selection ? editor_matches(initial_editor->range)
+                     : native_word_range(*current).has_value());
+      if (!exact_range)
+        return reject("selection_source_primary_identity");
+      source = *current;
+    }
     if (selection && initial_editor) {
       if (!editor_matches(initial_editor->range))
         return reject("selection_source_range");
-    } else if (!editor_matches()) {
+    } else if (initial_editor && !editor_matches()) {
       return reject("selection_source_editor");
     }
     if (!context_matches())
       return reject("selection_source_context_after");
     return true;
+  };
+  const auto orient_native_selection = [&](const SelectionRead &source,
+                                           const AccessibleRange &range,
+                                           bool forward) {
+    const auto count = range.end - range.start;
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    std::fprintf(
+        stderr,
+        "[punto-e2e] selection_direction start=%d end=%d forward=%d owner=%u\n",
+        range.start, range.end, forward, source.owner);
+#endif
+    if (!initial_editor || range.start < 0 || count <= 0 ||
+        count > static_cast<std::int32_t>(kMaxCharacters) ||
+        client_of(source.owner) != *active_client || !clipboard_time() ||
+        !context_matches() ||
+        !clipboard_->selection_identity_matches(Selection::Primary, source,
+                                                deadline) ||
+        !editor_matches(range))
+      return false;
+    // GTK4 can export an empty PRIMARY for a backwards native selection.
+    // Reorient only the proven range; this never authorizes a text write.
+    bool queued = false;
+    const bool collapsed = tap(connection, forward ? kLeft : kRight, false,
+                               deadline, false, &queued);
+    if (queued)
+      outcome.status = WordEditStatus::PreparedNotReplayed;
+    if (!collapsed)
+      return false;
+    for (std::int32_t i = 0; i < count; ++i) {
+      if (!context_matches() || !editor_matches() ||
+          !tap(connection, forward ? kRight : kLeft, true, deadline))
+        return false;
+    }
+    const bool exact = context_matches() && editor_matches(range);
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+    std::fprintf(stderr, "[punto-e2e] selection_direction completed exact=%d\n",
+                 exact);
+#endif
+    return exact;
   };
   const auto paste_replacement = [&](const SelectionRead *source, bool terminal,
                                      std::size_t erase_count = 0) {
@@ -2411,9 +2503,11 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
         return;
       }
     }
+    bool source_pinned = false;
     const auto source_matches = [&] {
-      return confirmed ? selection_source_matches(*confirmed)
-                       : context_matches() && editor_matches();
+      return confirmed
+                 ? selection_source_matches(*confirmed, false, !source_pinned)
+                 : context_matches() && editor_matches();
     };
     if (!source_matches()) {
       return;
@@ -2471,6 +2565,7 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     if (!receipt) {
       return;
     }
+    source_pinned = true;
     const auto cancel_unsent_receipt = [&] {
       if (clipboard_) {
         clipboard_->cancel_paste_receipt(*receipt);
@@ -2559,39 +2654,38 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     deadline += fixture_pause;
     hard_deadline += fixture_pause;
 #endif
-    if (!renew_budget(kMacroBudget) ||
-        !wait(Clock::now() + kExtendedLayoutClientSettle)) {
+    if (!finish_layout() || !renew_budget(kMacroBudget) ||
+        !wait(Clock::now() + kExtendedLayoutClientSettle) ||
+        !context_matches() || !editor_matches()) {
       return;
     }
-    if (finish_layout()) {
-      if (erase_count != 0) {
-        // A counted terminal edit completes only after its temporary payload
-        // retires. Preserve the delivered receipt's existing quiet deadline;
-        // restarting it here would delay the immediately queued inverse.
-        if (!begin_phase_budget(kTotalMacroBudget, hard_deadline)) {
-          return;
-        }
-        if (pending_ && pending_->generation == generation) {
-          pending_->restore_admitted = true;
-        }
-        while (pending_ && pending_->generation == generation) {
-          pump();
-          if (pending_ && pending_->generation == generation &&
-              !wait(Clock::now() + std::chrono::milliseconds{1})) {
-            return;
-          }
-        }
-        if (!clipboard_ || !clipboard_->is_open() ||
-            clipboard_->locally_owns_generation(Selection::Clipboard,
-                                                generation) ||
-            !context_matches()) {
+    if (erase_count != 0) {
+      // A counted terminal edit completes only after its temporary payload
+      // retires. Preserve the delivered receipt's existing quiet deadline;
+      // restarting it here would delay the immediately queued inverse.
+      if (!begin_phase_budget(kTotalMacroBudget, hard_deadline)) {
+        return;
+      }
+      if (pending_ && pending_->generation == generation) {
+        pending_->restore_admitted = true;
+      }
+      while (pending_ && pending_->generation == generation) {
+        pump();
+        if (pending_ && pending_->generation == generation &&
+            !wait(Clock::now() + std::chrono::milliseconds{1})) {
           return;
         }
       }
-      outcome.status = WordEditStatus::Dispatched;
-      if (source) {
-        retain_completed_selection(*source);
+      if (!clipboard_ || !clipboard_->is_open() ||
+          clipboard_->locally_owns_generation(Selection::Clipboard,
+                                              generation) ||
+          !context_matches()) {
+        return;
       }
+    }
+    outcome.status = WordEditStatus::Dispatched;
+    if (source) {
+      retain_completed_selection(*source);
     }
   };
   if (native_undo) {
@@ -2610,8 +2704,18 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   }
 
   if (selection) {
+    if (!begin_phase_budget(kTotalMacroBudget,
+                            hard_deadline - kDesktopLayoutCleanupBudget)) {
+      return outcome;
+    }
     outcome.rejection_stage = "selection_source";
     auto source = clipboard_->get_text_with_owner(Selection::Primary, deadline);
+    if (source && source->text.empty() && initial_editor) {
+      outcome.rejection_stage = "selection_direction";
+      if (!orient_native_selection(*source, initial_editor->range, true))
+        return outcome;
+      source = clipboard_->get_text_with_owner(Selection::Primary, deadline);
+    }
     if (!source || source->text.empty() || source->text.size() > 4096 ||
         client_of(source->owner) != *active_client || !context_matches()) {
       return outcome;
@@ -2626,6 +2730,16 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
               g_utf8_strlen(source->text.data(),
                             static_cast<gssize>(source->text.size())) &&
           initial_editor->range.sha256 == hash;
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+      std::fprintf(stderr,
+                   "[punto-e2e] selection_source_proof start=%d end=%d "
+                   "chars=%ld bytes=%zu hash_match=%d exact=%d\n",
+                   initial_editor->range.start, initial_editor->range.end,
+                   g_utf8_strlen(source->text.data(),
+                                 static_cast<gssize>(source->text.size())),
+                   source->text.size(), initial_editor->range.sha256 == hash,
+                   exact);
+#endif
       g_free(hash);
       if (!exact || !editor_matches(initial_editor->range)) {
         outcome.rejection_stage = "selection_source_range";
@@ -2659,7 +2773,7 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     }
     outcome.original = terminal ? std::string{} : source->text;
     outcome.terminal_insert = terminal;
-    const auto stable_selection_receipt = [&](const SelectionRead &expected) {
+    const auto stable_selection_receipt = [&](SelectionRead expected) {
       std::optional<SelectionRead> stable_selection;
       std::optional<Deadline> stable_since;
       while (clipboard_->is_open() &&
@@ -2668,6 +2782,10 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
         (void)clipboard_->pump_events();
         auto observed =
             clipboard_->get_text_with_owner(Selection::Primary, deadline);
+        if (observed && !same_selection(expected, *observed) &&
+            selection_source_matches(expected)) {
+          observed = expected;
+        }
         const bool authorized = observed && same_selection(expected, *observed);
         if (!authorized) {
           stable_selection.reset();
@@ -2677,7 +2795,9 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
           stable_selection = std::move(observed);
           stable_since = Clock::now();
         } else if (stable_since &&
-                   Clock::now() - *stable_since >= kSelectionClientSettle) {
+                   (Clock::now() - *stable_since >= kSelectionClientSettle ||
+                    (initial_editor &&
+                     editor_matches(initial_editor->range)))) {
           return stable_selection;
         }
         if (!wait(Clock::now() + std::chrono::milliseconds{1})) {
@@ -2700,13 +2820,11 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
       direct_replay.reset();
     }
     if (direct_replay &&
-        request.operation != WordEditOperation::SelectionLayout &&
+        request.operation == WordEditOperation::SelectionCase &&
         std::ranges::any_of(*direct_replay, [&](const Stroke &stroke) {
           return stroke.group != group;
         })) {
-      // A non-layout selection edit need not change the user's source merely
-      // to synthesize characters. The existing paste transport is independent
-      // of the active group and keeps its own clipboard lifetime.
+      // Case-only edits remain independent of a desktop layout transition.
       direct_replay.reset();
     }
     if (direct_replay) {
@@ -2807,6 +2925,7 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
   bool prepared_selection_foreign = false;
   bool current_word_extending = false;
   bool current_word_prefix_extending = false;
+  bool prepared_selection_forward = false;
   std::size_t prefix_steps_remaining = 0;
   if (!terminal) {
     if (!primary_selection_baseline) {
@@ -2860,7 +2979,27 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
       prepared_selection_since = Clock::now();
       prepared_selection_stable = false;
       current_word_extending = false;
+    } else if (current.owner == prepared_selection->owner &&
+               current.connection_generation ==
+                   prepared_selection->connection_generation &&
+               current.text == prepared_selection->text &&
+               native_word_range(current) && context_matches()) {
+      // A client may republish the same proven range after its first reply.
+      prepared_selection = std::make_unique<SelectionRead>(current);
+      prepared_selection_since = Clock::now();
+      prepared_selection_stable = false;
     } else {
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+      std::fprintf(
+          stderr,
+          "[punto-e2e] selection_lineage_changed same_owner=%d same_text=%d "
+          "old_stamp=%u new_stamp=%u old_gen=%llu new_gen=%llu\n",
+          current.owner == prepared_selection->owner,
+          current.text == prepared_selection->text,
+          prepared_selection->selection_timestamp, current.selection_timestamp,
+          static_cast<unsigned long long>(prepared_selection->owner_generation),
+          static_cast<unsigned long long>(current.owner_generation));
+#endif
       prepared_selection_foreign = true;
       return;
     }
@@ -2946,8 +3085,7 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     return cleanup_and_retain(receipt, false, deadline);
   };
   bool selection_write_queued = false;
-  if (terminal &&
-      !begin_phase_budget(kTotalMacroBudget,
+  if (!begin_phase_budget(kTotalMacroBudget,
                           hard_deadline - kDesktopLayoutCleanupBudget)) {
     return outcome;
   }
@@ -3017,12 +3155,33 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
       std::size_t confirmation_reads = 0;
       std::size_t confirmation_read_failures = 0;
       std::size_t confirmation_expected_reads = 0;
+      bool tried_forward_selection = false;
       while (clipboard_->is_open() &&
              Clock::now() + std::chrono::milliseconds{30} < deadline &&
              context_matches()) {
         (void)clipboard_->pump_events();
         auto observed =
             clipboard_->get_text_with_owner(Selection::Primary, deadline);
+        if (observed && observed->text.empty() && !tried_forward_selection &&
+            initial_editor) {
+          const auto selected = desktop_layout_->observe_editor(
+              lease->info(), *editor_pid, deadline, wait_,
+              initial_editor->token);
+          if (selected.status == AccessibleStatus::Observed &&
+              selected.range.start >= 0 &&
+              selected.range.end > selected.range.start &&
+              selected.range.end == initial_editor->caret &&
+              client_of(observed->owner) == *active_client) {
+            tried_forward_selection = true;
+            if (!begin_phase_budget(kTotalMacroBudget, confirmation_limit) ||
+                !orient_native_selection(*observed, selected.range, true) ||
+                !begin_phase_budget(kMacroBudget, confirmation_limit))
+              break;
+            prepared_selection_forward = true;
+            observed =
+                clipboard_->get_text_with_owner(Selection::Primary, deadline);
+          }
+        }
         if (observed) {
           ++confirmation_reads;
           SelectionRead current = std::move(observed).value();
@@ -3039,7 +3198,8 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
                     std::make_unique<SelectionRead>(std::move(current));
                 confirmed_since = Clock::now();
               } else if (Clock::now() - confirmed_since >=
-                         kSelectionClientSettle) {
+                             kSelectionClientSettle ||
+                         (initial_editor && native_word_range(current))) {
                 selection_confirmed = true;
                 break;
               }
@@ -3136,6 +3296,16 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
         (void)cleanup_prepared_selection(false);
         return outcome;
       }
+      if (prepared_selection_forward) {
+        const auto selected = desktop_layout_->observe_editor(
+            lease->info(), *editor_pid, deadline, wait_, initial_editor->token);
+        if (selected.status != AccessibleStatus::Observed ||
+            !orient_native_selection(*revalidated, selected.range, false)) {
+          (void)cleanup_prepared_selection(false);
+          return outcome;
+        }
+        prepared_selection_forward = false;
+      }
       if (current_word_prefix_extending) {
         --prefix_steps_remaining;
       } else {
@@ -3204,6 +3374,11 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
         outcome.target_layout != initial_state->group;
     const bool layout_ready = finish_layout();
     if (!layout_ready) {
+#if defined(PUNTO_EVENT_LOOP_E2E_TESTING)
+      std::fprintf(stderr, "[punto-e2e] layout_first_rejection stage=%.*s\n",
+                   static_cast<int>(outcome.rejection_stage.size()),
+                   outcome.rejection_stage.data());
+#endif
       // Failed cleanup must not orphan our confirmed temporary selection.
       // Retain lineage only; fresh input still needs a new proven range.
       ScopeExit failed_preparation_lineage{[&] {
@@ -3269,6 +3444,15 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
     (void)clipboard_->pump_events();
     const auto revalidated =
         clipboard_->get_text_with_owner(Selection::Primary, deadline);
+    if (revalidated &&
+        !same_selection(prepared_receipt->selection, *revalidated) &&
+        revalidated->owner == prepared_receipt->selection.owner &&
+        revalidated->connection_generation ==
+            prepared_receipt->selection.connection_generation &&
+        revalidated->text == prepared_receipt->selection.text &&
+        context_matches(false, true) && native_word_range(*revalidated)) {
+      prepared_receipt->selection = *revalidated;
+    }
     if (!revalidated ||
         !same_selection(prepared_receipt->selection, *revalidated) ||
         !context_matches(false, true)) {
@@ -3314,7 +3498,7 @@ WordEditOutcome WordEditor::execute(const WordEditRequest &request) {
       }
     }
     if (!replacement_started && !terminal &&
-        !selection_source_matches(prepared_receipt->selection)) {
+        !selection_source_matches(prepared_receipt->selection, true)) {
       outcome.rejection_stage = "word_source_before_replay";
       (void)cleanup_and_retain(prepared_receipt, true, hard_deadline);
       replacement_replayed = false;

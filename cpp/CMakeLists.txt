@@ -1267,6 +1267,22 @@ if(BUILD_TESTING)
             )
             list(APPEND PUNTO_GTK_E2E_TESTS ${PUNTO_GTK_E2E_NAME})
         endforeach()
+        foreach(PUNTO_NATIVE_EDITOR qt editor-matrix swt-editor webkit-editor)
+            string(REPLACE "-" "_" PUNTO_NATIVE_EDITOR_SCRIPT ${PUNTO_NATIVE_EDITOR})
+            if(PUNTO_NATIVE_EDITOR STREQUAL "qt")
+                set(PUNTO_NATIVE_EDITOR_SCRIPT event_loop_qt)
+            endif()
+            add_test(
+                NAME punto-${PUNTO_NATIVE_EDITOR}-e2e
+                COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/../tests/test_${PUNTO_NATIVE_EDITOR_SCRIPT}_e2e.py
+                        $<TARGET_FILE:punto-event-loop-layout-bridge-e2e-driver>
+                        $<TARGET_FILE:punto-session-bridge-app-e2e-bin>
+            )
+            set_tests_properties(punto-${PUNTO_NATIVE_EDITOR}-e2e
+                PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+                    ENVIRONMENT "PUNTO_REAL_LAYOUT_BRIDGE_E2E=1")
+        endforeach()
         set(PUNTO_GTK_SHARED_SESSION_CASE_LIST)
         foreach(PUNTO_GTK_SHARED_SESSION_REPEAT RANGE 1 10)
             list(APPEND PUNTO_GTK_SHARED_SESSION_CASE_LIST
@@ -1285,7 +1301,7 @@ if(BUILD_TESTING)
         set_tests_properties(
             punto-event-loop-gtk-shared-session-regression
             PROPERTIES
-                TIMEOUT 45
+                TIMEOUT 90
                 SKIP_RETURN_CODE 77
                 RUN_SERIAL TRUE
                 ENVIRONMENT

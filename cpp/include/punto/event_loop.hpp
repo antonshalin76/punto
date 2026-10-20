@@ -131,7 +131,9 @@ private:
                           const WordEditOutcome &outcome, bool undo,
                           std::optional<std::uint64_t> task_id,
                           const std::string &exclusion_key,
-                          bool exact_inverse = true);
+                          bool exact_inverse = true,
+                          std::string_view learned_word = {});
+  void queue_undo(bool learn);
 
   /// Обновляет состояние модификаторов
   void update_modifier_state(ScanCode code, bool pressed);
@@ -146,7 +148,6 @@ private:
   void process_word_observation(bool input_idle = false);
   void process_pending_word_edit();
   void process_held_tab();
-  void process_pending_learning();
   void release_held_tab();
   void dispatch_read_frame();
   void flush_unfinished_read_frame();
@@ -250,6 +251,7 @@ private:
       SelectionCase,
       SelectionTranslit,
       Undo,
+      LearnUndo,
       Tail
     };
     Kind kind;
@@ -291,6 +293,8 @@ private:
     std::optional<std::uint64_t> retry_after_input_sequence = std::nullopt;
     std::optional<std::uint64_t> retry_after_word_id = std::nullopt;
     std::string editor_token = {};
+    std::vector<KeyEntry> preceding_word = {};
+    bool manually_edited = false;
   };
   std::deque<TrackedWord> word_history_;
   std::size_t max_word_history_size_ = 0;
@@ -311,8 +315,11 @@ private:
   // Scheduling fence only. It never authorizes a selection or text mutation.
   std::uint64_t text_input_sequence_ = 0;
   std::uint64_t undo_input_sequence_ = 0;
-  std::string learning_editor_token_;
-  std::vector<std::chrono::steady_clock::time_point> learning_backspaces_;
+  std::string undo_exclusion_key_;
+  std::string pending_learning_word_;
+  enum class LearningGesture { None, FirstPress, Finished };
+  LearningGesture learning_gesture_ = LearningGesture::None;
+  bool swallow_backspace_until_release_ = false;
   bool swallow_z_until_release_ = false;
   std::unique_ptr<WordEditor> word_editor_;
   std::unique_ptr<SoundManager> sound_manager_;

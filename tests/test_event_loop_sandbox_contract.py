@@ -43,6 +43,15 @@ def run_fixture(driver: pathlib.Path) -> int:
 
 
 class SandboxContract(unittest.TestCase):
+    def test_real_owner_rejects_mocked_layout_driver(self) -> None:
+        result = subprocess.run([
+            "bwrap", "--unshare-all", "--die-with-parent", "--ro-bind", "/", "/",
+            "--tmpfs", "/run", "--tmpfs", "/tmp", "--proc", "/proc",
+            "--setenv", "PUNTO_REAL_LAYOUT_BRIDGE_E2E", "1", str(DRIVER),
+        ], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("requires the native layout driver", result.stderr)
+
     def test_missing_xprop_is_reported_before_gui_start(self) -> None:
         result = subprocess.run([
             "bwrap", "--unshare-all", "--die-with-parent", "--ro-bind", "/", "/",

@@ -114,11 +114,15 @@ class DesktopEditorE2E(unittest.TestCase):
 
         cls.saved_environment = {
             name: os.environ.get(name)
-            for name in ("DISPLAY", "GDK_BACKEND", "NO_AT_BRIDGE")
+            for name in ("DISPLAY", "GDK_BACKEND", "NO_AT_BRIDGE",
+                         "GTK_IM_MODULE", "XMODIFIERS")
         }
         cls.x11 = NestedX11()
         cls.x11.start()
         os.environ["DISPLAY"] = cls.x11.display
+        # This private X server has no desktop input-method service.
+        os.environ["GTK_IM_MODULE"] = "xim"
+        os.environ["XMODIFIERS"] = "@im=none"
         os.environ["GDK_BACKEND"] = "x11"
         os.environ["NO_AT_BRIDGE"] = "1"
 

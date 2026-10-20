@@ -1658,14 +1658,17 @@ void SessionBridge::handle_method(GDBusConnection *connection,
   const bool preparation = g_strcmp0(method, "PrepareEditorOrigin") == 0;
   const bool origin_only =
       preparation || g_strcmp0(method, "ObserveEditorOrigin") == 0;
-  if (origin_only || g_strcmp0(method, "ObserveEditor") == 0) {
-    const gchar *helper = nullptr, *token = nullptr, *sha = "";
+  const bool selection = g_strcmp0(method, "ObserveSelection") == 0;
+  if (origin_only || selection || g_strcmp0(method, "ObserveEditor") == 0) {
+    const gchar *helper = nullptr, *token = nullptr, *sha = "", *identity = "";
     guint pid = 0;
     guint64 deadline = 0;
     gint begin = -1, end = -1;
     if (g_variant_get_size(parameters) > kMaxMessageBytes ||
-        !g_variant_is_of_type(
-            parameters, G_VARIANT_TYPE(origin_only ? "(suts)" : "(sutsiis)"))) {
+        !g_variant_is_of_type(parameters,
+                              G_VARIANT_TYPE(origin_only ? "(suts)"
+                                             : selection ? "(sutsiiss)"
+                                                         : "(sutsiis)"))) {
       g_dbus_method_invocation_return_dbus_error(
           invocation, "org.punto.Switcher.Error.Invalid",
           "invalid observation");
@@ -1673,6 +1676,9 @@ void SessionBridge::handle_method(GDBusConnection *connection,
     }
     if (origin_only)
       g_variant_get(parameters, "(&sut&s)", &helper, &pid, &deadline, &token);
+    else if (selection)
+      g_variant_get(parameters, "(&sut&sii&s&s)", &helper, &pid, &deadline,
+                    &token, &begin, &end, &sha, &identity);
     else
       g_variant_get(parameters, "(&sut&sii&s)", &helper, &pid, &deadline,
                     &token, &begin, &end, &sha);
@@ -1690,6 +1696,8 @@ void SessionBridge::handle_method(GDBusConnection *connection,
     const bool current =
         !stopping_ && helper_id_ == helper && pid > 0 &&
         (token[0] == '\0' || is_lower_hex(token, 64)) &&
+        (!selection ||
+         (begin >= 0 ? is_lower_hex(identity, 64) : identity[0] == '\0')) &&
         (!preparation || token[0] == '\0') && range_valid &&
         session_resolver_.revalidate(uid_, static_cast<pid_t>(shell_pid_),
                                      session_selection_);
@@ -1697,22 +1705,25 @@ void SessionBridge::handle_method(GDBusConnection *connection,
       refused.status = !valid_deadline(deadline, now_us())
                            ? punto::AccessibleStatus::Expired
                            : punto::AccessibleStatus::Stale;
-      g_dbus_method_invocation_return_value(invocation,
-                                            refused.wire(helper_id_));
+      g_dbus_method_invocation_return_value(
+          invocation, refused.wire(helper_id_, selection));
       return;
     }
     punto::AccessibleRequest request{pid, deadline, token, std::nullopt};
     request.preparation = preparation;
     if (origin_only)
       request.scope = punto::AccessibleScope::Child;
+    else if (selection)
+      request.scope = punto::AccessibleScope::Selection;
     if (begin >= 0)
-      request.expected_range = punto::AccessibleRange{begin, end, sha};
+      request.expected_range =
+          punto::AccessibleRange{begin, end, sha, identity};
     found->second.inflight = true;
     found->second.observing_editor = true;
     g_object_ref(connection);
     g_object_ref(invocation);
     accessible_->observe(
-        std::move(request), [this, connection, invocation, deadline](
+        std::move(request), [this, connection, invocation, deadline, selection](
                                 punto::AccessibleObservation observation) {
           const auto peer = connections_.find(connection);
           if (peer != connections_.end()) {
@@ -1727,8 +1738,8 @@ void SessionBridge::handle_method(GDBusConnection *connection,
           if (now_us() >= deadline)
             observation =
                 punto::AccessibleObservation{punto::AccessibleStatus::Expired};
-          g_dbus_method_invocation_return_value(invocation,
-                                                observation.wire(helper_id_));
+          g_dbus_method_invocation_return_value(
+              invocation, observation.wire(helper_id_, selection));
           g_object_unref(invocation);
           g_object_unref(connection);
         });

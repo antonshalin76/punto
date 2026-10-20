@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -15,8 +16,9 @@ constexpr char kRoot[] = "/org/a11y/atspi/accessible/root";
 constexpr char kAccessible[] = "org.a11y.atspi.Accessible";
 constexpr char kText[] = "org.a11y.atspi.Text";
 constexpr char kCollection[] = "org.a11y.atspi.Collection";
+constexpr char kDocument[] = "org.a11y.atspi.Document";
 constexpr char kProperties[] = "org.freedesktop.DBus.Properties";
-constexpr std::size_t kReplyBytes = 8192, kApplications = 32;
+constexpr std::size_t kReplyBytes = 8192;
 guint64 now() { return static_cast<guint64>(g_get_monotonic_time()); }
 std::string digest(const void *data, gsize size) {
   gchar *value = g_compute_checksum_for_data(
@@ -51,8 +53,16 @@ GVariant *focus_rule(gint32 required = (1 << 7) | (1 << 12),
       1, FALSE);
 }
 } // namespace
-GVariant *AccessibleObservation::wire(std::string_view helper) const {
+GVariant *AccessibleObservation::wire(std::string_view helper,
+                                      bool selection) const {
   const std::string identity(helper);
+  if (selection)
+    return g_variant_new(
+        "(ustssottuiiiiisss)", static_cast<guint>(status), identity.c_str(),
+        bus_epoch, registry_owner.c_str(), provider.c_str(), object.c_str(),
+        focus_generation, observed_us, provider_pid, caret, selection_start,
+        selection_end, range.start, range.end, range.sha256.c_str(),
+        token.c_str(), range.identity.c_str());
   return g_variant_new("(ustssottuiiiiiss)", static_cast<guint>(status),
                        identity.c_str(), bus_epoch, registry_owner.c_str(),
                        provider.c_str(), object.c_str(), focus_generation,
@@ -65,6 +75,7 @@ struct AccessibleContext::State : std::enable_shared_from_this<State> {
   struct Job;
   GDBusConnection *session, *bus = nullptr;
   std::string helper, registry, watched_provider, watched_object;
+  std::vector<std::string> range_objects;
   guint uid, session_subscription = 0, object_subscription = 0;
   guint window_subscription = 0, focus_subscription = 0;
   guint cache_subscription = 0, owner_subscription = 0;
@@ -91,6 +102,10 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
              end == b.end && selections == b.selections;
     }
   };
+  struct NativePart {
+    std::string object, text;
+    gint begin = 0, end = 0;
+  };
   std::shared_ptr<State> state;
   AccessibleRequest request;
   Completion completion;
@@ -98,12 +113,22 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
   GSource *timer = nullptr, *discovery_timer = nullptr;
   AccessibleObservation observation;
   std::vector<std::pair<std::string, std::string>> applications;
+  std::vector<std::pair<std::string, std::string>> providers;
+  std::vector<std::vector<std::string>> provider_interfaces;
+  std::set<std::pair<std::string, std::string>> discovered;
+  std::set<std::string> tree_seen;
+  std::vector<std::string> tree;
+  std::size_t tree_index = 0;
   std::size_t application_index = 0;
   guint64 focus = 0, range = 0, epoch = 0;
   unsigned range_attempts = 0;
   bool activation_attempted = false;
   std::vector<std::string> document_paths;
   bool done = false;
+  GVariant *native_endpoints = nullptr, *native_children = nullptr;
+  std::vector<NativePart> native_parts;
+  gint native_begin = 0, native_end = 0;
+  std::size_t native_bytes = 0;
 #if defined(PUNTO_SESSION_BRIDGE_APP_E2E)
   const char *last_rpc = "none";
   unsigned rpc_count = 0;
@@ -112,7 +137,13 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
       Completion callback)
       : state(std::move(owner)), request(std::move(input)),
         completion(std::move(callback)) {}
-  ~Job() { g_object_unref(cancel); }
+  ~Job() {
+    g_object_unref(cancel);
+    if (native_endpoints)
+      g_variant_unref(native_endpoints);
+    if (native_children)
+      g_variant_unref(native_children);
+  }
   void finish(AccessibleStatus status) {
     if (done)
       return;
@@ -172,7 +203,7 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
     }
     auto self = shared_from_this();
     using Callback = std::function<void(GObject *, GAsyncResult *)>;
-    auto *callback = new Callback([self, method, reply = std::move(reply)](
+    auto *callback = new Callback([self, reply = std::move(reply)](
                                       GObject *source, GAsyncResult *result) {
       GError *error = nullptr;
       GVariant *value = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source),
@@ -325,11 +356,6 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
     call(state->bus, state->registry, kRoot, kAccessible, "GetChildren",
          nullptr, "(a(so))", [self](GVariant *value) {
            GVariant *children = g_variant_get_child_value(value, 0);
-           if (g_variant_n_children(children) > kApplications) {
-             g_variant_unref(children);
-             self->finish(AccessibleStatus::Unavailable);
-             return;
-           }
            GVariantIter iter;
            g_variant_iter_init(&iter, children);
            const gchar *provider = nullptr, *object = nullptr;
@@ -348,21 +374,12 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
   void find_application() {
     auto self = shared_from_this();
     if (application_index == applications.size()) {
-      if (observation.provider.empty()) {
+      if (providers.empty()) {
         finish(AccessibleStatus::Unavailable);
         return;
       }
-      call(state->bus, kDBus, kDBusPath, kDBus, "GetConnectionUnixUser",
-           g_variant_new("(s)", observation.provider.c_str()), "(u)",
-           [self](GVariant *value) {
-             guint uid = 0;
-             g_variant_get(value, "(u)", &uid);
-             if (uid != self->state->uid) {
-               self->finish(AccessibleStatus::Unavailable);
-               return;
-             }
-             self->matches(false);
-           });
+      provider_interfaces.resize(providers.size());
+      matches(false);
       return;
     }
     const auto application = applications[application_index++];
@@ -372,60 +389,211 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
            guint pid = 0;
            g_variant_get(value, "(u)", &pid);
            if (pid == self->request.provider_pid) {
-             if (!self->observation.provider.empty()) {
-               self->finish(AccessibleStatus::Unavailable);
-               return;
-             }
-             self->observation.provider = application.first;
-             self->observation.object = application.second;
+             self->call(self->state->bus, kDBus, kDBusPath, kDBus,
+                        "GetConnectionUnixUser",
+                        g_variant_new("(s)", application.first.c_str()), "(u)",
+                        [self, application](GVariant *owner) {
+                          guint uid = 0;
+                          g_variant_get(owner, "(u)", &uid);
+                          if (uid != self->state->uid) {
+                            self->finish(AccessibleStatus::Unavailable);
+                            return;
+                          }
+                          self->providers.push_back(application);
+                          self->find_application();
+                        });
+             return;
            }
            self->find_application();
          });
   }
-  void matches(bool final) {
+  void matches(bool final) { match_application(final, 0, {}); }
+  void match_application(bool final, std::size_t index,
+                         std::pair<std::string, std::string> found) {
     auto self = shared_from_this();
-    const char *app_path = nullptr;
-    for (const auto &app : applications)
-      if (app.first == observation.provider) {
-        app_path = app.second.c_str();
-        break;
+    if (index == providers.size()) {
+      if (found.first.empty()) {
+        // Only the single-provider browser path may activate its lazy tree.
+        if (!final && providers.size() == 1 &&
+            std::binary_search(provider_interfaces[0].begin(),
+                               provider_interfaces[0].end(), kCollection)) {
+          observation.provider = providers[0].first;
+          if (!activation_attempted) {
+            activate_documents();
+            return;
+          }
+          if (!document_paths.empty()) {
+            wait_for_document();
+            return;
+          }
+        }
+        finish(AccessibleStatus::Unavailable);
+        return;
       }
-    call(state->bus, observation.provider, app_path, kCollection, "GetMatches",
+      if (final && (found.first != observation.provider ||
+                    found.second != observation.object)) {
+        finish(AccessibleStatus::Stale);
+        return;
+      }
+      observation.provider = found.first;
+      observation.object = found.second;
+      verify_editor(final);
+      return;
+    }
+    const auto application = providers[index];
+    call(state->bus, application.first, application.second.c_str(), kAccessible,
+         "GetInterfaces", nullptr, "(as)",
+         [self, final, index, application, found](GVariant *value) {
+           GVariant *names = g_variant_get_child_value(value, 0);
+           GVariantIter iter;
+           g_variant_iter_init(&iter, names);
+           const gchar *name = nullptr;
+           std::vector<std::string> interfaces;
+           while (g_variant_iter_loop(&iter, "&s", &name)) {
+             if (!g_dbus_is_interface_name(name)) {
+               g_variant_unref(names);
+               self->finish(AccessibleStatus::Unknown);
+               return;
+             }
+             interfaces.emplace_back(name);
+           }
+           g_variant_unref(names);
+           std::sort(interfaces.begin(), interfaces.end());
+           if (!std::binary_search(interfaces.begin(), interfaces.end(),
+                                   kAccessible) ||
+               std::adjacent_find(interfaces.begin(), interfaces.end()) !=
+                   interfaces.end() ||
+               (final && interfaces != self->provider_interfaces[index])) {
+             self->finish(AccessibleStatus::Stale);
+             return;
+           }
+           if (!final)
+             self->provider_interfaces[index] = interfaces;
+           if (std::find(interfaces.begin(), interfaces.end(), kCollection) !=
+               interfaces.end()) {
+             self->match_collection(final, index, found);
+             return;
+           }
+           self->tree = {application.second};
+           self->tree_index = 0;
+           self->tree_seen = {application.second};
+           self->discovered.insert(application);
+           if (self->discovered.size() > 128) {
+             self->finish(AccessibleStatus::Unknown);
+             return;
+           }
+           self->walk_application(final, index, found);
+         });
+  }
+  void match_collection(bool final, std::size_t index,
+                        std::pair<std::string, std::string> found) {
+    auto self = shared_from_this();
+    const auto application = providers[index];
+    call(state->bus, application.first, application.second.c_str(), kCollection,
+         "GetMatches",
          g_variant_new("(@(aiia{ss}iaiiasib)uib)", focus_rule(), 1U, 2, TRUE),
-         "(a(so))", [self, final](GVariant *value) {
+         "(a(so))",
+         [self, final, index, application, found](GVariant *value) mutable {
            GVariant *children = g_variant_get_child_value(value, 0);
-           if (!final && g_variant_n_children(children) == 0 &&
-               !self->activation_attempted) {
-             g_variant_unref(children);
-             self->activate_documents();
-             return;
-           }
-           if (!final && g_variant_n_children(children) == 0 &&
-               !self->document_paths.empty()) {
-             g_variant_unref(children);
-             self->wait_for_document();
-             return;
-           }
-           if (g_variant_n_children(children) != 1) {
+           const auto count = g_variant_n_children(children);
+           if (count > 1 || (count == 1 && !found.first.empty())) {
              g_variant_unref(children);
              self->finish(AccessibleStatus::Unavailable);
              return;
            }
-           const gchar *provider = nullptr, *object = nullptr;
-           g_variant_get_child(children, 0, "(&s&o)", &provider, &object);
-           const bool valid = self->observation.provider == provider &&
-                              (!final || self->observation.object == object);
-           const std::string path(object);
+           if (count == 1) {
+             const gchar *provider = nullptr, *object = nullptr;
+             g_variant_get_child(children, 0, "(&s&o)", &provider, &object);
+             if (application.first != provider) {
+               g_variant_unref(children);
+               self->finish(AccessibleStatus::Stale);
+               return;
+             }
+             found = {provider, object};
+           }
            g_variant_unref(children);
-           if (!valid) {
-             self->finish(AccessibleStatus::Stale);
+           self->match_application(final, index + 1, std::move(found));
+         });
+  }
+  void walk_application(bool final, std::size_t index,
+                        std::pair<std::string, std::string> found) {
+    if (tree_index == tree.size()) {
+      match_application(final, index + 1, std::move(found));
+      return;
+    }
+    auto self = shared_from_this();
+    const auto provider = providers[index].first;
+    const auto path = tree[tree_index++];
+    call(state->bus, provider, path.c_str(), kAccessible, "GetState", nullptr,
+         "(au)",
+         [self, final, index, found, provider, path](GVariant *value) mutable {
+           GVariant *bits = g_variant_get_child_value(value, 0);
+           const bool valid_state = g_variant_n_children(bits) <= 2;
+           g_variant_unref(bits);
+           if (!valid_state) {
+             self->finish(AccessibleStatus::Unknown);
              return;
            }
+           if (focused(value)) {
+             if (!found.first.empty()) {
+               self->finish(AccessibleStatus::Unavailable);
+               return;
+             }
+             found = {provider, path};
+           }
+           self->call(
+               self->state->bus, provider, path.c_str(), kAccessible,
+               "GetChildren", nullptr, "(a(so))",
+               [self, final, index, found, provider](GVariant *value) {
+                 GVariant *children = g_variant_get_child_value(value, 0);
+                 GVariantIter iter;
+                 g_variant_iter_init(&iter, children);
+                 const gchar *owner = nullptr, *object = nullptr;
+                 while (g_variant_iter_loop(&iter, "(&s&o)", &owner, &object)) {
+                   if (provider != owner ||
+                       !self->tree_seen.insert(object).second) {
+                     g_variant_unref(children);
+                     self->finish(AccessibleStatus::Unknown);
+                     return;
+                   }
+                   self->discovered.emplace(owner, object);
+                   if (self->discovered.size() > 128) {
+                     g_variant_unref(children);
+                     self->finish(AccessibleStatus::Unknown);
+                     return;
+                   }
+                   self->tree.emplace_back(object);
+                 }
+                 g_variant_unref(children);
+                 self->walk_application(final, index, found);
+               });
+         });
+  }
+  void verify_editor(bool final) {
+    auto self = shared_from_this();
+    call(state->bus, observation.provider, observation.object.c_str(),
+         kAccessible, "GetRole", nullptr, "(u)",
+         [self, final](GVariant *value) {
+           guint role = 0;
+           g_variant_get(value, "(u)", &role);
+           // AT-SPI PASSWORD_TEXT must never reach any Text method.
+           if (role == 40) {
+             self->finish(AccessibleStatus::Unavailable);
+             return;
+           }
+           const auto path = self->observation.object;
            if (final) {
-             self->complete();
+             self->call(self->state->bus, self->observation.provider,
+                        path.c_str(), kAccessible, "GetState", nullptr, "(au)",
+                        [self](GVariant *value) {
+                          if (!focused(value)) {
+                            self->finish(AccessibleStatus::Stale);
+                            return;
+                          }
+                          self->verify_roster();
+                        });
              return;
            }
-           self->observation.object = path;
            if (self->request.expected_token.empty() &&
                !self->request.expected_range)
              self->focus = self->state->focus_generation;
@@ -440,6 +608,7 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
            }
            self->state->watched_provider = self->observation.provider;
            self->state->watched_object = path;
+           self->state->range_objects.clear();
            self->range = self->state->range_generation;
            self->call(self->state->bus, self->observation.provider,
                       path.c_str(), kAccessible, "GetState", nullptr, "(au)",
@@ -455,6 +624,28 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
                         self->metadata(
                             [self](Meta meta) { self->read_range(meta); });
                       });
+         });
+  }
+  void verify_roster() {
+    auto self = shared_from_this();
+    call(state->bus, state->registry, kRoot, kAccessible, "GetChildren",
+         nullptr, "(a(so))", [self](GVariant *value) {
+           GVariant *children = g_variant_get_child_value(value, 0);
+           bool equal =
+               g_variant_n_children(children) == self->applications.size();
+           for (std::size_t i = 0; equal && i < self->applications.size();
+                ++i) {
+             const gchar *provider = nullptr, *object = nullptr;
+             g_variant_get_child(children, i, "(&s&o)", &provider, &object);
+             equal = self->applications[i] ==
+                     std::make_pair(std::string(provider), std::string(object));
+           }
+           g_variant_unref(children);
+           if (!equal) {
+             self->finish(AccessibleStatus::Stale);
+             return;
+           }
+           self->complete();
          });
   }
   void activate_documents() {
@@ -504,9 +695,10 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
          kAccessible, "GetAttributes", nullptr, "(a{ss})",
          [self, index](GVariant *) { self->activate_document(index + 1); });
   }
-  void wait_for_document() {
+  void wait_for_document(bool range_only = false) {
     if (epoch != state->epoch || !state->ready ||
-        ((!request.expected_token.empty() || request.expected_range) &&
+        ((range_only || !request.expected_token.empty() ||
+          request.expected_range) &&
          focus != state->focus_generation)) {
       finish(AccessibleStatus::Stale);
       return;
@@ -514,79 +706,114 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
     // Renderer accessibility is asynchronous. GLib owns the short readiness
     // wait; the original hard timer remains the only observation deadline.
     discovery_timer = g_timeout_source_new(10);
-    auto *holder = new std::shared_ptr<Job>(shared_from_this());
+    using Readiness = std::pair<std::shared_ptr<Job>, bool>;
+    auto *holder = new Readiness(shared_from_this(), range_only);
     g_source_set_callback(
         discovery_timer,
         [](gpointer data) {
-          auto job = *static_cast<std::shared_ptr<Job> *>(data);
+          const auto [job, range_only] = *static_cast<Readiness *>(data);
           GSource *source = job->discovery_timer;
           job->discovery_timer = nullptr;
           g_source_unref(source);
-          job->matches(false);
+          if (range_only)
+            job->reobserve_range();
+          else
+            job->matches(false);
           return G_SOURCE_REMOVE;
         },
-        holder,
-        [](gpointer data) {
-          delete static_cast<std::shared_ptr<Job> *>(data);
-        });
+        holder, [](gpointer data) { delete static_cast<Readiness *>(data); });
     g_source_attach(discovery_timer, nullptr);
   }
-  void metadata(std::function<void(Meta)> callback) {
+  void text_property(const std::string &path, const char *name,
+                     std::function<void(gint)> callback) {
     auto self = shared_from_this();
-    call(state->bus, observation.provider, observation.object.c_str(),
-         kProperties, "GetAll", g_variant_new("(s)", kText), "(a{sv})",
+    call(state->bus, observation.provider, path.c_str(), kProperties, "Get",
+         g_variant_new("(ss)", kText, name), "(v)",
          [self, callback = std::move(callback)](GVariant *value) {
-           GVariant *properties = g_variant_get_child_value(value, 0);
-           Meta meta;
+           GVariant *boxed = g_variant_get_child_value(value, 0);
+           GVariant *property = g_variant_get_variant(boxed);
            const bool valid =
-               g_variant_lookup(properties, "CaretOffset", "i", &meta.caret) &&
-               g_variant_lookup(properties, "CharacterCount", "i",
-                                &meta.count) &&
-               meta.caret >= 0 && meta.count >= meta.caret;
-           g_variant_unref(properties);
+               g_variant_is_of_type(property, G_VARIANT_TYPE_INT32);
+           const auto number = valid ? g_variant_get_int32(property) : -1;
+           g_variant_unref(property);
+           g_variant_unref(boxed);
            if (!valid) {
              self->finish(AccessibleStatus::Unknown);
              return;
            }
-           self->call(
-               self->state->bus, self->observation.provider,
-               self->observation.object.c_str(), kText, "GetNSelections",
-               nullptr, "(i)", [self, meta, callback](GVariant *value) mutable {
-                 g_variant_get(value, "(i)", &meta.selections);
-                 if (meta.selections == 0) {
-                   meta.start = meta.end = meta.caret;
-                   callback(meta);
-                   return;
-                 }
-                 if (meta.selections != 1) {
-                   self->finish(AccessibleStatus::Unavailable);
-                   return;
-                 }
-                 self->call(self->state->bus, self->observation.provider,
-                            self->observation.object.c_str(), kText,
-                            "GetSelection", g_variant_new("(i)", 0), "(ii)",
-                            [self, meta, callback](GVariant *value) mutable {
-                              g_variant_get(value, "(ii)", &meta.start,
-                                            &meta.end);
-                              if (meta.start < 0 || meta.end < meta.start ||
-                                  meta.end > meta.count) {
-                                self->finish(AccessibleStatus::Unknown);
-                                return;
-                              }
-                              callback(meta);
-                            });
-               });
+           callback(number);
          });
+  }
+  void metadata(std::function<void(Meta)> callback, std::string path = {}) {
+    auto self = shared_from_this();
+    if (path.empty())
+      path = observation.object;
+    text_property(
+        path, "CaretOffset",
+        [self, path, callback = std::move(callback)](gint caret) {
+          self->text_property(
+              path, "CharacterCount",
+              [self, path, caret, callback](gint count) {
+                Meta meta;
+                meta.caret = caret;
+                meta.count = count;
+                const bool valid =
+                    meta.count >= 0 &&
+                    meta.caret >= (path == self->observation.object ? 0 : -1) &&
+                    meta.count >= meta.caret;
+                if (!valid) {
+                  self->finish(AccessibleStatus::Unknown);
+                  return;
+                }
+                self->call(
+                    self->state->bus, self->observation.provider, path.c_str(),
+                    kText, "GetNSelections", nullptr, "(i)",
+                    [self, path, meta, callback](GVariant *value) mutable {
+                      g_variant_get(value, "(i)", &meta.selections);
+                      if (meta.selections == 0) {
+                        meta.start = meta.end = meta.caret;
+                        callback(meta);
+                        return;
+                      }
+                      if (meta.selections != 1) {
+                        self->finish(AccessibleStatus::Unavailable);
+                        return;
+                      }
+                      self->call(
+                          self->state->bus, self->observation.provider,
+                          path.c_str(), kText, "GetSelection",
+                          g_variant_new("(i)", 0), "(ii)",
+                          [self, meta, callback](GVariant *value) mutable {
+                            g_variant_get(value, "(ii)", &meta.start,
+                                          &meta.end);
+                            if (meta.start < 0 || meta.end < meta.start ||
+                                meta.end > meta.count) {
+                              self->finish(AccessibleStatus::Unknown);
+                              return;
+                            }
+                            callback(meta);
+                          });
+                    });
+              });
+        });
   }
   void read_range(Meta before) {
     ++range_attempts;
+    if (request.scope == AccessibleScope::Selection &&
+        request.expected_token.empty() && !request.expected_range &&
+        before.start == before.end && range_attempts <= 3) {
+      // Pending renderer selection updates keep this exact child and deadline.
+      wait_for_document(true);
+      return;
+    }
     observation.range = AccessibleRange{};
     auto self = shared_from_this();
     observation.caret = before.caret;
     observation.selection_start = before.start;
     observation.selection_end = before.end;
     if (before.end - before.start > kAccessibleRangeCharacters) {
-      if (request.expected_range) {
+      if (request.expected_range ||
+          request.scope == AccessibleScope::Selection) {
         finish(AccessibleStatus::Stale);
         return;
       }
@@ -612,8 +839,23 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
              self->finish(AccessibleStatus::Unknown);
              return;
            }
+           if (self->request.scope == AccessibleScope::Selection &&
+               std::string_view{text}.find("\xef\xbf\xbc") !=
+                   std::string_view::npos) {
+             self->read_native_selection(before);
+             return;
+           }
            self->observation.range = {before.start, before.end,
                                       digest(text, bytes)};
+           if (self->request.scope == AccessibleScope::Selection) {
+             auto *proof = g_variant_ref_sink(g_variant_new(
+                 "(soiis)", self->observation.provider.c_str(),
+                 self->observation.object.c_str(), before.start, before.end,
+                 self->observation.range.sha256.c_str()));
+             self->observation.range.identity =
+                 digest(g_variant_get_data(proof), g_variant_get_size(proof));
+             g_variant_unref(proof);
+           }
            self->metadata([self, before](Meta after) {
              if (!(before == after)) {
                self->reobserve_range();
@@ -621,6 +863,237 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
              }
              self->matches(true);
            });
+         });
+  }
+
+  void read_native_selection(Meta before) {
+    auto self = shared_from_this();
+    call(state->bus, observation.provider, observation.object.c_str(),
+         kDocument, "GetTextSelections", nullptr, "(a((so)i(so)ib))",
+         [self, before](GVariant *value) {
+           if (self->native_endpoints)
+             g_variant_unref(self->native_endpoints);
+           self->native_endpoints = g_variant_get_child_value(value, 0);
+           if (g_variant_n_children(self->native_endpoints) != 1) {
+             self->finish(AccessibleStatus::Unavailable);
+             return;
+           }
+           const gchar *first_provider = nullptr, *last_provider = nullptr;
+           const gchar *first = nullptr, *last = nullptr;
+           gboolean active = FALSE;
+           g_variant_get_child(self->native_endpoints, 0, "((&s&o)i(&s&o)ib)",
+                               &first_provider, &first, &self->native_begin,
+                               &last_provider, &last, &self->native_end,
+                               &active);
+           if (self->observation.provider != first_provider ||
+               self->observation.provider != last_provider ||
+               self->native_begin < 0 || self->native_end < 0) {
+             self->finish(AccessibleStatus::Unavailable);
+             return;
+           }
+           const std::string first_path(first), last_path(last);
+           self->call(
+               self->state->bus, self->observation.provider,
+               self->observation.object.c_str(), kAccessible, "GetChildren",
+               nullptr, "(a(so))",
+               [self, before, first_path, last_path](GVariant *children) {
+                 if (self->native_children)
+                   g_variant_unref(self->native_children);
+                 self->native_children = g_variant_get_child_value(children, 0);
+                 const auto count = g_variant_n_children(self->native_children);
+                 if (count == 0 || count > 128) {
+                   self->finish(AccessibleStatus::Unavailable);
+                   return;
+                 }
+                 self->native_parts.clear();
+                 self->native_bytes = 0;
+                 self->state->range_objects.clear();
+                 bool collecting = false, ended = false;
+                 for (gsize i = 0; i < count; ++i) {
+                   const gchar *provider = nullptr, *object = nullptr;
+                   g_variant_get_child(self->native_children, i, "(&s&o)",
+                                       &provider, &object);
+                   if (ended)
+                     continue;
+                   if (self->observation.provider != provider) {
+                     if (collecting) {
+                       self->finish(AccessibleStatus::Unavailable);
+                       return;
+                     }
+                     continue;
+                   }
+                   if (first_path == object) {
+                     if (collecting) {
+                       self->finish(AccessibleStatus::Unknown);
+                       return;
+                     }
+                     collecting = true;
+                   }
+                   if (collecting) {
+                     self->native_parts.push_back(NativePart{object, {}});
+                     self->state->range_objects.emplace_back(object);
+                   }
+                   if (collecting && last_path == object)
+                     ended = true;
+                 }
+                 if (!ended || self->native_parts.empty()) {
+                   self->finish(AccessibleStatus::Unavailable);
+                   return;
+                 }
+                 self->read_native_part(before, 0);
+               });
+         });
+  }
+
+  void read_native_part(Meta before, std::size_t index) {
+    if (index == native_parts.size()) {
+      finish_native_selection(before);
+      return;
+    }
+    auto self = shared_from_this();
+    const auto path = native_parts[index].object;
+    call(state->bus, observation.provider, path.c_str(), kAccessible, "GetRole",
+         nullptr, "(u)", [self, before, index, path](GVariant *value) {
+           guint role = 0;
+           g_variant_get(value, "(u)", &role);
+           // AT-SPI paragraph=73 and section=85 are Chromium block text owners.
+           if (role != 73 && role != 85) {
+             self->finish(AccessibleStatus::Unavailable);
+             return;
+           }
+           self->call(
+               self->state->bus, self->observation.provider, path.c_str(),
+               kProperties, "Get", g_variant_new("(ss)", kAccessible, "Parent"),
+               "(v)", [self, before, index, path](GVariant *parent) {
+                 GVariant *boxed = g_variant_get_child_value(parent, 0);
+                 GVariant *reference = g_variant_get_variant(boxed);
+                 const gchar *provider = nullptr, *object = nullptr;
+                 const bool typed =
+                     g_variant_is_of_type(reference, G_VARIANT_TYPE("(so)"));
+                 if (typed)
+                   g_variant_get(reference, "(&s&o)", &provider, &object);
+                 const bool owned = typed &&
+                                    self->observation.provider == provider &&
+                                    self->observation.object == object;
+                 g_variant_unref(reference);
+                 g_variant_unref(boxed);
+                 if (!owned) {
+                   self->finish(AccessibleStatus::Stale);
+                   return;
+                 }
+                 self->metadata(
+                     [self, before, index, path](Meta meta) {
+                       auto &part = self->native_parts[index];
+                       part.begin = index == 0 ? self->native_begin : 0;
+                       part.end = index + 1 == self->native_parts.size()
+                                      ? self->native_end
+                                      : meta.count;
+                       if (part.end < part.begin || part.end > meta.count ||
+                           part.end - part.begin > kAccessibleRangeCharacters ||
+                           meta.start != part.begin || meta.end != part.end) {
+                         self->finish(AccessibleStatus::Stale);
+                         return;
+                       }
+                       self->call(
+                           self->state->bus, self->observation.provider,
+                           path.c_str(), kText, "GetText",
+                           g_variant_new("(ii)", part.begin, part.end), "(s)",
+                           [self, before, index, path, meta](GVariant *text) {
+                             const gchar *bytes = nullptr;
+                             g_variant_get(text, "(&s)", &bytes);
+                             auto &part = self->native_parts[index];
+                             part.text = bytes;
+                             self->native_bytes +=
+                                 part.text.size() + (index == 0 ? 0 : 1);
+                             if (part.text.size() > kAccessibleRangeBytes ||
+                                 self->native_bytes > kAccessibleRangeBytes ||
+                                 g_utf8_strlen(bytes, -1) !=
+                                     part.end - part.begin ||
+                                 part.text.find("\xef\xbf\xbc") !=
+                                     std::string::npos) {
+                               self->finish(AccessibleStatus::Unavailable);
+                               return;
+                             }
+                             self->metadata(
+                                 [self, before, index, meta](Meta after) {
+                                   if (!(meta == after)) {
+                                     self->reobserve_range();
+                                     return;
+                                   }
+                                   self->read_native_part(before, index + 1);
+                                 },
+                                 path);
+                           });
+                     },
+                     path);
+               });
+         });
+  }
+
+  void finish_native_selection(Meta before) {
+    auto self = shared_from_this();
+    call(state->bus, observation.provider, observation.object.c_str(),
+         kDocument, "GetTextSelections", nullptr, "(a((so)i(so)ib))",
+         [self, before](GVariant *value) {
+           auto *endpoints = g_variant_get_child_value(value, 0);
+           const bool same = g_variant_equal(endpoints, self->native_endpoints);
+           g_variant_unref(endpoints);
+           if (!same) {
+             self->reobserve_range();
+             return;
+           }
+           self->call(
+               self->state->bus, self->observation.provider,
+               self->observation.object.c_str(), kAccessible, "GetChildren",
+               nullptr, "(a(so))", [self, before](GVariant *value) {
+                 auto *children = g_variant_get_child_value(value, 0);
+                 const bool same =
+                     g_variant_equal(children, self->native_children);
+                 g_variant_unref(children);
+                 if (!same) {
+                   self->finish(AccessibleStatus::Stale);
+                   return;
+                 }
+                 std::string text;
+                 GVariantBuilder parts;
+                 g_variant_builder_init(&parts, G_VARIANT_TYPE("a(soiis)"));
+                 bool first = true;
+                 for (const auto &part : self->native_parts) {
+                   if (!first)
+                     text += '\n';
+                   first = false;
+                   text += part.text;
+                   const auto hash = digest(part.text.data(), part.text.size());
+                   g_variant_builder_add(
+                       &parts, "(soiis)", self->observation.provider.c_str(),
+                       part.object.c_str(), part.begin, part.end, hash.c_str());
+                 }
+                 const auto characters = g_utf8_strlen(
+                     text.data(), static_cast<gssize>(text.size()));
+                 if (text.size() > kAccessibleRangeBytes ||
+                     characters > kAccessibleRangeCharacters) {
+                   g_variant_builder_clear(&parts);
+                   self->finish(AccessibleStatus::Unavailable);
+                   return;
+                 }
+                 auto *proof = g_variant_ref_sink(g_variant_new(
+                     "(so@a((so)i(so)ib)@a(soiis))",
+                     self->observation.provider.c_str(),
+                     self->observation.object.c_str(), self->native_endpoints,
+                     g_variant_builder_end(&parts)));
+                 self->observation.range = {0, static_cast<gint>(characters),
+                                            digest(text.data(), text.size()),
+                                            digest(g_variant_get_data(proof),
+                                                   g_variant_get_size(proof))};
+                 g_variant_unref(proof);
+                 self->metadata([self, before](Meta after) {
+                   if (!(before == after)) {
+                     self->reobserve_range();
+                     return;
+                   }
+                   self->matches(true);
+                 });
+               });
          });
   }
   void reobserve_range() {
@@ -636,13 +1109,13 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
     finish(AccessibleStatus::Stale);
   }
   void complete() {
-    if (request.scope == AccessibleScope::Range &&
+    if (request.scope != AccessibleScope::Child &&
         range != state->range_generation) {
       reobserve_range();
       return;
     }
     if (epoch != state->epoch || focus != state->focus_generation ||
-        (request.scope == AccessibleScope::Range &&
+        (request.scope != AccessibleScope::Child &&
          range != state->range_generation) ||
         !state->ready) {
       finish(AccessibleStatus::Stale);
@@ -665,11 +1138,13 @@ struct AccessibleContext::State::Job : std::enable_shared_from_this<Job> {
          request.expected_token != observation.token) ||
         (expected && (expected->start != observation.range.start ||
                       expected->end != observation.range.end ||
-                      expected->sha256 != observation.range.sha256))) {
+                      expected->sha256 != observation.range.sha256 ||
+                      expected->identity != observation.range.identity))) {
       finish(AccessibleStatus::Stale);
       return;
     }
-    GVariant *reply = g_variant_ref_sink(observation.wire(state->helper));
+    GVariant *reply = g_variant_ref_sink(observation.wire(
+        state->helper, request.scope == AccessibleScope::Selection));
     const bool bounded = g_variant_get_size(reply) <= 1024;
     g_variant_unref(reply);
     finish(bounded ? AccessibleStatus::Observed
@@ -686,6 +1161,7 @@ void AccessibleContext::State::invalidate_editor() {
   ++range_generation;
   watched_provider.clear();
   watched_object.clear();
+  range_objects.clear();
   if (auto job = active.lock())
     job->finish(AccessibleStatus::Stale);
 }
@@ -707,6 +1183,7 @@ void AccessibleContext::State::drop_bus() {
   registry.clear();
   watched_provider.clear();
   watched_object.clear();
+  range_objects.clear();
 }
 AccessibleContext::State::~State() {
   reset();
@@ -752,7 +1229,9 @@ void AccessibleContext::State::event(GDBusConnection *connection,
       }
       if ((g_str_equal(name, "focused") && !repeated_focus) ||
           (g_str_equal(name, "defunct") && state->watched_provider == sender &&
-           state->watched_object == path))
+           (state->watched_object == path ||
+            std::find(state->range_objects.begin(), state->range_objects.end(),
+                      path) != state->range_objects.end())))
         ++state->focus_generation;
     } else
       ++state->focus_generation;
@@ -778,13 +1257,18 @@ void AccessibleContext::State::event(GDBusConnection *connection,
       const gchar *provider = nullptr, *object = nullptr;
       g_variant_get(reference, "(&s&o)", &provider, &object);
       if (state->watched_provider == provider &&
-          state->watched_object == object)
+          (state->watched_object == object ||
+           std::find(state->range_objects.begin(), state->range_objects.end(),
+                     object) != state->range_objects.end()))
         ++state->focus_generation;
     }
     g_variant_unref(reference);
     g_variant_unref(value);
   } else if (state->watched_provider == sender &&
-             state->watched_object == path &&
+             (state->watched_object == path ||
+              std::find(state->range_objects.begin(),
+                        state->range_objects.end(),
+                        path) != state->range_objects.end()) &&
              (g_str_equal(member, "TextChanged") ||
               g_str_equal(member, "TextSelectionChanged") ||
               g_str_equal(member, "TextCaretMoved")))

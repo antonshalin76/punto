@@ -58,6 +58,10 @@ public:
    */
   [[nodiscard]] AnalysisResult analyze(std::span<const KeyEntry> word) const;
 
+  // Conservative heuristic evidence, not a calibrated language probability.
+  [[nodiscard]] bool strongly_matches(std::span<const KeyEntry> word,
+                                      Language language) const;
+
   /**
    * @brief Вычисляет скор для указанной раскладки
    * @param word Буфер слова

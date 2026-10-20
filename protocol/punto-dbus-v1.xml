@@ -91,6 +91,33 @@
       <arg name="range_sha256" type="s" direction="out"/>
       <arg name="token" type="s" direction="out"/>
     </method>
+    <method name="ObserveSelection">
+      <arg name="helper_instance" type="s" direction="in"/>
+      <arg name="expected_provider_pid" type="u" direction="in"/>
+      <arg name="deadline_us" type="t" direction="in"/>
+      <arg name="expected_token" type="s" direction="in"/>
+      <arg name="expected_range_start" type="i" direction="in"/>
+      <arg name="expected_range_end" type="i" direction="in"/>
+      <arg name="expected_range_sha256" type="s" direction="in"/>
+      <arg name="expected_range_identity" type="s" direction="in"/>
+      <arg name="status" type="u" direction="out"/>
+      <arg name="helper_instance" type="s" direction="out"/>
+      <arg name="bus_epoch" type="t" direction="out"/>
+      <arg name="registry_owner" type="s" direction="out"/>
+      <arg name="provider" type="s" direction="out"/>
+      <arg name="object" type="o" direction="out"/>
+      <arg name="focus_generation" type="t" direction="out"/>
+      <arg name="observed_us" type="t" direction="out"/>
+      <arg name="provider_pid" type="u" direction="out"/>
+      <arg name="caret" type="i" direction="out"/>
+      <arg name="selection_start" type="i" direction="out"/>
+      <arg name="selection_end" type="i" direction="out"/>
+      <arg name="range_start" type="i" direction="out"/>
+      <arg name="range_end" type="i" direction="out"/>
+      <arg name="range_sha256" type="s" direction="out"/>
+      <arg name="token" type="s" direction="out"/>
+      <arg name="range_identity" type="s" direction="out"/>
+    </method>
     <method name="ObserveEditorOrigin">
       <arg name="helper_instance" type="s" direction="in"/>
       <arg name="expected_provider_pid" type="u" direction="in"/>

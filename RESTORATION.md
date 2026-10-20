@@ -1,9 +1,161 @@
 # Product restoration
 
-This document records the source restoration through the 2.8.14 candidate.
+This document records restoration and the2.8.17 release baseline.
 Source tests, package validation, publication and machine installation are
 separate evidence gates; runtime health alone is not proof of an editor
 correction.
+
+## Explicit learning gesture, 2026-10-20
+
+The2.8.17 candidate removes implicit Backspace/Ctrl+Z learning. Holding
+Ctrl+Shift and pressing/releasing Backspace twice admits an exact inverse only
+for the last native automatic correction, in the same child and within the
+existing2500ms undo window. Both presses require fresh editor proof. A repeated
+keydown cannot complete the gesture; a started gesture cannot become deletion
+after focus drift. Only successful exact inverse dispatch adds the exception.
+The existing secure storage, reset protocol, helpers and GNOME bridge are reused.
+
+The requested reset of12 old exclusions completed before development; the live
+list was durably empty. A new cutover snapshot must preserve this empty list,
+not restore old learning from the earlier feature-update backup.
+The [checkbox plan](protocol/explicit-learning-gesture-plan-20261020.md) owns
+source validation, package and installed-host acceptance separately.
+No GNOME Shell, IBus, GDM restart, logout or reboot is required.
+
+The installed DEB SHA256 is
+`6ef20f5be3fefdfd957de6b667a33ed558e1efbc392683fbdc1e32f1984f033a`.
+Recovery packet `/var/lib/punto-learning-update-20261020-2817` retains the exact
+previous2.8.16 archive and the fresh empty-learning snapshot. Transaction receipt0,
+all23 immutable paths and the four mutable files were verified at cutover.
+ASan/LSan/UBSan GTK32/32, Chromium3/3 and the secure-store contract pass;
+Release GTK32/32, Chromium3/3 and14 shared input cases pass. Package lifecycle107/107
+passes. Four existing lintian documentation warnings remain, not runtime failures.
+
+Installed-host GTK proves ordinary three-Backspace deletion and Ctrl+Z without
+learning, exact gesture inverse and durable exclusion, exclusion application,
+manual override, next RU glyph and unchanged clipboard representations.
+The owned test exclusion was removed with the public durable reset; the final
+list is empty. Nonportable host clipboard targets were preserved but do not
+qualify a portable-paste cohort. Desktop PID/start identities are unchanged.
+An extra one-off activation shell status check had a quoting error; independent
+positive Python readback verifies exact installed identity and all immutable
+paths. Its original error log remains recorded. This local installation checkpoint
+predates the code commit and GitHub publication; it is not hosted CI evidence.
+
+## Probabilistic correction and native editors, 2026-10-20
+
+The new local candidate2.8.16 is installed over the exact2.8.15 r2 baseline.
+DEB SHA256 is b73fa488d7b84a162fcc842187d9a41773aa43124e2bcd9af8fee6e4b266a39a.
+The [current checkbox plan](protocol/probabilistic-editor-coverage-plan-20261020.md)
+and [editor matrix](protocol/editor-coverage-matrix-20261020.md) distinguish
+source gates, toolkit coverage, actual applications and installation.
+
+Strong Unknown analysis reuses existing bigram/trigram tables; current-language
+dictionary words and uncertain/technical tokens remain protected. Contextual
+one-letter correction requires two agreeing known neighbors and the same proven
+editor. Unknown/context edits do not use terminal fallback. Qt/GTK providers of
+one process are checked individually; exactly one focused editable is required.
+Native tree discovery remains bounded, with password and foreign-owner refusal.
+
+Final ASan/UBSan checks pass GTK4 Entry/TextView2/2, six receipt/deadline negatives
+and six Chromium rich-text/retry/Tab cases. Actual private Code, GNOME Text Editor
+and Firefox complete slices pass3/3. Final affected-owner clang-tidy passes.
+The first broad Release failures remain in their original logs; the current
+targeted closure is recorded in the plan rather than relabeling old runs.
+
+The host update must pin the exact r2 archive SHA256b66c40b3bb9f6fa79d2f25b976ea712edafd57f013992fc6a04e1b900695d66f,
+take a fresh quiescent config/learning snapshot and stop only Punto units.
+GNOME JavaScript/protocol are unchanged from the installed r2 payload; compare
+the final extracted DEB before cutover. No Shell, IBus, GDM, logout or reboot is
+required. Package transaction UNKNOWN leaves the backend OFF for reconciliation.
+Actual Telegram acceptance uses only an authorized empty Saved Messages input,
+forbids Enter and sends no messages. Publication remains a separate gate.
+
+The root recovery packet is `/var/lib/punto-feature-update-20261020-2816`;
+the dpkg transaction receipt is0. All23 immutable paths and all four mutable
+config/learning files were verified at cutover, including metadata. Typed
+readiness then started only Punto. GTK and Chrome complete host slices pass;
+Unknown/noise and a contextual middle/right burst pass with next RU input and
+unchanged clipboard. The oldest burst word can leave the configured two-word
+rollback window before its result arrives; the test does not widen that window.
+The existing `ghbdtn` learning exclusion is preserved, not reset for acceptance.
+Explicit user layout shortcuts reset context, so the contextual host fixture
+uses uninterrupted physical typing rather than artificial shortcut changes.
+GNOME Shell8042, IBus8170/8342 and GDM3429 retain their original start times.
+Host evidence is in `deploy-feature-2816/host-{gtk-eligible,chrome,feature-burst}.log`
+beside the isolated source. Telegram's actual Qt6 field passes all five hotkeys,
+both directions, Unknown AUTO, contextual one-letter correction and next RU input.
+The first run passed functionality but failed only the redundant hidden scratch
+activation in cleanup. Final `host-telegram-cleanup.log` and
+`host-telegram-auto.log` both exit0 and prove an empty authorized Saved Messages
+field, no Enter/message, original layout, unchanged clipboard and released keys.
+These post-install receipts update source documentation, not the sealed DEB.
+
+## Autocorrection and selected hotkeys, 2026-10-20
+
+Current work is isolated on `fix/punto-hotkeys-20261020` from master `e85f403`.
+The first local2.8.15 candidate is installed; published2.8.14 assets remain
+unchanged. User reports reopened product acceptance: earlier finite host checks
+did not cover these failures. This is not a completed2.8.15 release.
+
+The working [checkbox plan](protocol/hotkeys-autocorrection-plan-20261020.md)
+records actual evidence and remaining delivery gates. The changes preserve
+Russian letter-ending keys during dictionary analysis, extend bounded typing
+origin admission from20 to100ms, and use native Document.GetTextSelections
+endpoints for plain paragraph selections exposed through Chromium hypertext.
+ObserveSelection is a separate method; existing D-Bus signatures and GNOME
+InputSource interface are unchanged. No Shell/IBus/GDM restart is required by
+this protocol addition. Unsupported nested selections still fail closed.
+
+New private Chromium16/16 and GTK origin40-ms RED/GREEN checks pass. A250-ms
+provider stall safely declines the first correction and the next word recovers
+without restarting Punto. Combined independent runtime/protocol review passes.
+An expanded sanitizer run found an extra GVariant reference in the new endpoint
+proof; it was removed and native Chromium16/16 passes with detect_leaks=1, without
+suppression. Additional sanitizer GTK4/4 and Chrome AUTO/recovery2/2 pass.
+The first broad Release run also exceeded a2-second fault hold when its33-word
+burst used the new100-ms per-word budget; the bounded-queue oracle is retained
+with a smaller overflowing burst. Its clipboard poll now waits through the
+temporary lack of STRING during restoration using the existing UTF-8 reader.
+The legacy private-Xvfb platform test no longer inherits the desktop IBus module.
+Broad Release46/50 plus final recheck4/4 close all50 groups for the pre-crowded-
+registry source checkpoint; neither failed run is rewritten as passing.
+
+### Installed r1 and crowded-registry correction
+
+The first2.8.15 package, SHA256
+`6fc826bedc318ef959767f8ec41d7b2c4004883e205430daf9464f8356096ca6`,
+was built, package-checked and installed with a fresh quiescent four-file backup.
+Host GTK passes all five hotkeys, empty recovery, AUTO, next RU glyph and the
+user's dictionary words. Config/learning and core desktop process identities
+remain preserved. Evidence: `deploy-20261020/host-gtk-quiet.log` alongside source.
+Earlier failed host probes remain recorded; they are not relabeled as passes.
+
+The host Chrome attempt still fails with `editor_context`. Independent inspection
+found31 registered applications before the owned GTK and Chrome windows, then33;
+the helper's unrelated32-application ceiling refused registry GetChildren before
+editor inspection. A native private test registers34 applications and reproduces
+that refusal. Removing the redundant count guard preserves the8KiB reply limit,
+original deadline and provider/session checks. The same test passes1/1 in4.488s,
+including AUTO/recovery, clipboard and released modifiers; independent review
+passes. Evidence: `crowded-desktop-{red,green}.log`.
+
+Final affected-source rechecks pass: the whole accessible GTK class14/14 in
+10.822s (`accessible-final.log`), crowded-registry ASan1/1 in5.115s
+(`crowded-sanitizer-green.log`) and native Chromium ASan17/17 in33.134s
+(`chromium-cap-final.log`). The rebuilt r2 package is installed and accepted in
+real GTK and Chrome: five hotkeys, AUTO, user words, empty refusal/recovery,
+next RU glyph, clipboard and released modifiers pass. The specific reported
+`rfrb[` also corrects to «каких». The final helper GTK14/14 check passes in8.457s.
+The package SHA256 is
+`b66c40b3bb9f6fa79d2f25b976ea712edafd57f013992fc6a04e1b900695d66f`.
+The fresh r2 quiescent snapshot and exact r1 rollback are retained in
+`/var/lib/punto-hotkeys-update-20261020-r2`; all23 immutable files and four
+config/learning files match after acceptance. Core desktop process identities
+are unchanged. Evidence: `deploy-20261020-r2/host-{gtk,chrome,word-ending}.log`.
+Post-install receipts update source documentation only, not the sealed DEB.
+GitHub publication remains a separate, unexecuted gate.
+GNOME JavaScript is unchanged; no Shell/IBus/GDM or session restart is required.
 
 ## Publication integration, 2026-10-19
 

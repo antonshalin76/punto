@@ -378,6 +378,7 @@ template <typename Reply> struct PendingCall {
   Reply reply;
   bool complete = false;
   bool valid = false;
+  bool selection = false;
 };
 
 int state_callback(sd_bus_message *message, void *userdata, sd_bus_error *) {
@@ -449,23 +450,29 @@ int editor_callback(sd_bus_message *message, void *userdata, sd_bus_error *) {
   std::uint32_t status = 4;
   const char *helper = nullptr, *registry = nullptr, *provider = nullptr;
   const char *object = nullptr, *sha = nullptr, *token = nullptr;
+  const char *identity = "";
   const int read = sd_bus_message_read(
       message, "ustssottuiiiiiss", &status, &helper, &value.bus_epoch,
       &registry, &provider, &object, &value.focus_generation,
       &value.observed_us, &value.provider_pid, &value.caret,
       &value.selection_start, &value.selection_end, &value.range.start,
       &value.range.end, &sha, &token);
-  if (read > 0 && sd_bus_message_at_end(message, 1) > 0 && status <= 4 &&
-      helper && registry && provider && object && sha && token &&
-      std::strlen(helper) <= 64 && std::strlen(registry) <= 255 &&
-      std::strlen(provider) <= 255 && std::strlen(object) <= 512 &&
-      std::strlen(sha) <= 64 && std::strlen(token) <= 64) {
+  const bool identity_read =
+      !call.selection ||
+      (read > 0 && sd_bus_message_read(message, "s", &identity) > 0);
+  if (read > 0 && identity_read && sd_bus_message_at_end(message, 1) > 0 &&
+      status <= 4 && helper && registry && provider && object && sha && token &&
+      identity && std::strlen(identity) <= 64 && std::strlen(helper) <= 64 &&
+      std::strlen(registry) <= 255 && std::strlen(provider) <= 255 &&
+      std::strlen(object) <= 512 && std::strlen(sha) <= 64 &&
+      std::strlen(token) <= 64) {
     value.status = static_cast<AccessibleStatus>(status);
     call.reply.helper = helper;
     value.registry_owner = registry;
     value.provider = provider;
     value.object = object;
     value.range.sha256 = sha;
+    value.range.identity = identity;
     value.token = token;
     call.valid = true;
   }
@@ -593,10 +600,13 @@ AccessibleObservation DesktopLayoutClient::observe_editor(
     const std::optional<AccessibleRange> &expected_range, AccessibleScope scope,
     bool preparation) {
   const auto started = Clock::now();
+  const bool selection = scope == AccessibleScope::Selection;
   if (provider_pid == 0 || started >= hard_deadline ||
       (scope == AccessibleScope::Child && expected_range) ||
       (preparation &&
        (scope != AccessibleScope::Child || !expected_token.empty())) ||
+      (selection && expected_range &&
+       !lower_hex(expected_range->identity, 64)) ||
       (!expected_token.empty() && !lower_hex(expected_token, 64)))
     return {};
   const auto deadline = std::min(hard_deadline, started + kCallBudget);
@@ -610,10 +620,10 @@ AccessibleObservation DesktopLayoutClient::observe_editor(
   sd_bus_message *raw_message = nullptr;
   if (sd_bus_message_new_method_call(
           bus.get(), &raw_message, nullptr, kPath, kInterface,
-          preparation
-              ? "PrepareEditorOrigin"
-              : (scope == AccessibleScope::Child ? "ObserveEditorOrigin"
-                                                 : "ObserveEditor")) < 0)
+          preparation ? "PrepareEditorOrigin"
+                      : (scope == AccessibleScope::Child ? "ObserveEditorOrigin"
+                         : selection                     ? "ObserveSelection"
+                                     : "ObserveEditor")) < 0)
     return {};
   message.reset(raw_message);
   const AccessibleRange range = expected_range.value_or(AccessibleRange{});
@@ -629,7 +639,11 @@ AccessibleObservation DesktopLayoutClient::observe_editor(
                 range.start, range.end, range.sha256.c_str());
   if (appended < 0)
     return {};
+  if (selection &&
+      sd_bus_message_append(message.get(), "s", range.identity.c_str()) < 0)
+    return {};
   PendingCall<EditorReply> call;
+  call.selection = selection;
   sd_bus_slot *raw_slot = nullptr;
   if (sd_bus_call_async(bus.get(), &raw_slot, message.get(), editor_callback,
                         &call, timeout_us(deadline)) < 0)
@@ -665,14 +679,17 @@ AccessibleObservation DesktopLayoutClient::observe_editor(
       value.registry_owner.empty() || value.registry_owner.front() != ':' ||
       value.provider.empty() || value.provider.front() != ':' ||
       value.object == "/" || !lower_hex(value.token, 64) ||
+      (selection && !lower_hex(value.range.identity, 64)) ||
       (scope == AccessibleScope::Child &&
        (value.caret != -1 || value.selection_start != -1 ||
         value.selection_end != -1 || value.range.start != -1 ||
         value.range.end != -1 || !value.range.sha256.empty())) ||
       (!expected_token.empty() && expected_token != value.token) ||
-      (expected_range && (expected_range->start != value.range.start ||
-                          expected_range->end != value.range.end ||
-                          expected_range->sha256 != value.range.sha256)))
+      (expected_range &&
+       (expected_range->start != value.range.start ||
+        expected_range->end != value.range.end ||
+        expected_range->sha256 != value.range.sha256 ||
+        (selection && expected_range->identity != value.range.identity))))
     return {};
   return std::move(value);
 }

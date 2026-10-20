@@ -22,11 +22,12 @@ enum class AccessibleStatus : std::uint32_t {
   Unknown
 };
 
-enum class AccessibleScope { Child, Range };
+enum class AccessibleScope { Child = 0, Range = 1, Selection = 2 };
 
 struct AccessibleRange {
   std::int32_t start = -1, end = -1;
   std::string sha256;
+  std::string identity{};
 };
 
 struct AccessibleRequest {
@@ -48,7 +49,7 @@ struct AccessibleObservation {
   std::string registry_owner, provider, object = "/", token;
   std::int32_t caret = -1, selection_start = -1, selection_end = -1;
   AccessibleRange range;
-  GVariant *wire(std::string_view helper) const;
+  GVariant *wire(std::string_view helper, bool selection = false) const;
 };
 
 // Desktop-user GMainContext only; never initializes libatspi or mutates text.

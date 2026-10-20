@@ -223,8 +223,7 @@ void test_learning_is_cached_while_write_is_blocked() {
                                                 [&] { return permitted; });
                                }};
   wait_ready(detector);
-  detector.on_correction_applied(1, "learned");
-  detector.on_undo();
+  detector.add_exclusion("learned");
   bool started;
   {
     std::unique_lock lock{mutex};
@@ -664,31 +663,33 @@ void test_published_mutation_is_not_replayed(bool clear) {
          "state");
 }
 
-void test_undo_window_learning() {
+void test_explicit_store_add_is_idempotent() {
   TempDir dir;
   punto::UndoDetector detector{(dir.path() / "undo.txt").string()};
   wait_ready(detector);
-  detector.on_correction_applied(1, "learn");
-  const auto now = std::chrono::steady_clock::now();
-  expect(!detector.on_backspace(now), "first backspace does not learn");
-  expect(!detector.on_backspace(now), "second backspace does not learn");
-  expect(detector.on_backspace(now), "third backspace learns");
-  expect(detector.is_excluded("learn"), "learned word is immediately cached");
+  const auto generation = detector.generation();
+  detector.add_exclusion("learn");
+  expect(detector.is_excluded("learn"), "explicit add is immediately cached");
+  expect(detector.generation() == generation + 1,
+         "one explicit add is one mutation");
+  detector.add_exclusion("learn");
+  expect(detector.generation() == generation + 1,
+         "duplicate add is not another mutation");
   wait_saved(detector);
+  expect(read_file(dir.path() / "undo.txt") == "learn\n", "one durable entry");
 }
 
-void test_intervening_input_invalidates_learning_candidate() {
+void test_store_does_not_invent_exclusions() {
   TempDir dir;
   punto::UndoDetector detector{(dir.path() / "undo.txt").string()};
   wait_ready(detector);
-  detector.on_correction_applied(1, "original");
-  detector.on_key_typed();
-  const auto now = std::chrono::steady_clock::now();
-  expect(!detector.on_backspace(now), "first later backspace is unrelated");
-  expect(!detector.on_backspace(now), "second later backspace is unrelated");
-  expect(!detector.on_backspace(now), "third later backspace is unrelated");
-  expect(!detector.is_excluded("original"),
-         "typing before deletion does not learn old correction");
+  const auto generation = detector.generation();
+  detector.load_from_file();
+  wait_saved(detector);
+  expect(detector.exclusion_count() == 0 && !detector.is_excluded("original"),
+         "refresh without an explicit add cannot learn a correction");
+  expect(detector.generation() >= generation,
+         "refresh retains monotonic generation");
 }
 
 void test_concurrent_writers_merge_under_lock() {
@@ -818,14 +819,15 @@ void test_clear_discards_add_accepted_before_global_reset() {
   bool stale_add_blocked = false;
   bool release_stale_add = false;
   punto::UndoDetector stale{path.string(), [&] {
-    std::unique_lock lock{mutex};
-    ++io_calls;
-    if (io_calls == 2U) {
-      stale_add_blocked = true;
-      condition.notify_all();
-      condition.wait(lock, [&] { return release_stale_add; });
-    }
-  }};
+                              std::unique_lock lock{mutex};
+                              ++io_calls;
+                              if (io_calls == 2U) {
+                                stale_add_blocked = true;
+                                condition.notify_all();
+                                condition.wait(
+                                    lock, [&] { return release_stale_add; });
+                              }
+                            }};
   wait_ready(stale);
   stale.add_exclusion("queuedbeforeclear");
   {
@@ -864,8 +866,7 @@ void test_clear_repairs_invalid_reset_marker_atomically() {
     std::ofstream output{marker};
     output << "PUNTO_RESET_V1 partial";
   }
-  expect(::chmod(path.c_str(), 0600) == 0 &&
-             ::chmod(marker.c_str(), 0600) == 0,
+  expect(::chmod(path.c_str(), 0600) == 0 && ::chmod(marker.c_str(), 0600) == 0,
          "invalid-marker fixture has secure metadata");
 
   punto::UndoDetector detector{path.string()};
@@ -902,19 +903,20 @@ void test_refresh_filters_pending_add_accepted_before_external_reset() {
   bool release_refresh = false;
   bool add_blocked = false;
   bool release_add = false;
-  punto::UndoDetector stale{path.string(), [&] {
-    std::unique_lock lock{mutex};
-    ++io_calls;
-    if (io_calls == 2U) {
-      refresh_blocked = true;
-      condition.notify_all();
-      condition.wait(lock, [&] { return release_refresh; });
-    } else if (io_calls == 3U) {
-      add_blocked = true;
-      condition.notify_all();
-      condition.wait(lock, [&] { return release_add; });
-    }
-  }};
+  punto::UndoDetector stale{
+      path.string(), [&] {
+        std::unique_lock lock{mutex};
+        ++io_calls;
+        if (io_calls == 2U) {
+          refresh_blocked = true;
+          condition.notify_all();
+          condition.wait(lock, [&] { return release_refresh; });
+        } else if (io_calls == 3U) {
+          add_blocked = true;
+          condition.notify_all();
+          condition.wait(lock, [&] { return release_add; });
+        }
+      }};
   wait_ready(stale);
   stale.load_from_file();
   {
@@ -1025,8 +1027,8 @@ int main(int argc, char **argv) {
   test_atomic_private_round_trip();
   test_invalid_words_and_capacity_are_bounded();
   test_unsafe_and_oversized_files_fail_closed();
-  test_undo_window_learning();
-  test_intervening_input_invalidates_learning_candidate();
+  test_explicit_store_add_is_idempotent();
+  test_store_does_not_invent_exclusions();
   test_concurrent_writers_merge_under_lock();
   test_clear_then_stale_process_add_does_not_resurrect_entries();
   test_clear_discards_add_accepted_before_global_reset();
